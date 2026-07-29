@@ -17,8 +17,9 @@ pixi run backend -- --no-ui       # WebSocket + /healthz only
 Builds the same binary + ships UI under `$PREFIX/share/fresh-gui/ui` (recipe in `recipe/`):
 
 ```bash
-pixi global install --path .   # from a clone with submodules
-# or: pixi run package         # writes .conda under ./dist
+pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git
+# or from a checkout: pixi global install --path .
+# or: pixi run package   # writes .conda under ./dist
 fresh-gui-backend
 ```
 

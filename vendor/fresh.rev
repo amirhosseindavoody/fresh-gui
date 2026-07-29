@@ -1,0 +1,3 @@
+# Pinned Fresh submodule commit (keep in sync with `git ls-tree HEAD vendor/fresh`).
+# Used by recipe/build.sh when `pixi global install --git` does not init submodules.
+f5f2c4639f7d5ed3d6b3ef3d2343365ced426401

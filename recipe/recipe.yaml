@@ -1,8 +1,8 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/prefix-dev/recipe-format/main/schema.json
 #
-# Local packaging uses path source (requires `git submodule update --init`).
-# conda-forge / tagged releases can later switch to a GitHub archive that includes
-# the Fresh submodule pin (or a recursive archive).
+# Install: `pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git`
+# Local packaging also works via path source. The build script fetches Fresh from
+# `vendor/fresh.rev` when the git submodule is not checked out (typical for --git).
 context:
   version: 2026.728.1
 
@@ -28,6 +28,7 @@ requirements:
     - cargo-auditable
     - cargo-bundle-licenses
     - bun
+    - git
   run:
     # Shells spawned by the daemon use the system shell/PTY; no extra run deps.
 

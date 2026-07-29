@@ -44,17 +44,14 @@ Auth: on loopback, token is optional unless `--token` / `FRESH_GUI_TOKEN` is set
 Same role as `pixi run serve`, without needing the full Rust/UI toolchain on the machine:
 
 ```bash
-git clone --recurse-submodules https://github.com/amirhosseindavoody/fresh-gui.git
-cd fresh-gui
-pixi global install --path .
-# exposes `fresh-gui-backend` (and ships UI under share/fresh-gui/ui)
+pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git
+# exposes `fresh-gui-backend` (UI under share/fresh-gui/ui)
 
 fresh-gui-backend
 # → UI: http://127.0.0.1:7420/   WS: ws://127.0.0.1:7420/ws
-
-# or build the conda package into ./dist
-pixi run package
 ```
+
+From a local checkout (optional): `pixi global install --path .` or `pixi run package` (writes `./dist`).
 
 ### Remote Linux + browser (SSH)
 

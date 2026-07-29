@@ -7,11 +7,44 @@ set -euo pipefail
 
 cd "${SRC_DIR}"
 
-if [[ ! -f vendor/fresh/Cargo.toml ]]; then
-  echo "error: vendor/fresh submodule is missing; run:" >&2
-  echo "  git submodule update --init --recursive" >&2
-  exit 1
-fi
+# Pixi `global install --git` clones the repo without submodules. Local path
+# builds may also lack vendor/fresh. Ensure the pinned Fresh tree is present.
+ensure_vendor_fresh() {
+  if [[ -f vendor/fresh/Cargo.toml ]]; then
+    return 0
+  fi
+
+  if [[ -d .git || -f .git ]]; then
+    echo "Initializing vendor/fresh submodule…"
+    git submodule update --init --recursive -- vendor/fresh || true
+    if [[ -f vendor/fresh/Cargo.toml ]]; then
+      return 0
+    fi
+  fi
+
+  local url rev pin_file
+  pin_file="vendor/fresh.rev"
+  url="https://github.com/amirhosseindavoody/fresh.git"
+  if [[ -f .gitmodules ]]; then
+    url="$(git config -f .gitmodules --get submodule.vendor/fresh.url || echo "${url}")"
+  fi
+  if [[ ! -f "${pin_file}" ]]; then
+    echo "error: vendor/fresh is missing and ${pin_file} was not found." >&2
+    echo "  For local clones: git submodule update --init --recursive" >&2
+    exit 1
+  fi
+  rev="$(tr -d '[:space:]' < "${pin_file}")"
+  echo "Fetching vendor/fresh @ ${rev} from ${url}…"
+  rm -rf vendor/fresh
+  mkdir -p vendor
+  git init vendor/fresh
+  git -C vendor/fresh remote add origin "${url}"
+  git -C vendor/fresh fetch --depth 1 origin "${rev}"
+  git -C vendor/fresh checkout --detach FETCH_HEAD
+  test -f vendor/fresh/Cargo.toml
+}
+
+ensure_vendor_fresh
 
 echo "Building host UI…"
 (
