@@ -477,6 +477,9 @@ async fn handle_client_msg(
             request_id,
             path,
             preview,
+            cwd,
+            line,
+            column,
         } => {
             require_auth(*authed)?;
             let Some(editor) = state.editor.as_ref() else {
@@ -485,46 +488,52 @@ async fn handle_client_msg(
                     message: format!("{request_id}: editor capability not available"),
                 });
             };
-            let resolved = resolve_editor_path(state, &path).await.map_err(|err| Message::Error {
-                code: "editor_open_failed".into(),
-                message: format!("{request_id}: {err:#}"),
-            })?;
-            let opened = editor
-                .open(resolved, preview)
+            let resolved = resolve_editor_open(state, &path, cwd.as_deref(), line, column)
                 .await
                 .map_err(|err| Message::Error {
                     code: "editor_open_failed".into(),
                     message: format!("{request_id}: {err:#}"),
                 })?;
-            send_msg(
-                sink,
-                &Message::EditorOpened {
-                    request_id,
-                    buffer_id: opened.buffer_id.clone(),
-                    path: opened.path.clone(),
-                    language: opened.language,
-                },
+            reply_editor_opened(sink, editor, request_id, resolved.path, preview, resolved.line, resolved.column)
+                .await
+        }
+        Message::EditorOpenLink {
+            request_id,
+            line_text,
+            column,
+            preview,
+            cwd,
+        } => {
+            require_auth(*authed)?;
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: format!("{request_id}: editor capability not available"),
+                });
+            };
+            let resolved = crate::path_open::resolve_link_open(
+                &state.fs_root,
+                &line_text,
+                column,
+                cwd.as_deref(),
             )
             .await
-            .map_err(|_| Message::Error {
-                code: "send_failed".into(),
-                message: "failed to send EditorOpened".into(),
+            .map_err(|err| Message::Error {
+                code: "editor_open_failed".into(),
+                message: format!("{request_id}: {err:#}"),
             })?;
-            send_msg(
+            // Settings config.json is still openable by explicit path; link
+            // opens stay inside the FS sandbox / authorized cwds.
+            reply_editor_opened(
                 sink,
-                &Message::BufferSnapshot {
-                    buffer_id: opened.buffer_id,
-                    rev: opened.rev,
-                    text: opened.text,
-                    path: opened.path,
-                },
+                editor,
+                request_id,
+                resolved.path,
+                preview,
+                resolved.line,
+                resolved.column,
             )
             .await
-            .map_err(|_| Message::Error {
-                code: "send_failed".into(),
-                message: "failed to send BufferSnapshot".into(),
-            })?;
-            Ok(())
         }
         Message::EditorClose { buffer_id } => {
             require_auth(*authed)?;
@@ -710,20 +719,83 @@ async fn handle_client_msg(
     }
 }
 
-/// Resolve an editor path: the settings `config.json` is always allowed (and
-/// created on first open); everything else stays inside the FS sandbox.
-async fn resolve_editor_path(state: &AppState, path: &str) -> anyhow::Result<std::path::PathBuf> {
-    if Config::path_matches(&state.config_path, path)
-        || path == state.config_path.display().to_string()
-        || std::path::Path::new(path) == state.config_path.as_path()
+/// Resolve an editor open: settings `config.json` is always allowed (and
+/// created on first open); everything else uses Fresh path/`cwd` resolution
+/// inside the FS sandbox (+ authorized terminal cwds).
+async fn resolve_editor_open(
+    state: &AppState,
+    path: &str,
+    cwd: Option<&str>,
+    line: Option<u32>,
+    column: Option<u32>,
+) -> anyhow::Result<crate::path_open::ResolvedOpen> {
+    let (path_part, parsed_line, parsed_col) =
+        fresh::input::quick_open::parse_path_line_col(path);
+    let line = line.or(parsed_line.map(|n| n as u32));
+    let column = column.or(parsed_col.map(|n| n as u32));
+
+    if Config::path_matches(&state.config_path, &path_part)
+        || path_part == state.config_path.display().to_string()
+        || std::path::Path::new(&path_part) == state.config_path.as_path()
     {
         Config::ensure_file(&state.config_path)?;
-        return Ok(state
-            .config_path
-            .canonicalize()
-            .unwrap_or_else(|_| state.config_path.clone()));
+        return Ok(crate::path_open::ResolvedOpen {
+            path: state
+                .config_path
+                .canonicalize()
+                .unwrap_or_else(|_| state.config_path.clone()),
+            line,
+            column,
+        });
     }
-    state.fs_root.resolve(path).await
+
+    crate::path_open::resolve_path_open(&state.fs_root, path, cwd, line, column).await
+}
+
+async fn reply_editor_opened(
+    sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
+    editor: &EditorHandle,
+    request_id: String,
+    path: std::path::PathBuf,
+    preview: bool,
+    line: Option<u32>,
+    column: Option<u32>,
+) -> Result<(), Message> {
+    let opened = editor.open(path, preview).await.map_err(|err| Message::Error {
+        code: "editor_open_failed".into(),
+        message: format!("{request_id}: {err:#}"),
+    })?;
+    send_msg(
+        sink,
+        &Message::EditorOpened {
+            request_id,
+            buffer_id: opened.buffer_id.clone(),
+            path: opened.path.clone(),
+            language: opened.language,
+            line,
+            column,
+        },
+    )
+    .await
+    .map_err(|_| Message::Error {
+        code: "send_failed".into(),
+        message: "failed to send EditorOpened".into(),
+    })?;
+    send_msg(
+        sink,
+        &Message::BufferSnapshot {
+            buffer_id: opened.buffer_id,
+            rev: opened.rev,
+            text: opened.text,
+            path: opened.path,
+        },
+    )
+    .await
+    .map_err(|_| Message::Error {
+        code: "send_failed".into(),
+        message: "failed to send BufferSnapshot".into(),
+    })?;
+    Ok(())
 }
 
 fn require_auth(authed: bool) -> Result<(), Message> {

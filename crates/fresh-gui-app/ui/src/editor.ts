@@ -21,6 +21,7 @@ import { toml } from "@codemirror/legacy-modes/mode/toml";
 import type { Extension } from "@codemirror/state";
 import type { ResolvedTheme } from "./theme";
 import { logLanguage } from "./log-lang";
+import { detectLinkAt } from "./path-link";
 
 const fontSizeCompartment = new Compartment();
 const themeCompartment = new Compartment();
@@ -135,12 +136,67 @@ function editorHighlightExtension(theme: ResolvedTheme): Extension {
   return theme === "light" ? syntaxHighlighting(lightHighlightStyle) : [];
 }
 
+export type EditorPathLinkHandler = (info: {
+  path: string;
+  line?: number;
+  column?: number;
+}) => void;
+
+function pathLinkClickHandler(onPathLink?: EditorPathLinkHandler): Extension {
+  return EditorView.domEventHandlers({
+    click(event, view) {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey || !onPathLink) {
+        return false;
+      }
+      const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
+      if (pos == null) return false;
+      const line = view.state.doc.lineAt(pos);
+      const col = pos - line.from;
+      const link = detectLinkAt(line.text, col);
+      if (!link) return false;
+      event.preventDefault();
+      onPathLink({ path: link.path, line: link.line, column: link.column });
+      return true;
+    },
+  });
+}
+
+/** Jump the cursor to 1-based line/column and scroll it into view. */
+export function revealEditorLocation(
+  view: EditorView,
+  line?: number | null,
+  column?: number | null,
+): void {
+  if (line == null || line < 1) return;
+  const doc = view.state.doc;
+  const lineNo = Math.min(line, doc.lines);
+  const lineObj = doc.line(lineNo);
+  const col = Math.max(0, (column ?? 1) - 1);
+  const pos = Math.min(lineObj.from + col, lineObj.to);
+  view.dispatch({
+    selection: { anchor: pos, head: pos },
+    effects: EditorView.scrollIntoView(pos, { y: "center" }),
+  });
+  view.focus();
+}
+
+function editorChromeTheme(fontSize: number): Extension {
+  return EditorView.theme({
+    "&": { height: "100%", fontSize: `${fontSize}px` },
+    ".cm-scroller": { overflow: "auto", fontFamily: "var(--font-mono)" },
+  });
+}
+
 export function createEditorView(
   parent: HTMLElement,
   text: string,
   path: string,
   onDocChange: () => void,
-  opts: { fontSize?: number; theme?: ResolvedTheme } = {},
+  opts: {
+    fontSize?: number;
+    theme?: ResolvedTheme;
+    onPathLink?: EditorPathLinkHandler;
+  } = {},
 ): EditorView {
   const fontSize = opts.fontSize ?? 14;
   const theme = opts.theme ?? "dark";
@@ -152,15 +208,13 @@ export function createEditorView(
     search(),
     keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap, indentWithTab]),
     syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-    fontSizeCompartment.of(EditorView.theme({
-      "&": { height: "100%", fontSize: `${fontSize}px` },
-      ".cm-scroller": { overflow: "auto", fontFamily: "var(--font-mono)" },
-    })),
+    fontSizeCompartment.of(editorChromeTheme(fontSize)),
     themeCompartment.of(editorThemeExtension(theme)),
     highlightCompartment.of(editorHighlightExtension(theme)),
     EditorView.updateListener.of((update) => {
       if (update.docChanged) onDocChange();
     }),
+    pathLinkClickHandler(opts.onPathLink),
   ];
   if (lang) extensions.push(lang);
 
@@ -179,12 +233,7 @@ export function openEditorSearch(view: EditorView): void {
 
 export function applyEditorFontSize(view: EditorView, fontSize: number): void {
   view.dispatch({
-    effects: fontSizeCompartment.reconfigure(
-      EditorView.theme({
-        "&": { height: "100%", fontSize: `${fontSize}px` },
-        ".cm-scroller": { overflow: "auto", fontFamily: "var(--font-mono)" },
-      }),
-    ),
+    effects: fontSizeCompartment.reconfigure(editorChromeTheme(fontSize)),
   });
 }
 

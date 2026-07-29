@@ -9,7 +9,7 @@ import {
   type ServerMessage,
 } from "./protocol";
 import { $, $button, $input, b64decode, b64encode, basename, relativePath } from "./dom";
-import { applyEditorFontSize, applyEditorTheme, createEditorView, openEditorSearch } from "./editor";
+import { applyEditorFontSize, applyEditorTheme, createEditorView, openEditorSearch, revealEditorLocation } from "./editor";
 import { isMarkdownPath, updateMarkdownPreview } from "./markdown-preview";
 import {
   applyTerminalFontSize,
@@ -31,7 +31,13 @@ import {
   splitLeaf,
 } from "./panes";
 import { installShortcuts, type ShortcutHandlers, type ShortcutId } from "./shortcuts";
-import { defaultPaletteCommands, openPalette, setPaletteCommands } from "./palette";
+import {
+  defaultPaletteCommands,
+  openGotoFile,
+  openPalette,
+  setGotoFileHandler,
+  setPaletteCommands,
+} from "./palette";
 import { VirtualTree } from "./tree";
 import { applyTheme, getResolvedTheme, initTheme, onResolvedThemeChange, resolveTheme } from "./theme";
 import {
@@ -62,11 +68,20 @@ interface OpenedInfo {
   buffer_id: string;
   path: string;
   language?: string;
+  line?: number;
+  column?: number;
 }
 
 interface PendingEditor extends Pending<OpenedInfo & { rev: number; text: string }> {
   _opened?: OpenedInfo;
 }
+
+type OpenEditorOpts = {
+  preview?: boolean;
+  cwd?: string;
+  line?: number;
+  column?: number;
+};
 
 interface TerminalTab {
   kind: "terminal";
@@ -360,15 +375,52 @@ function fsAuthorize(path: string): Promise<{ path: string }> {
   });
 }
 
-function editorOpen(path: string, preview = false): Promise<OpenedInfo & { rev: number; text: string }> {
+function editorOpen(
+  path: string,
+  opts: OpenEditorOpts = {},
+): Promise<OpenedInfo & { rev: number; text: string }> {
   const request_id = nextRequestId();
+  const preview = !!opts.preview;
   return new Promise((resolve, reject) => {
     pendingEditor.set(request_id, { resolve, reject });
-    send({ type: "editor_open", request_id, path, preview: !!preview });
+    send({
+      type: "editor_open",
+      request_id,
+      path,
+      preview,
+      ...(opts.cwd ? { cwd: opts.cwd } : {}),
+      ...(opts.line != null ? { line: opts.line } : {}),
+      ...(opts.column != null ? { column: opts.column } : {}),
+    });
     setTimeout(() => {
       if (pendingEditor.has(request_id)) {
         pendingEditor.delete(request_id);
         reject(new Error("editor_open timeout"));
+      }
+    }, 15000);
+  });
+}
+
+function editorOpenLink(
+  lineText: string,
+  column: number,
+  opts: { preview?: boolean; cwd?: string } = {},
+): Promise<OpenedInfo & { rev: number; text: string }> {
+  const request_id = nextRequestId();
+  return new Promise((resolve, reject) => {
+    pendingEditor.set(request_id, { resolve, reject });
+    send({
+      type: "editor_open_link",
+      request_id,
+      line_text: lineText,
+      column,
+      preview: !!opts.preview,
+      ...(opts.cwd ? { cwd: opts.cwd } : {}),
+    });
+    setTimeout(() => {
+      if (pendingEditor.has(request_id)) {
+        pendingEditor.delete(request_id);
+        reject(new Error("editor_open_link timeout"));
       }
     }, 15000);
   });
@@ -756,6 +808,10 @@ function makeTerminal(): TermBundle {
       setStatusLeft(`copied (${text.length} chars): ${oneLine}`);
     },
     onPasteFailed: (message) => setStatusLeft(message),
+    onPathLink: ({ lineText, column }) => {
+      const cwd = bundle.cwd || lastTerminalCwd || undefined;
+      void openEditorFromLink(lineText, column, { preview: true, cwd });
+    },
   });
   return bundle;
 }
@@ -1179,7 +1235,7 @@ function setTreeEmptyHint(show: boolean, text = "Connect to load remote tree"): 
 // Selection state lives inside VirtualTree (tree.getSelectedPath()); no duplicate module state needed.
 const tree = new VirtualTree(treeEl, fsList, {
   onOpenFile: (entry, preview) => {
-    void openEditorTab(entry.path, preview);
+    void openEditorTab(entry.path, { preview });
   },
   onStatus: (text) => setStatusLeft(text),
   noteInteraction: () => noteTreeInteraction(),
@@ -1267,79 +1323,145 @@ async function loadRoot(opts: { silent?: boolean } = {}): Promise<void> {
   }
 }
 
-async function openEditorTab(path: string, preview: boolean): Promise<void> {
+async function openEditorFromLink(
+  lineText: string,
+  column: number,
+  opts: { preview?: boolean; cwd?: string } = {},
+): Promise<void> {
   if (!hasEditor) {
     setStatusLeft("backend has no editor capability");
     return;
   }
+  setStatusLeft("opening path link…");
+  try {
+    const opened = await editorOpenLink(lineText, column, opts);
+    await presentOpenedBuffer(opened, { preview: !!opts.preview });
+  } catch (err) {
+    setStatusLeft(`editor error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
 
-  const existingIdx = tabs.findIndex((t) => t.kind === "editor" && t.path === path);
+async function presentOpenedBuffer(
+  opened: OpenedInfo & { rev: number; text: string },
+  opts: OpenEditorOpts = {},
+): Promise<void> {
+  const preview = !!opts.preview;
+  const existingIdx = tabs.findIndex(
+    (t) => t.kind === "editor" && (t.path === opened.path || pathsEqual(t.path, opened.path)),
+  );
   if (existingIdx >= 0) {
     const et = tabs[existingIdx] as EditorTab;
     if (!preview) et.preview = false;
     activeTabIndex = existingIdx;
     renderAll();
     focusActiveTab();
+    const jumpLine = opened.line ?? opts.line;
+    const jumpCol = opened.column ?? opts.column;
+    if (jumpLine != null) revealEditorLocation(et.view, jumpLine, jumpCol);
+    setStatusLeft(`opened ${opened.path}`);
     return;
   }
 
   if (preview) {
-    const previewIdx = tabs.findIndex(
-      (t) => t.kind === "editor" && t.preview && !t.dirty,
-    );
+    const previewIdx = tabs.findIndex((t) => t.kind === "editor" && t.preview && !t.dirty);
     if (previewIdx >= 0) closeTabAt(previewIdx, { force: true });
   }
 
-  setStatusLeft(`opening ${path}…`);
-  try {
-    const opened = await editorOpen(path, preview);
-    const host = document.createElement("div");
-    host.className = "editor-host";
-    editorStack.appendChild(host);
+  const host = document.createElement("div");
+  host.className = "editor-host";
+  editorStack.appendChild(host);
 
-    let tabRef!: EditorTab;
-    const view = createEditorView(host, opened.text, opened.path, () => {
+  let tabRef!: EditorTab;
+  const view = createEditorView(
+    host,
+    opened.text,
+    opened.path,
+    () => {
       if (tabRef.suppressChange) return;
       tabRef.dirty = true;
       tabRef.preview = false;
       renderTabs();
       updateSaveButton();
       updateStatusRight();
-    }, { fontSize: uiSettings.editorFontSize, theme: getResolvedTheme() });
+    },
+    {
+      fontSize: uiSettings.editorFontSize,
+      theme: getResolvedTheme(),
+      onPathLink: (info) => {
+        void openEditorTab(info.path, {
+          preview: true,
+          cwd: lastTerminalCwd || undefined,
+          line: info.line,
+          column: info.column,
+        });
+      },
+    },
+  );
 
-    let mdPreviewEl: HTMLElement | null = null;
-    if (isMarkdownPath(opened.path)) {
-      mdPreviewEl = document.createElement("div");
-      mdPreviewEl.className = "md-preview";
-      mdPreviewEl.tabIndex = -1;
-      mdPreviewEl.setAttribute("role", "document");
-      mdPreviewEl.setAttribute("aria-label", "Markdown preview");
-      host.appendChild(mdPreviewEl);
-    }
+  let mdPreviewEl: HTMLElement | null = null;
+  if (isMarkdownPath(opened.path)) {
+    mdPreviewEl = document.createElement("div");
+    mdPreviewEl.className = "md-preview";
+    mdPreviewEl.tabIndex = -1;
+    mdPreviewEl.setAttribute("role", "document");
+    mdPreviewEl.setAttribute("aria-label", "Markdown preview");
+    host.appendChild(mdPreviewEl);
+  }
 
-    tabRef = {
-      kind: "editor",
-      id: `editor-${opened.buffer_id}`,
-      bufferId: opened.buffer_id,
-      path: opened.path,
-      rev: opened.rev,
-      dirty: false,
-      preview,
-      mdView: "source",
-      view,
-      host,
-      mdPreviewEl,
-      suppressChange: false,
-    };
+  tabRef = {
+    kind: "editor",
+    id: `editor-${opened.buffer_id}`,
+    bufferId: opened.buffer_id,
+    path: opened.path,
+    rev: opened.rev,
+    dirty: false,
+    preview,
+    mdView: "source",
+    view,
+    host,
+    mdPreviewEl,
+    suppressChange: false,
+  };
 
-    tabs.push(tabRef);
-    activeTabIndex = tabs.length - 1;
-    if (configPath && (pathsEqual(opened.path, configPath) || pathsEqual(path, configPath))) {
-      configPath = opened.path;
-    }
+  tabs.push(tabRef);
+  activeTabIndex = tabs.length - 1;
+  if (configPath && pathsEqual(opened.path, configPath)) {
+    configPath = opened.path;
+  }
+  renderAll();
+  focusActiveTab();
+  const jumpLine = opened.line ?? opts.line;
+  const jumpCol = opened.column ?? opts.column;
+  if (jumpLine != null) revealEditorLocation(view, jumpLine, jumpCol);
+  setStatusLeft(`opened ${opened.path}`);
+}
+
+async function openEditorTab(path: string, opts: boolean | OpenEditorOpts = {}): Promise<void> {
+  const options: OpenEditorOpts = typeof opts === "boolean" ? { preview: opts } : opts;
+  const preview = !!options.preview;
+
+  if (!hasEditor) {
+    setStatusLeft("backend has no editor capability");
+    return;
+  }
+
+  const existingIdx = tabs.findIndex(
+    (t) => t.kind === "editor" && (t.path === path || pathsEqual(t.path, path)),
+  );
+  if (existingIdx >= 0) {
+    const et = tabs[existingIdx] as EditorTab;
+    if (!preview) et.preview = false;
+    activeTabIndex = existingIdx;
     renderAll();
     focusActiveTab();
-    setStatusLeft(`opened ${opened.path}`);
+    if (options.line != null) revealEditorLocation(et.view, options.line, options.column);
+    return;
+  }
+
+  setStatusLeft(`opening ${path}…`);
+  try {
+    const opened = await editorOpen(path, options);
+    await presentOpenedBuffer(opened, options);
   } catch (err) {
     setStatusLeft(`editor error: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -1575,6 +1697,8 @@ function onMessage(raw: string): void {
           buffer_id: msg.buffer_id,
           path: msg.path,
           language: msg.language,
+          line: msg.line,
+          column: msg.column,
         };
       }
       break;
@@ -1795,6 +1919,7 @@ activitySettings.addEventListener("click", () => {
 tabsEl.addEventListener("scroll", () => requestAnimationFrame(measurePill));
 
 const shortcutHandlers: ShortcutHandlers = {
+  "gotoFile.open": () => openGotoFile(),
   "commandPalette.open": () => openPalette(),
   "tab.new": () => openNewTerminalTab(),
   "tab.close": () => closeActiveTabOrLeaf(),
@@ -1823,7 +1948,12 @@ function runShortcutId(id: ShortcutId): void {
 
 installShortcuts(shortcutHandlers);
 setPaletteCommands(defaultPaletteCommands(runShortcutId));
-
+setGotoFileHandler((path) => {
+  void openEditorTab(path, {
+    preview: false,
+    cwd: lastTerminalCwd || undefined,
+  });
+});
 // OS theme flips while preference is "system" → restyle open panes.
 onResolvedThemeChange((resolved) => {
   if (uiSettings.theme !== "system") return;

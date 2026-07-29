@@ -4,6 +4,7 @@ mod config;
 mod editor_worker;
 mod fs;
 mod fs_watch;
+mod path_open;
 mod pty;
 mod server;
 mod session;

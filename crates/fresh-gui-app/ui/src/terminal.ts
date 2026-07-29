@@ -1,4 +1,5 @@
 import { Terminal } from "@xterm/xterm";
+import type { ILink, ILinkProvider, IBufferLine } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { SearchAddon } from "@xterm/addon-search";
@@ -6,6 +7,7 @@ import type { UiSettings } from "./settings";
 import { parseOsc7 } from "./osc7";
 import { xtermThemeFromCss } from "./theme";
 import { copyToClipboard } from "./context-menu";
+import { detectLinksInLine } from "./path-link";
 
 export { parseOsc7 };
 
@@ -20,12 +22,24 @@ export interface TermBundle {
   oscCarry: { buf: string };
 }
 
+export type PathLinkActivate = (info: {
+  lineText: string;
+  /** 0-based character offset within `lineText`. */
+  column: number;
+  path: string;
+  line?: number;
+  columnHint?: number;
+  event: MouseEvent;
+}) => void;
+
 export type CreateTerminalOpts = {
   settings?: UiSettings;
   onCwd?: (cwd: string) => void;
   /** Fired after a successful selection copy (Fresh-style status). */
   onCopied?: (text: string) => void;
   onPasteFailed?: (message: string) => void;
+  /** Fresh/VS Code: Ctrl/Cmd+click a path in output to open it. */
+  onPathLink?: PathLinkActivate;
 };
 
 /** Apply the current CSS token palette to an open xterm instance. */
@@ -35,6 +49,53 @@ export function applyTerminalTheme(bundle: TermBundle): void {
 
 function isModKey(ev: KeyboardEvent): boolean {
   return (ev.ctrlKey || ev.metaKey) && !ev.altKey;
+}
+
+function lineTranslateToString(line: IBufferLine | undefined): string {
+  if (!line) return "";
+  // trimRight=false so column offsets match the detector's view of the line.
+  return line.translateToString(false);
+}
+
+function installPathLinkProvider(term: Terminal, opts: CreateTerminalOpts): void {
+  if (!opts.onPathLink) return;
+  const provider: ILinkProvider = {
+    provideLinks(y, callback) {
+      const bufLine = term.buffer.active.getLine(y - 1);
+      const text = lineTranslateToString(bufLine);
+      if (!text.trim()) {
+        callback(undefined);
+        return;
+      }
+      const detected = detectLinksInLine(text);
+      if (detected.length === 0) {
+        callback(undefined);
+        return;
+      }
+      const links: ILink[] = detected.map((link) => ({
+        range: {
+          start: { x: link.start + 1, y },
+          end: { x: link.end, y },
+        },
+        text: text.slice(link.start, link.end),
+        activate: (event: MouseEvent) => {
+          if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
+          event.preventDefault();
+          event.stopPropagation();
+          opts.onPathLink?.({
+            lineText: text,
+            column: link.start,
+            path: link.path,
+            line: link.line,
+            columnHint: link.column,
+            event,
+          });
+        },
+      }));
+      callback(links);
+    },
+  };
+  term.registerLinkProvider(provider);
 }
 
 /**
@@ -109,6 +170,7 @@ export function createTerminal(opts: CreateTerminalOpts = {}): TermBundle {
   term.open(el);
 
   installClipboardKeys(term, opts);
+  installPathLinkProvider(term, opts);
 
   // OSC 7 → cwd (xterm parser; also scanned from raw PTY bytes in main.ts)
   try {

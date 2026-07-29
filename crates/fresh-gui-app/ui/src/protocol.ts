@@ -37,7 +37,23 @@ export type ClientMessage =
   | { type: "fs_authorize"; request_id: string; path: string }
   | { type: "fs_watch"; request_id: string; path: string; recursive: boolean }
   | { type: "fs_unwatch"; watch_id: string }
-  | { type: "editor_open"; request_id: string; path: string; preview: boolean }
+  | {
+      type: "editor_open";
+      request_id: string;
+      path: string;
+      preview: boolean;
+      cwd?: string;
+      line?: number;
+      column?: number;
+    }
+  | {
+      type: "editor_open_link";
+      request_id: string;
+      line_text: string;
+      column: number;
+      preview?: boolean;
+      cwd?: string;
+    }
   | { type: "editor_close"; buffer_id: string }
   | {
       type: "buffer_edit";
@@ -97,6 +113,8 @@ export type ServerMessage =
       buffer_id: string;
       path: string;
       language?: string;
+      line?: number;
+      column?: number;
     }
   | {
       type: "buffer_snapshot";
