@@ -60,7 +60,9 @@ Default path: `$XDG_CONFIG_HOME/fresh-gui/config.json` or `~/.config/fresh-gui/c
     "theme": "system", // system | light | dark
     "terminalFontSize": 14,
     "editorFontSize": 14,
-    "webgl": true
+    "webgl": true,
+    "showDotfiles": false, // show .* names in the explorer
+    "showGitDirs": false // show .git folders (separate from showDotfiles)
   },
   // Default PTY shell when the client omits `shell` on pty_open
   "terminal": {
@@ -69,6 +71,6 @@ Default path: `$XDG_CONFIG_HOME/fresh-gui/config.json` or `~/.config/fresh-gui/c
 }
 ```
 
-Missing file → built-in defaults (`zsh`, system theme). First **Settings** / `Mod+,` open creates the documented template. Empty shell `args` keep interactive / OSC 7 setup; non-empty args are passed through. JSONC (`//` / `/* */`) is accepted.
+Missing file → built-in defaults (`zsh`, system theme, hidden dotfiles / `.git`). First **Settings** / `Mod+,` open creates the documented template. Empty shell `args` keep interactive / OSC 7 setup; non-empty args are passed through. JSONC (`//` / `/* */`) is accepted.
 
 See [docs/DESIGN.md](../../docs/DESIGN.md).

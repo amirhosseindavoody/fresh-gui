@@ -74,7 +74,9 @@ All prefs live in one JSONC file on the **backend** host:
     "theme": "system", // system | light | dark
     "terminalFontSize": 14,
     "editorFontSize": 14,
-    "webgl": true
+    "webgl": true,
+    "showDotfiles": false, // show .* names in the explorer
+    "showGitDirs": false // show .git folders (separate from showDotfiles)
   },
   "terminal": {
     "shell": { "command": "zsh", "args": [] }
@@ -82,7 +84,7 @@ All prefs live in one JSONC file on the **backend** host:
 }
 ```
 
-Open it from the UI (**Settings** / `Mod+,`), edit, save with `Mod+S`. Theme follows the OS by default; terminal chrome tracks the same theme. Empty shell `args` keep interactive / OSC 7 setup for known shells.
+Open it from the UI (**Settings** / `Mod+,`), edit, save with `Mod+S`. Theme follows the OS by default; terminal chrome tracks the same theme. Empty shell `args` keep interactive / OSC 7 setup for known shells. Dotfiles and `.git` directories are hidden in the explorer by default; enable them independently via `showDotfiles` / `showGitDirs`.
 
 ## Windows host app
 

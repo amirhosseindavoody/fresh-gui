@@ -44,6 +44,10 @@ pub struct HelloUi {
     pub editor_font_size: u32,
     #[serde(default = "hello_ui_webgl")]
     pub webgl: bool,
+    #[serde(default, rename = "showDotfiles")]
+    pub show_dotfiles: bool,
+    #[serde(default, rename = "showGitDirs")]
+    pub show_git_dirs: bool,
 }
 
 fn hello_ui_theme() -> String {
