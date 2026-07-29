@@ -1,5 +1,6 @@
 //! fresh-gui-backend — remote ADE daemon (PTY + FS + optional Fresh editor).
 
+mod config;
 mod editor_worker;
 mod fs;
 mod fs_watch;
@@ -16,6 +17,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use tracing::{info, warn};
 
+use crate::config::Config;
 use crate::editor_worker::EditorHandle;
 use crate::fs::FsRoot;
 use crate::fs_watch::FsWatchStore;
@@ -64,6 +66,12 @@ struct Args {
     /// When unset, uses an assigned FQDN/domain if one is available; otherwise the bind address.
     #[arg(long, env = "FRESH_GUI_PUBLIC_HOST")]
     public_host: Option<String>,
+
+    /// Path to JSON config (default: `$XDG_CONFIG_HOME/fresh-gui/config.json`
+    /// or `~/.config/fresh-gui/config.json`). Missing file → built-in defaults
+    /// (default shell: `zsh`).
+    #[arg(long, env = "FRESH_GUI_CONFIG")]
+    config: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -91,6 +99,9 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let fs_root = FsRoot::new(root_path).context("init FS root")?;
 
+    let config = Arc::new(Config::load(args.config.as_deref()).context("load config")?);
+    let (default_shell, _) = config.resolve_shell();
+
     let require_auth = !loopback || token.is_some();
 
     // Bind before spawning Fresh so a busy port fails cleanly (no editor teardown panic).
@@ -110,6 +121,7 @@ async fn main() -> Result<()> {
         sessions: SessionStore::new(),
         editor,
         watches: FsWatchStore::new(),
+        config,
     });
 
     let ui_dir = if args.no_ui {
@@ -126,6 +138,7 @@ async fn main() -> Result<()> {
         auth_required = state.require_auth,
         fs_root = %state.fs_root.root_display(),
         editor = state.editor.is_some(),
+        default_shell = %default_shell,
         "starting fresh-gui-backend"
     );
     // Plain lines so the launch URL is obvious in `pixi run serve` output.

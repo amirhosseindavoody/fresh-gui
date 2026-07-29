@@ -150,10 +150,11 @@ impl SessionStore {
         rows: u16,
         cwd: Option<String>,
         shell: Option<String>,
+        config: &crate::config::Config,
     ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let (raw_tx, mut raw_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let pty = PtySession::spawn(id.clone(), cols, rows, cwd, shell, raw_tx)?;
+        let pty = PtySession::spawn(id.clone(), cols, rows, cwd, shell, config, raw_tx)?;
 
         {
             let mut guard = self.inner.lock().await;
