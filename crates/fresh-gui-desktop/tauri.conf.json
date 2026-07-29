@@ -22,7 +22,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "msi"],
+    "targets": ["nsis"],
     "publisher": "Amirhossein Davoody",
     "shortDescription": "Terminal-first ADE GUI for remote Fresh backends",
     "longDescription": "Host GUI that connects to a remote fresh-gui-backend over WebSocket for PTY and file browsing.",
@@ -44,9 +44,6 @@
       "nsis": {
         "installMode": "currentUser",
         "displayLanguageSelector": false
-      },
-      "wix": {
-        "language": "en-US"
       }
     }
   }

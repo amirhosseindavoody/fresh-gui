@@ -14,10 +14,10 @@ npm ci
 npm run dev
 ```
 
-## Windows installers
+## Windows NSIS installer
 
 ```powershell
 npm run build:windows
 ```
 
-See [docs/WINDOWS.md](../../docs/WINDOWS.md).
+See [docs/WINDOWS.md](../../docs/WINDOWS.md) (NSIS only; MSI incompatible with CalVer).

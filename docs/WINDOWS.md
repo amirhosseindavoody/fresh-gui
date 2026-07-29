@@ -1,6 +1,10 @@
 # Windows host packaging (Tauri)
 
-The Windows MVP host is `fresh-gui-desktop` (Tauri 2). Installers are **NSIS** (`.exe`) and **MSI** (WiX).
+The Windows MVP host is `fresh-gui-desktop` (Tauri 2). The installer is **NSIS** (`.exe`).
+
+## Why not MSI?
+
+WiX/MSI requires each of major/minor ≤ **255**. Our CalVer `YYYY.MMDD.N` (e.g. `2026.728.1`) exceeds that (`2026` and often `MMDD`). NSIS accepts CalVer filenames and is the supported Windows channel for now. MSI can return later with a mapped SemVer if needed.
 
 ## Local build (on Windows)
 
@@ -12,17 +16,18 @@ npm ci
 npm run build:windows
 ```
 
-Artifacts land under the workspace target directory:
+Artifact:
 
-`target/release/bundle/nsis/`  
-`target/release/bundle/msi/`
+`target/release/bundle/nsis/fresh-gui_*_x64-setup.exe`
+
+(Paths are under the **repo root** `target\`, not under the crate.)
 
 Note: the Rust package lives at `crates/fresh-gui-desktop`; `tauri.conf.json` sets `frontendDist` to `../fresh-gui-app/ui`.
 
 ## CI
 
-GitHub Actions workflow [`.github/workflows/windows-tauri.yml`](../.github/workflows/windows-tauri.yml) builds NSIS + MSI on `windows-latest` and uploads artifacts.
+GitHub Actions workflow [`.github/workflows/windows-tauri.yml`](../.github/workflows/windows-tauri.yml) builds the NSIS installer on `windows-latest` and uploads it as an artifact.
 
 ## Scope note
 
-Full polish (code signing, auto-update) remains Phase 4. This packaging path produces unsigned installers suitable for MVP distribution and testing.
+Full polish (code signing, auto-update) remains Phase 4. This packaging path produces an unsigned NSIS installer suitable for MVP distribution and testing.

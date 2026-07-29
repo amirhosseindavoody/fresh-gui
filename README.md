@@ -4,7 +4,7 @@ Terminal-first ADE **GUI on the local host**, powered by a **remote backend** (F
 
 Inspired by [Terax](https://github.com/crynta/terax-ai). Repo logistics follow [pixi-mise](https://github.com/amirhosseindavoody/pixi-mise).
 
-**Status:** Phase 1 + 1b (PTY + read-only file tree); Windows Tauri NSIS/MSI packaging wired. See **[docs/DESIGN.md](./docs/DESIGN.md)** and **[docs/WINDOWS.md](./docs/WINDOWS.md)**.
+**Status:** Phase 1 + 1b (PTY + read-only file tree); Windows Tauri NSIS packaging wired. See **[docs/DESIGN.md](./docs/DESIGN.md)** and **[docs/WINDOWS.md](./docs/WINDOWS.md)**.
 
 ## Split
 
@@ -37,7 +37,7 @@ pixi run ui
 
 Auth: on loopback, token is optional unless `--token` / `FRESH_GUI_TOKEN` is set. Non-loopback binds **require** a token. FS listing is sandboxed to `--root` (default: cwd).
 
-## Windows installers
+## Windows installer (NSIS)
 
 On a Windows machine (or via CI):
 
@@ -47,7 +47,7 @@ npm ci
 npm run build:windows
 ```
 
-See [docs/WINDOWS.md](./docs/WINDOWS.md). CI workflow: `.github/workflows/windows-tauri.yml`.
+Produces `target/release/bundle/nsis/*-setup.exe`. MSI is not used (CalVer vs WiX version limits — [docs/WINDOWS.md](./docs/WINDOWS.md)).
 
 ## Development
 
