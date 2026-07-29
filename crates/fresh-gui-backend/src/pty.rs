@@ -10,13 +10,17 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 pub struct PtySession {
-    _id: String,
+    id: String,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     _child_killer: Arc<Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
 }
 
 impl PtySession {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
     pub fn spawn(
         id: String,
         cols: u16,
@@ -82,7 +86,7 @@ impl PtySession {
             .context("spawn pty reader thread")?;
 
         Ok(Self {
-            _id: id,
+            id,
             master,
             writer: Arc::new(Mutex::new(writer)),
             _child_killer: Arc::new(Mutex::new(killer)),

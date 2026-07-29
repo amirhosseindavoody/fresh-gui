@@ -4,7 +4,7 @@ Terminal-first ADE **GUI on the local host**, powered by a **remote backend** (F
 
 Inspired by [Terax](https://github.com/crynta/terax-ai). Repo logistics follow [pixi-mise](https://github.com/amirhosseindavoody/pixi-mise).
 
-**Status:** Phase 1 + 1b (PTY + read-only file tree); Windows Tauri NSIS/MSI packaging wired. See **[docs/DESIGN.md](./docs/DESIGN.md)** and **[docs/WINDOWS.md](./docs/WINDOWS.md)**.
+**Status:** Phase 2 (sessions, multi-tab/splits, detach/reattach) on top of Phase 1 + 1b; Windows Tauri NSIS/MSI packaging wired. See **[docs/DESIGN.md](./docs/DESIGN.md)** and **[docs/WINDOWS.md](./docs/WINDOWS.md)**.
 
 ## Split
 
@@ -30,12 +30,13 @@ pixi run backend
 # terminal 2 — CLI smoke
 pixi run app -- smoke --backend ws://127.0.0.1:7420/ws
 
-# terminal 2 — serve UI (PTY + file tree)
+# terminal 2 — serve UI (PTY + file tree + tabs/splits)
 pixi run ui
 # open http://127.0.0.1:1420/ → Connect to ws://127.0.0.1:7420/ws
+# leave Session empty to create; reconnect with the same id to reattach
 ```
 
-Auth: on loopback, token is optional unless `--token` / `FRESH_GUI_TOKEN` is set. Non-loopback binds **require** a token. FS listing is sandboxed to `--root` (default: cwd).
+Auth: on loopback, token is optional unless `--token` / `FRESH_GUI_TOKEN` is set. Non-loopback binds **require** a token. FS listing is sandboxed to `--root` (default: cwd). Sessions keep PTYs alive across GUI disconnect.
 
 ## Windows installers (NSIS + MSI)
 
@@ -63,7 +64,7 @@ pixi run build
 
 JSON text frames over WebSocket `ws://host:port/ws`:
 
-`hello` → optional `auth` → `pty_*` and/or `fs_list` / `fs_stat`
+`hello` → optional `auth` → `session_*` / `layout_set` → `pty_*` and/or `fs_list` / `fs_stat` (protocol `0.2.0`)
 
 ## Versioning
 

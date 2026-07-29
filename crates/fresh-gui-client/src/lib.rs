@@ -4,11 +4,13 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
-use fresh_gui_protocol::{Hello, Message, PROTOCOL_VERSION};
+use fresh_gui_protocol::{Hello, Message, PtyInfo, SessionInfo, PROTOCOL_VERSION};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    connect_async, tungstenite::Message as WsMessage, MaybeTlsStream, WebSocketStream,
+};
 use url::Url;
 
 pub use fresh_gui_protocol;
@@ -42,6 +44,7 @@ pub struct Client {
     sink: futures_util::stream::SplitSink<Ws, WsMessage>,
     stream: futures_util::stream::SplitStream<Ws>,
     pub backend_hello: Hello,
+    pub session_id: Option<String>,
 }
 
 impl Client {
@@ -52,7 +55,6 @@ impl Client {
             .with_context(|| format!("connect {}", opts.url))?;
         let (mut sink, mut stream) = ws.split();
 
-        // Backend sends Hello first.
         let backend_hello = match recv_msg(&mut stream).await.context("backend hello")? {
             Message::Hello(h) => h,
             other => bail!("expected Hello from backend, got {other:?}"),
@@ -83,11 +85,86 @@ impl Client {
             sink,
             stream,
             backend_hello,
+            session_id: None,
         })
     }
 
     pub async fn ping(&mut self, nonce: u64) -> Result<()> {
         send_msg(&mut self.sink, &Message::Ping { nonce }).await
+    }
+
+    pub async fn create_session(&mut self, layout: Option<String>) -> Result<String> {
+        send_msg(&mut self.sink, &Message::SessionCreate { layout }).await?;
+        loop {
+            match self.recv().await? {
+                Message::SessionCreated { session_id } => {
+                    self.session_id = Some(session_id.clone());
+                    return Ok(session_id);
+                }
+                Message::Error { code, message } => {
+                    bail!("session create failed: {code}: {message}")
+                }
+                Message::Pong { .. } | Message::Ping { .. } | Message::AuthOk => continue,
+                other => bail!("unexpected while creating session: {other:?}"),
+            }
+        }
+    }
+
+    pub async fn attach_session(
+        &mut self,
+        session_id: impl Into<String>,
+    ) -> Result<(Vec<PtyInfo>, Option<String>)> {
+        let session_id = session_id.into();
+        send_msg(
+            &mut self.sink,
+            &Message::SessionAttach {
+                session_id: session_id.clone(),
+            },
+        )
+        .await?;
+        loop {
+            match self.recv().await? {
+                Message::SessionAttached {
+                    session_id: sid,
+                    ptys,
+                    layout,
+                } => {
+                    self.session_id = Some(sid);
+                    return Ok((ptys, layout));
+                }
+                Message::Error { code, message } => {
+                    bail!("session attach failed: {code}: {message}")
+                }
+                Message::Pong { .. } | Message::Ping { .. } | Message::AuthOk => continue,
+                other => bail!("unexpected while attaching session: {other:?}"),
+            }
+        }
+    }
+
+    pub async fn list_sessions(&mut self) -> Result<Vec<SessionInfo>> {
+        send_msg(&mut self.sink, &Message::SessionList).await?;
+        loop {
+            match self.recv().await? {
+                Message::SessionListed { sessions } => return Ok(sessions),
+                Message::Error { code, message } => {
+                    bail!("session list failed: {code}: {message}")
+                }
+                Message::PtyData { .. }
+                | Message::Pong { .. }
+                | Message::Ping { .. } => continue,
+                other => bail!("unexpected while listing sessions: {other:?}"),
+            }
+        }
+    }
+
+    pub async fn set_layout(&mut self, layout: impl Into<String>) -> Result<()> {
+        send_msg(
+            &mut self.sink,
+            &Message::LayoutSet {
+                layout: layout.into(),
+            },
+        )
+        .await
     }
 
     pub async fn open_pty(
@@ -109,13 +186,13 @@ impl Client {
         .await?;
         loop {
             match self.recv().await? {
-                Message::PtyOpened { id } => return Ok(id),
+                Message::PtyOpened { id, .. } => return Ok(id),
                 Message::Error { code, message } => {
                     bail!("pty open failed: {code}: {message}")
                 }
-                // Ignore control / unrelated traffic while waiting for the open ack.
-                // Backend must still send `PtyOpened` before this PTY's `PtyData`
-                // (see server PtyOpen handler) so we do not drop banner bytes here.
+                Message::SessionCreated { session_id } => {
+                    self.session_id = Some(session_id);
+                }
                 Message::Pong { .. }
                 | Message::Ping { .. }
                 | Message::AuthOk
@@ -196,7 +273,6 @@ impl Client {
         recv_msg(&mut self.stream).await
     }
 
-    /// Decode `PtyData` payload.
     pub fn decode_pty_data(data_b64: &str) -> Result<Vec<u8>> {
         Ok(base64::engine::general_purpose::STANDARD.decode(data_b64)?)
     }
@@ -240,9 +316,11 @@ pub async fn smoke_echo(url: &str, token: Option<&str>) -> Result<String> {
         opts = opts.with_token(t);
     }
     let mut client = Client::connect(opts).await?;
-    let id = client.open_pty(80, 24, None, Some("/bin/bash".into())).await?;
+    let _ = client.create_session(None).await?;
+    let id = client
+        .open_pty(80, 24, None, Some("/bin/bash".into()))
+        .await?;
 
-    // Disable echo weirdness: run a simple printf via bash -c style by typing a command.
     client
         .write_pty(&id, b"printf 'fresh-gui-ok\\n'; exit\\n")
         .await?;

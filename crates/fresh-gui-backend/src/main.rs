@@ -3,6 +3,7 @@
 mod fs;
 mod pty;
 mod server;
+mod session;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -14,6 +15,7 @@ use tracing::info;
 
 use crate::fs::FsRoot;
 use crate::server::AppState;
+use crate::session::SessionStore;
 
 #[derive(Debug, Parser)]
 #[command(name = "fresh-gui-backend", version, about = "Remote daemon for fresh-gui")]
@@ -62,6 +64,7 @@ async fn main() -> Result<()> {
         token,
         require_auth,
         fs_root,
+        sessions: SessionStore::new(),
     });
 
     info!(

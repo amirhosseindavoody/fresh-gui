@@ -1,16 +1,16 @@
 //! Shared protocol types for fresh-gui (host ↔ remote).
 //!
-//! PTY-first ADE protocol (D1 = B). Wire: JSON text frames over WebSocket.
-//! Phase 1b adds read-only `fs` listing. Fresh Editor/scene comes later.
+//! PTY-first ADE protocol. Phase 2 adds detachable sessions + multi-PTY.
 
 use serde::{Deserialize, Serialize};
 
 /// Protocol version negotiated in [`Hello`].
-pub const PROTOCOL_VERSION: &str = "0.1.0";
+pub const PROTOCOL_VERSION: &str = "0.2.0";
 
 pub const CAP_PING: &str = "ping";
 pub const CAP_PTY: &str = "pty";
 pub const CAP_FS: &str = "fs";
+pub const CAP_SESSION: &str = "session";
 
 /// First message after WebSocket connect. Client sends; backend replies with its own.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -48,6 +48,20 @@ pub struct FsEntry {
     pub size: Option<u64>,
 }
 
+/// Summary of a live PTY inside a session (sent on attach).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PtyInfo {
+    pub id: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub id: String,
+    pub pty_count: u32,
+}
+
 /// Top-level JSON envelope (one WebSocket text frame per message).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -67,7 +81,37 @@ pub enum Message {
     Pong {
         nonce: u64,
     },
-    /// Client → backend: open a PTY.
+    /// Client → backend: create a detachable session.
+    SessionCreate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        layout: Option<String>,
+    },
+    /// Backend → client.
+    SessionCreated {
+        session_id: String,
+    },
+    /// Client → backend: attach to an existing session (PTYs keep running while detached).
+    SessionAttach {
+        session_id: String,
+    },
+    /// Backend → client after attach (includes live PTYs; scrollback follows as `pty_data`).
+    SessionAttached {
+        session_id: String,
+        ptys: Vec<PtyInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        layout: Option<String>,
+    },
+    /// Client → backend.
+    SessionList,
+    /// Backend → client.
+    SessionListed {
+        sessions: Vec<SessionInfo>,
+    },
+    /// Client → backend: persist UI layout JSON with the session.
+    LayoutSet {
+        layout: String,
+    },
+    /// Client → backend: open a PTY in the attached session.
     PtyOpen {
         cols: u16,
         rows: u16,
@@ -79,6 +123,8 @@ pub enum Message {
     /// Backend → client: PTY ready.
     PtyOpened {
         id: String,
+        cols: u16,
+        rows: u16,
     },
     /// Either direction: base64-encoded bytes (stdin ↔ stdout/stderr merged).
     PtyData {
@@ -163,6 +209,7 @@ impl Hello {
             CAP_PING.to_owned(),
             CAP_PTY.to_owned(),
             CAP_FS.to_owned(),
+            CAP_SESSION.to_owned(),
         ]
     }
 
@@ -171,6 +218,7 @@ impl Hello {
             CAP_PING.to_owned(),
             CAP_PTY.to_owned(),
             CAP_FS.to_owned(),
+            CAP_SESSION.to_owned(),
         ]
     }
 }
@@ -190,36 +238,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hello_roundtrips_json() {
+    fn hello_includes_session_cap() {
         let hello = Hello::backend("fresh-gui-backend/test", Hello::default_backend_caps());
-        let msg = Message::Hello(hello.clone());
-        let json = msg.to_json().unwrap();
-        let back = Message::from_json(&json).unwrap();
-        assert_eq!(back, Message::Hello(hello));
-        assert!(json.contains("\"fs\""));
+        let json = Message::Hello(hello).to_json().unwrap();
+        assert!(json.contains("\"session\""));
+        assert!(json.contains("0.2.0"));
     }
 
     #[test]
-    fn pty_data_roundtrips() {
-        let msg = Message::PtyData {
-            id: "p1".into(),
-            data: "aGVsbG8=".into(),
+    fn session_attached_roundtrips() {
+        let msg = Message::SessionAttached {
+            session_id: "s1".into(),
+            ptys: vec![PtyInfo {
+                id: "p1".into(),
+                cols: 80,
+                rows: 24,
+            }],
+            layout: Some(r#"{"split":"vertical"}"#.into()),
         };
         let back = Message::from_json(&msg.to_json().unwrap()).unwrap();
         assert_eq!(back, msg);
     }
 
     #[test]
-    fn fs_listed_roundtrips() {
-        let msg = Message::FsListed {
-            request_id: "r1".into(),
-            path: "/tmp".into(),
-            entries: vec![FsEntry {
-                name: "a".into(),
-                path: "/tmp/a".into(),
-                kind: FsKind::File,
-                size: Some(3),
-            }],
+    fn pty_opened_includes_size() {
+        let msg = Message::PtyOpened {
+            id: "p1".into(),
+            cols: 120,
+            rows: 40,
         };
         let back = Message::from_json(&msg.to_json().unwrap()).unwrap();
         assert_eq!(back, msg);

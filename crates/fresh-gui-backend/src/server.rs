@@ -1,6 +1,5 @@
-//! WebSocket ADE server (JSON frames).
+//! WebSocket ADE server (JSON frames) with detachable sessions.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -13,17 +12,17 @@ use axum::Router;
 use base64::Engine;
 use fresh_gui_protocol::{Hello, Message, PROTOCOL_VERSION};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
-use uuid::Uuid;
 
 use crate::fs::FsRoot;
-use crate::pty::PtySession;
+use crate::session::SessionStore;
 
 pub struct AppState {
     pub token: Option<String>,
     pub require_auth: bool,
     pub fs_root: FsRoot,
+    pub sessions: SessionStore,
 }
 
 pub async fn serve(addr: SocketAddr, state: Arc<AppState>) -> Result<()> {
@@ -57,7 +56,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     }
 
     let mut authed = !state.require_auth;
-    let ptys: Arc<Mutex<HashMap<String, PtySession>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mut session_id: Option<String> = None;
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
 
     loop {
@@ -76,7 +75,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 let Some(frame) = frame else { break };
                 let Ok(frame) = frame else { break };
                 let WsMessage::Text(text) = frame else {
-                    // ignore binary/ping; axum handles ping/pong at protocol layer
                     continue;
                 };
                 let msg = match Message::from_json(&text) {
@@ -98,7 +96,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     msg,
                     &state,
                     &mut authed,
-                    &ptys,
+                    &mut session_id,
                     out_tx.clone(),
                     &mut sink,
                 )
@@ -110,6 +108,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
+    if let Some(sid) = session_id {
+        state.sessions.detach_subscriber(&sid).await;
+    }
     info!("websocket client disconnected");
 }
 
@@ -117,7 +118,7 @@ async fn handle_client_msg(
     msg: Message,
     state: &AppState,
     authed: &mut bool,
-    ptys: &Arc<Mutex<HashMap<String, PtySession>>>,
+    session_id: &mut Option<String>,
     out_tx: mpsc::UnboundedSender<Message>,
     sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
 ) -> Result<(), Message> {
@@ -169,6 +170,91 @@ async fn handle_client_msg(
                 })?;
             Ok(())
         }
+        Message::SessionCreate { layout } => {
+            require_auth(*authed)?;
+            if let Some(prev) = session_id.take() {
+                state.sessions.detach_subscriber(&prev).await;
+            }
+            let id = state.sessions.create(layout).await;
+            state
+                .sessions
+                .attach(&id, out_tx)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "session_attach_failed".into(),
+                    message: err.to_string(),
+                })?;
+            *session_id = Some(id.clone());
+            send_msg(sink, &Message::SessionCreated { session_id: id })
+                .await
+                .map_err(|_| Message::Error {
+                    code: "send_failed".into(),
+                    message: "failed to send SessionCreated".into(),
+                })?;
+            Ok(())
+        }
+        Message::SessionAttach {
+            session_id: want_id,
+        } => {
+            require_auth(*authed)?;
+            if let Some(prev) = session_id.take() {
+                state.sessions.detach_subscriber(&prev).await;
+            }
+            let (ptys, layout, replay) = state
+                .sessions
+                .attach(&want_id, out_tx)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "session_attach_failed".into(),
+                    message: err.to_string(),
+                })?;
+            *session_id = Some(want_id.clone());
+            send_msg(
+                sink,
+                &Message::SessionAttached {
+                    session_id: want_id,
+                    ptys,
+                    layout,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send SessionAttached".into(),
+            })?;
+            // Replay scrollback after the attach ack so clients can wire terminals first.
+            for msg in replay {
+                send_msg(sink, &msg).await.map_err(|_| Message::Error {
+                    code: "send_failed".into(),
+                    message: "failed to replay scrollback".into(),
+                })?;
+            }
+            Ok(())
+        }
+        Message::SessionList => {
+            require_auth(*authed)?;
+            let sessions = state.sessions.list().await;
+            send_msg(sink, &Message::SessionListed { sessions })
+                .await
+                .map_err(|_| Message::Error {
+                    code: "send_failed".into(),
+                    message: "failed to send SessionListed".into(),
+                })?;
+            Ok(())
+        }
+        Message::LayoutSet { layout } => {
+            require_auth(*authed)?;
+            let sid = require_session(session_id)?;
+            state
+                .sessions
+                .set_layout(&sid, layout)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "layout_set_failed".into(),
+                    message: err.to_string(),
+                })?;
+            Ok(())
+        }
         Message::PtyOpen {
             cols,
             rows,
@@ -176,97 +262,99 @@ async fn handle_client_msg(
             shell,
         } => {
             require_auth(*authed)?;
-            let id = Uuid::new_v4().to_string();
-            let (pty_out_tx, mut pty_out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-            let session = PtySession::spawn(id.clone(), cols, rows, cwd, shell, pty_out_tx)
+            let sid = match session_id.as_ref() {
+                Some(s) => s.clone(),
+                None => {
+                    // Compat: auto-create a session on first PTY open.
+                    let id = state.sessions.create(None).await;
+                    state
+                        .sessions
+                        .attach(&id, out_tx.clone())
+                        .await
+                        .map_err(|err| Message::Error {
+                            code: "session_attach_failed".into(),
+                            message: err.to_string(),
+                        })?;
+                    send_msg(
+                        sink,
+                        &Message::SessionCreated {
+                            session_id: id.clone(),
+                        },
+                    )
+                    .await
+                    .ok();
+                    *session_id = Some(id.clone());
+                    id
+                }
+            };
+
+            let id = state
+                .sessions
+                .open_pty(&sid, cols, rows, cwd, shell)
+                .await
                 .map_err(|err| Message::Error {
                     code: "pty_open_failed".into(),
                     message: err.to_string(),
                 })?;
 
-            // Announce the PTY before forwarding any output. The reader thread may
-            // already be buffering bytes on `pty_out_rx`; do not drain them onto
-            // `out_tx` until `PtyOpened` is on the wire, or clients waiting in
-            // `open_pty` can see `PtyData` first and fail.
-            ptys.lock().await.insert(id.clone(), session);
-            send_msg(sink, &Message::PtyOpened { id: id.clone() })
-                .await
-                .map_err(|_| Message::Error {
-                    code: "send_failed".into(),
-                    message: "failed to send PtyOpened".into(),
-                })?;
-
-            let id_for_task = id;
-            let out_tx2 = out_tx.clone();
-            tokio::spawn(async move {
-                while let Some(bytes) = pty_out_rx.recv().await {
-                    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                    if out_tx2
-                        .send(Message::PtyData {
-                            id: id_for_task.clone(),
-                            data,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                let _ = out_tx2.send(Message::PtyClosed {
-                    id: id_for_task,
-                    reason: Some("eof".into()),
-                });
-            });
+            send_msg(
+                sink,
+                &Message::PtyOpened {
+                    id,
+                    cols,
+                    rows,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send PtyOpened".into(),
+            })?;
             Ok(())
         }
         Message::PtyData { id, data } => {
             require_auth(*authed)?;
+            let sid = require_session(session_id)?;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(&data)
                 .map_err(|err| Message::Error {
                     code: "bad_base64".into(),
                     message: err.to_string(),
                 })?;
-            let ptys = ptys.lock().await;
-            let Some(session) = ptys.get(&id) else {
-                return Err(Message::Error {
-                    code: "unknown_pty".into(),
-                    message: id,
-                });
-            };
-            session.write_all(&bytes).map_err(|err| Message::Error {
-                code: "pty_write_failed".into(),
-                message: err.to_string(),
-            })?;
+            state
+                .sessions
+                .write_pty(&sid, &id, &bytes)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "pty_write_failed".into(),
+                    message: err.to_string(),
+                })?;
             Ok(())
         }
         Message::PtyResize { id, cols, rows } => {
             require_auth(*authed)?;
-            let ptys = ptys.lock().await;
-            let Some(session) = ptys.get(&id) else {
-                return Err(Message::Error {
-                    code: "unknown_pty".into(),
-                    message: id,
-                });
-            };
-            session.resize(cols, rows).map_err(|err| Message::Error {
-                code: "pty_resize_failed".into(),
-                message: err.to_string(),
-            })?;
+            let sid = require_session(session_id)?;
+            state
+                .sessions
+                .resize_pty(&sid, &id, cols, rows)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "pty_resize_failed".into(),
+                    message: err.to_string(),
+                })?;
             Ok(())
         }
         Message::PtyClose { id } => {
             require_auth(*authed)?;
-            let mut ptys = ptys.lock().await;
-            ptys.remove(&id);
-            send_msg(
-                sink,
-                &Message::PtyClosed {
-                    id,
-                    reason: Some("client_close".into()),
-                },
-            )
-            .await
-            .ok();
+            let sid = require_session(session_id)?;
+            state
+                .sessions
+                .close_pty(&sid, &id)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "pty_close_failed".into(),
+                    message: err.to_string(),
+                })?;
             Ok(())
         }
         Message::FsList { request_id, path } => {
@@ -331,6 +419,13 @@ fn require_auth(authed: bool) -> Result<(), Message> {
             message: "send auth first".into(),
         })
     }
+}
+
+fn require_session(session_id: &Option<String>) -> Result<String, Message> {
+    session_id.clone().ok_or_else(|| Message::Error {
+        code: "no_session".into(),
+        message: "create or attach a session first".into(),
+    })
 }
 
 async fn send_msg(

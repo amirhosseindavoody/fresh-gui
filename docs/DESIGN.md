@@ -102,7 +102,7 @@ The protocol crate owns:
 
 - **Hello / version** — `protocol_version`, backend implementation id, advertised capabilities (e.g. `pty`, later `scene` / `fs`).
 - **Auth** — token / mTLS / SSH-channel; reject anonymous binds on non-loopback.
-- **Session** — create / attach / list / dispose.
+- **Session** — create / attach / list; layout blob; PTYs survive GUI disconnect (Phase 2).
 - **Streams (MVP / Phase 1)** — terminal I/O (bytes + resize) under a `pty` capability.
 - **Streams (Phase 1b)** — read-only remote file tree under an `fs` capability (list / stat); negotiated, not required for Phase 1 connect.
 - **Streams (Phase 3+)** — optional Fresh scene diffs, diagnostics — negotiated via capabilities.
@@ -139,9 +139,12 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 - Bundle version is a WiX-safe mapping of CalVer (e.g. `2026.728.1` → `26.7.28001`); see `docs/WINDOWS.md`.
 - Code signing + auto-update remain Phase 4.
 
-### Phase 2 — Multi-tab / splits + session detach
+### Phase 2 — Multi-tab / splits + session detach ✅
 
-- Multiple PTYs, horizontal/vertical splits, session survives GUI restart.
+- Protocol `session` capability (`0.2.0`): `session_create` / `session_attach` / `session_list`, `layout_set`; PTYs belong to a session.
+- Backend `SessionStore`: multi-PTY per session, ~64KB scrollback replay on reattach, subscriber detach on WS close (PTYs keep running).
+- Host UI: tab bar, H/V splits, session id in localStorage; reconnect reattaches and restores layout + scrollback.
+- Tests: `session_detach_reattach_keeps_pty`, `multi_pty_in_session`.
 
 ### Phase 3 — Editor surface (Fresh pull-in)
 
