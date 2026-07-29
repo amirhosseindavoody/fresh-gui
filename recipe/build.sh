@@ -33,7 +33,11 @@ ensure_vendor_fresh() {
     echo "  For local clones: git submodule update --init --recursive" >&2
     exit 1
   fi
-  rev="$(tr -d '[:space:]' < "${pin_file}")"
+  rev="$(grep -E '^[0-9a-f]{7,40}$' "${pin_file}" | head -n1 || true)"
+  if [[ -z "${rev}" ]]; then
+    echo "error: ${pin_file} does not contain a git commit SHA" >&2
+    exit 1
+  fi
   echo "Fetching vendor/fresh @ ${rev} from ${url}…"
   rm -rf vendor/fresh
   mkdir -p vendor
