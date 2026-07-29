@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
-use fresh_gui_protocol::{Hello, Message, PtyInfo, SessionInfo, PROTOCOL_VERSION};
+use fresh_gui_protocol::{
+    Hello, Message, PtyInfo, SceneBuffer, SessionInfo, PROTOCOL_VERSION,
+};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -322,8 +324,147 @@ impl Client {
                 | Message::PtyClosed { .. }
                 | Message::Pong { .. }
                 | Message::Ping { .. }
-                | Message::FsListed { .. } => continue,
+                | Message::FsListed { .. }
+                | Message::FsChanged { .. } => continue,
                 other => bail!("unexpected while opening editor: {other:?}"),
+            }
+        }
+    }
+
+    /// Replace buffer text (CAS on `base_rev`). Returns new revision.
+    pub async fn edit_buffer(
+        &mut self,
+        buffer_id: impl Into<String>,
+        base_rev: u64,
+        text: impl Into<String>,
+    ) -> Result<u64> {
+        let request_id = format!("ed-{}", uuid_simple());
+        let buffer_id = buffer_id.into();
+        send_msg(
+            &mut self.sink,
+            &Message::BufferEdit {
+                request_id: request_id.clone(),
+                buffer_id: buffer_id.clone(),
+                base_rev,
+                text: text.into(),
+            },
+        )
+        .await?;
+        loop {
+            match self.recv().await? {
+                Message::BufferChanged {
+                    request_id: rid,
+                    buffer_id: bid,
+                    rev,
+                } if rid == request_id && bid == buffer_id => return Ok(rev),
+                Message::Error { code, message } => {
+                    bail!("buffer edit failed: {code}: {message}")
+                }
+                Message::PtyData { .. }
+                | Message::FsChanged { .. }
+                | Message::Pong { .. }
+                | Message::Ping { .. } => continue,
+                other => bail!("unexpected while editing buffer: {other:?}"),
+            }
+        }
+    }
+
+    /// Save buffer to disk (CAS on `base_rev`). Returns `(path, new_rev)`.
+    pub async fn save_buffer(
+        &mut self,
+        buffer_id: impl Into<String>,
+        base_rev: u64,
+    ) -> Result<(String, u64)> {
+        let request_id = format!("sv-{}", uuid_simple());
+        let buffer_id = buffer_id.into();
+        send_msg(
+            &mut self.sink,
+            &Message::BufferSave {
+                request_id: request_id.clone(),
+                buffer_id: buffer_id.clone(),
+                base_rev,
+            },
+        )
+        .await?;
+        loop {
+            match self.recv().await? {
+                Message::BufferSaved {
+                    request_id: rid,
+                    buffer_id: bid,
+                    path,
+                    rev,
+                } if rid == request_id && bid == buffer_id => return Ok((path, rev)),
+                Message::Error { code, message } => {
+                    bail!("buffer save failed: {code}: {message}")
+                }
+                Message::PtyData { .. }
+                | Message::FsChanged { .. }
+                | Message::Pong { .. }
+                | Message::Ping { .. } => continue,
+                other => bail!("unexpected while saving buffer: {other:?}"),
+            }
+        }
+    }
+
+    pub async fn watch_fs(
+        &mut self,
+        path: impl Into<String>,
+        recursive: bool,
+    ) -> Result<(String, String)> {
+        let request_id = format!("w-{}", uuid_simple());
+        send_msg(
+            &mut self.sink,
+            &Message::FsWatch {
+                request_id: request_id.clone(),
+                path: path.into(),
+                recursive,
+            },
+        )
+        .await?;
+        loop {
+            match self.recv().await? {
+                Message::FsWatchStarted {
+                    request_id: rid,
+                    watch_id,
+                    path,
+                } if rid == request_id => return Ok((watch_id, path)),
+                Message::Error { code, message } => {
+                    bail!("fs watch failed: {code}: {message}")
+                }
+                Message::PtyData { .. }
+                | Message::FsChanged { .. }
+                | Message::Pong { .. }
+                | Message::Ping { .. } => continue,
+                other => bail!("unexpected while starting watch: {other:?}"),
+            }
+        }
+    }
+
+    pub async fn scene_get(&mut self) -> Result<(Vec<SceneBuffer>, Option<String>)> {
+        let request_id = format!("sc-{}", uuid_simple());
+        send_msg(
+            &mut self.sink,
+            &Message::SceneGet {
+                request_id: request_id.clone(),
+            },
+        )
+        .await?;
+        loop {
+            match self.recv().await? {
+                Message::SceneSnapshot {
+                    request_id: rid,
+                    buffers,
+                    active_buffer_id,
+                    ..
+                } if rid == request_id => return Ok((buffers, active_buffer_id)),
+                Message::Error { code, message } => {
+                    bail!("scene get failed: {code}: {message}")
+                }
+                Message::PtyData { .. }
+                | Message::FsChanged { .. }
+                | Message::Pong { .. }
+                | Message::Ping { .. } => continue,
+                other => bail!("unexpected while getting scene: {other:?}"),
             }
         }
     }

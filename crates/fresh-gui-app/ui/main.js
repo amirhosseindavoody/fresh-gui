@@ -1,6 +1,6 @@
-/* Phase 3a host UI: sessions, tabs/splits, file tree, Fresh editor open/snapshot. */
+/* Phase 3b/3c host UI: sessions, tabs/splits, tree+watch, CodeMirror edit/save, thin scene. */
 
-const PROTOCOL_VERSION = "0.3.0";
+const PROTOCOL_VERSION = "0.4.0";
 const SESSION_KEY = "fresh-gui.sessionId";
 const LAYOUT_KEY = "fresh-gui.layout";
 
@@ -12,8 +12,9 @@ const treeEl = $("tree");
 const tabsEl = $("tabs");
 const panesEl = $("panes");
 const editorPanel = $("editor-panel");
-const editorEl = $("editor");
+const editorHost = $("editor-host");
 const editorPathEl = $("editor-path");
+const editorSaveBtn = $("editor-save");
 
 let ws = null;
 let authed = false;
@@ -24,8 +25,38 @@ let hasEditor = false;
 const pendingFs = new Map();
 /** @type {Map<string, {resolve: Function, reject: Function}>} */
 const pendingEditor = new Map();
+/** @type {Map<string, {resolve: Function, reject: Function}>} */
+const pendingEdit = new Map();
+/** @type {Map<string, {resolve: Function, reject: Function}>} */
+const pendingSave = new Map();
 let selectedPath = null;
 let openBufferId = null;
+let openBufferRev = 0;
+let openBufferPath = null;
+let editorDirty = false;
+let suppressCmChange = false;
+/** @type {any} */
+let cm = null;
+let watchId = null;
+let treeRefreshTimer = null;
+let treeLoading = false;
+let treeLoaded = false;
+let treeNeedsRefresh = false;
+/** @type {Set<string>} */
+const expandedPaths = new Set();
+/** Suppress auto-refresh briefly after the user clicks the tree. */
+let treeQuietUntil = 0;
+
+/** Paths under these directory names are ignored for tree auto-refresh. */
+const WATCH_IGNORE_DIRS = new Set([
+  ".git",
+  "target",
+  ".pixi",
+  "node_modules",
+  "vendor",
+  ".cursor",
+  "dist",
+]);
 
 /** @type {{ id: string, title: string, term: any, fit: any, el: HTMLElement }[]} */
 let tabs = [];
@@ -95,12 +126,92 @@ function editorOpen(path, preview = false) {
   });
 }
 
-function showEditor(path, text, bufferId) {
+function bufferEdit(bufferId, baseRev, text) {
+  const request_id = nextRequestId();
+  return new Promise((resolve, reject) => {
+    pendingEdit.set(request_id, { resolve, reject });
+    send({
+      type: "buffer_edit",
+      request_id,
+      buffer_id: bufferId,
+      base_rev: baseRev,
+      text,
+    });
+    setTimeout(() => {
+      if (pendingEdit.has(request_id)) {
+        pendingEdit.delete(request_id);
+        reject(new Error("buffer_edit timeout"));
+      }
+    }, 15000);
+  });
+}
+
+function bufferSave(bufferId, baseRev) {
+  const request_id = nextRequestId();
+  return new Promise((resolve, reject) => {
+    pendingSave.set(request_id, { resolve, reject });
+    send({
+      type: "buffer_save",
+      request_id,
+      buffer_id: bufferId,
+      base_rev: baseRev,
+    });
+    setTimeout(() => {
+      if (pendingSave.has(request_id)) {
+        pendingSave.delete(request_id);
+        reject(new Error("buffer_save timeout"));
+      }
+    }, 15000);
+  });
+}
+
+function modeForPath(path) {
+  const lower = (path || "").toLowerCase();
+  if (lower.endsWith(".rs")) return "rust";
+  if (lower.endsWith(".js") || lower.endsWith(".ts") || lower.endsWith(".mjs")) return "javascript";
+  if (lower.endsWith(".py")) return "python";
+  if (lower.endsWith(".md")) return "markdown";
+  return null;
+}
+
+function ensureCodeMirror() {
+  if (cm) return cm;
+  cm = CodeMirror(editorHost, {
+    value: "",
+    theme: "material-darker",
+    lineNumbers: true,
+    indentUnit: 4,
+    lineWrapping: true,
+  });
+  cm.on("change", () => {
+    if (suppressCmChange || !openBufferId) return;
+    editorDirty = true;
+    updateEditorChrome();
+  });
+  return cm;
+}
+
+function updateEditorChrome() {
+  const name = openBufferPath || "untitled";
+  editorPathEl.textContent = editorDirty ? `${name} •` : name;
+  editorPathEl.classList.toggle("dirty", editorDirty);
+  editorSaveBtn.disabled = !openBufferId || !editorDirty;
+}
+
+function showEditor(path, text, bufferId, rev) {
   openBufferId = bufferId;
-  editorPathEl.textContent = path || "untitled";
-  editorEl.value = text ?? "";
+  openBufferRev = rev || 0;
+  openBufferPath = path || "untitled";
+  editorDirty = false;
+  const editor = ensureCodeMirror();
+  suppressCmChange = true;
+  editor.setValue(text ?? "");
+  editor.setOption("mode", modeForPath(path));
+  suppressCmChange = false;
   editorPanel.classList.add("visible");
+  updateEditorChrome();
   requestAnimationFrame(() => {
+    editor.refresh();
     for (const tab of tabs) {
       try {
         tab.fit.fit();
@@ -112,9 +223,17 @@ function showEditor(path, text, bufferId) {
 function hideEditor() {
   if (openBufferId) send({ type: "editor_close", buffer_id: openBufferId });
   openBufferId = null;
+  openBufferRev = 0;
+  openBufferPath = null;
+  editorDirty = false;
+  if (cm) {
+    suppressCmChange = true;
+    cm.setValue("");
+    suppressCmChange = false;
+  }
   editorPanel.classList.remove("visible");
+  updateEditorChrome();
   editorPathEl.textContent = "No file open";
-  editorEl.value = "";
   requestAnimationFrame(() => {
     for (const tab of tabs) {
       try {
@@ -122,6 +241,58 @@ function hideEditor() {
       } catch (_) {}
     }
   });
+}
+
+async function saveOpenBuffer() {
+  if (!openBufferId || !cm || !editorDirty) return;
+  const text = cm.getValue();
+  setStatus(`saving ${openBufferPath}…`);
+  try {
+    const revAfterEdit = await bufferEdit(openBufferId, openBufferRev, text);
+    openBufferRev = revAfterEdit;
+    const saved = await bufferSave(openBufferId, openBufferRev);
+    openBufferRev = saved.rev;
+    editorDirty = false;
+    updateEditorChrome();
+    setStatus(`saved ${saved.path}`);
+  } catch (err) {
+    setStatus(`save error: ${err}`);
+  }
+}
+
+function pathIsNoisy(path) {
+  const parts = String(path).split(/[/\\]/).filter(Boolean);
+  return parts.some((p) => WATCH_IGNORE_DIRS.has(p));
+}
+
+function noteTreeInteraction() {
+  treeQuietUntil = Date.now() + 2000;
+}
+
+function scheduleTreeRefresh() {
+  if (Date.now() < treeQuietUntil) {
+    // Retry after the quiet window so we don't drop real updates forever.
+    if (treeRefreshTimer) clearTimeout(treeRefreshTimer);
+    treeRefreshTimer = setTimeout(() => {
+      treeRefreshTimer = null;
+      scheduleTreeRefresh();
+    }, Math.max(200, treeQuietUntil - Date.now() + 50));
+    return;
+  }
+  if (treeRefreshTimer) clearTimeout(treeRefreshTimer);
+  treeRefreshTimer = setTimeout(() => {
+    treeRefreshTimer = null;
+    if (Date.now() < treeQuietUntil) {
+      scheduleTreeRefresh();
+      return;
+    }
+    loadRoot({ silent: true }).catch(() => {});
+  }, 800);
+}
+
+function startFsWatch() {
+  const request_id = nextRequestId();
+  send({ type: "fs_watch", request_id, path: "", recursive: true });
 }
 
 function escapeHtml(s) {
@@ -286,13 +457,31 @@ function clearTree() {
   treeEl.innerHTML = "";
   pendingFs.clear();
   selectedPath = null;
+  expandedPaths.clear();
+  treeLoaded = false;
+  treeLoading = false;
+  treeNeedsRefresh = false;
+  if (treeRefreshTimer) {
+    clearTimeout(treeRefreshTimer);
+    treeRefreshTimer = null;
+  }
 }
 
-async function loadRoot() {
-  clearTree();
-  treeEl.textContent = "Loading…";
+async function loadRoot(opts = {}) {
+  const silent = !!opts.silent && treeLoaded;
+  if (treeLoading) {
+    treeNeedsRefresh = true;
+    return;
+  }
+  treeLoading = true;
+  if (!silent) {
+    clearTree();
+    treeEl.textContent = "Loading…";
+  }
   try {
     const listed = await fsList("");
+    const prevSelected = selectedPath;
+    const keepExpanded = new Set(expandedPaths);
     treeEl.innerHTML = "";
     const rootLabel = document.createElement("div");
     rootLabel.className = "tree-item";
@@ -302,9 +491,52 @@ async function loadRoot() {
     children.className = "tree-children";
     treeEl.appendChild(children);
     renderEntries(children, listed.entries);
-    setStatus(`session ${sessionId || "?"} · ${listed.path}`);
+    treeLoaded = true;
+    if (prevSelected) selectedPath = prevSelected;
+    if (keepExpanded.size) {
+      await restoreExpanded(children, keepExpanded);
+    }
+    if (!silent) {
+      setStatus(`session ${sessionId || "?"} · ${listed.path}`);
+    }
   } catch (err) {
-    treeEl.innerHTML = `<div style="padding:0.75rem;color:#f85149">${escapeHtml(String(err))}</div>`;
+    if (!silent || !treeLoaded) {
+      treeEl.innerHTML = `<div style="padding:0.75rem;color:#f85149">${escapeHtml(String(err))}</div>`;
+    }
+  } finally {
+    treeLoading = false;
+    if (treeNeedsRefresh) {
+      treeNeedsRefresh = false;
+      scheduleTreeRefresh();
+    }
+  }
+}
+
+/** Re-expand directories that were open before a silent tree rebuild. */
+async function restoreExpanded(container, paths) {
+  const rows = [...container.querySelectorAll(":scope > .tree-item")];
+  for (const row of rows) {
+    const childBox = row.nextElementSibling;
+    if (!childBox || !childBox.classList.contains("tree-children")) continue;
+    const path = row.dataset.path;
+    if (!path || !paths.has(path)) continue;
+    const twist = row.querySelector(".twist");
+    try {
+      if (!childBox.dataset.loaded) {
+        if (twist) twist.textContent = "…";
+        const listed = await fsList(path);
+        childBox.innerHTML = "";
+        renderEntries(childBox, listed.entries);
+        childBox.dataset.loaded = "1";
+      }
+      childBox.hidden = false;
+      if (twist) twist.textContent = "▾";
+      expandedPaths.add(path);
+      await restoreExpanded(childBox, paths);
+    } catch (_) {
+      if (twist) twist.textContent = "▸";
+      expandedPaths.delete(path);
+    }
   }
 }
 
@@ -318,6 +550,8 @@ function renderEntries(container, entries) {
   for (const entry of entries) {
     const row = document.createElement("div");
     row.className = "tree-item";
+    row.dataset.path = entry.path;
+    if (selectedPath === entry.path) row.classList.add("selected");
     const twist = document.createElement("span");
     twist.className = "twist";
     twist.textContent = entry.kind === "dir" ? "▸" : "";
@@ -333,6 +567,7 @@ function renderEntries(container, entries) {
 
     row.addEventListener("click", async (ev) => {
       ev.stopPropagation();
+      noteTreeInteraction();
       document.querySelectorAll(".tree-item.selected").forEach((el) => el.classList.remove("selected"));
       row.classList.add("selected");
       selectedPath = entry.path;
@@ -347,19 +582,27 @@ function renderEntries(container, entries) {
             childBox.dataset.loaded = "1";
             childBox.hidden = false;
             twist.textContent = "▾";
+            expandedPaths.add(entry.path);
           } catch (err) {
             twist.textContent = "▸";
+            expandedPaths.delete(entry.path);
             setStatus(`fs error: ${err}`);
           }
+        } else if (childBox.hidden) {
+          childBox.hidden = false;
+          twist.textContent = "▾";
+          expandedPaths.add(entry.path);
         } else {
-          childBox.hidden = !childBox.hidden;
-          twist.textContent = childBox.hidden ? "▸" : "▾";
+          childBox.hidden = true;
+          twist.textContent = "▸";
+          expandedPaths.delete(entry.path);
         }
       }
     });
     if (entry.kind === "file") {
       row.addEventListener("dblclick", async (ev) => {
         ev.stopPropagation();
+        noteTreeInteraction();
         if (!hasEditor) {
           setStatus("backend has no editor capability");
           return;
@@ -367,7 +610,7 @@ function renderEntries(container, entries) {
         setStatus(`opening ${entry.path}…`);
         try {
           const opened = await editorOpen(entry.path, false);
-          showEditor(opened.path, opened.text, opened.buffer_id);
+          showEditor(opened.path, opened.text, opened.buffer_id, opened.rev);
           setStatus(`opened ${opened.path}`);
         } catch (err) {
           setStatus(`editor error: ${err}`);
@@ -383,7 +626,7 @@ function afterSessionReady() {
   $("split-h").disabled = false;
   $("split-v").disabled = false;
   $("split-off").disabled = false;
-  loadRoot();
+  loadRoot().then(() => startFsWatch()).catch(() => startFsWatch());
 }
 
 function onMessage(raw) {
@@ -402,8 +645,8 @@ function onMessage(raw) {
         type: "hello",
         protocol_version: PROTOCOL_VERSION,
         role: "client",
-        implementation: "fresh-gui-ui/0.3",
-        capabilities: ["ping", "pty", "fs", "session", "editor"],
+        implementation: "fresh-gui-ui/0.4",
+        capabilities: ["ping", "pty", "fs", "session", "editor", "scene"],
       });
       {
         const token = $("token").value;
@@ -516,7 +759,6 @@ function onMessage(raw) {
       break;
     }
     case "buffer_snapshot": {
-      // Pair with the most recent editor_opened still waiting.
       for (const [id, pending] of pendingEditor) {
         if (pending._opened && pending._opened.buffer_id === msg.buffer_id) {
           pendingEditor.delete(id);
@@ -531,6 +773,31 @@ function onMessage(raw) {
       }
       break;
     }
+    case "buffer_changed": {
+      const pending = pendingEdit.get(msg.request_id);
+      if (pending) {
+        pendingEdit.delete(msg.request_id);
+        pending.resolve(msg.rev);
+      }
+      break;
+    }
+    case "buffer_saved": {
+      const pending = pendingSave.get(msg.request_id);
+      if (pending) {
+        pendingSave.delete(msg.request_id);
+        pending.resolve({ path: msg.path, rev: msg.rev });
+      }
+      break;
+    }
+    case "fs_watch_started":
+      watchId = msg.watch_id;
+      break;
+    case "fs_changed": {
+      const paths = Array.isArray(msg.paths) ? msg.paths : [];
+      if (paths.length && paths.every(pathIsNoisy)) break;
+      scheduleTreeRefresh();
+      break;
+    }
     case "error":
       for (const [id, pending] of pendingFs) {
         if (msg.message && msg.message.startsWith(id)) {
@@ -541,6 +808,18 @@ function onMessage(raw) {
       for (const [id, pending] of pendingEditor) {
         if (msg.message && msg.message.startsWith(id)) {
           pendingEditor.delete(id);
+          pending.reject(new Error(`${msg.code}: ${msg.message}`));
+        }
+      }
+      for (const [id, pending] of pendingEdit) {
+        if (msg.message && msg.message.startsWith(id)) {
+          pendingEdit.delete(id);
+          pending.reject(new Error(`${msg.code}: ${msg.message}`));
+        }
+      }
+      for (const [id, pending] of pendingSave) {
+        if (msg.message && msg.message.startsWith(id)) {
+          pendingSave.delete(id);
           pending.reject(new Error(`${msg.code}: ${msg.message}`));
         }
       }
@@ -571,6 +850,9 @@ function beginSession() {
 }
 
 function disconnect() {
+  if (watchId) send({ type: "fs_unwatch", watch_id: watchId });
+  watchId = null;
+  if (openBufferId) send({ type: "editor_close", buffer_id: openBufferId });
   if (ws) {
     try {
       ws.close();
@@ -581,6 +863,9 @@ function disconnect() {
   sessionId = null;
   hasEditor = false;
   pendingEditor.clear();
+  pendingEdit.clear();
+  pendingSave.clear();
+  openBufferId = null;
   hideEditor();
   clearTerminals();
   clearTree();
@@ -618,6 +903,17 @@ function connect() {
 connectBtn.addEventListener("click", connect);
 disconnectBtn.addEventListener("click", disconnect);
 $("editor-close").addEventListener("click", hideEditor);
+editorSaveBtn.addEventListener("click", () => {
+  saveOpenBuffer();
+});
+window.addEventListener("keydown", (ev) => {
+  if ((ev.ctrlKey || ev.metaKey) && ev.key === "s") {
+    if (openBufferId && editorDirty) {
+      ev.preventDefault();
+      saveOpenBuffer();
+    }
+  }
+});
 
 $("new-tab").addEventListener("click", () => {
   const dims = tabs[activeTab]?.fit.proposeDimensions?.() || { cols: 80, rows: 24 };

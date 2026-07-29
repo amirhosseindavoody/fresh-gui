@@ -148,19 +148,24 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 
 ### Phase 3 — Editor surface (Fresh pull-in)
 
-#### Phase 3a — Open / snapshot ✅ (in progress toward full Phase 3)
+#### Phase 3a — Open / snapshot ✅
 
-- Protocol `0.3.0` optional `editor` capability: `editor_open` / `editor_opened` / `buffer_snapshot` / `editor_close`.
+- Optional `editor` capability: `editor_open` / `editor_opened` / `buffer_snapshot` / `editor_close`.
 - Backend embeds Fresh `Editor` in-process on a dedicated `!Send` thread (`EditorWorker`); path dep on `vendor/fresh` (`runtime` feature, plugins off for MVP).
-- Host UI: double-click file in tree → editor pane shows snapshot (read-only textarea for now).
+- Host UI: double-click file in tree → editor pane.
 - Test: `editor_open_snapshot`.
-- Still deferred: edit/save, scene/`web`, `fs_watch`, merging Fresh session detach with ADE sessions.
 
-#### Phase 3b / 3c (next)
+#### Phase 3b — Edit / save + CodeMirror ✅
 
-- Edit + save with revision; richer host editor (CodeMirror/Monaco).
-- Optional `scene` capability (ADE envelopes, not `fresh --web` as primary wire).
-- File tree deepen: watch / open-in-editor polish.
+- Protocol `0.4.0`: `buffer_edit` / `buffer_changed` / `buffer_save` / `buffer_saved` with revision CAS.
+- Host UI: CodeMirror 5 pane; Ctrl/Cmd+S save; dirty indicator.
+- Test: `editor_edit_save_reopen`.
+
+#### Phase 3c — fs_watch + thin scene ✅
+
+- `fs_watch` / `fs_watch_started` / `fs_unwatch` / `fs_changed` (notify); UI refreshes tree on change.
+- Optional `scene` capability: ADE `scene_get` / `scene_snapshot` listing open buffers (not Fresh `--web` cell scene).
+- Still deferred: full Fresh web-ui scene envelopes, merging Fresh session detach with ADE sessions.
 
 ### Phase 4 — Polish / packaging
 

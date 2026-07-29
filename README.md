@@ -4,7 +4,7 @@ Terminal-first ADE **GUI on the local host**, powered by a **remote backend** (F
 
 Inspired by [Terax](https://github.com/crynta/terax-ai). Repo logistics follow [pixi-mise](https://github.com/amirhosseindavoody/pixi-mise).
 
-**Status:** Phase 3a (Fresh editor open/snapshot) on Phase 2 sessions/tabs; Windows Tauri NSIS/MSI packaging wired. See **[docs/DESIGN.md](./docs/DESIGN.md)** and **[docs/WINDOWS.md](./docs/WINDOWS.md)**.
+**Status:** Phase 3 (Fresh editor edit/save, CodeMirror, fs_watch, thin scene) on Phase 2 sessions/tabs; Windows Tauri NSIS/MSI packaging wired. See **[docs/DESIGN.md](./docs/DESIGN.md)** and **[docs/WINDOWS.md](./docs/WINDOWS.md)**.
 
 ## Split
 
@@ -64,7 +64,7 @@ pixi run build
 
 JSON text frames over WebSocket `ws://host:port/ws`:
 
-`hello` → optional `auth` → `session_*` / `layout_set` → `pty_*` / `fs_*` / `editor_open` (protocol `0.3.0`)
+`hello` → optional `auth` → `session_*` / `layout_set` → `pty_*` / `fs_*` / `editor_*` / `buffer_*` / `scene_*` (protocol `0.4.0`)
 
 ## Versioning
 

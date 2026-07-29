@@ -1,17 +1,21 @@
 //! Shared protocol types for fresh-gui (host ↔ remote).
 //!
-//! PTY-first ADE protocol. Phase 2: sessions. Phase 3a: optional `editor` open/snapshot.
+//! PTY-first ADE protocol.
+//! Phase 2: sessions. Phase 3a: editor open/snapshot.
+//! Phase 3b: edit/save. Phase 3c: fs_watch + thin scene.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
 /// Protocol version negotiated in [`Hello`].
-pub const PROTOCOL_VERSION: &str = "0.3.0";
+pub const PROTOCOL_VERSION: &str = "0.4.0";
 
 pub const CAP_PING: &str = "ping";
 pub const CAP_PTY: &str = "pty";
 pub const CAP_FS: &str = "fs";
 pub const CAP_SESSION: &str = "session";
 pub const CAP_EDITOR: &str = "editor";
+pub const CAP_SCENE: &str = "scene";
 
 /// First message after WebSocket connect. Client sends; backend replies with its own.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,8 +67,19 @@ pub struct SessionInfo {
     pub pty_count: u32,
 }
 
-/// Top-level JSON envelope (one WebSocket text frame per message).
+/// Open buffer summary for the thin ADE `scene` capability (not Fresh web-ui scene).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SceneBuffer {
+    pub buffer_id: String,
+    pub path: String,
+    pub rev: u64,
+    pub dirty: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
+/// Top-level JSON envelope (one WebSocket text frame per message).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Message {
     Hello(Hello),
@@ -170,6 +185,28 @@ pub enum Message {
         request_id: String,
         entry: FsEntry,
     },
+    /// Client → backend: watch a path under the FS root (capability `fs`).
+    FsWatch {
+        request_id: String,
+        path: String,
+        #[serde(default)]
+        recursive: bool,
+    },
+    /// Backend → client.
+    FsWatchStarted {
+        request_id: String,
+        watch_id: String,
+        path: String,
+    },
+    /// Client → backend.
+    FsUnwatch {
+        watch_id: String,
+    },
+    /// Backend → client: filesystem change under a watch.
+    FsChanged {
+        watch_id: String,
+        paths: Vec<String>,
+    },
     /// Client → backend: open a path in the Fresh editor (capability `editor`).
     EditorOpen {
         request_id: String,
@@ -185,16 +222,56 @@ pub enum Message {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         language: Option<String>,
     },
-    /// Backend → client: full buffer text (Phase 3a MVP; diffs later).
+    /// Backend → client: full buffer text.
     BufferSnapshot {
         buffer_id: String,
         rev: u64,
         text: String,
         path: String,
     },
+    /// Client → backend: replace full buffer text when `base_rev` matches (CAS).
+    BufferEdit {
+        request_id: String,
+        buffer_id: String,
+        base_rev: u64,
+        text: String,
+    },
+    /// Backend → client: edit applied (or conflict via `error`).
+    BufferChanged {
+        request_id: String,
+        buffer_id: String,
+        rev: u64,
+    },
+    /// Client → backend: save buffer to disk when `base_rev` matches.
+    BufferSave {
+        request_id: String,
+        buffer_id: String,
+        base_rev: u64,
+    },
+    /// Backend → client.
+    BufferSaved {
+        request_id: String,
+        buffer_id: String,
+        path: String,
+        rev: u64,
+    },
     /// Client → backend: close an editor buffer.
     EditorClose {
         buffer_id: String,
+    },
+    /// Client → backend: thin ADE scene snapshot (capability `scene`).
+    SceneGet {
+        request_id: String,
+    },
+    /// Backend → client: open-buffer chrome (not Fresh `--web` cell scene).
+    SceneSnapshot {
+        request_id: String,
+        buffers: Vec<SceneBuffer>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_buffer_id: Option<String>,
+        /// Opaque extension bag for future fields.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extra: Option<JsonValue>,
     },
     Error {
         code: String,
@@ -238,6 +315,7 @@ impl Hello {
             CAP_FS.to_owned(),
             CAP_SESSION.to_owned(),
             CAP_EDITOR.to_owned(),
+            CAP_SCENE.to_owned(),
         ]
     }
 
@@ -248,6 +326,7 @@ impl Hello {
             CAP_FS.to_owned(),
             CAP_SESSION.to_owned(),
             CAP_EDITOR.to_owned(),
+            CAP_SCENE.to_owned(),
         ]
     }
 }
@@ -267,55 +346,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hello_includes_editor_cap() {
+    fn hello_includes_editor_and_scene() {
         let hello = Hello::backend("fresh-gui-backend/test", Hello::default_backend_caps());
         let json = Message::Hello(hello).to_json().unwrap();
         assert!(json.contains("\"editor\""));
-        assert!(json.contains("\"session\""));
-        assert!(json.contains("0.3.0"));
+        assert!(json.contains("\"scene\""));
+        assert!(json.contains("0.4.0"));
     }
 
     #[test]
-    fn session_attached_roundtrips() {
-        let msg = Message::SessionAttached {
-            session_id: "s1".into(),
-            ptys: vec![PtyInfo {
-                id: "p1".into(),
-                cols: 80,
-                rows: 24,
-            }],
-            layout: Some(r#"{"split":"vertical"}"#.into()),
-        };
-        let back = Message::from_json(&msg.to_json().unwrap()).unwrap();
-        assert_eq!(back, msg);
-    }
-
-    #[test]
-    fn editor_open_snapshot_roundtrips() {
-        let open = Message::EditorOpen {
+    fn buffer_edit_save_roundtrips() {
+        let edit = Message::BufferEdit {
             request_id: "r1".into(),
-            path: "/tmp/a.rs".into(),
-            preview: false,
-        };
-        assert_eq!(Message::from_json(&open.to_json().unwrap()).unwrap(), open);
-
-        let snap = Message::BufferSnapshot {
             buffer_id: "1".into(),
-            rev: 0,
-            text: "fn main() {}\n".into(),
-            path: "/tmp/a.rs".into(),
+            base_rev: 0,
+            text: "hello\n".into(),
         };
-        assert_eq!(Message::from_json(&snap.to_json().unwrap()).unwrap(), snap);
+        assert_eq!(Message::from_json(&edit.to_json().unwrap()).unwrap(), edit);
+
+        let saved = Message::BufferSaved {
+            request_id: "r2".into(),
+            buffer_id: "1".into(),
+            path: "/tmp/a.rs".into(),
+            rev: 1,
+        };
+        assert_eq!(Message::from_json(&saved.to_json().unwrap()).unwrap(), saved);
     }
 
     #[test]
-    fn pty_opened_includes_size() {
-        let msg = Message::PtyOpened {
-            id: "p1".into(),
-            cols: 120,
-            rows: 40,
+    fn scene_snapshot_roundtrips() {
+        let msg = Message::SceneSnapshot {
+            request_id: "s1".into(),
+            buffers: vec![SceneBuffer {
+                buffer_id: "1".into(),
+                path: "/tmp/a.rs".into(),
+                rev: 2,
+                dirty: true,
+                language: Some("rust".into()),
+            }],
+            active_buffer_id: Some("1".into()),
+            extra: None,
         };
-        let back = Message::from_json(&msg.to_json().unwrap()).unwrap();
-        assert_eq!(back, msg);
+        assert_eq!(Message::from_json(&msg.to_json().unwrap()).unwrap(), msg);
+    }
+
+    #[test]
+    fn fs_watch_roundtrips() {
+        let start = Message::FsWatch {
+            request_id: "w1".into(),
+            path: "".into(),
+            recursive: true,
+        };
+        assert_eq!(Message::from_json(&start.to_json().unwrap()).unwrap(), start);
+        let changed = Message::FsChanged {
+            watch_id: "w".into(),
+            paths: vec!["/tmp/a".into()],
+        };
+        assert_eq!(
+            Message::from_json(&changed.to_json().unwrap()).unwrap(),
+            changed
+        );
     }
 }

@@ -1,5 +1,6 @@
 //! In-process Fresh `Editor` on a dedicated `!Send` thread.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -10,12 +11,13 @@ use fresh::config::Config;
 use fresh::config_io::DirectoryContext;
 use fresh::model::filesystem::{FileSystem, StdFileSystem};
 use fresh::view::color_support::ColorCapability;
+use fresh_gui_protocol::SceneBuffer;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 const MAX_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OpenedBuffer {
     pub buffer_id: String,
     pub path: String,
@@ -24,15 +26,43 @@ pub struct OpenedBuffer {
     pub text: String,
 }
 
+#[derive(Debug, Clone)]
+struct TrackedBuffer {
+    path: PathBuf,
+    rev: u64,
+    dirty: bool,
+    language: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SceneState {
+    pub buffers: Vec<SceneBuffer>,
+    pub active_buffer_id: Option<String>,
+}
+
 enum Cmd {
     Open {
         path: PathBuf,
         preview: bool,
         reply: oneshot::Sender<Result<OpenedBuffer>>,
     },
+    Edit {
+        buffer_id: String,
+        base_rev: u64,
+        text: String,
+        reply: oneshot::Sender<Result<u64>>,
+    },
+    Save {
+        buffer_id: String,
+        base_rev: u64,
+        reply: oneshot::Sender<Result<(String, u64)>>,
+    },
     Close {
         buffer_id: String,
         reply: oneshot::Sender<Result<()>>,
+    },
+    Scene {
+        reply: oneshot::Sender<Result<SceneState>>,
     },
 }
 
@@ -51,15 +81,13 @@ impl EditorHandle {
 
         thread::Builder::new()
             .name("fresh-editor".into())
-            .spawn(move || {
-                match build_editor(&working_dir) {
-                    Ok(editor) => {
-                        let _ = ready_tx.send(Ok(()));
-                        run_loop(editor, rx);
-                    }
-                    Err(err) => {
-                        let _ = ready_tx.send(Err(err));
-                    }
+            .spawn(move || match build_editor(&working_dir) {
+                Ok(editor) => {
+                    let _ = ready_tx.send(Ok(()));
+                    run_loop(editor, rx);
+                }
+                Err(err) => {
+                    let _ = ready_tx.send(Err(err));
                 }
             })
             .ok()?;
@@ -94,6 +122,35 @@ impl EditorHandle {
             .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
     }
 
+    pub async fn edit(&self, buffer_id: String, base_rev: u64, text: String) -> Result<u64> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::Edit {
+                buffer_id,
+                base_rev,
+                text,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+    }
+
+    pub async fn save(&self, buffer_id: String, base_rev: u64) -> Result<(String, u64)> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::Save {
+                buffer_id,
+                base_rev,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+    }
+
     pub async fn close(&self, buffer_id: String) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -106,10 +163,19 @@ impl EditorHandle {
             .await
             .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
     }
+
+    pub async fn scene(&self) -> Result<SceneState> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::Scene { reply: reply_tx })
+            .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+    }
 }
 
 fn build_editor(working_dir: &Path) -> Result<Editor> {
-    // Keep Fresh config/state out of the project tree (and out of git).
     let state_dir = std::env::temp_dir().join(format!(
         "fresh-gui-editor-{}",
         std::process::id()
@@ -126,7 +192,7 @@ fn build_editor(working_dir: &Path) -> Result<Editor> {
         24,
         Some(working_dir.to_path_buf()),
         dir_context,
-        false, // plugins off for ADE MVP — faster/stabler headless
+        false,
         ColorCapability::TrueColor,
         fs,
     )
@@ -134,8 +200,6 @@ fn build_editor(working_dir: &Path) -> Result<Editor> {
 }
 
 fn run_loop(mut editor: Editor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
-    // Drive the channel with a small Tokio runtime on this thread so we can
-    // await without touching the axum runtime (Editor is !Send).
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -147,6 +211,8 @@ fn run_loop(mut editor: Editor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
         }
     };
 
+    let mut tracked: HashMap<String, TrackedBuffer> = HashMap::new();
+
     rt.block_on(async move {
         while let Some(cmd) = rx.recv().await {
             match cmd {
@@ -155,19 +221,63 @@ fn run_loop(mut editor: Editor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     preview,
                     reply,
                 } => {
-                    let result = open_buffer(&mut editor, &path, preview);
+                    let result = open_buffer(&mut editor, &mut tracked, &path, preview);
+                    let _ = reply.send(result);
+                }
+                Cmd::Edit {
+                    buffer_id,
+                    base_rev,
+                    text,
+                    reply,
+                } => {
+                    let result = edit_buffer(&mut editor, &mut tracked, &buffer_id, base_rev, &text);
+                    let _ = reply.send(result);
+                }
+                Cmd::Save {
+                    buffer_id,
+                    base_rev,
+                    reply,
+                } => {
+                    let result = save_buffer(&mut editor, &mut tracked, &buffer_id, base_rev);
                     let _ = reply.send(result);
                 }
                 Cmd::Close { buffer_id, reply } => {
-                    let result = close_buffer(&mut editor, &buffer_id);
-                    let _ = reply.send(result);
+                    tracked.remove(&buffer_id);
+                    let _ = reply.send(Ok(()));
+                }
+                Cmd::Scene { reply } => {
+                    let active = editor.active_buffer().0.to_string();
+                    let buffers = tracked
+                        .iter()
+                        .map(|(id, t)| SceneBuffer {
+                            buffer_id: id.clone(),
+                            path: t.path.display().to_string(),
+                            rev: t.rev,
+                            dirty: t.dirty,
+                            language: t.language.clone(),
+                        })
+                        .collect();
+                    let active_buffer_id = if tracked.contains_key(&active) {
+                        Some(active)
+                    } else {
+                        tracked.keys().next().cloned()
+                    };
+                    let _ = reply.send(Ok(SceneState {
+                        buffers,
+                        active_buffer_id,
+                    }));
                 }
             }
         }
     });
 }
 
-fn open_buffer(editor: &mut Editor, path: &Path, preview: bool) -> Result<OpenedBuffer> {
+fn open_buffer(
+    editor: &mut Editor,
+    tracked: &mut HashMap<String, TrackedBuffer>,
+    path: &Path,
+    preview: bool,
+) -> Result<OpenedBuffer> {
     if !path.is_file() {
         bail!("not a file: {}", path.display());
     }
@@ -189,8 +299,6 @@ fn open_buffer(editor: &mut Editor, path: &Path, preview: bool) -> Result<Opened
             .with_context(|| format!("open_file {}", path.display()))?
     };
 
-    // Ensure the opened buffer is active for text extraction.
-    // open_file already activates; preview should too.
     let language = editor.active_buffer_mode().map(|s| s.to_owned());
     let text = editor
         .active_state()
@@ -205,19 +313,92 @@ fn open_buffer(editor: &mut Editor, path: &Path, preview: bool) -> Result<Opened
         );
     }
 
+    let id = buffer_id.0.to_string();
+    let rev = tracked.get(&id).map(|t| t.rev).unwrap_or(0);
+    tracked.insert(
+        id.clone(),
+        TrackedBuffer {
+            path: path.to_path_buf(),
+            rev,
+            dirty: false,
+            language: language.clone(),
+        },
+    );
+
     Ok(OpenedBuffer {
-        buffer_id: buffer_id.0.to_string(),
+        buffer_id: id,
         path: path.display().to_string(),
         language,
-        rev: 0,
+        rev,
         text,
     })
 }
 
-fn close_buffer(_editor: &mut Editor, buffer_id: &str) -> Result<()> {
-    // Phase 3a: validate id; actual Fresh buffer close deferred to 3b.
-    let _: usize = buffer_id
-        .parse()
-        .with_context(|| format!("invalid buffer_id {buffer_id}"))?;
+fn activate_tracked(
+    editor: &mut Editor,
+    tracked: &HashMap<String, TrackedBuffer>,
+    buffer_id: &str,
+) -> Result<()> {
+    let Some(entry) = tracked.get(buffer_id) else {
+        bail!("unknown buffer_id {buffer_id}");
+    };
+    // open_file switches to an already-open buffer when the path matches.
+    editor
+        .open_file(&entry.path)
+        .with_context(|| format!("activate {}", entry.path.display()))?;
+    let active = editor.active_buffer().0.to_string();
+    if active != buffer_id {
+        bail!("failed to activate buffer {buffer_id} (active={active})");
+    }
     Ok(())
+}
+
+fn edit_buffer(
+    editor: &mut Editor,
+    tracked: &mut HashMap<String, TrackedBuffer>,
+    buffer_id: &str,
+    base_rev: u64,
+    text: &str,
+) -> Result<u64> {
+    if text.len() > MAX_SNAPSHOT_BYTES {
+        bail!(
+            "edit too large ({} bytes; max {MAX_SNAPSHOT_BYTES})",
+            text.len()
+        );
+    }
+    let current = tracked
+        .get(buffer_id)
+        .with_context(|| format!("unknown buffer_id {buffer_id}"))?
+        .rev;
+    if current != base_rev {
+        bail!("revision conflict: base_rev={base_rev} current={current}");
+    }
+    activate_tracked(editor, tracked, buffer_id)?;
+    editor.active_state_mut().buffer.replace_content(text);
+    let entry = tracked.get_mut(buffer_id).expect("tracked");
+    entry.rev += 1;
+    entry.dirty = true;
+    Ok(entry.rev)
+}
+
+fn save_buffer(
+    editor: &mut Editor,
+    tracked: &mut HashMap<String, TrackedBuffer>,
+    buffer_id: &str,
+    base_rev: u64,
+) -> Result<(String, u64)> {
+    let current = tracked
+        .get(buffer_id)
+        .with_context(|| format!("unknown buffer_id {buffer_id}"))?
+        .rev;
+    if current != base_rev {
+        bail!("revision conflict: base_rev={base_rev} current={current}");
+    }
+    activate_tracked(editor, tracked, buffer_id)?;
+    editor.save().context("Editor::save")?;
+    let entry = tracked.get_mut(buffer_id).expect("tracked");
+    entry.dirty = false;
+    // Bump rev so peers know disk matches this generation.
+    entry.rev += 1;
+    Ok((entry.path.display().to_string(), entry.rev))
 }

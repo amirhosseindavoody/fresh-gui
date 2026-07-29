@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>fresh-gui</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/lib/codemirror.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/theme/material-darker.css" />
     <style>
       :root {
         color-scheme: dark;
@@ -145,20 +147,20 @@
       }
       #editor-bar .path { color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       #editor-bar button { padding: 0.2rem 0.5rem; font-size: 11px; }
-      #editor {
+      #editor-host {
         flex: 1;
         min-height: 8rem;
         width: 100%;
-        border: none;
-        resize: vertical;
-        padding: 0.6rem 0.75rem;
-        background: #010409;
-        color: var(--text);
+        overflow: hidden;
+      }
+      #editor-host .CodeMirror {
+        height: 100%;
         font-family: "IBM Plex Mono", ui-monospace, monospace;
         font-size: 13px;
-        line-height: 1.45;
-        outline: none;
+        background: #010409;
       }
+      #editor-bar .dirty { color: #d29922; }
+      #editor-save:disabled { opacity: 0.45; }
       #tree-panel {
         border-right: 1px solid var(--border);
         background: color-mix(in srgb, var(--panel) 70%, transparent);
@@ -275,9 +277,10 @@
         <div id="editor-panel">
           <div id="editor-bar">
             <span class="path" id="editor-path">No file open</span>
+            <button id="editor-save" type="button" disabled title="Save (Ctrl/Cmd+S)">Save</button>
             <button id="editor-close" type="button" title="Hide editor">Close</button>
           </div>
-          <textarea id="editor" spellcheck="false" readonly placeholder="Double-click a file in the tree to open"></textarea>
+          <div id="editor-host"></div>
         </div>
         <div id="term-area">
           <div id="panes" class="no-split"></div>
@@ -287,6 +290,11 @@
 
     <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/lib/codemirror.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/mode/rust/rust.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/mode/javascript/javascript.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/mode/python/python.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/mode/markdown/markdown.js"></script>
     <script src="./main.js"></script>
   </body>
 </html>

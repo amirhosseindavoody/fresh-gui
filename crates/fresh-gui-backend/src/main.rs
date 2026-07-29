@@ -2,6 +2,7 @@
 
 mod editor_worker;
 mod fs;
+mod fs_watch;
 mod pty;
 mod server;
 mod session;
@@ -16,6 +17,7 @@ use tracing::info;
 
 use crate::editor_worker::EditorHandle;
 use crate::fs::FsRoot;
+use crate::fs_watch::FsWatchStore;
 use crate::server::AppState;
 use crate::session::SessionStore;
 
@@ -79,6 +81,7 @@ async fn main() -> Result<()> {
         fs_root,
         sessions: SessionStore::new(),
         editor,
+        watches: FsWatchStore::new(),
     });
 
     info!(

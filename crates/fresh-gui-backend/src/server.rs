@@ -1,5 +1,7 @@
 //! WebSocket ADE server (JSON frames) with detachable sessions.
 
+#![allow(clippy::result_large_err)] // ADE `Message` is the shared error envelope.
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -10,13 +12,14 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use base64::Engine;
-use fresh_gui_protocol::{Hello, Message, CAP_EDITOR, PROTOCOL_VERSION};
+use fresh_gui_protocol::{Hello, Message, CAP_EDITOR, CAP_SCENE, PROTOCOL_VERSION};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::editor_worker::EditorHandle;
 use crate::fs::FsRoot;
+use crate::fs_watch::FsWatchStore;
 use crate::session::SessionStore;
 
 pub struct AppState {
@@ -25,6 +28,7 @@ pub struct AppState {
     pub fs_root: FsRoot,
     pub sessions: SessionStore,
     pub editor: Option<EditorHandle>,
+    pub watches: FsWatchStore,
 }
 
 pub async fn serve(addr: SocketAddr, state: Arc<AppState>) -> Result<()> {
@@ -51,7 +55,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     let mut caps = Hello::default_backend_caps();
     if state.editor.is_none() {
-        caps.retain(|c| c != CAP_EDITOR);
+        caps.retain(|c| c != CAP_EDITOR && c != CAP_SCENE);
     }
     let hello = Message::Hello(Hello::backend(
         format!("fresh-gui-backend/{}", env!("CARGO_PKG_VERSION")),
@@ -473,6 +477,146 @@ async fn handle_client_msg(
             editor.close(buffer_id).await.map_err(|err| Message::Error {
                 code: "editor_close_failed".into(),
                 message: err.to_string(),
+            })?;
+            Ok(())
+        }
+        Message::BufferEdit {
+            request_id,
+            buffer_id,
+            base_rev,
+            text,
+        } => {
+            require_auth(*authed)?;
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: format!("{request_id}: editor capability not available"),
+                });
+            };
+            let rev = editor
+                .edit(buffer_id.clone(), base_rev, text)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "buffer_edit_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
+            send_msg(
+                sink,
+                &Message::BufferChanged {
+                    request_id,
+                    buffer_id,
+                    rev,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send BufferChanged".into(),
+            })?;
+            Ok(())
+        }
+        Message::BufferSave {
+            request_id,
+            buffer_id,
+            base_rev,
+        } => {
+            require_auth(*authed)?;
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: format!("{request_id}: editor capability not available"),
+                });
+            };
+            let (path, rev) = editor
+                .save(buffer_id.clone(), base_rev)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "buffer_save_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
+            send_msg(
+                sink,
+                &Message::BufferSaved {
+                    request_id,
+                    buffer_id,
+                    path,
+                    rev,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send BufferSaved".into(),
+            })?;
+            Ok(())
+        }
+        Message::FsWatch {
+            request_id,
+            path,
+            recursive,
+        } => {
+            require_auth(*authed)?;
+            let resolved = state.fs_root.resolve(&path).await.map_err(|err| Message::Error {
+                code: "fs_watch_failed".into(),
+                message: format!("{request_id}: {err:#}"),
+            })?;
+            let (watch_id, display) = state
+                .watches
+                .watch(&state.fs_root, resolved, recursive, out_tx.clone())
+                .map_err(|err| Message::Error {
+                    code: "fs_watch_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
+            send_msg(
+                sink,
+                &Message::FsWatchStarted {
+                    request_id,
+                    watch_id,
+                    path: display,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send FsWatchStarted".into(),
+            })?;
+            Ok(())
+        }
+        Message::FsUnwatch { watch_id } => {
+            require_auth(*authed)?;
+            if !state.watches.unwatch(&watch_id) {
+                return Err(Message::Error {
+                    code: "fs_unwatch_failed".into(),
+                    message: format!("unknown watch_id {watch_id}"),
+                });
+            }
+            Ok(())
+        }
+        Message::SceneGet { request_id } => {
+            require_auth(*authed)?;
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error {
+                    code: "scene_unavailable".into(),
+                    message: format!("{request_id}: scene capability not available"),
+                });
+            };
+            let scene = editor.scene().await.map_err(|err| Message::Error {
+                code: "scene_get_failed".into(),
+                message: format!("{request_id}: {err:#}"),
+            })?;
+            send_msg(
+                sink,
+                &Message::SceneSnapshot {
+                    request_id,
+                    buffers: scene.buffers,
+                    active_buffer_id: scene.active_buffer_id,
+                    extra: None,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send SceneSnapshot".into(),
             })?;
             Ok(())
         }
