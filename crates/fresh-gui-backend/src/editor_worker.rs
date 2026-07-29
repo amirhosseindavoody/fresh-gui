@@ -213,7 +213,10 @@ fn run_loop(mut editor: Editor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
 
     let mut tracked: HashMap<String, TrackedBuffer> = HashMap::new();
 
-    rt.block_on(async move {
+    // Borrow editor/tracked into the future (no `async move`) so `Editor` is
+    // dropped *after* `block_on` returns — Fresh's Drop must not run while a
+    // Tokio runtime is still in an async teardown path.
+    rt.block_on(async {
         while let Some(cmd) = rx.recv().await {
             match cmd {
                 Cmd::Open {
@@ -270,6 +273,7 @@ fn run_loop(mut editor: Editor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             }
         }
     });
+    drop(editor);
 }
 
 fn open_buffer(

@@ -1,15 +1,5 @@
-/* Phase 3b/3c host UI: sessions, tabs/splits, tree+watch, CodeMirror edit/save, thin scene. */
-import { Terminal } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
-import CodeMirror from "codemirror";
-import type { Editor } from "codemirror";
-import "@xterm/xterm/css/xterm.css";
-import "codemirror/lib/codemirror.css";
-import "codemirror/theme/material-darker.css";
-import "codemirror/mode/rust/rust.js";
-import "codemirror/mode/javascript/javascript.js";
-import "codemirror/mode/python/python.js";
-import "codemirror/mode/markdown/markdown.js";
+/** Phase UI-1 host shell: unified tabs, connection strip, status bar, CM6 + xterm WebGL. */
+import type { EditorView } from "@codemirror/view";
 import "./styles.css";
 import {
   PROTOCOL_VERSION,
@@ -17,36 +7,22 @@ import {
   type FsEntry,
   type ServerMessage,
 } from "./protocol";
+import {
+  $,
+  $button,
+  $input,
+  b64decode,
+  b64encode,
+  basename,
+  escapeHtml,
+} from "./dom";
+import { createEditorView } from "./editor";
+import { createTerminal, disposeTerminal, type TermBundle } from "./terminal";
 
 const SESSION_KEY = "fresh-gui.sessionId";
 const LAYOUT_KEY = "fresh-gui.layout";
-
-function $(id: string): HTMLElement {
-  const el = document.getElementById(id);
-  if (!el) throw new Error(`missing #${id}`);
-  return el;
-}
-function $input(id: string): HTMLInputElement {
-  const el = $(id);
-  if (!(el instanceof HTMLInputElement)) throw new Error(`#${id} is not an input`);
-  return el;
-}
-function $button(id: string): HTMLButtonElement {
-  const el = $(id);
-  if (!(el instanceof HTMLButtonElement)) throw new Error(`#${id} is not a button`);
-  return el;
-}
-
-const statusEl = $("status");
-const connectBtn = $button("connect");
-const disconnectBtn = $button("disconnect");
-const treeEl = $("tree");
-const tabsEl = $("tabs");
-const panesEl = $("panes");
-const editorPanel = $("editor-panel");
-const editorHost = $("editor-host");
-const editorPathEl = $("editor-path");
-const editorSaveBtn = $button("editor-save");
+const SIDEBAR_WIDTH_KEY = "fresh-gui.sidebarWidth";
+const SIDEBAR_COLLAPSED_KEY = "fresh-gui.sidebarCollapsed";
 
 interface Pending<T> {
   resolve: (value: T) => void;
@@ -63,41 +39,91 @@ interface PendingEditor extends Pending<OpenedInfo & { rev: number; text: string
   _opened?: OpenedInfo;
 }
 
-interface Tab {
+interface TerminalTab {
+  kind: "terminal";
   id: string;
   title: string;
-  term: Terminal;
-  fit: FitAddon;
-  el: HTMLElement;
+  bundle: TermBundle;
 }
 
+interface EditorTab {
+  kind: "editor";
+  id: string;
+  bufferId: string;
+  path: string;
+  rev: number;
+  dirty: boolean;
+  preview: boolean;
+  view: EditorView;
+  host: HTMLElement;
+  suppressChange: boolean;
+}
+
+type Tab = TerminalTab | EditorTab;
 type SplitMode = "horizontal" | "vertical";
+
+interface LayoutBlob {
+  activeTab?: number;
+  split?: SplitMode | null;
+  splitTab?: number;
+  sidebarWidth?: number;
+  sidebarCollapsed?: boolean;
+  tabs?: Array<{ kind: "terminal"; id: string; title: string } | { kind: "editor"; id: string; path: string }>;
+}
+
+const connectionStrip = $("connection-strip");
+const stripToggle = $button("strip-toggle");
+const stripCompact = $("strip-compact");
+const stripHost = $("strip-host");
+const stripSession = $("strip-session");
+const stripState = $("strip-state");
+const connectBtn = $button("connect");
+const disconnectBtn = $button("disconnect");
+const workspaceEl = $("workspace");
+const sidebarToggle = $button("sidebar-toggle");
+const sidebarResizer = $("sidebar-resizer");
+const treeEl = $("tree");
+const tabsEl = $("tabs");
+const tabPill = $("tab-pill");
+const panesEl = $("panes");
+const emptyStack = $("empty-stack");
+const terminalStack = $("terminal-stack");
+const editorStack = $("editor-stack");
+const statusLeft = $("status-left");
+const statusRight = $("status-right");
+const editorSaveBtn = $button("editor-save");
+const newTabBtn = $button("new-tab");
+const splitHBtn = $button("split-h");
+const splitVBtn = $button("split-v");
+const splitOffBtn = $button("split-off");
+
+const terminalPark = document.createElement("div");
+terminalPark.className = "terminal-park";
+terminalPark.style.cssText =
+  "position:absolute;visibility:hidden;pointer-events:none;width:0;height:0;overflow:hidden";
+terminalStack.appendChild(terminalPark);
 
 let ws: WebSocket | null = null;
 let sessionId: string | null = null;
 let reqSeq = 0;
 let hasEditor = false;
+let watchId: string | null = null;
+let stripForceExpanded = false;
+let connected = false;
+
 const pendingFs = new Map<string, Pending<{ path: string; entries: FsEntry[] }>>();
 const pendingEditor = new Map<string, PendingEditor>();
 const pendingEdit = new Map<string, Pending<number>>();
 const pendingSave = new Map<string, Pending<{ path: string; rev: number }>>();
+
 let selectedPath: string | null = null;
-let openBufferId: string | null = null;
-let openBufferRev = 0;
-let openBufferPath: string | null = null;
-let editorDirty = false;
-let suppressCmChange = false;
-let cm: Editor | null = null;
-let watchId: string | null = null;
 let treeRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let treeLoading = false;
 let treeLoaded = false;
 let treeNeedsRefresh = false;
 const expandedPaths = new Set<string>();
-/** Suppress auto-refresh briefly after the user clicks the tree. */
 let treeQuietUntil = 0;
 
-/** Paths under these directory names are ignored for tree auto-refresh. */
 const WATCH_IGNORE_DIRS = new Set([
   ".git",
   "target",
@@ -109,32 +135,129 @@ const WATCH_IGNORE_DIRS = new Set([
 ]);
 
 let tabs: Tab[] = [];
-let activeTab = 0;
+let activeTabIndex = 0;
 let splitMode: SplitMode | null = null;
-/** second pane tab index when split */
-let splitTab = 1;
-/** Apply this split once a newly opened PTY arrives (when splitting with <2 tabs). */
+/** Unified tab index of the second terminal pane when split. */
+let splitTabIndex = 1;
 let pendingSplit: SplitMode | null = null;
 
-function setStatus(text: string): void {
-  statusEl.textContent = text;
-  statusEl.title = text;
+function isMod(ev: KeyboardEvent): boolean {
+  return ev.metaKey || ev.ctrlKey;
 }
 
-function b64encode(str: string): string {
-  const bytes = new TextEncoder().encode(str);
-  let s = "";
-  bytes.forEach((b) => {
-    s += String.fromCharCode(b);
-  });
-  return btoa(s);
+function setStatusLeft(text: string): void {
+  statusLeft.textContent = text;
+  statusLeft.title = text;
 }
 
-function b64decode(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return bytes;
+function updateStatusRight(): void {
+  const caps: string[] = [];
+  if (connected) caps.push("online");
+  if (hasEditor) caps.push("editor");
+  if (connected) caps.push("fs");
+  if (watchId) caps.push("watch");
+  const dirty = tabs.filter((t) => t.kind === "editor" && t.dirty).length;
+  if (dirty > 0) caps.push(`${dirty} dirty`);
+  statusRight.textContent = caps.join(" · ");
+}
+
+function updateStripChips(): void {
+  const url = $input("url").value.trim();
+  stripHost.textContent = url || "—";
+  stripHost.title = url;
+  stripSession.textContent = sessionId ? sessionId.slice(0, 12) + (sessionId.length > 12 ? "…" : "") : "—";
+  stripSession.title = sessionId || "";
+  stripState.textContent = connected ? "connected" : ws ? "connecting" : "disconnected";
+  stripState.classList.toggle("connected", connected);
+}
+
+function updateStripLayout(): void {
+  if (!connected) {
+    connectionStrip.classList.remove("compact");
+    connectionStrip.classList.add("expanded");
+    stripToggle.hidden = true;
+    stripCompact.hidden = true;
+    return;
+  }
+  stripToggle.hidden = false;
+  stripCompact.hidden = false;
+  updateStripChips();
+  if (stripForceExpanded) {
+    connectionStrip.classList.remove("compact");
+    connectionStrip.classList.add("expanded");
+  } else {
+    connectionStrip.classList.add("compact");
+    connectionStrip.classList.remove("expanded");
+  }
+}
+
+function expandStrip(): void {
+  stripForceExpanded = true;
+  updateStripLayout();
+}
+
+function compactStrip(): void {
+  stripForceExpanded = false;
+  updateStripLayout();
+}
+
+function applySidebarWidth(width: number): void {
+  const w = Math.max(160, Math.min(480, width));
+  document.documentElement.style.setProperty("--sidebar-width", `${w}px`);
+  localStorage.setItem(SIDEBAR_WIDTH_KEY, String(w));
+}
+
+function isSidebarCollapsed(): boolean {
+  return workspaceEl.classList.contains("sidebar-collapsed");
+}
+
+function setSidebarCollapsed(collapsed: boolean): void {
+  workspaceEl.classList.toggle("sidebar-collapsed", collapsed);
+  localStorage.setItem(SIDEBAR_COLLAPSED_KEY, collapsed ? "1" : "0");
+  sidebarToggle.textContent = collapsed ? "›" : "‹";
+}
+
+function toggleSidebar(): void {
+  setSidebarCollapsed(!isSidebarCollapsed());
+  persistLayout();
+  requestAnimationFrame(measurePill);
+}
+
+function loadSidebarPrefs(): void {
+  const w = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+  if (w) applySidebarWidth(Number.parseInt(w, 10) || 260);
+  setSidebarCollapsed(localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1");
+}
+
+function readLayoutBlob(): LayoutBlob {
+  try {
+    const raw = localStorage.getItem(LAYOUT_KEY);
+    if (!raw) return {};
+    return JSON.parse(raw) as LayoutBlob;
+  } catch {
+    return {};
+  }
+}
+
+function persistLayout(): void {
+  const layout: LayoutBlob = {
+    activeTab: activeTabIndex,
+    split: splitMode,
+    splitTab: splitTabIndex,
+    sidebarWidth: Number.parseInt(
+      getComputedStyle(document.documentElement).getPropertyValue("--sidebar-width") || "260",
+      10,
+    ),
+    sidebarCollapsed: isSidebarCollapsed(),
+    tabs: tabs.map((t) =>
+      t.kind === "terminal"
+        ? { kind: "terminal", id: t.id, title: t.title }
+        : { kind: "editor", id: t.id, path: t.path },
+    ),
+  };
+  const json = JSON.stringify(layout);
+  localStorage.setItem(LAYOUT_KEY, json);
+  if (sessionId) send({ type: "layout_set", layout: json });
 }
 
 function send(msg: ClientMessage): void {
@@ -213,102 +336,310 @@ function bufferSave(bufferId: string, baseRev: number): Promise<{ path: string; 
   });
 }
 
-function modeForPath(path: string | null | undefined): string | null {
-  const lower = (path || "").toLowerCase();
-  if (lower.endsWith(".rs")) return "rust";
-  if (lower.endsWith(".js") || lower.endsWith(".ts") || lower.endsWith(".mjs")) return "javascript";
-  if (lower.endsWith(".py")) return "python";
-  if (lower.endsWith(".md")) return "markdown";
-  return null;
-}
-
-function ensureCodeMirror(): Editor {
-  if (cm) return cm;
-  cm = CodeMirror(editorHost, {
-    value: "",
-    theme: "material-darker",
-    lineNumbers: true,
-    indentUnit: 4,
-    lineWrapping: true,
-  });
-  cm.on("change", () => {
-    if (suppressCmChange || !openBufferId) return;
-    editorDirty = true;
-    updateEditorChrome();
-  });
-  return cm;
-}
-
-function updateEditorChrome(): void {
-  const name = openBufferPath || "untitled";
-  editorPathEl.textContent = editorDirty ? `${name} •` : name;
-  editorPathEl.classList.toggle("dirty", editorDirty);
-  editorSaveBtn.disabled = !openBufferId || !editorDirty;
-}
-
-function showEditor(path: string, text: string, bufferId: string, rev: number): void {
-  openBufferId = bufferId;
-  openBufferRev = rev || 0;
-  openBufferPath = path || "untitled";
-  editorDirty = false;
-  const editor = ensureCodeMirror();
-  suppressCmChange = true;
-  editor.setValue(text ?? "");
-  editor.setOption("mode", modeForPath(path));
-  suppressCmChange = false;
-  editorPanel.classList.add("visible");
-  updateEditorChrome();
-  requestAnimationFrame(() => {
-    editor.refresh();
-    for (const tab of tabs) {
-      try {
-        tab.fit.fit();
-      } catch {
-        /* ignore */
+function rejectPendingError(msg: Extract<ServerMessage, { type: "error" }>): void {
+  const err = new Error(`${msg.code}: ${msg.message}`);
+  const tryReject = <T>(map: Map<string, Pending<T>>): boolean => {
+    for (const [id, pending] of map) {
+      if (msg.message && msg.message.startsWith(id)) {
+        map.delete(id);
+        pending.reject(err);
+        return true;
       }
     }
-  });
-}
-
-function hideEditor(): void {
-  if (openBufferId) send({ type: "editor_close", buffer_id: openBufferId });
-  openBufferId = null;
-  openBufferRev = 0;
-  openBufferPath = null;
-  editorDirty = false;
-  if (cm) {
-    suppressCmChange = true;
-    cm.setValue("");
-    suppressCmChange = false;
+    return false;
+  };
+  if (
+    tryReject(pendingFs) ||
+    tryReject(pendingEditor) ||
+    tryReject(pendingEdit) ||
+    tryReject(pendingSave)
+  ) {
+    return;
   }
-  editorPanel.classList.remove("visible");
-  updateEditorChrome();
-  editorPathEl.textContent = "No file open";
-  requestAnimationFrame(() => {
-    for (const tab of tabs) {
-      try {
-        tab.fit.fit();
-      } catch {
-        /* ignore */
-      }
+}
+
+function terminalIndices(): number[] {
+  const out: number[] = [];
+  tabs.forEach((t, i) => {
+    if (t.kind === "terminal") out.push(i);
+  });
+  return out;
+}
+
+function activeTerminalIndex(): number | null {
+  const active = tabs[activeTabIndex];
+  if (active?.kind === "terminal") return activeTabIndex;
+  const terms = terminalIndices();
+  return terms.length ? terms[0] : null;
+}
+
+function measurePill(): void {
+  const activeEl = tabsEl.querySelector(".tab.active");
+  if (!(activeEl instanceof HTMLElement) || tabs.length === 0) {
+    tabPill.hidden = true;
+    return;
+  }
+  tabPill.hidden = false;
+  const tabsRect = tabsEl.getBoundingClientRect();
+  const rect = activeEl.getBoundingClientRect();
+  tabPill.style.left = `${rect.left - tabsRect.left + tabsEl.scrollLeft}px`;
+  tabPill.style.width = `${rect.width}px`;
+}
+
+function updateSaveButton(): void {
+  const active = tabs[activeTabIndex];
+  const editorActive = active?.kind === "editor";
+  editorSaveBtn.hidden = !editorActive;
+  editorSaveBtn.disabled = !editorActive || !active.dirty;
+  splitHBtn.hidden = editorActive;
+  splitVBtn.hidden = editorActive;
+  splitOffBtn.hidden = editorActive;
+}
+
+function updateStacks(): void {
+  const hasTabs = tabs.length > 0;
+  emptyStack.hidden = connected && hasTabs;
+  const active = tabs[activeTabIndex];
+  terminalStack.hidden = !connected || active?.kind !== "terminal";
+  editorStack.hidden = !connected || active?.kind !== "editor";
+  tabs.forEach((t, i) => {
+    if (t.kind === "editor") {
+      t.host.hidden = i !== activeTabIndex;
     }
   });
 }
 
-async function saveOpenBuffer(): Promise<void> {
-  if (!openBufferId || !cm || !editorDirty) return;
-  const text = cm.getValue();
-  setStatus(`saving ${openBufferPath}…`);
+function setWorkspaceControls(enabled: boolean): void {
+  newTabBtn.disabled = !enabled;
+  splitHBtn.disabled = !enabled;
+  splitVBtn.disabled = !enabled;
+  splitOffBtn.disabled = !enabled;
+}
+
+function openPtyForDims(cols: number, rows: number): void {
+  send({ type: "pty_open", cols, rows });
+}
+
+function wireTerminalTab(tab: TerminalTab): void {
+  const { term, el } = tab.bundle;
+  el.dataset.ptyId = tab.id;
+  term.onData((data) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    send({ type: "pty_data", id: tab.id, data: b64encode(data) });
+  });
+  term.onResize(({ cols, rows }) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    send({ type: "pty_resize", id: tab.id, cols, rows });
+  });
+}
+
+function createTerminalTab(ptyId: string, title?: string, opts: { silentActivate?: boolean } = {}): TerminalTab {
+  const bundle = createTerminal();
+  const tab: TerminalTab = {
+    kind: "terminal",
+    id: ptyId,
+    title: title || `sh ${terminalIndices().length + 1}`,
+    bundle,
+  };
+  wireTerminalTab(tab);
+  tabs.push(tab);
+  if (!opts.silentActivate) activeTabIndex = tabs.length - 1;
+  renderAll();
+  persistLayout();
+  return tab;
+}
+
+function disposeEditorTab(tab: EditorTab): void {
+  send({ type: "editor_close", buffer_id: tab.bufferId });
   try {
-    const revAfterEdit = await bufferEdit(openBufferId, openBufferRev, text);
-    openBufferRev = revAfterEdit;
-    const saved = await bufferSave(openBufferId, openBufferRev);
-    openBufferRev = saved.rev;
-    editorDirty = false;
-    updateEditorChrome();
-    setStatus(`saved ${saved.path}`);
-  } catch (err) {
-    setStatus(`save error: ${err instanceof Error ? err.message : String(err)}`);
+    tab.view.destroy();
+  } catch {
+    /* ignore */
+  }
+  tab.host.remove();
+}
+
+function closeTabAt(index: number, opts: { force?: boolean } = {}): void {
+  const tab = tabs[index];
+  if (!tab) return;
+  if (tab.kind === "editor") {
+    if (tab.dirty && !opts.force) {
+      if (!confirm(`Discard unsaved changes to ${basename(tab.path)}?`)) return;
+    }
+    disposeEditorTab(tab);
+  } else {
+    send({ type: "pty_close", id: tab.id });
+    disposeTerminal(tab.bundle);
+  }
+  tabs.splice(index, 1);
+  if (activeTabIndex >= tabs.length) activeTabIndex = Math.max(0, tabs.length - 1);
+  if (activeTabIndex === index && tabs.length) {
+    activeTabIndex = Math.min(index, tabs.length - 1);
+  }
+  const terms = terminalIndices();
+  if (splitTabIndex >= tabs.length) splitTabIndex = terms.length > 1 ? terms[1] : terms[0] ?? 0;
+  if (terms.length < 2) splitMode = null;
+  renderAll();
+  persistLayout();
+}
+
+function tabLabel(tab: Tab): string {
+  if (tab.kind === "terminal") return tab.title;
+  return basename(tab.path);
+}
+
+function renderTabs(): void {
+  const pill = tabPill;
+  tabsEl.innerHTML = "";
+  tabsEl.appendChild(pill);
+
+  tabs.forEach((tab, i) => {
+    const el = document.createElement("div");
+    el.className = "tab";
+    el.dataset.index = String(i);
+    if (i === activeTabIndex) el.classList.add("active");
+    if (tab.kind === "editor") {
+      if (tab.preview) el.classList.add("preview");
+      if (tab.dirty) el.classList.add("dirty");
+    }
+    el.setAttribute("role", "tab");
+    el.innerHTML = `<span class="tab-label">${escapeHtml(tabLabel(tab))}</span>`;
+    const x = document.createElement("button");
+    x.className = "x";
+    x.type = "button";
+    x.textContent = "×";
+    x.title = "Close tab";
+    x.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      closeTabAt(i);
+    });
+    el.appendChild(x);
+    el.addEventListener("click", () => {
+      activeTabIndex = i;
+      renderAll();
+      persistLayout();
+      focusActiveTab();
+    });
+    tabsEl.appendChild(el);
+  });
+
+  requestAnimationFrame(measurePill);
+}
+
+function fitTerminalTab(tab: TerminalTab): void {
+  try {
+    tab.bundle.fit.fit();
+  } catch {
+    /* ignore */
+  }
+}
+
+function renderPanes(): void {
+  panesEl.innerHTML = "";
+  panesEl.className =
+    splitMode === "horizontal"
+      ? "panes split-horizontal"
+      : splitMode === "vertical"
+        ? "panes split-vertical"
+        : "panes no-split";
+
+  terminalPark.innerHTML = "";
+
+  const terms = terminalIndices();
+  if (!terms.length) return;
+
+  let primary = activeTerminalIndex() ?? terms[0];
+  let secondary = splitTabIndex;
+  if (!terms.includes(primary)) primary = terms[0];
+  if (splitMode && terms.length >= 2) {
+    if (!terms.includes(secondary) || secondary === primary) {
+      secondary = terms.find((idx) => idx !== primary) ?? terms[0];
+      splitTabIndex = secondary;
+    }
+    const indices = [primary, secondary];
+    for (const idx of indices) {
+      const tab = tabs[idx] as TerminalTab;
+      const pane = document.createElement("div");
+      pane.className = "pane";
+      const label = document.createElement("div");
+      label.className = "pane-label";
+      label.textContent = tab.title;
+      pane.appendChild(label);
+      pane.appendChild(tab.bundle.el);
+      panesEl.appendChild(pane);
+      requestAnimationFrame(() => fitTerminalTab(tab));
+    }
+    for (const idx of terms) {
+      if (!indices.includes(idx)) {
+        const tab = tabs[idx] as TerminalTab;
+        terminalPark.appendChild(tab.bundle.el);
+      }
+    }
+  } else {
+    const tab = tabs[primary] as TerminalTab;
+    const pane = document.createElement("div");
+    pane.className = "pane";
+    pane.appendChild(tab.bundle.el);
+    panesEl.appendChild(pane);
+    requestAnimationFrame(() => fitTerminalTab(tab));
+    for (const idx of terms) {
+      if (idx !== primary) {
+        const t = tabs[idx] as TerminalTab;
+        terminalPark.appendChild(t.bundle.el);
+      }
+    }
+  }
+}
+
+function focusActiveTab(): void {
+  const active = tabs[activeTabIndex];
+  if (!active) return;
+  if (active.kind === "terminal") {
+    requestAnimationFrame(() => {
+      fitTerminalTab(active);
+      active.bundle.term.focus();
+    });
+  } else {
+    active.view.focus();
+  }
+}
+
+function renderAll(): void {
+  renderTabs();
+  renderPanes();
+  updateStacks();
+  updateSaveButton();
+  updateStatusRight();
+}
+
+function clearTabs(): void {
+  for (const tab of tabs) {
+    if (tab.kind === "terminal") disposeTerminal(tab.bundle);
+    else disposeEditorTab(tab);
+  }
+  tabs = [];
+  activeTabIndex = 0;
+  splitTabIndex = 1;
+  splitMode = null;
+  pendingSplit = null;
+  panesEl.innerHTML = "";
+  panesEl.className = "panes no-split";
+  terminalPark.innerHTML = "";
+  editorStack.innerHTML = "";
+  renderAll();
+}
+
+function clearTree(): void {
+  treeEl.innerHTML = "";
+  pendingFs.clear();
+  selectedPath = null;
+  expandedPaths.clear();
+  treeLoaded = false;
+  treeLoading = false;
+  treeNeedsRefresh = false;
+  if (treeRefreshTimer) {
+    clearTimeout(treeRefreshTimer);
+    treeRefreshTimer = null;
   }
 }
 
@@ -323,7 +654,6 @@ function noteTreeInteraction(): void {
 
 function scheduleTreeRefresh(): void {
   if (Date.now() < treeQuietUntil) {
-    // Retry after the quiet window so we don't drop real updates forever.
     if (treeRefreshTimer) clearTimeout(treeRefreshTimer);
     treeRefreshTimer = setTimeout(() => {
       treeRefreshTimer = null;
@@ -345,184 +675,6 @@ function scheduleTreeRefresh(): void {
 function startFsWatch(): void {
   const request_id = nextRequestId();
   send({ type: "fs_watch", request_id, path: "", recursive: true });
-}
-
-function escapeHtml(s: string): string {
-  return String(s)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
-}
-
-function persistLayout(): void {
-  const layout = {
-    split: splitMode,
-    activeTab,
-    splitTab,
-    tabs: tabs.map((t) => ({ id: t.id, title: t.title })),
-  };
-  const json = JSON.stringify(layout);
-  localStorage.setItem(LAYOUT_KEY, json);
-  if (sessionId) send({ type: "layout_set", layout: json });
-}
-
-function makeTerm(): { term: Terminal; fit: FitAddon } {
-  const term = new Terminal({
-    cursorBlink: true,
-    fontFamily: '"IBM Plex Mono", ui-monospace, monospace',
-    fontSize: 14,
-    theme: {
-      background: "#010409",
-      foreground: "#e6edf3",
-      cursor: "#3fb950",
-    },
-  });
-  const fit = new FitAddon();
-  term.loadAddon(fit);
-  return { term, fit };
-}
-
-function openPtyForDims(cols: number, rows: number): void {
-  send({ type: "pty_open", cols, rows });
-}
-
-function createTab(ptyId: string, title?: string, opts: { silentActivate?: boolean } = {}): Tab {
-  const { term, fit } = makeTerm();
-  const host = document.createElement("div");
-  host.className = "xterm-host";
-  host.dataset.ptyId = ptyId;
-  term.open(host);
-  term.onData((data) => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    send({ type: "pty_data", id: ptyId, data: b64encode(data) });
-  });
-  term.onResize(({ cols, rows }) => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    send({ type: "pty_resize", id: ptyId, cols, rows });
-  });
-  const tab = {
-    id: ptyId,
-    title: title || `sh ${tabs.length + 1}`,
-    term,
-    fit,
-    el: host,
-  };
-  tabs.push(tab);
-  if (!opts.silentActivate) activeTab = tabs.length - 1;
-  renderTabs();
-  renderPanes();
-  persistLayout();
-  return tab;
-}
-
-function closeTab(index: number): void {
-  const tab = tabs[index];
-  if (!tab) return;
-  send({ type: "pty_close", id: tab.id });
-  try {
-    tab.term.dispose();
-  } catch {
-        /* ignore */
-      }
-  tabs.splice(index, 1);
-  if (activeTab >= tabs.length) activeTab = Math.max(0, tabs.length - 1);
-  if (splitTab >= tabs.length) splitTab = Math.max(0, tabs.length - 1);
-  if (tabs.length < 2) splitMode = null;
-  renderTabs();
-  renderPanes();
-  persistLayout();
-}
-
-function renderTabs(): void {
-  tabsEl.innerHTML = "";
-  tabs.forEach((tab, i) => {
-    const el = document.createElement("div");
-    el.className = "tab" + (i === activeTab ? " active" : "");
-    el.innerHTML = `<span>${escapeHtml(tab.title)}</span>`;
-    const x = document.createElement("button");
-    x.className = "x";
-    x.type = "button";
-    x.textContent = "×";
-    x.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      closeTab(i);
-    });
-    el.appendChild(x);
-    el.addEventListener("click", () => {
-      activeTab = i;
-      if (splitMode && splitTab === activeTab) {
-        splitTab = (activeTab + 1) % tabs.length;
-      }
-      renderTabs();
-      renderPanes();
-      persistLayout();
-      tab.term.focus();
-    });
-    tabsEl.appendChild(el);
-  });
-}
-
-function renderPanes(): void {
-  panesEl.innerHTML = "";
-  panesEl.className =
-    splitMode === "horizontal"
-      ? "split-horizontal"
-      : splitMode === "vertical"
-        ? "split-vertical"
-        : "no-split";
-
-  const indices = splitMode && tabs.length >= 2 ? [activeTab, splitTab] : [activeTab];
-  for (const idx of indices) {
-    const tab = tabs[idx];
-    if (!tab) continue;
-    const pane = document.createElement("div");
-    pane.className = "pane";
-    const label = document.createElement("div");
-    label.className = "pane-label";
-    label.textContent = tab.title;
-    pane.appendChild(label);
-    pane.appendChild(tab.el);
-    panesEl.appendChild(pane);
-    requestAnimationFrame(() => {
-      try {
-        tab.fit.fit();
-      } catch {
-        /* ignore */
-      }
-    });
-  }
-}
-
-function clearTerminals(): void {
-  for (const tab of tabs) {
-    try {
-      tab.term.dispose();
-    } catch {
-        /* ignore */
-      }
-  }
-  tabs = [];
-  activeTab = 0;
-  splitTab = 1;
-  splitMode = null;
-  tabsEl.innerHTML = "";
-  panesEl.innerHTML = "";
-  panesEl.className = "no-split";
-}
-
-function clearTree(): void {
-  treeEl.innerHTML = "";
-  pendingFs.clear();
-  selectedPath = null;
-  expandedPaths.clear();
-  treeLoaded = false;
-  treeLoading = false;
-  treeNeedsRefresh = false;
-  if (treeRefreshTimer) {
-    clearTimeout(treeRefreshTimer);
-    treeRefreshTimer = null;
-  }
 }
 
 async function loadRoot(opts: { silent?: boolean } = {}): Promise<void> {
@@ -551,15 +703,11 @@ async function loadRoot(opts: { silent?: boolean } = {}): Promise<void> {
     renderEntries(children, listed.entries);
     treeLoaded = true;
     if (prevSelected) selectedPath = prevSelected;
-    if (keepExpanded.size) {
-      await restoreExpanded(children, keepExpanded);
-    }
-    if (!silent) {
-      setStatus(`session ${sessionId || "?"} · ${listed.path}`);
-    }
+    if (keepExpanded.size) await restoreExpanded(children, keepExpanded);
+    if (!silent) setStatusLeft(`session ${sessionId || "?"} · ${listed.path}`);
   } catch (err) {
     if (!silent || !treeLoaded) {
-      treeEl.innerHTML = `<div style="padding:0.75rem;color:#f85149">${escapeHtml(String(err))}</div>`;
+      treeEl.innerHTML = `<div class="tree-empty">${escapeHtml(String(err))}</div>`;
     }
   } finally {
     treeLoading = false;
@@ -570,19 +718,16 @@ async function loadRoot(opts: { silent?: boolean } = {}): Promise<void> {
   }
 }
 
-/** Re-expand directories that were open before a silent tree rebuild. */
 async function restoreExpanded(container: HTMLElement, paths: Set<string>): Promise<void> {
   const rows = [...container.querySelectorAll(":scope > .tree-item")].filter(
     (el): el is HTMLElement => el instanceof HTMLElement,
   );
   for (const row of rows) {
     const childBox = row.nextElementSibling;
-    if (!(childBox instanceof HTMLElement) || !childBox.classList.contains("tree-children")) {
-      continue;
-    }
+    if (!(childBox instanceof HTMLElement) || !childBox.classList.contains("tree-children")) continue;
     const path = row.dataset.path;
     if (!path || !paths.has(path)) continue;
-    const twist = row.querySelector(".twist") as HTMLElement | null;
+    const twist = row.querySelector(".twist");
     try {
       if (!childBox.dataset.loaded) {
         if (twist) twist.textContent = "…";
@@ -627,15 +772,16 @@ function renderEntries(container: HTMLElement, entries: FsEntry[]): void {
     childBox.className = "tree-children";
     childBox.hidden = true;
 
+    let fileClickTimer: ReturnType<typeof setTimeout> | null = null;
+
     row.addEventListener("click", async (ev) => {
       ev.stopPropagation();
       noteTreeInteraction();
-      document.querySelectorAll(".tree-item.selected").forEach((el) => {
-        el.classList.remove("selected");
-      });
+      document.querySelectorAll(".tree-item.selected").forEach((el) => el.classList.remove("selected"));
       row.classList.add("selected");
       selectedPath = entry.path;
-      setStatus(`${entry.kind}: ${entry.path}`);
+      setStatusLeft(`${entry.kind}: ${entry.path}`);
+
       if (entry.kind === "dir") {
         if (!childBox.dataset.loaded) {
           twist.textContent = "…";
@@ -650,7 +796,7 @@ function renderEntries(container: HTMLElement, entries: FsEntry[]): void {
           } catch (err) {
             twist.textContent = "▸";
             expandedPaths.delete(entry.path);
-            setStatus(`fs error: ${err instanceof Error ? err.message : String(err)}`);
+            setStatusLeft(`fs error: ${err instanceof Error ? err.message : String(err)}`);
           }
         } else if (childBox.hidden) {
           childBox.hidden = false;
@@ -661,36 +807,132 @@ function renderEntries(container: HTMLElement, entries: FsEntry[]): void {
           twist.textContent = "▸";
           expandedPaths.delete(entry.path);
         }
+        return;
+      }
+
+      if (entry.kind === "file") {
+        if (fileClickTimer) clearTimeout(fileClickTimer);
+        fileClickTimer = setTimeout(() => {
+          fileClickTimer = null;
+          void openEditorTab(entry.path, true);
+        }, 220);
       }
     });
+
     if (entry.kind === "file") {
-      row.addEventListener("dblclick", async (ev) => {
+      row.addEventListener("dblclick", (ev) => {
         ev.stopPropagation();
         noteTreeInteraction();
-        if (!hasEditor) {
-          setStatus("backend has no editor capability");
-          return;
+        if (fileClickTimer) {
+          clearTimeout(fileClickTimer);
+          fileClickTimer = null;
         }
-        setStatus(`opening ${entry.path}…`);
-        try {
-          const opened = await editorOpen(entry.path, false);
-          showEditor(opened.path, opened.text, opened.buffer_id, opened.rev);
-          setStatus(`opened ${opened.path}`);
-        } catch (err) {
-          setStatus(`editor error: ${err instanceof Error ? err.message : String(err)}`);
-        }
+        void openEditorTab(entry.path, false);
       });
     }
+
     container.append(row, childBox);
   }
 }
 
+async function openEditorTab(path: string, preview: boolean): Promise<void> {
+  if (!hasEditor) {
+    setStatusLeft("backend has no editor capability");
+    return;
+  }
+
+  const existingIdx = tabs.findIndex((t) => t.kind === "editor" && t.path === path);
+  if (existingIdx >= 0) {
+    const et = tabs[existingIdx] as EditorTab;
+    if (!preview) et.preview = false;
+    activeTabIndex = existingIdx;
+    renderAll();
+    focusActiveTab();
+    return;
+  }
+
+  if (preview) {
+    const previewIdx = tabs.findIndex(
+      (t) => t.kind === "editor" && t.preview && !t.dirty,
+    );
+    if (previewIdx >= 0) closeTabAt(previewIdx, { force: true });
+  }
+
+  setStatusLeft(`opening ${path}…`);
+  try {
+    const opened = await editorOpen(path, preview);
+    const host = document.createElement("div");
+    host.className = "editor-host";
+    editorStack.appendChild(host);
+
+    let tabRef!: EditorTab;
+    const view = createEditorView(host, opened.text, opened.path, () => {
+      if (tabRef.suppressChange) return;
+      tabRef.dirty = true;
+      tabRef.preview = false;
+      renderTabs();
+      updateSaveButton();
+      updateStatusRight();
+    });
+
+    tabRef = {
+      kind: "editor",
+      id: `editor-${opened.buffer_id}`,
+      bufferId: opened.buffer_id,
+      path: opened.path,
+      rev: opened.rev,
+      dirty: false,
+      preview,
+      view,
+      host,
+      suppressChange: false,
+    };
+
+    tabs.push(tabRef);
+    activeTabIndex = tabs.length - 1;
+    renderAll();
+    focusActiveTab();
+    setStatusLeft(`opened ${opened.path}`);
+  } catch (err) {
+    setStatusLeft(`editor error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+async function saveActiveEditor(): Promise<void> {
+  const active = tabs[activeTabIndex];
+  if (active?.kind !== "editor" || !active.dirty) return;
+  const text = active.view.state.doc.toString();
+  setStatusLeft(`saving ${active.path}…`);
+  try {
+    const revAfterEdit = await bufferEdit(active.bufferId, active.rev, text);
+    active.rev = revAfterEdit;
+    const saved = await bufferSave(active.bufferId, active.rev);
+    active.rev = saved.rev;
+    active.dirty = false;
+    active.preview = false;
+    renderAll();
+    setStatusLeft(`saved ${saved.path}`);
+  } catch (err) {
+    setStatusLeft(`save error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 function afterSessionReady(): void {
-  $button("new-tab").disabled = false;
-  $button("split-h").disabled = false;
-  $button("split-v").disabled = false;
-  $button("split-off").disabled = false;
-  loadRoot().then(() => startFsWatch()).catch(() => startFsWatch());
+  connected = true;
+  setWorkspaceControls(true);
+  updateStripLayout();
+  updateStatusRight();
+  loadRoot()
+    .then(() => startFsWatch())
+    .catch(() => startFsWatch());
+}
+
+function applyLayoutFromBlob(layout: LayoutBlob): void {
+  splitMode = layout.split || null;
+  activeTabIndex = layout.activeTab ?? 0;
+  splitTabIndex = layout.splitTab ?? 1;
+  if (layout.sidebarWidth) applySidebarWidth(layout.sidebarWidth);
+  if (layout.sidebarCollapsed !== undefined) setSidebarCollapsed(layout.sidebarCollapsed);
 }
 
 function onMessage(raw: string): void {
@@ -698,7 +940,7 @@ function onMessage(raw: string): void {
   try {
     msg = JSON.parse(raw) as ServerMessage;
   } catch {
-    setStatus("bad json from backend");
+    setStatusLeft("bad json from backend");
     return;
   }
 
@@ -715,20 +957,17 @@ function onMessage(raw: string): void {
       {
         const token = $input("token").value;
         if (token) send({ type: "auth", token });
-        else {
-          beginSession();
-        }
+        else beginSession();
       }
-      setStatus(
-        `hello from ${msg.implementation}${hasEditor ? " · editor" : " · no editor"}`,
-      );
+      setStatusLeft(`hello from ${msg.implementation}${hasEditor ? " · editor" : " · no editor"}`);
+      updateStatusRight();
       break;
     case "auth_ok":
       beginSession();
-      setStatus("authenticated");
+      setStatusLeft("authenticated");
       break;
     case "auth_error":
-      setStatus(`auth failed: ${msg.message}`);
+      setStatusLeft(`auth failed: ${msg.message}`);
       break;
     case "session_created":
       sessionId = msg.session_id;
@@ -736,79 +975,60 @@ function onMessage(raw: string): void {
       localStorage.setItem(SESSION_KEY, sessionId);
       afterSessionReady();
       openPtyForDims(80, 24);
-      setStatus(`session ${sessionId}`);
+      setStatusLeft(`session ${sessionId}`);
+      updateStripChips();
       break;
     case "session_attached":
       sessionId = msg.session_id;
       $input("session").value = sessionId;
       localStorage.setItem(SESSION_KEY, sessionId);
-      clearTerminals();
+      clearTabs();
       if (typeof msg.layout === "string" && msg.layout) {
         try {
-          const layout = JSON.parse(msg.layout) as {
-            split?: SplitMode | null;
-            activeTab?: number;
-            splitTab?: number;
-          };
-          splitMode = layout.split || null;
-          activeTab = layout.activeTab || 0;
-          splitTab = layout.splitTab ?? 1;
+          applyLayoutFromBlob(JSON.parse(msg.layout) as LayoutBlob);
         } catch {
           /* ignore bad layout */
         }
+      } else {
+        applyLayoutFromBlob(readLayoutBlob());
       }
       for (const p of msg.ptys || []) {
-        createTab(p.id, `sh ${tabs.length + 1}`, { silentActivate: true });
+        createTerminalTab(p.id, `sh ${terminalIndices().length + 1}`, { silentActivate: true });
       }
-      if (tabs.length === 0) openPtyForDims(80, 24);
+      if (terminalIndices().length === 0) openPtyForDims(80, 24);
       else {
-        activeTab = Math.min(activeTab, tabs.length - 1);
-        renderTabs();
-        renderPanes();
+        activeTabIndex = Math.min(activeTabIndex, tabs.length - 1);
+        renderAll();
       }
       afterSessionReady();
-      setStatus(`reattached ${sessionId} (${(msg.ptys || []).length} ptys)`);
+      setStatusLeft(`reattached ${sessionId} (${(msg.ptys || []).length} ptys)`);
+      updateStripChips();
       break;
-    case "pty_opened":
-      createTab(msg.id, `sh ${tabs.length + 1}`);
-      {
-        const tab = tabs[tabs.length - 1];
-        if (pendingSplit && tabs.length >= 2) {
-          splitMode = pendingSplit;
-          splitTab = tabs.length - 1;
-          pendingSplit = null;
-          renderPanes();
-          persistLayout();
-          setStatus(`split ${splitMode}`);
-        }
-        requestAnimationFrame(() => {
-          try {
-            tab.fit.fit();
-            tab.term.focus();
-          } catch {
-        /* ignore */
+    case "pty_opened": {
+      const tab = createTerminalTab(msg.id, `sh ${terminalIndices().length}`);
+      if (pendingSplit && terminalIndices().length >= 2) {
+        splitMode = pendingSplit;
+        const terms = terminalIndices();
+        splitTabIndex = terms[terms.length - 1];
+        pendingSplit = null;
+        renderPanes();
+        persistLayout();
+        setStatusLeft(`split ${splitMode}`);
       }
-        });
-      }
+      requestAnimationFrame(() => {
+        fitTerminalTab(tab);
+        if (tabs[activeTabIndex]?.kind === "terminal") tab.bundle.term.focus();
+      });
       break;
+    }
     case "pty_data": {
-      const tab = tabs.find((t) => t.id === msg.id);
-      if (tab) tab.term.write(b64decode(msg.data));
+      const tab = tabs.find((t) => t.kind === "terminal" && t.id === msg.id) as TerminalTab | undefined;
+      if (tab) tab.bundle.term.write(b64decode(msg.data));
       break;
     }
     case "pty_closed": {
-      const idx = tabs.findIndex((t) => t.id === msg.id);
-      if (idx >= 0) {
-        try {
-          tabs[idx].term.dispose();
-        } catch {
-        /* ignore */
-      }
-        tabs.splice(idx, 1);
-        if (activeTab >= tabs.length) activeTab = Math.max(0, tabs.length - 1);
-        renderTabs();
-        renderPanes();
-      }
+      const idx = tabs.findIndex((t) => t.kind === "terminal" && t.id === msg.id);
+      if (idx >= 0) closeTabAt(idx, { force: true });
       break;
     }
     case "fs_listed": {
@@ -863,6 +1083,7 @@ function onMessage(raw: string): void {
     }
     case "fs_watch_started":
       watchId = msg.watch_id;
+      updateStatusRight();
       break;
     case "fs_changed": {
       const paths = Array.isArray(msg.paths) ? msg.paths : [];
@@ -871,39 +1092,15 @@ function onMessage(raw: string): void {
       break;
     }
     case "error":
-      for (const [id, pending] of pendingFs) {
-        if (msg.message && msg.message.startsWith(id)) {
-          pendingFs.delete(id);
-          pending.reject(new Error(`${msg.code}: ${msg.message}`));
-        }
-      }
-      for (const [id, pending] of pendingEditor) {
-        if (msg.message && msg.message.startsWith(id)) {
-          pendingEditor.delete(id);
-          pending.reject(new Error(`${msg.code}: ${msg.message}`));
-        }
-      }
-      for (const [id, pending] of pendingEdit) {
-        if (msg.message && msg.message.startsWith(id)) {
-          pendingEdit.delete(id);
-          pending.reject(new Error(`${msg.code}: ${msg.message}`));
-        }
-      }
-      for (const [id, pending] of pendingSave) {
-        if (msg.message && msg.message.startsWith(id)) {
-          pendingSave.delete(id);
-          pending.reject(new Error(`${msg.code}: ${msg.message}`));
-        }
-      }
+      rejectPendingError(msg);
       if (msg.code === "session_attach_failed") {
         localStorage.removeItem(SESSION_KEY);
         $input("session").value = "";
-        setStatus(`${msg.code}: ${msg.message}; creating new session…`);
-        const layout = localStorage.getItem(LAYOUT_KEY);
-        send({ type: "session_create", layout: layout || undefined });
+        setStatusLeft(`${msg.code}: ${msg.message}; creating new session…`);
+        send({ type: "session_create", layout: localStorage.getItem(LAYOUT_KEY) || undefined });
         break;
       }
-      setStatus(`${msg.code}: ${msg.message}`);
+      setStatusLeft(`${msg.code}: ${msg.message}`);
       break;
     default:
       break;
@@ -916,126 +1113,221 @@ function beginSession(): void {
     $input("session").value = wanted;
     send({ type: "session_attach", session_id: wanted });
   } else {
-    const layout = localStorage.getItem(LAYOUT_KEY);
-    send({ type: "session_create", layout: layout || undefined });
+    send({ type: "session_create", layout: localStorage.getItem(LAYOUT_KEY) || undefined });
   }
 }
 
 function disconnect(): void {
   if (watchId) send({ type: "fs_unwatch", watch_id: watchId });
   watchId = null;
-  if (openBufferId) send({ type: "editor_close", buffer_id: openBufferId });
   if (ws) {
     try {
       ws.close();
     } catch {
-        /* ignore */
-      }
+      /* ignore */
+    }
   }
   ws = null;
+  connected = false;
   sessionId = null;
   hasEditor = false;
+  stripForceExpanded = false;
   pendingEditor.clear();
   pendingEdit.clear();
   pendingSave.clear();
-  openBufferId = null;
-  hideEditor();
-  clearTerminals();
+  clearTabs();
   clearTree();
-  treeEl.innerHTML =
-    '<div class="tree-empty" style="padding:0.75rem;color:var(--muted)">Connect to load remote tree</div>';
+  treeEl.innerHTML = '<div class="tree-empty">Connect to load remote tree</div>';
   connectBtn.disabled = false;
   disconnectBtn.disabled = true;
-  $button("new-tab").disabled = true;
-  $button("split-h").disabled = true;
-  $button("split-v").disabled = true;
-  $button("split-off").disabled = true;
-  setStatus("disconnected (session kept on backend if created)");
+  setWorkspaceControls(false);
+  updateStripLayout();
+  updateStatusRight();
+  setStatusLeft("disconnected (session kept on backend if created)");
 }
 
 function connect(): void {
   disconnect();
   const url = $input("url").value.trim();
-  setStatus(`connecting ${url}…`);
+  setStatusLeft(`connecting ${url}…`);
   ws = new WebSocket(url);
   ws.addEventListener("open", () => {
     connectBtn.disabled = true;
     disconnectBtn.disabled = false;
-    setStatus("socket open, waiting for hello…");
+    setStatusLeft("socket open, waiting for hello…");
+    updateStripChips();
   });
   ws.addEventListener("message", (ev) => {
     if (typeof ev.data === "string") onMessage(ev.data);
   });
   ws.addEventListener("close", () => {
+    connected = false;
+    sessionId = null;
     connectBtn.disabled = false;
     disconnectBtn.disabled = true;
-    $button("new-tab").disabled = true;
-    setStatus("disconnected (session kept on backend if created)");
+    setWorkspaceControls(false);
+    updateStripLayout();
+    updateStatusRight();
+    setStatusLeft("disconnected (session kept on backend if created)");
   });
-  ws.addEventListener("error", () => setStatus("websocket error"));
+  ws.addEventListener("error", () => setStatusLeft("websocket error"));
 }
 
-connectBtn.addEventListener("click", connect);
-disconnectBtn.addEventListener("click", disconnect);
-$button("editor-close").addEventListener("click", hideEditor);
-editorSaveBtn.addEventListener("click", () => {
-  saveOpenBuffer();
-});
-window.addEventListener("keydown", (ev) => {
-  if ((ev.ctrlKey || ev.metaKey) && ev.key === "s") {
-    if (openBufferId && editorDirty) {
-      ev.preventDefault();
-      saveOpenBuffer();
-    }
-  }
-});
-
-$button("new-tab").addEventListener("click", () => {
-  const dims = tabs[activeTab]?.fit.proposeDimensions?.() || { cols: 80, rows: 24 };
-  openPtyForDims(dims.cols || 80, dims.rows || 24);
-});
-
 function requestSplit(mode: SplitMode): void {
-  if (tabs.length < 1) {
-    setStatus("open a shell first");
+  const terms = terminalIndices();
+  if (terms.length < 1) {
+    setStatusLeft("open a shell first");
     return;
   }
-  if (tabs.length < 2) {
+  if (terms.length < 2) {
     pendingSplit = mode;
-    setStatus(`opening second shell for ${mode} split…`);
-    const dims = tabs[activeTab]?.fit.proposeDimensions?.() || { cols: 80, rows: 24 };
+    setStatusLeft(`opening second shell for ${mode} split…`);
+    const primary = tabs[terms[0]] as TerminalTab;
+    const dims = primary.bundle.fit.proposeDimensions?.() || { cols: 80, rows: 24 };
     openPtyForDims(dims.cols || 80, dims.rows || 24);
     return;
   }
   splitMode = mode;
-  if (splitTab === activeTab || splitTab >= tabs.length) {
-    splitTab = (activeTab + 1) % tabs.length;
+  const primary = activeTerminalIndex() ?? terms[0];
+  if (splitTabIndex === primary || !terms.includes(splitTabIndex)) {
+    splitTabIndex = terms.find((i) => i !== primary) ?? terms[0];
   }
   renderPanes();
   persistLayout();
-  setStatus(`split ${mode}`);
+  setStatusLeft(`split ${mode}`);
 }
 
-$button("split-h").addEventListener("click", () => requestSplit("horizontal"));
-$button("split-v").addEventListener("click", () => requestSplit("vertical"));
+function setupSidebarResizer(): void {
+  let dragging = false;
+  let startX = 0;
+  let startWidth = 0;
 
-$button("split-off").addEventListener("click", () => {
+  sidebarResizer.addEventListener("mousedown", (ev) => {
+    if (isSidebarCollapsed()) return;
+    dragging = true;
+    startX = ev.clientX;
+    startWidth = Number.parseInt(
+      getComputedStyle(document.documentElement).getPropertyValue("--sidebar-width") || "260",
+      10,
+    );
+    sidebarResizer.classList.add("dragging");
+    ev.preventDefault();
+  });
+
+  window.addEventListener("mousemove", (ev) => {
+    if (!dragging) return;
+    applySidebarWidth(startWidth + (ev.clientX - startX));
+  });
+
+  window.addEventListener("mouseup", () => {
+    if (!dragging) return;
+    dragging = false;
+    sidebarResizer.classList.remove("dragging");
+    persistLayout();
+    requestAnimationFrame(measurePill);
+  });
+}
+
+connectBtn.addEventListener("click", connect);
+disconnectBtn.addEventListener("click", disconnect);
+stripToggle.addEventListener("click", () => {
+  if (stripForceExpanded) compactStrip();
+  else expandStrip();
+});
+stripCompact.addEventListener("click", expandStrip);
+editorSaveBtn.addEventListener("click", () => {
+  void saveActiveEditor();
+});
+newTabBtn.addEventListener("click", () => {
+  const idx = activeTerminalIndex();
+  const dims =
+    (idx !== null ? (tabs[idx] as TerminalTab).bundle.fit.proposeDimensions?.() : null) ||
+    { cols: 80, rows: 24 };
+  openPtyForDims(dims.cols || 80, dims.rows || 24);
+});
+splitHBtn.addEventListener("click", () => requestSplit("horizontal"));
+splitVBtn.addEventListener("click", () => requestSplit("vertical"));
+splitOffBtn.addEventListener("click", () => {
   splitMode = null;
   pendingSplit = null;
   renderPanes();
   persistLayout();
-  setStatus("no split");
+  setStatusLeft("no split");
+});
+sidebarToggle.addEventListener("click", toggleSidebar);
+
+tabsEl.addEventListener("scroll", () => requestAnimationFrame(measurePill));
+
+window.addEventListener("keydown", (ev) => {
+  if (isMod(ev) && ev.key === "s") {
+    const active = tabs[activeTabIndex];
+    if (active?.kind === "editor" && active.dirty) {
+      ev.preventDefault();
+      void saveActiveEditor();
+    }
+    return;
+  }
+  if (isMod(ev) && ev.key === "t") {
+    ev.preventDefault();
+    if (!connected) return;
+    const idx = activeTerminalIndex();
+    const dims =
+      (idx !== null ? (tabs[idx] as TerminalTab).bundle.fit.proposeDimensions?.() : null) ||
+      { cols: 80, rows: 24 };
+    openPtyForDims(dims.cols || 80, dims.rows || 24);
+    return;
+  }
+  if (isMod(ev) && ev.key === "w") {
+    if (tabs.length === 0) return;
+    ev.preventDefault();
+    closeTabAt(activeTabIndex);
+    return;
+  }
+  if (isMod(ev) && ev.key === "d" && ev.shiftKey) {
+    ev.preventDefault();
+    if (connected) requestSplit("vertical");
+    return;
+  }
+  if (isMod(ev) && ev.key === "d" && !ev.shiftKey) {
+    ev.preventDefault();
+    if (connected) requestSplit("horizontal");
+    return;
+  }
+  if (isMod(ev) && ev.key === "b") {
+    ev.preventDefault();
+    toggleSidebar();
+  }
 });
 
 window.addEventListener("resize", () => {
   for (const tab of tabs) {
-    try {
-      tab.fit.fit();
-    } catch {
-        /* ignore */
-      }
+    if (tab.kind === "terminal") fitTerminalTab(tab);
   }
+  requestAnimationFrame(measurePill);
 });
+
+loadSidebarPrefs();
+updateStripLayout();
+updateStatusRight();
+setStatusLeft("disconnected");
+
+function defaultWsUrl(): string {
+  // Vite dev UI is on :1420; backend stays on :7420.
+  if (import.meta.env.DEV) {
+    return "ws://127.0.0.1:7420/ws";
+  }
+  const { protocol, host } = window.location;
+  if (protocol === "http:" || protocol === "https:") {
+    const wsProto = protocol === "https:" ? "wss:" : "ws:";
+    return `${wsProto}//${host}/ws`;
+  }
+  return "ws://127.0.0.1:7420/ws";
+}
+
+$input("url").value = defaultWsUrl();
 
 const savedSession = localStorage.getItem(SESSION_KEY);
 if (savedSession) $input("session").value = savedSession;
+
+setupSidebarResizer();
+renderAll();

@@ -6,70 +6,110 @@
     <title>fresh-gui</title>
   </head>
   <body>
-    <header>
+    <header id="connection-strip" class="connection-strip expanded">
       <div class="brand">fresh-gui</div>
-      <label>
-        Backend WS
-        <input id="url" value="ws://127.0.0.1:7420/ws" spellcheck="false" />
-      </label>
-      <label>
-        Token
-        <input id="token" type="password" placeholder="optional on loopback" spellcheck="false" />
-      </label>
-      <label>
-        Session
-        <input id="session" placeholder="empty = create new" spellcheck="false" />
-      </label>
-      <button id="connect" class="primary" type="button">Connect</button>
-      <button id="disconnect" type="button" disabled>Disconnect</button>
-      <div id="status">disconnected</div>
+      <button
+        id="strip-toggle"
+        class="strip-toggle"
+        type="button"
+        title="Expand or compact connection strip"
+        hidden
+      >
+        ▾
+      </button>
+      <div id="strip-compact" class="strip-compact" hidden>
+        <span id="strip-host" class="strip-chip">—</span>
+        <span id="strip-session" class="strip-chip mono">—</span>
+        <span id="strip-state" class="strip-chip state">disconnected</span>
+      </div>
+      <div id="strip-fields" class="strip-fields">
+        <label>
+          Backend WS
+          <input id="url" value="" spellcheck="false" placeholder="ws://host/ws" />
+        </label>
+        <label>
+          Token
+          <input
+            id="token"
+            type="password"
+            placeholder="optional on loopback"
+            spellcheck="false"
+          />
+        </label>
+        <label>
+          Session
+          <input id="session" placeholder="empty = create new" spellcheck="false" />
+        </label>
+        <button id="connect" class="primary" type="button">Connect</button>
+        <button id="disconnect" type="button" disabled>Disconnect</button>
+      </div>
     </header>
-    <div id="tabs-bar">
-      <button id="new-tab" type="button" disabled>+ Tab</button>
-      <button
-        id="split-h"
-        type="button"
-        disabled
-        title="Show two shells side by side (opens a second tab if needed)"
-      >
-        Split ‖
-      </button>
-      <button
-        id="split-v"
-        type="button"
-        disabled
-        title="Show two shells stacked (opens a second tab if needed)"
-      >
-        Split ═
-      </button>
-      <button id="split-off" type="button" disabled title="Show only the active tab">
-        No split
-      </button>
-      <div id="tabs"></div>
-    </div>
-    <div id="main">
-      <aside id="tree-panel">
-        <h2>Files</h2>
-        <div id="tree">
-          <div class="tree-empty" style="padding: 0.75rem; color: var(--muted)">
-            Connect to load remote tree
-          </div>
+
+    <div id="workspace" class="workspace">
+      <aside id="sidebar" class="sidebar">
+        <div class="sidebar-head">
+          <h2>Files</h2>
+          <button id="sidebar-toggle" type="button" title="Toggle sidebar (Mod+B)">‹</button>
+        </div>
+        <div id="tree" class="tree">
+          <div class="tree-empty">Connect to load remote tree</div>
         </div>
       </aside>
-      <div id="work">
-        <div id="editor-panel">
-          <div id="editor-bar">
-            <span class="path" id="editor-path">No file open</span>
-            <button id="editor-save" type="button" disabled title="Save (Ctrl/Cmd+S)">Save</button>
-            <button id="editor-close" type="button" title="Hide editor">Close</button>
+      <div id="sidebar-resizer" class="sidebar-resizer" title="Drag to resize"></div>
+
+      <div id="main-col" class="main-col">
+        <div id="tabs-bar" class="tabs-bar">
+          <div class="tabs-actions">
+            <button id="new-tab" type="button" disabled title="New terminal (Mod+T)">+</button>
+            <button
+              id="split-h"
+              type="button"
+              disabled
+              title="Split shells side by side (Mod+D)"
+            >
+              ‖
+            </button>
+            <button
+              id="split-v"
+              type="button"
+              disabled
+              title="Split shells stacked (Mod+Shift+D)"
+            >
+              ═
+            </button>
+            <button id="split-off" type="button" disabled title="No split">▢</button>
+            <button
+              id="editor-save"
+              type="button"
+              disabled
+              title="Save (Mod+S)"
+              hidden
+            >
+              Save
+            </button>
           </div>
-          <div id="editor-host"></div>
+          <div id="tabs" class="tabs" role="tablist">
+            <div id="tab-pill" class="tab-pill" hidden></div>
+          </div>
         </div>
-        <div id="term-area">
-          <div id="panes" class="no-split"></div>
+
+        <div id="stacks" class="stacks">
+          <div id="empty-stack" class="empty-stack">
+            Connect to a backend to open a session
+          </div>
+          <div id="terminal-stack" class="stack" hidden>
+            <div id="panes" class="panes no-split"></div>
+          </div>
+          <div id="editor-stack" class="stack" hidden></div>
         </div>
       </div>
     </div>
+
+    <footer id="statusbar" class="statusbar">
+      <span id="status-left">disconnected</span>
+      <span id="status-right"></span>
+    </footer>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

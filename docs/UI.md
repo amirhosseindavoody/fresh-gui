@@ -2,7 +2,7 @@
 
 Product UI for the **local host** ADE shell. Architecture and protocol live in [DESIGN.md](./DESIGN.md). This document defines **what the UI should become**, borrowing layout and interaction patterns from [Terax](https://github.com/crynta/terax-ai) while staying honest about our remote-backend split.
 
-**Status:** design target. Current `crates/fresh-gui-app/ui` is a functional Phase 1–3 shell (connect bar, crude tree, CodeMirror 5, simple tab/split). Visual polish is **Phase UI** below, not Phase 4 packaging.
+**Status:** UI-1 chrome shipped in `crates/fresh-gui-app/ui` (connection strip, status bar, unified terminal/editor tabs, CodeMirror 6, xterm WebGL). UI-2+ still ahead. Architecture/protocol: [DESIGN.md](./DESIGN.md).
 
 ## 1. Goals
 
@@ -115,10 +115,10 @@ type PaneNode =
 
 | Today | Target |
 |-------|--------|
-| Flat `tabs[]` of PTYs only | `terminal` tabs with `paneTree` |
-| Global H/V “two shells” split | Per-tab recursive splits |
-| Editor docked under terminals | `editor` tabs in the same bar |
-| Connect fields always large | Collapsible connection strip |
+| Flat `tabs[]` of PTYs only | **UI-1:** unified `terminal` \| `editor` tabs |
+| Global H/V “two shells” split | UI-2: per-tab recursive splits (UI-1 keeps global H/V) |
+| Editor docked under terminals | **UI-1:** `editor` tabs in the same bar |
+| Connect fields always large | **UI-1:** compact strip when connected |
 
 ## 5. Visual language
 
@@ -193,7 +193,7 @@ Connection errors and auth failures use inline strip status + optional toast; ne
 | `#panes` two-up grid | `terminal/PaneTreeView` |
 | xterm create/fit | `terminal/TerminalStack` (WebGL) |
 | `#tree` | `explorer/FileTree` |
-| `#editor-panel` dock | `editor/EditorStack` (CM6) as tabs |
+| `#editor-panel` dock | **Done (UI-1):** editor tabs in `#editor-stack` (CM6) |
 | ad-hoc CSS | `styles/tokens.css` + region CSS |
 | protocol types | keep `protocol.ts`; add layout types |
 
@@ -219,7 +219,7 @@ Connection errors and auth failures use inline strip status + optional toast; ne
 
 - Agree IA, tab model, non-goals; link from DESIGN.md.
 
-### Phase UI-1 — Chrome + unified surfaces
+### Phase UI-1 — Chrome + unified surfaces ✅
 
 - Collapsible connection strip; status bar.
 - Tokenized theme; restyle tree / tabs / panes without new features.

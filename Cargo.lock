@@ -1473,6 +1473,7 @@ dependencies = [
  "notify 7.0.0",
  "portable-pty",
  "tokio",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "uuid",

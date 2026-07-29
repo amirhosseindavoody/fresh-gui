@@ -121,7 +121,7 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 ### Phase 1 — Remote PTY loop (D4) ✅ (core)
 
 - Backend exposes authenticated PTY create/read/write/resize over WebSocket (`/ws`).
-- Host: Tauri 2 crate (`fresh-gui-desktop`) loads the Vite-built UI (`ui/dist`); Linux/WSL can use `pixi run ui` (Vite) or `fresh-gui serve-ui` (static `ui/dist`) when webkit isn’t installed.
+- Host: Tauri 2 crate (`fresh-gui-desktop`) loads the Vite-built UI (`ui/dist`); Linux/WSL can use `pixi run serve` (backend embeds `ui/dist` on the same port as `/ws`) or `pixi run ui` (Vite) when iterating on chrome.
 - Host CLI: `fresh-gui ping|smoke|attach` via `fresh-gui-client`.
 - Integration test: `pty_smoke_echo`.
 - Remaining / follow-ups: reconnect UX polish, measured latency on real SSH forwards.
@@ -158,7 +158,7 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 #### Phase 3b — Edit / save + CodeMirror ✅
 
 - Protocol `0.4.0`: `buffer_edit` / `buffer_changed` / `buffer_save` / `buffer_saved` with revision CAS.
-- Host UI: CodeMirror 5 pane; Ctrl/Cmd+S save; dirty indicator.
+- Host UI: CodeMirror 6 pane (Phase UI-1); Ctrl/Cmd+S save; dirty indicator.
 - Host UI stack: Vite + TypeScript under `crates/fresh-gui-app/ui` (Bun via Pixi for install/scripts; xterm/CodeMirror from registry; no CDN).
 - Test: `editor_edit_save_reopen`.
 
@@ -170,9 +170,9 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 
 ### Phase UI — Host chrome polish (see [UI.md](./UI.md))
 
-- **Not started.** Functional surfaces from Phases 1–3 exist; visual IA is still a connect-bar prototype.
-- Target: Terax-inspired three-zone shell, unified terminal/editor tabs, pane trees, tokenized theme, CM6 + xterm WebGL.
-- Phased as UI-1 → UI-3 in [UI.md](./UI.md). Do not conflate with packaging polish below.
+- **UI-1 ✅** — Terax-inspired chrome: always-on connection strip, status bar, unified terminal/editor tabs, tokenized theme, CodeMirror 6, xterm WebGL, tab pill, collapsible sidebar, dirty/preview affordances.
+- **UI-2 / UI-3** — pane trees, shortcuts registry, virtualized explorer, etc. (see [UI.md](./UI.md)).
+- Do not conflate with packaging polish below.
 
 ### Phase 4 — Polish / packaging
 

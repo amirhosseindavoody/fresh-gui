@@ -40,6 +40,15 @@ struct Args {
     /// Disable the in-process Fresh editor (omit `editor` capability).
     #[arg(long, env = "FRESH_GUI_NO_EDITOR")]
     no_editor: bool,
+
+    /// Directory of built host UI (`index.html` from `ui/dist`). Served at `/`.
+    /// Default: search common workspace/package paths. Empty / missing → API only.
+    #[arg(long, env = "FRESH_GUI_UI_DIR")]
+    ui_dir: Option<PathBuf>,
+
+    /// Do not serve the web UI (WebSocket + health only).
+    #[arg(long, env = "FRESH_GUI_NO_UI")]
+    no_ui: bool,
 }
 
 #[tokio::main]
@@ -68,6 +77,12 @@ async fn main() -> Result<()> {
     let fs_root = FsRoot::new(root_path).context("init FS root")?;
 
     let require_auth = !loopback || token.is_some();
+
+    // Bind before spawning Fresh so a busy port fails cleanly (no editor teardown panic).
+    let listener = tokio::net::TcpListener::bind(args.listen)
+        .await
+        .with_context(|| format!("bind {}", args.listen))?;
+
     let editor = if args.no_editor {
         info!("Fresh editor disabled (--no-editor)");
         None
@@ -92,7 +107,59 @@ async fn main() -> Result<()> {
         "starting fresh-gui-backend"
     );
 
-    server::serve(args.listen, state)
+    let ui_dir = if args.no_ui {
+        None
+    } else {
+        resolve_ui_dir(args.ui_dir.as_deref())
+    };
+
+    server::serve_listener(listener, state, ui_dir)
         .await
         .context("server exited with error")
+}
+
+/// Pick a directory that contains `index.html` for the embedded web UI.
+fn resolve_ui_dir(explicit: Option<&std::path::Path>) -> Option<PathBuf> {
+    if let Some(dir) = explicit {
+        let dir = dir.to_path_buf();
+        if dir.join("index.html").is_file() {
+            info!(dir = %dir.display(), "serving web UI");
+            return Some(dir);
+        }
+        tracing::warn!(
+            dir = %dir.display(),
+            "ui-dir missing index.html — API only (run `pixi run ui-build`)"
+        );
+        return None;
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fresh-gui-app/ui/dist"),
+    );
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("crates/fresh-gui-app/ui/dist"));
+        candidates.push(cwd.join("ui/dist"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("ui"));
+            candidates.push(parent.join("../ui/dist"));
+        }
+    }
+
+    for dir in candidates {
+        let Ok(dir) = dir.canonicalize() else {
+            continue;
+        };
+        if dir.join("index.html").is_file() {
+            info!(dir = %dir.display(), "serving web UI");
+            return Some(dir);
+        }
+    }
+
+    tracing::warn!(
+        "no web UI found (expected crates/fresh-gui-app/ui/dist) — API only; run `pixi run ui-build`"
+    );
+    None
 }

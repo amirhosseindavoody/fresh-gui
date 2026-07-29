@@ -4,7 +4,7 @@ Terminal-first ADE **GUI on the local host**, powered by a **remote backend** (F
 
 Inspired by [Terax](https://github.com/crynta/terax-ai). Repo logistics follow [pixi-mise](https://github.com/amirhosseindavoody/pixi-mise).
 
-**Status:** Phase 3 (Fresh editor edit/save, CodeMirror, fs_watch, thin scene) on Phase 2 sessions/tabs; Windows Tauri NSIS/MSI packaging wired. Host UI polish target: **[docs/UI.md](./docs/UI.md)**. See also **[docs/DESIGN.md](./docs/DESIGN.md)** and **[docs/WINDOWS.md](./docs/WINDOWS.md)**.
+**Status:** Phase 3 (Fresh editor edit/save, fs_watch, thin scene) + **UI-1** host chrome; Windows Tauri NSIS/MSI packaging wired. Host UI: **[docs/UI.md](./docs/UI.md)**. See also **[docs/DESIGN.md](./docs/DESIGN.md)** and **[docs/WINDOWS.md](./docs/WINDOWS.md)**.
 
 ## Split
 
@@ -22,23 +22,32 @@ Fresh is vendored as a **git submodule** at `vendor/fresh`, pinned by commit (DE
 
 ```bash
 pixi install
+pixi run ui-install   # once (Bun via Pixi)
 
-# terminal 1 — remote daemon (loopback; add --token for non-loopback)
-pixi run backend
-# pixi run backend -- --listen 0.0.0.0:7420 --token secret --root /path/to/project
+# one process: build UI + backend (HTTP UI + WebSocket on :7420)
+pixi run serve
+# open http://127.0.0.1:7420/ → Connect (WS defaults to same host /ws)
 
-# terminal 2 — CLI smoke
+# optional CLI smoke against that backend
 pixi run app -- smoke --backend ws://127.0.0.1:7420/ws
 
-# terminal 2 — Vite UI (PTY + file tree + tabs/splits + editor)
-pixi run ui-install   # once (Bun via Pixi)
-pixi run ui
-# open http://127.0.0.1:1420/ → Connect to ws://127.0.0.1:7420/ws
-# leave Session empty to create; double-click a file to open in the editor pane
-# production-like: pixi run ui-build && pixi run ui-serve
+# UI hot-reload during development (two processes):
+#   pixi run backend
+#   pixi run ui          # Vite on :1420 → Connect to ws://127.0.0.1:7420/ws
 ```
 
-Auth: on loopback, token is optional unless `--token` / `FRESH_GUI_TOKEN` is set. Non-loopback binds **require** a token. FS listing and editor open are sandboxed to `--root` (default: cwd). Sessions keep PTYs alive across GUI disconnect. Pass `--no-editor` to run without Fresh.
+Auth: on loopback, token is optional unless `--token` / `FRESH_GUI_TOKEN` is set. Non-loopback binds **require** a token. FS listing and editor open are sandboxed to `--root` (default: cwd). Sessions keep PTYs alive across GUI disconnect. Pass `--no-editor` to run without Fresh. Pass `--no-ui` for API-only.
+
+### Remote Linux + browser (SSH)
+
+```bash
+# on the server
+pixi run serve -- --listen 127.0.0.1:7420 --token secret --root "$PWD"
+
+# on your laptop
+ssh -L 7420:127.0.0.1:7420 user@server
+# browser → http://127.0.0.1:7420/
+```
 
 ## Windows installers (NSIS + MSI)
 

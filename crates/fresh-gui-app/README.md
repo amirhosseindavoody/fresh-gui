@@ -1,6 +1,6 @@
 # fresh-gui-app
 
-Host CLI (`fresh-gui`) and the **Vite + TypeScript** UI under `ui/` (xterm.js, CodeMirror, tabs/splits, session reattach).
+Host CLI (`fresh-gui`) and the **Vite + TypeScript** UI under `ui/` (xterm.js WebGL, CodeMirror 6, unified tabs/splits, session reattach).
 
 ```bash
 pixi run app -- ping

@@ -2,7 +2,6 @@
 
 #![allow(clippy::result_large_err)] // ADE `Message` is the shared error envelope.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -31,14 +30,26 @@ pub struct AppState {
     pub watches: FsWatchStore,
 }
 
-pub async fn serve(addr: SocketAddr, state: Arc<AppState>) -> Result<()> {
-    let app = Router::new()
+pub async fn serve_listener(
+    listener: tokio::net::TcpListener,
+    state: Arc<AppState>,
+    ui_dir: Option<std::path::PathBuf>,
+) -> Result<()> {
+    let addr = listener.local_addr()?;
+    let api = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/ws", get(ws_upgrade))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!(%addr, "listening (ws path /ws)");
+    let app = if let Some(dir) = ui_dir {
+        api.fallback_service(
+            tower_http::services::ServeDir::new(dir).append_index_html_on_directories(true),
+        )
+    } else {
+        api
+    };
+
+    info!(%addr, "listening (http UI + ws path /ws)");
     axum::serve(listener, app).await?;
     Ok(())
 }
