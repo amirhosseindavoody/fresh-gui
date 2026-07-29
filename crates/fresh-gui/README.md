@@ -61,7 +61,7 @@ Default path: `$XDG_CONFIG_HOME/fresh-gui/config.json` or `~/.config/fresh-gui/c
   // Host UI — applied on connect and when this file is saved
   "ui": {
     "theme": "system", // system | light | dark (used when palette is primer)
-    "palette": "primer", // primer | nord | dracula | solarized-dark | high-contrast | nostalgia | dark | light
+    "palette": "primer", // primer | nord | dracula | … — also via activity bar / Mod+Shift+P “Color Palette”
     "terminalFontSize": 14,
     "editorFontSize": 14,
     "fontWeight": 400, // UI chrome 100–900

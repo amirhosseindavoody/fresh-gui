@@ -180,6 +180,17 @@ export function openPalette(): void {
   show("commands");
 }
 
+/** Open the command palette with an initial filter (e.g. `"Color Palette"`). */
+export function openPaletteWithQuery(query: string): void {
+  show("commands");
+  if (!filterInput) return;
+  filterInput.value = query;
+  applyFilter();
+  renderList();
+  filterInput.focus();
+  filterInput.select();
+}
+
 export function openGotoFile(): void {
   show("gotoFile");
 }

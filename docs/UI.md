@@ -149,6 +149,8 @@ Primer-inspired dark/light surfaces live in `src/tokens.css` (palette `primer`).
 }
 ```
 
+Pick a palette from the activity bar swatch, or **Mod+Shift+P** → “Color Palette…”. Choices apply immediately and are written to `config.json` when connected.
+
 Motion: 2–3 intentional uses — tab pill slide, sidebar collapse, panel focus ring. No perpetual ambient animation.
 
 ## 6. Interaction map
