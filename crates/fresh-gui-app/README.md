@@ -12,7 +12,7 @@ pixi run ui-build
 pixi run ui-serve    # serve ui/dist on :1420
 ```
 
-**UI basics:** leave Session empty to create; Disconnect keeps the backend session. Open files from the tree (editor tabs). `Mod+S` saves. Settings / `Mod+,` opens `config.json` on the backend. Right-click tabs or tree rows to copy paths. Theme follows the OS by default.
+**UI basics:** leave Session empty to create; Disconnect keeps the backend session. Open files from the tree (editor tabs). `Mod+S` saves. Settings / `Mod+,` opens `config.json` on the backend. Right-click tabs or tree rows to copy paths. In the terminal, mouse-drag to select, then `Mod+C` to copy (`Mod+V` pastes). Theme follows the OS by default.
 
 Tauri window: `fresh-gui-desktop` (builds `ui/dist` via `beforeBuildCommand`).
 
