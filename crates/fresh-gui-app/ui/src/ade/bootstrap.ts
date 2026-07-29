@@ -1237,7 +1237,6 @@ function setTreeEmptyHint(show: boolean, text = "Connect to load remote tree"): 
 
 // Selection state lives inside VirtualTree (tree.getSelectedPath()); no duplicate module state needed.
 let tree: VirtualTree;
-setTreeEmptyHint(true);
 
 function clearTree(): void {
   tree.clear();
@@ -1944,6 +1943,7 @@ export function bootstrapAde(): void {
     showDotfiles: uiSettings.showDotfiles,
     showGitDirs: uiSettings.showGitDirs,
   });
+  setTreeEmptyHint(true);
 
 connectBtn.addEventListener("click", connect);
 disconnectBtn.addEventListener("click", disconnect);
