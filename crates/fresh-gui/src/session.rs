@@ -206,7 +206,10 @@ impl SessionStore {
         let Some(session) = guard.get_mut(session_id) else {
             return;
         };
-        session.ptys.remove(pty_id);
+        // Already removed by `close_pty` (client kill) — don't emit a second closed event.
+        if session.ptys.remove(pty_id).is_none() {
+            return;
+        }
         session.emit(Message::PtyClosed {
             id: pty_id.to_owned(),
             reason: Some("eof".into()),
@@ -251,7 +254,11 @@ impl SessionStore {
         let session = guard
             .get_mut(session_id)
             .with_context(|| format!("unknown session {session_id}"))?;
-        session.ptys.remove(pty_id);
+        let Some(slot) = session.ptys.remove(pty_id) else {
+            anyhow::bail!("unknown pty {pty_id}");
+        };
+        // Kill the shell before dropping the slot (Fresh TerminalManager::close → shutdown).
+        slot.session.kill();
         session.emit(Message::PtyClosed {
             id: pty_id.to_owned(),
             reason: Some("client_close".into()),
