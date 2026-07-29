@@ -33,5 +33,20 @@ fresh-gui-backend
 - `--ui-dir` / `FRESH_GUI_UI_DIR` — override UI assets directory
 - `--no-ui` / `FRESH_GUI_NO_UI` — disable static UI
 - `--public-host` / `FRESH_GUI_PUBLIC_HOST` — hostname in startup UI/WS URLs; when unset, uses an assigned FQDN (`hostname -f` / `HOSTNAME` / `FRESH_GUI_DOMAIN`) if one looks like a real domain
+- `--config` / `FRESH_GUI_CONFIG` — JSON config path (default: `$XDG_CONFIG_HOME/fresh-gui/config.json` or `~/.config/fresh-gui/config.json`)
+
+### Config (`config.json`)
+
+Same nesting as Fresh’s terminal shell setting. When the client omits `shell` on `pty_open`, the backend uses:
+
+```json
+{
+  "terminal": {
+    "shell": { "command": "zsh", "args": [] }
+  }
+}
+```
+
+`zsh` is the built-in default when the file is missing. Empty `args` keep the backend’s interactive / OSC 7 setup; non-empty `args` are passed through as-is. JSONC (`//` / `/* */`) is accepted.
 
 See [docs/DESIGN.md](../../docs/DESIGN.md).

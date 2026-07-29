@@ -16,6 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::config::Config;
 use crate::editor_worker::EditorHandle;
 use crate::fs::FsRoot;
 use crate::fs_watch::FsWatchStore;
@@ -28,6 +29,7 @@ pub struct AppState {
     pub sessions: SessionStore,
     pub editor: Option<EditorHandle>,
     pub watches: FsWatchStore,
+    pub config: Arc<Config>,
 }
 
 pub async fn serve_listener(
@@ -315,7 +317,7 @@ async fn handle_client_msg(
 
             let id = state
                 .sessions
-                .open_pty(&sid, cols, rows, cwd, shell)
+                .open_pty(&sid, cols, rows, cwd, shell, &state.config)
                 .await
                 .map_err(|err| Message::Error {
                     code: "pty_open_failed".into(),

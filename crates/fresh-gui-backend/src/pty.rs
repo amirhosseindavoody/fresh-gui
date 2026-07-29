@@ -10,6 +10,8 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+use crate::config::Config;
+
 pub struct PtySession {
     id: String,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
@@ -22,12 +24,17 @@ impl PtySession {
         &self.id
     }
 
+    /// Spawn a PTY. When `shell` is set (client override), that executable is
+    /// used with interactive / OSC 7 setup. Otherwise [`Config::resolve_shell`]
+    /// supplies the command; empty `args` still get OSC 7 setup, non-empty
+    /// `args` are passed through as-is (Fresh-compatible).
     pub fn spawn(
         id: String,
         cols: u16,
         rows: u16,
         cwd: Option<String>,
         shell: Option<String>,
+        config: &Config,
         output_tx: mpsc::UnboundedSender<Vec<u8>>,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
@@ -40,12 +47,25 @@ impl PtySession {
             })
             .context("openpty")?;
 
-        let shell = shell.unwrap_or_else(default_shell);
+        let (shell, args, apply_osc7) = match shell {
+            Some(s) => (s, Vec::new(), true),
+            None => {
+                let (cmd, args) = config.resolve_shell();
+                let apply = args.is_empty();
+                (cmd, args, apply)
+            }
+        };
         let mut cmd = CommandBuilder::new(&shell);
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
         }
-        configure_shell_cmd(&mut cmd, &shell);
+        if apply_osc7 {
+            configure_shell_cmd(&mut cmd, &shell);
+        } else {
+            for arg in &args {
+                cmd.arg(arg);
+            }
+        }
 
         let child = pair
             .slave
@@ -109,10 +129,6 @@ impl PtySession {
             })
             .context("pty resize")
     }
-}
-
-fn default_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned())
 }
 
 fn shell_basename(shell: &str) -> &str {
