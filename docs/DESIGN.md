@@ -148,8 +148,19 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 
 ### Phase 3 — Editor surface (Fresh pull-in)
 
-- Extend the ADE protocol with optional capabilities that expose Fresh Editor / scene (or buffer APIs), without replacing the PTY-first path.
-- File tree from Phase 1b deepens (open-in-editor, watch) as needed.
+#### Phase 3a — Open / snapshot ✅ (in progress toward full Phase 3)
+
+- Protocol `0.3.0` optional `editor` capability: `editor_open` / `editor_opened` / `buffer_snapshot` / `editor_close`.
+- Backend embeds Fresh `Editor` in-process on a dedicated `!Send` thread (`EditorWorker`); path dep on `vendor/fresh` (`runtime` feature, plugins off for MVP).
+- Host UI: double-click file in tree → editor pane shows snapshot (read-only textarea for now).
+- Test: `editor_open_snapshot`.
+- Still deferred: edit/save, scene/`web`, `fs_watch`, merging Fresh session detach with ADE sessions.
+
+#### Phase 3b / 3c (next)
+
+- Edit + save with revision; richer host editor (CodeMirror/Monaco).
+- Optional `scene` capability (ADE envelopes, not `fresh --web` as primary wire).
+- File tree deepen: watch / open-in-editor polish.
 
 ### Phase 4 — Polish / packaging
 
@@ -167,7 +178,7 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 
 ### Fresh dependency
 
-**Resolved (D3):** git submodule at `vendor/fresh`, pinned by commit SHA. Backend Cargo deps use `path = "../../vendor/fresh/crates/…"`. No Fresh linkage in Phase 0 stubs.
+**Resolved (D3):** git submodule at `vendor/fresh`, pinned by commit SHA. Backend Cargo deps use `path = "../../vendor/fresh/crates/…"`. Phase 3a links `fresh-editor` (`runtime`) into `fresh-gui-backend`; workspace `exclude = ["vendor/fresh"]` keeps Fresh’s own workspace metadata.
 
 ### Versioning
 

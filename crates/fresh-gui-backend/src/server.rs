@@ -10,11 +10,12 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use base64::Engine;
-use fresh_gui_protocol::{Hello, Message, PROTOCOL_VERSION};
+use fresh_gui_protocol::{Hello, Message, CAP_EDITOR, PROTOCOL_VERSION};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::editor_worker::EditorHandle;
 use crate::fs::FsRoot;
 use crate::session::SessionStore;
 
@@ -23,6 +24,7 @@ pub struct AppState {
     pub require_auth: bool,
     pub fs_root: FsRoot,
     pub sessions: SessionStore,
+    pub editor: Option<EditorHandle>,
 }
 
 pub async fn serve(addr: SocketAddr, state: Arc<AppState>) -> Result<()> {
@@ -47,9 +49,13 @@ async fn ws_upgrade(
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (mut sink, mut stream) = socket.split();
 
+    let mut caps = Hello::default_backend_caps();
+    if state.editor.is_none() {
+        caps.retain(|c| c != CAP_EDITOR);
+    }
     let hello = Message::Hello(Hello::backend(
         format!("fresh-gui-backend/{}", env!("CARGO_PKG_VERSION")),
-        Hello::default_backend_caps(),
+        caps,
     ));
     if send_msg(&mut sink, &hello).await.is_err() {
         return;
@@ -402,6 +408,73 @@ async fn handle_client_msg(
                     message: format!("{request_id}: {err:#}"),
                 }),
             }
+        }
+        Message::EditorOpen {
+            request_id,
+            path,
+            preview,
+        } => {
+            require_auth(*authed)?;
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: format!("{request_id}: editor capability not available"),
+                });
+            };
+            let resolved = state.fs_root.resolve(&path).await.map_err(|err| Message::Error {
+                code: "editor_open_failed".into(),
+                message: format!("{request_id}: {err:#}"),
+            })?;
+            let opened = editor
+                .open(resolved, preview)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "editor_open_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
+            send_msg(
+                sink,
+                &Message::EditorOpened {
+                    request_id,
+                    buffer_id: opened.buffer_id.clone(),
+                    path: opened.path.clone(),
+                    language: opened.language,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send EditorOpened".into(),
+            })?;
+            send_msg(
+                sink,
+                &Message::BufferSnapshot {
+                    buffer_id: opened.buffer_id,
+                    rev: opened.rev,
+                    text: opened.text,
+                    path: opened.path,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send BufferSnapshot".into(),
+            })?;
+            Ok(())
+        }
+        Message::EditorClose { buffer_id } => {
+            require_auth(*authed)?;
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: "editor capability not available".into(),
+                });
+            };
+            editor.close(buffer_id).await.map_err(|err| Message::Error {
+                code: "editor_close_failed".into(),
+                message: err.to_string(),
+            })?;
+            Ok(())
         }
         other => {
             warn!(?other, "unexpected client message");

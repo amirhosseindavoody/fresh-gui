@@ -1,6 +1,6 @@
-/* Phase 2 host UI: sessions, multi-tab, splits, file tree. */
+/* Phase 3a host UI: sessions, tabs/splits, file tree, Fresh editor open/snapshot. */
 
-const PROTOCOL_VERSION = "0.2.0";
+const PROTOCOL_VERSION = "0.3.0";
 const SESSION_KEY = "fresh-gui.sessionId";
 const LAYOUT_KEY = "fresh-gui.layout";
 
@@ -11,14 +11,21 @@ const disconnectBtn = $("disconnect");
 const treeEl = $("tree");
 const tabsEl = $("tabs");
 const panesEl = $("panes");
+const editorPanel = $("editor-panel");
+const editorEl = $("editor");
+const editorPathEl = $("editor-path");
 
 let ws = null;
 let authed = false;
 let sessionId = null;
 let reqSeq = 0;
+let hasEditor = false;
 /** @type {Map<string, {resolve: Function, reject: Function}>} */
 const pendingFs = new Map();
+/** @type {Map<string, {resolve: Function, reject: Function}>} */
+const pendingEditor = new Map();
 let selectedPath = null;
+let openBufferId = null;
 
 /** @type {{ id: string, title: string, term: any, fit: any, el: HTMLElement }[]} */
 let tabs = [];
@@ -71,6 +78,49 @@ function fsList(path) {
         reject(new Error("fs_list timeout"));
       }
     }, 8000);
+  });
+}
+
+function editorOpen(path, preview = false) {
+  const request_id = nextRequestId();
+  return new Promise((resolve, reject) => {
+    pendingEditor.set(request_id, { resolve, reject });
+    send({ type: "editor_open", request_id, path, preview: !!preview });
+    setTimeout(() => {
+      if (pendingEditor.has(request_id)) {
+        pendingEditor.delete(request_id);
+        reject(new Error("editor_open timeout"));
+      }
+    }, 15000);
+  });
+}
+
+function showEditor(path, text, bufferId) {
+  openBufferId = bufferId;
+  editorPathEl.textContent = path || "untitled";
+  editorEl.value = text ?? "";
+  editorPanel.classList.add("visible");
+  requestAnimationFrame(() => {
+    for (const tab of tabs) {
+      try {
+        tab.fit.fit();
+      } catch (_) {}
+    }
+  });
+}
+
+function hideEditor() {
+  if (openBufferId) send({ type: "editor_close", buffer_id: openBufferId });
+  openBufferId = null;
+  editorPanel.classList.remove("visible");
+  editorPathEl.textContent = "No file open";
+  editorEl.value = "";
+  requestAnimationFrame(() => {
+    for (const tab of tabs) {
+      try {
+        tab.fit.fit();
+      } catch (_) {}
+    }
   });
 }
 
@@ -307,6 +357,23 @@ function renderEntries(container, entries) {
         }
       }
     });
+    if (entry.kind === "file") {
+      row.addEventListener("dblclick", async (ev) => {
+        ev.stopPropagation();
+        if (!hasEditor) {
+          setStatus("backend has no editor capability");
+          return;
+        }
+        setStatus(`opening ${entry.path}…`);
+        try {
+          const opened = await editorOpen(entry.path, false);
+          showEditor(opened.path, opened.text, opened.buffer_id);
+          setStatus(`opened ${opened.path}`);
+        } catch (err) {
+          setStatus(`editor error: ${err}`);
+        }
+      });
+    }
     container.append(row, childBox);
   }
 }
@@ -330,12 +397,13 @@ function onMessage(raw) {
 
   switch (msg.type) {
     case "hello":
+      hasEditor = Array.isArray(msg.capabilities) && msg.capabilities.includes("editor");
       send({
         type: "hello",
         protocol_version: PROTOCOL_VERSION,
         role: "client",
-        implementation: "fresh-gui-ui/0.2",
-        capabilities: ["ping", "pty", "fs", "session"],
+        implementation: "fresh-gui-ui/0.3",
+        capabilities: ["ping", "pty", "fs", "session", "editor"],
       });
       {
         const token = $("token").value;
@@ -345,7 +413,9 @@ function onMessage(raw) {
           beginSession();
         }
       }
-      setStatus(`hello from ${msg.implementation}`);
+      setStatus(
+        `hello from ${msg.implementation}${hasEditor ? " · editor" : " · no editor"}`,
+      );
       break;
     case "auth_ok":
       authed = true;
@@ -434,10 +504,43 @@ function onMessage(raw) {
       }
       break;
     }
+    case "editor_opened": {
+      const pending = pendingEditor.get(msg.request_id);
+      if (pending) {
+        pending._opened = {
+          buffer_id: msg.buffer_id,
+          path: msg.path,
+          language: msg.language,
+        };
+      }
+      break;
+    }
+    case "buffer_snapshot": {
+      // Pair with the most recent editor_opened still waiting.
+      for (const [id, pending] of pendingEditor) {
+        if (pending._opened && pending._opened.buffer_id === msg.buffer_id) {
+          pendingEditor.delete(id);
+          pending.resolve({
+            ...pending._opened,
+            rev: msg.rev,
+            text: msg.text,
+            path: msg.path || pending._opened.path,
+          });
+          break;
+        }
+      }
+      break;
+    }
     case "error":
       for (const [id, pending] of pendingFs) {
         if (msg.message && msg.message.startsWith(id)) {
           pendingFs.delete(id);
+          pending.reject(new Error(`${msg.code}: ${msg.message}`));
+        }
+      }
+      for (const [id, pending] of pendingEditor) {
+        if (msg.message && msg.message.startsWith(id)) {
+          pendingEditor.delete(id);
           pending.reject(new Error(`${msg.code}: ${msg.message}`));
         }
       }
@@ -476,6 +579,9 @@ function disconnect() {
   ws = null;
   authed = false;
   sessionId = null;
+  hasEditor = false;
+  pendingEditor.clear();
+  hideEditor();
   clearTerminals();
   clearTree();
   treeEl.innerHTML =
@@ -511,6 +617,7 @@ function connect() {
 
 connectBtn.addEventListener("click", connect);
 disconnectBtn.addEventListener("click", disconnect);
+$("editor-close").addEventListener("click", hideEditor);
 
 $("new-tab").addEventListener("click", () => {
   const dims = tabs[activeTab]?.fit.proposeDimensions?.() || { cols: 80, rows: 24 };

@@ -6,6 +6,9 @@
 /target/
 **/*.rs.bk
 
+# Fresh editor runtime state (if spawned with cwd under the crate)
+crates/fresh-gui-backend/data/
+
 # Editors / OS
 .idea/
 .vscode/

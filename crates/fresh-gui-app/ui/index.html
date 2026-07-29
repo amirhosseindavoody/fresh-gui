@@ -116,6 +116,49 @@
         min-height: 0;
         height: 100%;
       }
+      #work {
+        display: grid;
+        grid-template-rows: auto 1fr;
+        min-width: 0;
+        min-height: 0;
+      }
+      #editor-panel {
+        display: none;
+        flex-direction: column;
+        border-bottom: 1px solid var(--border);
+        background: #0d1117;
+        min-height: 10rem;
+        max-height: 45%;
+      }
+      #editor-panel.visible {
+        display: flex;
+      }
+      #editor-bar {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.35rem 0.6rem;
+        border-bottom: 1px solid var(--border);
+        font-size: 12px;
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        color: var(--muted);
+      }
+      #editor-bar .path { color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #editor-bar button { padding: 0.2rem 0.5rem; font-size: 11px; }
+      #editor {
+        flex: 1;
+        min-height: 8rem;
+        width: 100%;
+        border: none;
+        resize: vertical;
+        padding: 0.6rem 0.75rem;
+        background: #010409;
+        color: var(--text);
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 13px;
+        line-height: 1.45;
+        outline: none;
+      }
       #tree-panel {
         border-right: 1px solid var(--border);
         background: color-mix(in srgb, var(--panel) 70%, transparent);
@@ -193,6 +236,7 @@
         #main { grid-template-columns: 1fr; grid-template-rows: 30% 1fr; }
         #tree-panel { border-right: none; border-bottom: 1px solid var(--border); }
         #panes.split-horizontal { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+        #editor-panel { max-height: 35%; }
       }
     </style>
   </head>
@@ -227,8 +271,17 @@
         <h2>Files</h2>
         <div id="tree"><div class="tree-empty" style="padding:0.75rem;color:var(--muted)">Connect to load remote tree</div></div>
       </aside>
-      <div id="term-area">
-        <div id="panes" class="no-split"></div>
+      <div id="work">
+        <div id="editor-panel">
+          <div id="editor-bar">
+            <span class="path" id="editor-path">No file open</span>
+            <button id="editor-close" type="button" title="Hide editor">Close</button>
+          </div>
+          <textarea id="editor" spellcheck="false" readonly placeholder="Double-click a file in the tree to open"></textarea>
+        </div>
+        <div id="term-area">
+          <div id="panes" class="no-split"></div>
+        </div>
       </div>
     </div>
 

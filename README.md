@@ -4,7 +4,7 @@ Terminal-first ADE **GUI on the local host**, powered by a **remote backend** (F
 
 Inspired by [Terax](https://github.com/crynta/terax-ai). Repo logistics follow [pixi-mise](https://github.com/amirhosseindavoody/pixi-mise).
 
-**Status:** Phase 2 (sessions, multi-tab/splits, detach/reattach) on top of Phase 1 + 1b; Windows Tauri NSIS/MSI packaging wired. See **[docs/DESIGN.md](./docs/DESIGN.md)** and **[docs/WINDOWS.md](./docs/WINDOWS.md)**.
+**Status:** Phase 3a (Fresh editor open/snapshot) on Phase 2 sessions/tabs; Windows Tauri NSIS/MSI packaging wired. See **[docs/DESIGN.md](./docs/DESIGN.md)** and **[docs/WINDOWS.md](./docs/WINDOWS.md)**.
 
 ## Split
 
@@ -30,13 +30,13 @@ pixi run backend
 # terminal 2 — CLI smoke
 pixi run app -- smoke --backend ws://127.0.0.1:7420/ws
 
-# terminal 2 — serve UI (PTY + file tree + tabs/splits)
+# terminal 2 — serve UI (PTY + file tree + tabs/splits + editor)
 pixi run ui
 # open http://127.0.0.1:1420/ → Connect to ws://127.0.0.1:7420/ws
-# leave Session empty to create; reconnect with the same id to reattach
+# leave Session empty to create; double-click a file to open in the editor pane
 ```
 
-Auth: on loopback, token is optional unless `--token` / `FRESH_GUI_TOKEN` is set. Non-loopback binds **require** a token. FS listing is sandboxed to `--root` (default: cwd). Sessions keep PTYs alive across GUI disconnect.
+Auth: on loopback, token is optional unless `--token` / `FRESH_GUI_TOKEN` is set. Non-loopback binds **require** a token. FS listing and editor open are sandboxed to `--root` (default: cwd). Sessions keep PTYs alive across GUI disconnect. Pass `--no-editor` to run without Fresh.
 
 ## Windows installers (NSIS + MSI)
 
@@ -64,7 +64,7 @@ pixi run build
 
 JSON text frames over WebSocket `ws://host:port/ws`:
 
-`hello` → optional `auth` → `session_*` / `layout_set` → `pty_*` and/or `fs_list` / `fs_stat` (protocol `0.2.0`)
+`hello` → optional `auth` → `session_*` / `layout_set` → `pty_*` / `fs_*` / `editor_open` (protocol `0.3.0`)
 
 ## Versioning
 

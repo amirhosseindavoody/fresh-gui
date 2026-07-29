@@ -269,6 +269,65 @@ impl Client {
         }
     }
 
+    /// Open a path in the Fresh editor and return `(buffer_id, path, language, rev, text)`.
+    pub async fn open_editor(
+        &mut self,
+        path: impl Into<String>,
+        preview: bool,
+    ) -> Result<(String, String, Option<String>, u64, String)> {
+        let request_id = format!("ed-{}", uuid_simple());
+        send_msg(
+            &mut self.sink,
+            &Message::EditorOpen {
+                request_id: request_id.clone(),
+                path: path.into(),
+                preview,
+            },
+        )
+        .await?;
+        let mut opened: Option<(String, String, Option<String>)> = None;
+        loop {
+            match self.recv().await? {
+                Message::EditorOpened {
+                    request_id: rid,
+                    buffer_id,
+                    path,
+                    language,
+                } if rid == request_id => {
+                    opened = Some((buffer_id, path, language));
+                }
+                Message::BufferSnapshot {
+                    buffer_id,
+                    rev,
+                    text,
+                    path: snap_path,
+                } => {
+                    if opened
+                        .as_ref()
+                        .is_some_and(|(oid, _, _)| oid == &buffer_id)
+                    {
+                        let (_, opath, lang) = opened.take().expect("opened set");
+                        let path = if snap_path.is_empty() {
+                            opath
+                        } else {
+                            snap_path
+                        };
+                        return Ok((buffer_id, path, lang, rev, text));
+                    }
+                }
+                Message::Error { code, message } => {
+                    bail!("editor open failed: {code}: {message}")
+                }
+                Message::PtyData { .. }
+                | Message::PtyClosed { .. }
+                | Message::Pong { .. }
+                | Message::Ping { .. }
+                | Message::FsListed { .. } => continue,
+                other => bail!("unexpected while opening editor: {other:?}"),
+            }
+        }
+    }
+
     pub async fn recv(&mut self) -> Result<Message> {
         recv_msg(&mut self.stream).await
     }

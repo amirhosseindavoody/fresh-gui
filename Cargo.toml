@@ -13,6 +13,9 @@ default-members = [
     "crates/fresh-gui-client",
     "crates/fresh-gui-app",
 ]
+# Fresh is a separate Cargo workspace (git submodule); keep path deps from
+# inheriting this workspace's package metadata.
+exclude = ["vendor/fresh"]
 
 [workspace.package]
 version = "2026.728.1"

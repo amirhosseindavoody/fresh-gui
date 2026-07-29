@@ -26,6 +26,10 @@ impl FsRoot {
         self.root.display().to_string()
     }
 
+    pub fn root_path(&self) -> &Path {
+        &self.root
+    }
+
     /// Resolve a client path to an absolute path inside the root.
     /// Empty, `.`, or `/` → root. Absolute paths must still stay under root.
     pub async fn resolve(&self, path: &str) -> Result<PathBuf> {

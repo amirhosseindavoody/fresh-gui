@@ -1,5 +1,6 @@
-//! fresh-gui-backend — remote ADE daemon (PTY + read-only FS).
+//! fresh-gui-backend — remote ADE daemon (PTY + FS + optional Fresh editor).
 
+mod editor_worker;
 mod fs;
 mod pty;
 mod server;
@@ -13,6 +14,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use tracing::info;
 
+use crate::editor_worker::EditorHandle;
 use crate::fs::FsRoot;
 use crate::server::AppState;
 use crate::session::SessionStore;
@@ -29,9 +31,13 @@ struct Args {
     #[arg(long, env = "FRESH_GUI_TOKEN")]
     token: Option<String>,
 
-    /// Sandbox root for read-only `fs` listing (default: current directory).
+    /// Sandbox root for read-only `fs` listing and editor open (default: current directory).
     #[arg(long, env = "FRESH_GUI_FS_ROOT")]
     root: Option<PathBuf>,
+
+    /// Disable the in-process Fresh editor (omit `editor` capability).
+    #[arg(long, env = "FRESH_GUI_NO_EDITOR")]
+    no_editor: bool,
 }
 
 #[tokio::main]
@@ -60,17 +66,26 @@ async fn main() -> Result<()> {
     let fs_root = FsRoot::new(root_path).context("init FS root")?;
 
     let require_auth = !loopback || token.is_some();
+    let editor = if args.no_editor {
+        info!("Fresh editor disabled (--no-editor)");
+        None
+    } else {
+        EditorHandle::spawn(fs_root.root_path().to_path_buf())
+    };
+
     let state = Arc::new(AppState {
         token,
         require_auth,
         fs_root,
         sessions: SessionStore::new(),
+        editor,
     });
 
     info!(
         listen = %args.listen,
         auth_required = state.require_auth,
         fs_root = %state.fs_root.root_display(),
+        editor = state.editor.is_some(),
         "starting fresh-gui-backend"
     );
 

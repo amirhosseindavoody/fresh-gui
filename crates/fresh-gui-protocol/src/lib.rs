@@ -1,16 +1,17 @@
 //! Shared protocol types for fresh-gui (host ↔ remote).
 //!
-//! PTY-first ADE protocol. Phase 2 adds detachable sessions + multi-PTY.
+//! PTY-first ADE protocol. Phase 2: sessions. Phase 3a: optional `editor` open/snapshot.
 
 use serde::{Deserialize, Serialize};
 
 /// Protocol version negotiated in [`Hello`].
-pub const PROTOCOL_VERSION: &str = "0.2.0";
+pub const PROTOCOL_VERSION: &str = "0.3.0";
 
 pub const CAP_PING: &str = "ping";
 pub const CAP_PTY: &str = "pty";
 pub const CAP_FS: &str = "fs";
 pub const CAP_SESSION: &str = "session";
+pub const CAP_EDITOR: &str = "editor";
 
 /// First message after WebSocket connect. Client sends; backend replies with its own.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -169,6 +170,32 @@ pub enum Message {
         request_id: String,
         entry: FsEntry,
     },
+    /// Client → backend: open a path in the Fresh editor (capability `editor`).
+    EditorOpen {
+        request_id: String,
+        path: String,
+        #[serde(default)]
+        preview: bool,
+    },
+    /// Backend → client: file opened; full text follows in [`Message::BufferSnapshot`].
+    EditorOpened {
+        request_id: String,
+        buffer_id: String,
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+    },
+    /// Backend → client: full buffer text (Phase 3a MVP; diffs later).
+    BufferSnapshot {
+        buffer_id: String,
+        rev: u64,
+        text: String,
+        path: String,
+    },
+    /// Client → backend: close an editor buffer.
+    EditorClose {
+        buffer_id: String,
+    },
     Error {
         code: String,
         message: String,
@@ -210,6 +237,7 @@ impl Hello {
             CAP_PTY.to_owned(),
             CAP_FS.to_owned(),
             CAP_SESSION.to_owned(),
+            CAP_EDITOR.to_owned(),
         ]
     }
 
@@ -219,6 +247,7 @@ impl Hello {
             CAP_PTY.to_owned(),
             CAP_FS.to_owned(),
             CAP_SESSION.to_owned(),
+            CAP_EDITOR.to_owned(),
         ]
     }
 }
@@ -238,11 +267,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hello_includes_session_cap() {
+    fn hello_includes_editor_cap() {
         let hello = Hello::backend("fresh-gui-backend/test", Hello::default_backend_caps());
         let json = Message::Hello(hello).to_json().unwrap();
+        assert!(json.contains("\"editor\""));
         assert!(json.contains("\"session\""));
-        assert!(json.contains("0.2.0"));
+        assert!(json.contains("0.3.0"));
     }
 
     #[test]
@@ -258,6 +288,24 @@ mod tests {
         };
         let back = Message::from_json(&msg.to_json().unwrap()).unwrap();
         assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn editor_open_snapshot_roundtrips() {
+        let open = Message::EditorOpen {
+            request_id: "r1".into(),
+            path: "/tmp/a.rs".into(),
+            preview: false,
+        };
+        assert_eq!(Message::from_json(&open.to_json().unwrap()).unwrap(), open);
+
+        let snap = Message::BufferSnapshot {
+            buffer_id: "1".into(),
+            rev: 0,
+            text: "fn main() {}\n".into(),
+            path: "/tmp/a.rs".into(),
+        };
+        assert_eq!(Message::from_json(&snap.to_json().unwrap()).unwrap(), snap);
     }
 
     #[test]
