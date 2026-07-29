@@ -26,6 +26,7 @@ export CARGO_PROFILE_RELEASE_STRIP="${CARGO_PROFILE_RELEASE_STRIP:-symbols}"
 export CARGO_PROFILE_RELEASE_LTO="${CARGO_PROFILE_RELEASE_LTO:-fat}"
 cargo auditable install \
   --locked \
+  --force \
   --no-track \
   --bin fresh-gui-backend \
   --root "${PREFIX}" \
@@ -33,7 +34,13 @@ cargo auditable install \
 
 echo "Installing UI assets…"
 mkdir -p "${PREFIX}/share/fresh-gui/ui"
-cp -a crates/fresh-gui-app/ui/dist/. "${PREFIX}/share/fresh-gui/ui/"
+# Copy built assets but skip Vite sourcemaps (keeps the package lean).
+if command -v rsync >/dev/null 2>&1; then
+  rsync -a --exclude='*.map' crates/fresh-gui-app/ui/dist/ "${PREFIX}/share/fresh-gui/ui/"
+else
+  (cd crates/fresh-gui-app/ui/dist && tar -cf - --exclude='*.map' .) \
+    | (cd "${PREFIX}/share/fresh-gui/ui" && tar -xf -)
+fi
 test -f "${PREFIX}/share/fresh-gui/ui/index.html"
 
 echo "Bundling third-party licenses…"
