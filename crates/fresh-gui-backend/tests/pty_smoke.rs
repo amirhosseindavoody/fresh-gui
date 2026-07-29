@@ -27,6 +27,7 @@ fn spawn_backend(addr: SocketAddr) -> Child {
     Command::new(bin)
         .arg("--listen")
         .arg(addr.to_string())
+        .arg("--allow-no-auth")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
