@@ -651,7 +651,12 @@ function restyleOpenPanes(resolved: ReturnType<typeof resolveTheme>, themeChange
       }
     } else {
       applyEditorFontSize(tab.view, uiSettings.editorFontSize);
-      if (themeChanged) applyEditorTheme(tab.view, resolved);
+      if (themeChanged) {
+        applyEditorTheme(tab.view, resolved);
+        if (tab.mdView === "preview" && tab.mdPreviewEl) {
+          applyEditorMdView(tab, { refresh: true });
+        }
+      }
     }
   }
 }

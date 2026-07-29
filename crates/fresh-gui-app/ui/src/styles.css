@@ -660,6 +660,43 @@ input#session {
   margin-right: 0.4em;
 }
 
+.md-preview .katex-display {
+  margin: 1em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.15em 0;
+}
+
+.md-preview .katex {
+  font-size: 1.05em;
+}
+
+.md-preview pre.mermaid {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 1rem;
+  text-align: center;
+  overflow: auto;
+}
+
+.md-preview pre.mermaid svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.md-preview pre.mermaid.md-mermaid-error {
+  color: var(--danger);
+  text-align: left;
+  white-space: pre-wrap;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+}
+
+.md-preview .md-math-error {
+  color: var(--danger);
+}
+
 .statusbar {
   display: flex;
   align-items: center;
