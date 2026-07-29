@@ -1,48 +1,229 @@
-//! Host-side client stub for talking to `fresh-gui-backend`.
+//! Host-side WebSocket client for the fresh-gui ADE protocol.
 
-use fresh_gui_protocol::{Hello, PROTOCOL_VERSION};
+use std::time::Duration;
 
-/// Connection options (placeholder until transport is chosen).
+use anyhow::{bail, Context, Result};
+use base64::Engine;
+use fresh_gui_protocol::{Hello, Message, PROTOCOL_VERSION};
+use futures_util::{SinkExt, StreamExt};
+use tokio::net::TcpStream;
+use tokio::time::timeout;
+use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage, MaybeTlsStream, WebSocketStream};
+use url::Url;
+
+pub use fresh_gui_protocol;
+
+/// Connection options.
 #[derive(Debug, Clone)]
 pub struct ConnectOptions {
-    pub endpoint: String,
+    /// e.g. `ws://127.0.0.1:7420/ws`
+    pub url: String,
+    pub token: Option<String>,
 }
 
 impl ConnectOptions {
-    pub fn new(endpoint: impl Into<String>) -> Self {
+    pub fn new(url: impl Into<String>) -> Self {
         Self {
-            endpoint: endpoint.into(),
+            url: url.into(),
+            token: None,
         }
+    }
+
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(token.into());
+        self
     }
 }
 
-/// Client handle (no I/O yet).
-#[derive(Debug)]
+type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Connected ADE client.
 pub struct Client {
-    opts: ConnectOptions,
-    hello: Hello,
+    sink: futures_util::stream::SplitSink<Ws, WsMessage>,
+    stream: futures_util::stream::SplitStream<Ws>,
+    pub backend_hello: Hello,
 }
 
 impl Client {
-    pub fn prepare(opts: ConnectOptions) -> Self {
-        let hello = Hello::client(
+    pub async fn connect(opts: ConnectOptions) -> Result<Self> {
+        let url = Url::parse(&opts.url).context("parse backend url")?;
+        let (ws, _) = connect_async(url.as_str())
+            .await
+            .with_context(|| format!("connect {}", opts.url))?;
+        let (mut sink, mut stream) = ws.split();
+
+        // Backend sends Hello first.
+        let backend_hello = match recv_msg(&mut stream).await.context("backend hello")? {
+            Message::Hello(h) => h,
+            other => bail!("expected Hello from backend, got {other:?}"),
+        };
+        if backend_hello.protocol_version != PROTOCOL_VERSION {
+            bail!(
+                "protocol mismatch: client {PROTOCOL_VERSION} vs backend {}",
+                backend_hello.protocol_version
+            );
+        }
+
+        let client_hello = Message::Hello(Hello::client(
             format!("fresh-gui-client/{}", env!("CARGO_PKG_VERSION")),
-            vec!["ping".into(), "pty".into()],
-        );
-        Self { opts, hello }
+            Hello::default_client_caps(),
+        ));
+        send_msg(&mut sink, &client_hello).await?;
+
+        if let Some(token) = opts.token {
+            send_msg(&mut sink, &Message::Auth { token }).await?;
+            match recv_msg(&mut stream).await.context("auth response")? {
+                Message::AuthOk => {}
+                Message::AuthError { message } => bail!("auth failed: {message}"),
+                other => bail!("unexpected auth response: {other:?}"),
+            }
+        }
+
+        Ok(Self {
+            sink,
+            stream,
+            backend_hello,
+        })
     }
 
-    pub fn endpoint(&self) -> &str {
-        &self.opts.endpoint
+    pub async fn ping(&mut self, nonce: u64) -> Result<()> {
+        send_msg(&mut self.sink, &Message::Ping { nonce }).await
     }
 
-    pub fn hello(&self) -> &Hello {
-        &self.hello
+    pub async fn open_pty(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cwd: Option<String>,
+        shell: Option<String>,
+    ) -> Result<String> {
+        send_msg(
+            &mut self.sink,
+            &Message::PtyOpen {
+                cols,
+                rows,
+                cwd,
+                shell,
+            },
+        )
+        .await?;
+        loop {
+            match self.recv().await? {
+                Message::PtyOpened { id } => return Ok(id),
+                Message::Error { code, message } => {
+                    bail!("pty open failed: {code}: {message}")
+                }
+                Message::Pong { .. } | Message::Ping { .. } => continue,
+                other => bail!("unexpected while opening pty: {other:?}"),
+            }
+        }
     }
 
-    pub fn protocol_version() -> &'static str {
-        PROTOCOL_VERSION
+    pub async fn write_pty(&mut self, id: &str, data: &[u8]) -> Result<()> {
+        let data = base64::engine::general_purpose::STANDARD.encode(data);
+        send_msg(
+            &mut self.sink,
+            &Message::PtyData {
+                id: id.to_owned(),
+                data,
+            },
+        )
+        .await
     }
+
+    pub async fn resize_pty(&mut self, id: &str, cols: u16, rows: u16) -> Result<()> {
+        send_msg(
+            &mut self.sink,
+            &Message::PtyResize {
+                id: id.to_owned(),
+                cols,
+                rows,
+            },
+        )
+        .await
+    }
+
+    pub async fn close_pty(&mut self, id: &str) -> Result<()> {
+        send_msg(
+            &mut self.sink,
+            &Message::PtyClose {
+                id: id.to_owned(),
+            },
+        )
+        .await
+    }
+
+    pub async fn recv(&mut self) -> Result<Message> {
+        recv_msg(&mut self.stream).await
+    }
+
+    /// Decode `PtyData` payload.
+    pub fn decode_pty_data(data_b64: &str) -> Result<Vec<u8>> {
+        Ok(base64::engine::general_purpose::STANDARD.decode(data_b64)?)
+    }
+}
+
+async fn send_msg(
+    sink: &mut futures_util::stream::SplitSink<Ws, WsMessage>,
+    msg: &Message,
+) -> Result<()> {
+    let json = msg.to_json()?;
+    sink.send(WsMessage::Text(json.into())).await?;
+    Ok(())
+}
+
+async fn recv_msg(stream: &mut futures_util::stream::SplitStream<Ws>) -> Result<Message> {
+    while let Some(frame) = stream.next().await {
+        let frame = frame.context("ws read")?;
+        match frame {
+            WsMessage::Text(text) => return Ok(Message::from_json(&text)?),
+            WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
+            WsMessage::Close(_) => bail!("websocket closed"),
+            WsMessage::Binary(_) | WsMessage::Frame(_) => continue,
+        }
+    }
+    bail!("websocket ended")
+}
+
+/// Run a short PTY echo smoke test against a running backend.
+pub async fn smoke_echo(url: &str, token: Option<&str>) -> Result<String> {
+    let mut opts = ConnectOptions::new(url);
+    if let Some(t) = token {
+        opts = opts.with_token(t);
+    }
+    let mut client = Client::connect(opts).await?;
+    let id = client.open_pty(80, 24, None, Some("/bin/bash".into())).await?;
+
+    // Disable echo weirdness: run a simple printf via bash -c style by typing a command.
+    client
+        .write_pty(&id, b"printf 'fresh-gui-ok\\n'; exit\\n")
+        .await?;
+
+    let mut collected = String::new();
+    let deadline = Duration::from_secs(5);
+    let start = std::time::Instant::now();
+    while start.elapsed() < deadline {
+        let remaining = deadline.saturating_sub(start.elapsed());
+        let msg = match timeout(remaining, client.recv()).await {
+            Ok(Ok(m)) => m,
+            Ok(Err(err)) => return Err(err),
+            Err(_) => break,
+        };
+        match msg {
+            Message::PtyData { id: pid, data } if pid == id => {
+                let bytes = Client::decode_pty_data(&data)?;
+                collected.push_str(&String::from_utf8_lossy(&bytes));
+                if collected.contains("fresh-gui-ok") {
+                    return Ok(collected);
+                }
+            }
+            Message::PtyClosed { id: pid, .. } if pid == id => break,
+            Message::Pong { .. } | Message::Ping { .. } => {}
+            Message::Error { code, message } => bail!("error {code}: {message}"),
+            _ => {}
+        }
+    }
+    bail!("did not observe fresh-gui-ok in pty output: {collected:?}")
 }
 
 #[cfg(test)]
@@ -50,9 +231,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prepare_sets_client_hello() {
-        let client = Client::prepare(ConnectOptions::new("127.0.0.1:7420"));
-        assert_eq!(client.endpoint(), "127.0.0.1:7420");
-        assert_eq!(client.hello().protocol_version, PROTOCOL_VERSION);
+    fn connect_options_token() {
+        let opts = ConnectOptions::new("ws://127.0.0.1:7420/ws").with_token("secret");
+        assert_eq!(opts.token.as_deref(), Some("secret"));
     }
 }

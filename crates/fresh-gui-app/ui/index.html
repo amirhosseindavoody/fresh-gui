@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>fresh-gui</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0e1116;
+        --panel: #161b22;
+        --border: #30363d;
+        --text: #e6edf3;
+        --muted: #8b949e;
+        --accent: #3fb950;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: radial-gradient(1200px 600px at 10% -10%, #1a2332 0%, var(--bg) 55%);
+        color: var(--text);
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      }
+      body {
+        display: grid;
+        grid-template-rows: auto 1fr;
+        min-height: 100%;
+      }
+      header {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        align-items: end;
+        padding: 0.85rem 1rem;
+        border-bottom: 1px solid var(--border);
+        background: color-mix(in srgb, var(--panel) 88%, transparent);
+        backdrop-filter: blur(8px);
+      }
+      .brand {
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        margin-right: 0.5rem;
+      }
+      label {
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
+        font-size: 0.75rem;
+        color: var(--muted);
+      }
+      input {
+        min-width: 16rem;
+        padding: 0.45rem 0.6rem;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: #0d1117;
+        color: var(--text);
+        font: inherit;
+      }
+      button {
+        padding: 0.5rem 0.9rem;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: #21262d;
+        color: var(--text);
+        font: inherit;
+        cursor: pointer;
+      }
+      button.primary {
+        background: color-mix(in srgb, var(--accent) 35%, #21262d);
+        border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
+      }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      #status { font-size: 0.8rem; color: var(--muted); margin-left: auto; }
+      #term-wrap {
+        padding: 0.75rem;
+        min-height: 0;
+      }
+      #terminal {
+        height: 100%;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        overflow: hidden;
+        background: #010409;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="brand">fresh-gui</div>
+      <label>
+        Backend WS
+        <input id="url" value="ws://127.0.0.1:7420/ws" spellcheck="false" />
+      </label>
+      <label>
+        Token
+        <input id="token" type="password" placeholder="optional on loopback" spellcheck="false" />
+      </label>
+      <button id="connect" class="primary" type="button">Connect</button>
+      <button id="disconnect" type="button" disabled>Disconnect</button>
+      <div id="status">disconnected</div>
+    </header>
+    <div id="term-wrap">
+      <div id="terminal"></div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+    <script src="./main.js"></script>
+  </body>
+</html>

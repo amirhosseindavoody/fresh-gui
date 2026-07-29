@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "Linux remote daemon for fresh-gui (Fresh session host)"
+description = "Linux remote daemon for fresh-gui (PTY ADE protocol)"
 readme = "README.md"
 
 [[bin]]
@@ -15,8 +15,17 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
 clap = { workspace = true }
 fresh-gui-protocol = { workspace = true }
+futures-util = { workspace = true }
+portable-pty = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+fresh-gui-client = { workspace = true }
+tokio = { workspace = true }

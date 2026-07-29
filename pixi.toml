@@ -7,14 +7,16 @@ platforms = ["linux-64"]
 version = "2026.728.1"
 
 [tasks]
-check = "cargo check --workspace"
-test = "cargo test --workspace"
-build = "cargo build --workspace"
-clippy = "cargo clippy --workspace --all-targets -- -D warnings"
+check = "cargo check --workspace --exclude fresh-gui-desktop"
+test = "cargo test --workspace --exclude fresh-gui-desktop"
+build = "cargo build --workspace --exclude fresh-gui-desktop"
+clippy = "cargo clippy --workspace --exclude fresh-gui-desktop --all-targets -- -D warnings"
 fmt = "cargo fmt --all"
 fmt-check = "cargo fmt --all -- --check"
 backend = "cargo run -p fresh-gui-backend --"
 app = "cargo run -p fresh-gui-app --"
+ui = "cargo run -p fresh-gui-app -- serve-ui"
+desktop = "cargo run -p fresh-gui-desktop --"
 update-version = "scripts/update-version.sh"
 
 [dependencies]

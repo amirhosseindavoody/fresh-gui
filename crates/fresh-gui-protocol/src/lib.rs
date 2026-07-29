@@ -1,14 +1,17 @@
 //! Shared protocol types for fresh-gui (host ↔ remote).
 //!
-//! PTY-first ADE protocol (D1 = B). Fresh Editor/scene is a later optional
-//! capability — see `docs/DESIGN.md` §5 / §10.
+//! PTY-first ADE protocol (D1 = B). Wire: JSON text frames over WebSocket.
+//! Fresh Editor/scene is a later optional capability — see `docs/DESIGN.md`.
 
 use serde::{Deserialize, Serialize};
 
-/// Protocol major.minor negotiated in [`Hello`].
+/// Protocol version negotiated in [`Hello`].
 pub const PROTOCOL_VERSION: &str = "0.1.0";
 
-/// First message after connect (either direction may send; backend replies).
+pub const CAP_PING: &str = "ping";
+pub const CAP_PTY: &str = "pty";
+
+/// First message after WebSocket connect. Client sends; backend replies with its own.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Hello {
     pub protocol_version: String,
@@ -25,14 +28,64 @@ pub enum PeerRole {
     Backend,
 }
 
-/// Top-level envelope (placeholder until D1 is decided).
+/// Top-level JSON envelope (one WebSocket text frame per message).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Message {
     Hello(Hello),
-    Ping { nonce: u64 },
-    Pong { nonce: u64 },
-    Error { code: String, message: String },
+    /// Client → backend. Required before PTY ops when the backend demands a token.
+    Auth {
+        token: String,
+    },
+    AuthOk,
+    AuthError {
+        message: String,
+    },
+    Ping {
+        nonce: u64,
+    },
+    Pong {
+        nonce: u64,
+    },
+    /// Client → backend: open a PTY.
+    PtyOpen {
+        cols: u16,
+        rows: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shell: Option<String>,
+    },
+    /// Backend → client: PTY ready.
+    PtyOpened {
+        id: String,
+    },
+    /// Either direction: base64-encoded bytes (stdin ↔ stdout/stderr merged).
+    PtyData {
+        id: String,
+        /// Standard base64 (no newlines).
+        data: String,
+    },
+    /// Client → backend.
+    PtyResize {
+        id: String,
+        cols: u16,
+        rows: u16,
+    },
+    /// Client → backend: request close.
+    PtyClose {
+        id: String,
+    },
+    /// Backend → client: PTY ended.
+    PtyClosed {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +94,8 @@ pub enum ProtocolError {
     UnsupportedVersion(String),
     #[error("missing capability: {0}")]
     MissingCapability(String),
+    #[error("invalid message json: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 impl Hello {
@@ -61,6 +116,24 @@ impl Hello {
             capabilities,
         }
     }
+
+    pub fn default_backend_caps() -> Vec<String> {
+        vec![CAP_PING.to_owned(), CAP_PTY.to_owned()]
+    }
+
+    pub fn default_client_caps() -> Vec<String> {
+        vec![CAP_PING.to_owned(), CAP_PTY.to_owned()]
+    }
+}
+
+impl Message {
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(s)
+    }
 }
 
 #[cfg(test)]
@@ -69,10 +142,20 @@ mod tests {
 
     #[test]
     fn hello_roundtrips_json() {
-        let hello = Hello::backend("fresh-gui-backend/test", vec!["ping".into()]);
+        let hello = Hello::backend("fresh-gui-backend/test", Hello::default_backend_caps());
         let msg = Message::Hello(hello.clone());
-        let json = serde_json::to_string(&msg).unwrap();
-        let back: Message = serde_json::from_str(&json).unwrap();
+        let json = msg.to_json().unwrap();
+        let back = Message::from_json(&json).unwrap();
         assert_eq!(back, Message::Hello(hello));
+    }
+
+    #[test]
+    fn pty_data_roundtrips() {
+        let msg = Message::PtyData {
+            id: "p1".into(),
+            data: "aGVsbG8=".into(),
+        };
+        let back = Message::from_json(&msg.to_json().unwrap()).unwrap();
+        assert_eq!(back, msg);
     }
 }

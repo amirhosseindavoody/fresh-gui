@@ -81,7 +81,8 @@ Logistics template: `pixi.toml` + Cargo workspace under `crates/`, `docs/DESIGN.
 | `fresh-gui-protocol` | no | all | Versioned messages, capability negotiation, errors |
 | `fresh-gui-backend` | yes (`fresh-gui-backend`) | linux | Daemon: bind transport, host Fresh session(s), serve protocol |
 | `fresh-gui-client` | no | all (host) | Dial, auth, reconnect, typed RPC / streams |
-| `fresh-gui-app` | yes (`fresh-gui`) | windows | Tauri 2 shell + web UI (xterm.js); dials backend via `fresh-gui-client` |
+| `fresh-gui-app` | yes (`fresh-gui`) | all | CLI (`ping`/`smoke`/`attach`/`serve-ui`) + `ui/` xterm assets |
+| `fresh-gui-desktop` | yes (`fresh-gui-desktop`) | windows | Tauri 2 window loading `fresh-gui-app/ui` |
 
 Dev machines (e.g. WSL) may build backend + protocol + client locally; the Windows GUI is cross-built or built on Windows CI / a Windows host.
 
@@ -107,7 +108,7 @@ The protocol crate owns:
 - **Streams (Phase 3+)** — optional Fresh scene diffs, diagnostics — negotiated via capabilities.
 - **Control** — ping/pong, graceful shutdown, error envelopes.
 
-Wire framing (JSON over WebSocket vs length-prefixed MessagePack/CBOR, etc.) can be chosen during Phase 1 implementation; it must not imply Fresh web-ui message shapes.
+Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `/ws`. PTY payloads use standard base64 in `pty_data`. Not Fresh web-ui message shapes.
 
 ## 6. MVP Scope (phased)
 
@@ -117,12 +118,13 @@ Wire framing (JSON over WebSocket vs length-prefixed MessagePack/CBOR, etc.) can
 - No Fresh linkage yet; protocol types are placeholders.
 - Decisions D1–D5 resolved; `vendor/fresh` submodule pinned.
 
-### Phase 1 — Remote PTY loop (D4)
+### Phase 1 — Remote PTY loop (D4) ✅ (core)
 
-- Backend exposes authenticated PTY create/read/write/resize.
-- Host GUI (Tauri 2 + xterm.js): connect dialog + single terminal tab.
-- Prove latency and reconnect on WSL ↔ Windows and real SSH.
-- **No** file tree / editor in this phase.
+- Backend exposes authenticated PTY create/read/write/resize over WebSocket (`/ws`).
+- Host: Tauri 2 crate (`fresh-gui-desktop`) loads xterm.js UI; Linux/WSL can use `fresh-gui serve-ui` as a stand-in when webkit isn’t installed.
+- Host CLI: `fresh-gui ping|smoke|attach` via `fresh-gui-client`.
+- Integration test: `pty_smoke_echo`.
+- Remaining / follow-ups: Windows desktop packaging proof, reconnect UX polish, measured latency on real SSH forwards.
 
 ### Phase 1b — Read-only file tree (immediately after Phase 1)
 
@@ -258,7 +260,8 @@ fresh-gui/
     fresh-gui-protocol/
     fresh-gui-backend/
     fresh-gui-client/
-    fresh-gui-app/          # Tauri 2 host (src-tauri + web UI; lands in Phase 1)
+    fresh-gui-app/            # CLI + xterm.js UI assets (`ui/`)
+    fresh-gui-desktop/        # Tauri 2 host (Windows MVP)
   scripts/
     update-version.sh
 ```

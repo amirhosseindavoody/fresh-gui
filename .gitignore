@@ -15,3 +15,7 @@
 
 # Built conda packages
 dist/
+
+# Tauri
+crates/fresh-gui-desktop/gen/
+crates/fresh-gui-desktop/target/

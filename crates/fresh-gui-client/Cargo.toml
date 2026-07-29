@@ -6,11 +6,19 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "Host-side connection client for fresh-gui"
+description = "Host-side WebSocket client for fresh-gui ADE protocol"
 readme = "README.md"
 
 [dependencies]
 anyhow = { workspace = true }
+base64 = { workspace = true }
 fresh-gui-protocol = { workspace = true }
+futures-util = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

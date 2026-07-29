@@ -168,12 +168,13 @@ main() {
     -p fresh-gui-backend \
     -p fresh-gui-client \
     -p fresh-gui-app \
+    -p fresh-gui-desktop \
     --quiet 2>/dev/null; then
     # Fallback when cargo is too old / unavailable: rewrite workspace crate versions.
     local lock="$ROOT/Cargo.lock"
     if [[ -f "$lock" ]]; then
       awk -v ver="$new_version" '
-        /^name = "(fresh-gui-protocol|fresh-gui-backend|fresh-gui-client|fresh-gui-app)"$/ {
+        /^name = "(fresh-gui-protocol|fresh-gui-backend|fresh-gui-client|fresh-gui-app|fresh-gui-desktop)"$/ {
           print
           in_pkg = 1
           next

@@ -1,37 +1,63 @@
-//! fresh-gui-backend — remote daemon stub (Phase 0).
+//! fresh-gui-backend — remote ADE daemon (Phase 1: authenticated PTY over WebSocket).
 
-use anyhow::Result;
+mod pty;
+mod server;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use anyhow::{bail, Context, Result};
 use clap::Parser;
-use fresh_gui_protocol::{Hello, PROTOCOL_VERSION};
 use tracing::info;
+
+use crate::server::AppState;
 
 #[derive(Debug, Parser)]
 #[command(name = "fresh-gui-backend", version, about = "Remote daemon for fresh-gui")]
 struct Args {
-    /// Listen address (loopback-only recommended until auth lands).
-    #[arg(long, default_value = "127.0.0.1:7420")]
-    listen: String,
+    /// Listen address. Non-loopback binds require `--token`.
+    #[arg(long, default_value = "127.0.0.1:7420", env = "FRESH_GUI_LISTEN")]
+    listen: SocketAddr,
+
+    /// Shared auth token (also `FRESH_GUI_TOKEN`). Required for non-loopback binds.
+    /// On loopback, if set, clients must present the same token.
+    #[arg(long, env = "FRESH_GUI_TOKEN")]
+    token: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     let args = Args::parse();
-    let hello = Hello::backend(
-        format!("fresh-gui-backend/{}", env!("CARGO_PKG_VERSION")),
-        vec!["ping".into(), "pty".into()],
-    );
+    let loopback = args.listen.ip().is_loopback();
+    let token = args.token.filter(|t| !t.is_empty());
+
+    if !loopback && token.is_none() {
+        bail!(
+            "non-loopback listen ({}) requires --token / FRESH_GUI_TOKEN",
+            args.listen
+        );
+    }
+
+    let require_auth = !loopback || token.is_some();
+    let state = Arc::new(AppState {
+        token,
+        require_auth,
+    });
 
     info!(
         listen = %args.listen,
-        protocol = PROTOCOL_VERSION,
-        implementation = %hello.implementation,
-        "fresh-gui-backend stub; PTY transport not implemented yet (see docs/DESIGN.md)"
+        auth_required = state.require_auth,
+        "starting fresh-gui-backend"
     );
 
-    // Keep the process useful as a smoke-test binary without blocking forever in CI.
-    Ok(())
+    server::serve(args.listen, state)
+        .await
+        .context("server exited with error")
 }
