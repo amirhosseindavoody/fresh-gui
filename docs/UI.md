@@ -36,7 +36,8 @@ Inspired by Terax’s public UI / [TERAX.md](https://github.com/crynta/terax-ai/
 | Web preview / markdown tabs | **Later** | Optional tab kinds after editor tabs land |
 | Spaces / multi-project switcher | **Later** | Map to ADE sessions when useful |
 | Custom window controls | **Windows only** | Follow Tauri; don’t invent chrome early |
-| shadcn + Tailwind + React 19 | **No** | Stay Vite + TS; large trees → virtualization, not React |
+| Tailwind CSS utilities (no React) | **Yes** | Spacing/typography helpers; still Vite + TS modules |
+| shadcn + React 19 | **No** | Stay Vite + TS; large trees → virtualization, not React |
 
 ## 3. Information architecture
 
@@ -133,28 +134,14 @@ type PaneNode =
 - **Surfaces:** subtle elevation via border + slight fill shifts, not card grids. Resizable gutters like Terax (`react-resizable-panels` or CSS equivalent).
 - **Icons:** Lightweight SVG folder/file icons with extension color tones in the explorer; indent guides + chevrons (VS Code–like). Full Material icon packs remain optional later.
 
-### 5.2 Tokens (illustrative)
+### 5.2 Tokens
 
-Define CSS variables once; drive xterm theme + CodeMirror theme from the same source (Terax `theme` module pattern).
+Primer-inspired dark/light surfaces live in `src/tokens.css`. The same variables drive chrome, xterm (`xtermThemeFromCss`), and CodeMirror (CSS `var(--syn-*)` / `--editor-*`). Tailwind `@theme` in `styles.css` exposes them as utilities (`bg-bg`, `text-muted`, …) without React/shadcn.
 
 ```css
-:root {
-  --bg: …;
-  --bg-elevated: …;
-  --panel: …;
-  --border: …;
-  --text: …;
-  --muted: …;
-  --accent: …;
-  --danger: …;
-  --warning: …;
-  --focus-ring: …;
-  --radius-sm: 4px;
-  --radius-md: 8px;
-  --font-ui: …;
-  --font-mono: …;
-  --tab-height: 36px;
-  --statusbar-height: 28px;
+:root[data-theme="dark"] {
+  --bg: …; --panel: …; --text: …; --accent: …;
+  --term-bg: …; --editor-bg: …; --syn-keyword: …;
 }
 ```
 
@@ -222,9 +209,9 @@ Connection errors and auth failures use inline strip status; never modal loops.
 
 | Option | Status |
 |--------|--------|
-| **A. Vite + TypeScript modules** (current) | **Chosen.** UI-1 through UI-3 default. Large-tree perf = virtualization + watch discipline in the explorer, not a framework switch. |
+| **A. Vite + TypeScript modules** (current) | **Chosen.** UI-1 through UI-3 default. Large-tree perf = virtualization + watch discipline in the explorer, not a framework switch. Tailwind utilities OK for chrome polish. |
 | **B. Preact/React later** | Deferred escape hatch only if recursive pane trees become unmaintainable by hand — **not** for 10k-file trees. |
-| **C. Full Terax clone (React 19 + Tailwind + shadcn)** | Rejected: high cost, product/AI divergence. |
+| **C. Full Terax clone (React 19 + Tailwind + shadcn)** | Rejected: high cost, product/AI divergence. Tailwind-without-React is allowed; shadcn/React is not. |
 
 ## 9. Implementation phases
 
@@ -259,7 +246,7 @@ Connection errors and auth failures use inline strip status; never modal loops.
 - Activity bar with Explorer (toggles sidebar) + Settings entry; explorer remains the only sidebar view until SCM exists.
 - Lightweight SVG file/folder icons + indent guides in the virtualized tree (`src/icons.ts`, `src/tree.ts`) — no heavy icon pack.
 - Skipped `fs_list` pagination for now — row virtualization covers large trees; revisit only if a single directory listing becomes a protocol bottleneck.
-- Theme preference (`system` / `light` / `dark`) + CSS tokens (`data-theme` resolved). Settings live in backend `config.json` (`ui` + `terminal.shell`); the activity-bar / `Mod+,` entry opens that file in the editor (no modal).
+- Theme preference (`system` / `light` / `dark`) + Primer-inspired CSS tokens (`data-theme` resolved); xterm + CodeMirror read the same vars. Tailwind v4 utilities for chrome polish (no React). IBM Plex via `@fontsource`. Settings live in backend `config.json`.
 - Path context menus on tabs and the file tree (copy absolute / relative / name).
 - Terminal mouse selection + `Mod+C` / `Mod+V` clipboard (Fresh policy: copy when selected, else interrupt).
 

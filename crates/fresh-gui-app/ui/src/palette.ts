@@ -34,7 +34,7 @@ function ensureDom(): void {
       <div class="palette-title"></div>
       <input class="palette-input" type="text" spellcheck="false" />
       <div class="palette-list" role="listbox"></div>
-      <div class="palette-hint">Esc to close</div>
+      <div class="palette-hint text-xs text-muted">Esc to close</div>
     </div>
   `;
   document.body.appendChild(root);

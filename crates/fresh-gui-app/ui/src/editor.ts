@@ -8,7 +8,6 @@ import {
   syntaxHighlighting,
 } from "@codemirror/language";
 import { tags as t } from "@lezer/highlight";
-import { oneDark } from "@codemirror/theme-one-dark";
 import { search, openSearchPanel, searchKeymap } from "@codemirror/search";
 import { rust } from "@codemirror/lang-rust";
 import { javascript } from "@codemirror/lang-javascript";
@@ -27,55 +26,100 @@ const fontSizeCompartment = new Compartment();
 const themeCompartment = new Compartment();
 const highlightCompartment = new Compartment();
 
-/** Light-mode syntax colors tuned for contrast on the app light surface. */
-const lightHighlightStyle = HighlightStyle.define([
-  { tag: t.keyword, color: "#cf222e" },
-  { tag: t.controlKeyword, color: "#cf222e" },
-  { tag: t.operatorKeyword, color: "#cf222e" },
-  { tag: t.definitionKeyword, color: "#cf222e" },
-  { tag: t.moduleKeyword, color: "#cf222e" },
-  { tag: t.comment, color: "#6e7781", fontStyle: "italic" },
-  { tag: t.docComment, color: "#6e7781", fontStyle: "italic" },
-  { tag: t.string, color: "#0a3069" },
-  { tag: t.character, color: "#0a3069" },
-  { tag: t.special(t.string), color: "#0a3069" },
-  { tag: t.number, color: "#0550ae" },
-  { tag: t.bool, color: "#0550ae" },
-  { tag: t.null, color: "#0550ae" },
-  { tag: t.regexp, color: "#0a3069" },
-  { tag: t.escape, color: "#0a3069" },
-  { tag: t.variableName, color: "#1f2328" },
-  { tag: t.definition(t.variableName), color: "#953800" },
-  { tag: t.function(t.variableName), color: "#0550ae" },
-  { tag: t.function(t.propertyName), color: "#0550ae" },
-  { tag: t.propertyName, color: "#0550ae" },
-  { tag: t.typeName, color: "#116329" },
-  { tag: t.className, color: "#116329" },
-  { tag: t.namespace, color: "#116329" },
-  { tag: t.macroName, color: "#953800" },
-  { tag: t.labelName, color: "#0550ae" },
-  { tag: t.attributeName, color: "#0550ae" },
-  { tag: t.attributeValue, color: "#0a3069" },
-  { tag: t.heading, color: "#0550ae", fontWeight: "bold" },
-  { tag: t.heading1, color: "#0550ae", fontWeight: "bold" },
-  { tag: t.heading2, color: "#0550ae", fontWeight: "bold" },
-  { tag: t.heading3, color: "#0550ae", fontWeight: "bold" },
-  { tag: t.url, color: "#0969da", textDecoration: "underline" },
-  { tag: t.link, color: "#0969da" },
-  { tag: t.emphasis, fontStyle: "italic" },
-  { tag: t.strong, fontWeight: "bold" },
-  { tag: t.strikethrough, textDecoration: "line-through" },
-  { tag: t.meta, color: "#656d76" },
-  { tag: t.invalid, color: "#cf222e" },
-  { tag: t.tagName, color: "#116329" },
-  { tag: t.angleBracket, color: "#1f2328" },
-  { tag: t.operator, color: "#1f2328" },
-  { tag: t.punctuation, color: "#656d76" },
-  { tag: t.bracket, color: "#1f2328" },
-  { tag: t.monospace, color: "#1f2328" },
-  { tag: t.contentSeparator, color: "#656d76" },
-  { tag: t.processingInstruction, color: "#656d76" },
-]);
+/**
+ * Editor chrome + syntax highlight from CSS tokens (`tokens.css`).
+ * Colors use `var(--*)` so `data-theme` swaps update without rebundling themes.
+ */
+function tokenEditorTheme(fontSize: number): Extension {
+  return EditorView.theme({
+    "&": {
+      height: "100%",
+      fontSize: `${fontSize}px`,
+      backgroundColor: "var(--editor-bg)",
+      color: "var(--editor-fg)",
+    },
+    ".cm-scroller": {
+      overflow: "auto",
+      fontFamily: "var(--font-mono)",
+      backgroundColor: "var(--editor-bg)",
+    },
+    ".cm-content": { caretColor: "var(--editor-cursor)" },
+    "&.cm-focused .cm-cursor": { borderLeftColor: "var(--editor-cursor)" },
+    ".cm-gutters": {
+      backgroundColor: "var(--editor-gutter-bg)",
+      color: "var(--editor-gutter-fg)",
+      borderRight: "1px solid var(--border)",
+    },
+    ".cm-activeLine": { backgroundColor: "var(--editor-active-line)" },
+    ".cm-activeLineGutter": { backgroundColor: "var(--editor-active-line)" },
+    ".cm-selectionBackground, &.cm-focused .cm-selectionBackground": {
+      backgroundColor: "var(--editor-selection) !important",
+    },
+    ".cm-selectionMatch": { backgroundColor: "var(--editor-matching-bracket)" },
+    "&.cm-focused .cm-matchingBracket": {
+      backgroundColor: "var(--editor-matching-bracket)",
+      outline: "1px solid var(--border-strong)",
+    },
+    ".cm-path-link": {
+      textDecoration: "underline",
+      textUnderlineOffset: "2px",
+      cursor: "pointer",
+    },
+  });
+}
+
+function tokenHighlightStyle(): Extension {
+  return syntaxHighlighting(
+    HighlightStyle.define([
+      { tag: t.keyword, color: "var(--syn-keyword)" },
+      { tag: t.controlKeyword, color: "var(--syn-control)" },
+      { tag: t.operatorKeyword, color: "var(--syn-operator)" },
+      { tag: t.definitionKeyword, color: "var(--syn-keyword)" },
+      { tag: t.moduleKeyword, color: "var(--syn-keyword)" },
+      { tag: t.comment, color: "var(--syn-comment)", fontStyle: "italic" },
+      { tag: t.docComment, color: "var(--syn-comment)", fontStyle: "italic" },
+      { tag: t.string, color: "var(--syn-string)" },
+      { tag: t.character, color: "var(--syn-string)" },
+      { tag: t.special(t.string), color: "var(--syn-string)" },
+      { tag: t.number, color: "var(--syn-number)" },
+      { tag: t.bool, color: "var(--syn-bool)" },
+      { tag: t.null, color: "var(--syn-bool)" },
+      { tag: t.regexp, color: "var(--syn-string)" },
+      { tag: t.escape, color: "var(--syn-string)" },
+      { tag: t.variableName, color: "var(--syn-variable)" },
+      { tag: t.definition(t.variableName), color: "var(--syn-type)" },
+      { tag: t.function(t.variableName), color: "var(--syn-function)" },
+      { tag: t.function(t.propertyName), color: "var(--syn-function)" },
+      { tag: t.propertyName, color: "var(--syn-property)" },
+      { tag: t.typeName, color: "var(--syn-type)" },
+      { tag: t.className, color: "var(--syn-type)" },
+      { tag: t.namespace, color: "var(--syn-type)" },
+      { tag: t.macroName, color: "var(--syn-type)" },
+      { tag: t.labelName, color: "var(--syn-property)" },
+      { tag: t.attributeName, color: "var(--syn-attribute)" },
+      { tag: t.attributeValue, color: "var(--syn-string)" },
+      { tag: t.heading, color: "var(--syn-heading)", fontWeight: "bold" },
+      { tag: t.heading1, color: "var(--syn-heading)", fontWeight: "bold" },
+      { tag: t.heading2, color: "var(--syn-heading)", fontWeight: "bold" },
+      { tag: t.heading3, color: "var(--syn-heading)", fontWeight: "bold" },
+      { tag: t.url, color: "var(--syn-link)", textDecoration: "underline" },
+      { tag: t.link, color: "var(--syn-link)" },
+      { tag: t.emphasis, fontStyle: "italic" },
+      { tag: t.strong, fontWeight: "bold" },
+      { tag: t.strikethrough, textDecoration: "line-through" },
+      { tag: t.meta, color: "var(--syn-meta)" },
+      { tag: t.invalid, color: "var(--syn-invalid)" },
+      { tag: t.tagName, color: "var(--syn-tag)" },
+      { tag: t.angleBracket, color: "var(--syn-punctuation)" },
+      { tag: t.operator, color: "var(--syn-operator)" },
+      { tag: t.punctuation, color: "var(--syn-meta)" },
+      { tag: t.bracket, color: "var(--syn-punctuation)" },
+      { tag: t.monospace, color: "var(--syn-variable)" },
+      { tag: t.contentSeparator, color: "var(--syn-meta)" },
+      { tag: t.processingInstruction, color: "var(--syn-meta)" },
+    ]),
+  );
+}
 
 function langForPath(path: string): Extension | null {
   const lower = path.toLowerCase();
@@ -127,15 +171,6 @@ function langForPath(path: string): Extension | null {
   return null;
 }
 
-function editorThemeExtension(theme: ResolvedTheme): Extension {
-  return theme === "dark" ? oneDark : [];
-}
-
-function editorHighlightExtension(theme: ResolvedTheme): Extension {
-  // oneDark ships its own highlight style; light gets an explicit high-contrast set.
-  return theme === "light" ? syntaxHighlighting(lightHighlightStyle) : [];
-}
-
 export type EditorPathLinkHandler = (info: {
   path: string;
   line?: number;
@@ -180,13 +215,6 @@ export function revealEditorLocation(
   view.focus();
 }
 
-function editorChromeTheme(fontSize: number): Extension {
-  return EditorView.theme({
-    "&": { height: "100%", fontSize: `${fontSize}px` },
-    ".cm-scroller": { overflow: "auto", fontFamily: "var(--font-mono)" },
-  });
-}
-
 export function createEditorView(
   parent: HTMLElement,
   text: string,
@@ -199,7 +227,6 @@ export function createEditorView(
   } = {},
 ): EditorView {
   const fontSize = opts.fontSize ?? 14;
-  const theme = opts.theme ?? "dark";
   const lang = langForPath(path);
   const extensions: Extension[] = [
     lineNumbers(),
@@ -208,15 +235,16 @@ export function createEditorView(
     search(),
     keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap, indentWithTab]),
     syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-    fontSizeCompartment.of(editorChromeTheme(fontSize)),
-    themeCompartment.of(editorThemeExtension(theme)),
-    highlightCompartment.of(editorHighlightExtension(theme)),
+    fontSizeCompartment.of(tokenEditorTheme(fontSize)),
+    themeCompartment.of([]),
+    highlightCompartment.of(tokenHighlightStyle()),
     EditorView.updateListener.of((update) => {
       if (update.docChanged) onDocChange();
     }),
     pathLinkClickHandler(opts.onPathLink),
   ];
   if (lang) extensions.push(lang);
+  void opts.theme;
 
   return new EditorView({
     parent,
@@ -233,15 +261,16 @@ export function openEditorSearch(view: EditorView): void {
 
 export function applyEditorFontSize(view: EditorView, fontSize: number): void {
   view.dispatch({
-    effects: fontSizeCompartment.reconfigure(editorChromeTheme(fontSize)),
+    effects: fontSizeCompartment.reconfigure(tokenEditorTheme(fontSize)),
   });
 }
 
-export function applyEditorTheme(view: EditorView, theme: ResolvedTheme): void {
+/** Theme colors follow `data-theme` via CSS vars; keep API for restyle hooks. */
+export function applyEditorTheme(view: EditorView, _theme: ResolvedTheme): void {
   view.dispatch({
     effects: [
-      themeCompartment.reconfigure(editorThemeExtension(theme)),
-      highlightCompartment.reconfigure(editorHighlightExtension(theme)),
+      themeCompartment.reconfigure([]),
+      highlightCompartment.reconfigure(tokenHighlightStyle()),
     ],
   });
 }
