@@ -2,7 +2,7 @@
 
 Product UI for the **local host** ADE shell. Architecture and protocol live in [DESIGN.md](./DESIGN.md). This document defines **what the UI should become**, borrowing layout and interaction patterns from [Terax](https://github.com/crynta/terax-ai) while staying honest about our remote-backend split.
 
-**Status:** UI-1 chrome shipped in `crates/fresh-gui-app/ui` (connection strip, status bar, unified terminal/editor tabs, CodeMirror 6, xterm WebGL). UI-2+ still ahead. Architecture/protocol: [DESIGN.md](./DESIGN.md).
+**Status:** UI-1 and UI-2 shipped in `crates/fresh-gui-app/ui` (connection strip, status bar, unified terminal/editor tabs, CodeMirror 6, xterm WebGL, per-tab recursive pane trees, shortcut registry + command palette, virtualized file tree). UI-3 still ahead. Architecture/protocol: [DESIGN.md](./DESIGN.md).
 
 ## 1. Goals
 
@@ -116,7 +116,7 @@ type PaneNode =
 | Today | Target |
 |-------|--------|
 | Flat `tabs[]` of PTYs only | **UI-1:** unified `terminal` \| `editor` tabs |
-| Global H/V “two shells” split | UI-2: per-tab recursive splits (UI-1 keeps global H/V) |
+| Global H/V “two shells” split | **UI-2 ✅:** per-tab recursive `PaneNode` splits (max 4 leaves) |
 | Editor docked under terminals | **UI-1:** `editor` tabs in the same bar |
 | Connect fields always large | **UI-1:** compact strip when connected |
 
@@ -228,13 +228,14 @@ Connection errors and auth failures use inline strip status + optional toast; ne
 - Tab pill animation; sidebar collapse + persisted width.
 - Dirty / preview tab affordances.
 
-### Phase UI-2 — Pane tree + keyboard
+### Phase UI-2 — Pane tree + keyboard ✅
 
-- Recursive splits (max 4); replace global two-pane mode.
-- Shortcut registry; command palette stub.
-- Tree keyboard navigation (still text-only glyphs).
-- Explorer: **virtualized rows** when expanded views can hit thousands of entries (target: responsive with ~10k files / deep nests via lazy list + windowing, not full-tree fetch).
-- Richer layout blob in `layout_set`.
+- Recursive splits (max 4 leaves/tab, `src/panes.ts`); replaced the old global two-pane mode — each terminal tab now owns its own `PaneNode` tree and a `leaves: Map<ptyId, TermBundle>`.
+- Shortcut registry (`src/shortcuts.ts`) wired via `installShortcuts`; command palette (`src/palette.ts`, `Mod+P`) lists all shortcuts and runs them by id.
+- Tree keyboard navigation (arrow keys, Enter) via the virtualized tree (still text-only glyphs).
+- Explorer: **virtualized rows** (`src/tree.ts` `VirtualTree`) — lazy one-level `fs_list` + windowed row rendering, so expanded views stay responsive with large trees.
+- Richer layout blob (`version: 2`) in `layout_set` / localStorage, including each terminal tab's `paneTree` and `activeLeafId`.
+- Simplifications: pane-tree restore across `session_attach` only recreates the exact multi-pane layout when the reattached ptys match a persisted tab's leaf ids 1:1; otherwise it falls back to one terminal tab per pty. Editor tabs are not restored across reattach (server-side buffers aren't rehydrated by path yet).
 
 ### Phase UI-3 — Depth (protocol-gated)
 

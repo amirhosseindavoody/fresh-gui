@@ -1,0 +1,317 @@
+/** Lazy, virtualized file tree with keyboard navigation (UI-2). */
+
+import type { FsEntry } from "./protocol";
+import { escapeHtml } from "./dom";
+
+export type TreeListFn = (path: string) => Promise<{ path: string; entries: FsEntry[] }>;
+
+export type TreeCallbacks = {
+  onSelect?: (entry: FsEntry | null) => void;
+  onOpenFile?: (entry: FsEntry, preview: boolean) => void;
+  onStatus?: (text: string) => void;
+  noteInteraction?: () => void;
+};
+
+type Row = {
+  path: string;
+  name: string;
+  kind: FsEntry["kind"];
+  depth: number;
+  expanded: boolean;
+  hasChildren: boolean;
+};
+
+const ROW_HEIGHT = 24;
+
+export class VirtualTree {
+  private host: HTMLElement;
+  private viewport: HTMLElement;
+  private spacer: HTMLElement;
+  private listFn: TreeListFn;
+  private callbacks: TreeCallbacks;
+  private childrenCache = new Map<string, FsEntry[]>();
+  private rootPath = "";
+  private expanded = new Set<string>();
+  private selected: string | null = null;
+  private rows: Row[] = [];
+  private scrollTop = 0;
+  private raf = 0;
+
+  constructor(host: HTMLElement, listFn: TreeListFn, callbacks: TreeCallbacks = {}) {
+    this.host = host;
+    this.listFn = listFn;
+    this.callbacks = callbacks;
+    host.classList.add("vtree");
+    host.tabIndex = 0;
+    host.replaceChildren();
+
+    this.viewport = document.createElement("div");
+    this.viewport.className = "vtree-viewport";
+    this.spacer = document.createElement("div");
+    this.spacer.className = "vtree-spacer";
+    this.viewport.appendChild(this.spacer);
+    host.appendChild(this.viewport);
+
+    this.viewport.addEventListener("scroll", () => {
+      this.scrollTop = this.viewport.scrollTop;
+      this.schedulePaint();
+    });
+    host.addEventListener("keydown", (ev) => this.onKey(ev));
+  }
+
+  getExpandedPaths(): Set<string> {
+    return new Set(this.expanded);
+  }
+
+  getSelectedPath(): string | null {
+    return this.selected;
+  }
+
+  async loadRoot(opts: { silent?: boolean; keepExpanded?: Set<string> } = {}): Promise<void> {
+    if (!opts.silent) {
+      this.host.classList.add("loading");
+    }
+    try {
+      const listed = await this.listFn("");
+      this.rootPath = listed.path;
+      this.childrenCache.set("", listed.entries);
+      if (opts.keepExpanded) {
+        this.expanded = new Set(
+          [...opts.keepExpanded].filter((p) => p !== "" && p !== this.rootPath),
+        );
+      }
+      await this.ensureExpandedLoaded();
+      this.rebuildRows();
+      this.schedulePaint();
+      if (!opts.silent) {
+        this.callbacks.onStatus?.(`tree ${this.rootPath}`);
+      }
+    } finally {
+      this.host.classList.remove("loading");
+    }
+  }
+
+  clear(): void {
+    this.childrenCache.clear();
+    this.expanded.clear();
+    this.selected = null;
+    this.rows = [];
+    this.spacer.style.height = "0px";
+    this.viewport.querySelectorAll(".vtree-row").forEach((el) => el.remove());
+  }
+
+  private async ensureExpandedLoaded(): Promise<void> {
+    const pending = [...this.expanded];
+    for (const path of pending) {
+      if (!this.childrenCache.has(path)) {
+        try {
+          const listed = await this.listFn(path);
+          this.childrenCache.set(path, listed.entries);
+        } catch {
+          this.expanded.delete(path);
+        }
+      }
+    }
+  }
+
+  private rebuildRows(): void {
+    const rows: Row[] = [];
+    rows.push({
+      path: this.rootPath || "",
+      name: this.rootPath || "/",
+      kind: "dir",
+      depth: 0,
+      expanded: true,
+      hasChildren: true,
+    });
+    const walk = (parentKey: string, depth: number) => {
+      const entries = this.childrenCache.get(parentKey) || [];
+      for (const entry of entries) {
+        const isDir = entry.kind === "dir";
+        const expanded = isDir && this.expanded.has(entry.path);
+        rows.push({
+          path: entry.path,
+          name: entry.name,
+          kind: entry.kind,
+          depth,
+          expanded,
+          hasChildren: isDir,
+        });
+        if (expanded) walk(entry.path, depth + 1);
+      }
+    };
+    walk("", 1);
+    this.rows = rows;
+    this.spacer.style.height = `${rows.length * ROW_HEIGHT}px`;
+  }
+
+  private schedulePaint(): void {
+    if (this.raf) cancelAnimationFrame(this.raf);
+    this.raf = requestAnimationFrame(() => {
+      this.raf = 0;
+      this.paint();
+    });
+  }
+
+  private paint(): void {
+    const height = this.viewport.clientHeight || 300;
+    const start = Math.max(0, Math.floor(this.scrollTop / ROW_HEIGHT) - 5);
+    const end = Math.min(this.rows.length, Math.ceil((this.scrollTop + height) / ROW_HEIGHT) + 5);
+
+    const existing = new Map<string, HTMLElement>();
+    this.viewport.querySelectorAll<HTMLElement>(".vtree-row").forEach((el) => {
+      const path = el.dataset.path || "";
+      existing.set(path, el);
+    });
+
+    const keep = new Set<string>();
+    for (let i = start; i < end; i++) {
+      const row = this.rows[i];
+      keep.add(row.path);
+      let el = existing.get(row.path);
+      if (!el) {
+        el = document.createElement("div");
+        el.className = "vtree-row";
+        el.dataset.path = row.path;
+        el.addEventListener("click", (ev) => {
+          ev.preventDefault();
+          void this.activateRow(row, false);
+        });
+        el.addEventListener("dblclick", (ev) => {
+          ev.preventDefault();
+          if (row.kind === "file") {
+            this.callbacks.noteInteraction?.();
+            this.callbacks.onOpenFile?.(
+              { name: row.name, path: row.path, kind: row.kind },
+              false,
+            );
+          }
+        });
+        this.viewport.appendChild(el);
+      }
+      el.style.top = `${i * ROW_HEIGHT}px`;
+      el.style.paddingLeft = `${0.4 + row.depth * 0.85}rem`;
+      el.classList.toggle("selected", this.selected === row.path);
+      const twist = row.kind === "dir" ? (row.expanded ? "▾" : "▸") : "";
+      const kind = row.kind === "dir" ? "▸" : row.kind === "symlink" ? "↗" : "·";
+      el.innerHTML = `<span class="twist">${twist}</span><span class="kind">${kind}</span><span class="name">${escapeHtml(row.name)}</span>`;
+    }
+
+    for (const [path, el] of existing) {
+      if (!keep.has(path)) el.remove();
+    }
+  }
+
+  private entryForRow(row: Row): FsEntry {
+    return { name: row.name, path: row.path, kind: row.kind };
+  }
+
+  private async activateRow(row: Row, fromKeyboard: boolean): Promise<void> {
+    this.callbacks.noteInteraction?.();
+    this.selected = row.path;
+    this.callbacks.onSelect?.(this.entryForRow(row));
+    this.callbacks.onStatus?.(`${row.kind}: ${row.path}`);
+
+    if (row.path === this.rootPath || row.path === "") {
+      this.schedulePaint();
+      return;
+    }
+
+    if (row.kind === "file") {
+      this.callbacks.onOpenFile?.(this.entryForRow(row), true);
+      this.schedulePaint();
+      return;
+    }
+
+    if (row.kind === "dir") {
+      if (this.expanded.has(row.path)) {
+        if (!fromKeyboard) {
+          this.expanded.delete(row.path);
+        } else {
+          // keyboard Enter/ArrowRight expands; ArrowLeft collapses elsewhere
+          this.expanded.delete(row.path);
+        }
+      } else {
+        if (!this.childrenCache.has(row.path)) {
+          try {
+            const listed = await this.listFn(row.path);
+            this.childrenCache.set(row.path, listed.entries);
+          } catch (err) {
+            this.callbacks.onStatus?.(
+              `fs error: ${err instanceof Error ? err.message : String(err)}`,
+            );
+            this.schedulePaint();
+            return;
+          }
+        }
+        this.expanded.add(row.path);
+      }
+      this.rebuildRows();
+      this.schedulePaint();
+    }
+  }
+
+  private selectedIndex(): number {
+    if (!this.selected) return 0;
+    const idx = this.rows.findIndex((r) => r.path === this.selected);
+    return idx < 0 ? 0 : idx;
+  }
+
+  private focusIndex(idx: number): void {
+    if (this.rows.length === 0) return;
+    const i = Math.max(0, Math.min(this.rows.length - 1, idx));
+    const row = this.rows[i];
+    this.selected = row.path;
+    this.callbacks.onSelect?.(this.entryForRow(row));
+    const top = i * ROW_HEIGHT;
+    if (top < this.viewport.scrollTop) this.viewport.scrollTop = top;
+    if (top + ROW_HEIGHT > this.viewport.scrollTop + this.viewport.clientHeight) {
+      this.viewport.scrollTop = top + ROW_HEIGHT - this.viewport.clientHeight;
+    }
+    this.schedulePaint();
+  }
+
+  private onKey(ev: KeyboardEvent): void {
+    if (ev.key === "ArrowDown") {
+      ev.preventDefault();
+      this.focusIndex(this.selectedIndex() + 1);
+    } else if (ev.key === "ArrowUp") {
+      ev.preventDefault();
+      this.focusIndex(this.selectedIndex() - 1);
+    } else if (ev.key === "ArrowRight") {
+      ev.preventDefault();
+      const row = this.rows[this.selectedIndex()];
+      if (row?.kind === "dir" && !this.expanded.has(row.path)) {
+        void this.activateRow(row, true);
+      } else if (row?.kind === "dir" && this.expanded.has(row.path)) {
+        this.focusIndex(this.selectedIndex() + 1);
+      }
+    } else if (ev.key === "ArrowLeft") {
+      ev.preventDefault();
+      const row = this.rows[this.selectedIndex()];
+      if (row?.kind === "dir" && this.expanded.has(row.path)) {
+        this.expanded.delete(row.path);
+        this.rebuildRows();
+        this.schedulePaint();
+      } else if (row && row.depth > 0) {
+        // jump to parent
+        for (let i = this.selectedIndex() - 1; i >= 0; i--) {
+          if (this.rows[i].depth < row.depth) {
+            this.focusIndex(i);
+            break;
+          }
+        }
+      }
+    } else if (ev.key === "Enter") {
+      ev.preventDefault();
+      const row = this.rows[this.selectedIndex()];
+      if (!row) return;
+      if (row.kind === "file") {
+        this.callbacks.noteInteraction?.();
+        this.callbacks.onOpenFile?.(this.entryForRow(row), false);
+      } else {
+        void this.activateRow(row, true);
+      }
+    }
+  }
+}

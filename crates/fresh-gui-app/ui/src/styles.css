@@ -481,6 +481,217 @@ input#session {
   color: color-mix(in srgb, var(--muted) 80%, var(--accent));
 }
 
+/* Virtual tree */
+.vtree {
+  flex: 1;
+  min-height: 0;
+  outline: none;
+  position: relative;
+}
+
+.vtree:focus-visible {
+  box-shadow: inset 0 0 0 1px var(--focus-ring);
+}
+
+.vtree-viewport {
+  position: absolute;
+  inset: 0;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.vtree-spacer {
+  position: relative;
+  width: 100%;
+  pointer-events: none;
+}
+
+.vtree-row {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding-right: 0.5rem;
+  cursor: pointer;
+  white-space: nowrap;
+  box-sizing: border-box;
+}
+
+.vtree-row:hover {
+  background: color-mix(in srgb, var(--panel-2) 80%, transparent);
+}
+
+.vtree-row.selected {
+  background: var(--accent-dim);
+}
+
+.vtree-row .twist,
+.vtree-row .kind {
+  width: 0.9rem;
+  color: var(--muted);
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.vtree.loading::after {
+  content: "Loading…";
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--bg-elevated) 70%, transparent);
+  pointer-events: none;
+}
+
+.vtree.empty::after {
+  content: attr(data-empty-text);
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  text-align: center;
+  color: var(--muted);
+  font-family: var(--font-ui);
+  font-size: 0.85rem;
+  pointer-events: none;
+}
+
+/* Nested pane tree */
+.pane-tree {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  height: 100%;
+  width: 100%;
+}
+
+.pane-tree.split-row {
+  flex-direction: row;
+}
+
+.pane-tree.split-col {
+  flex-direction: column;
+}
+
+.pane-tree > .pane-branch {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+
+.pane-leaf {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: #010409;
+  position: relative;
+  margin: 0.2rem;
+}
+
+.pane-leaf.active {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  box-shadow: 0 0 0 1px var(--focus-ring);
+}
+
+.pane-leaf .pane-label {
+  position: absolute;
+  top: 0.35rem;
+  right: 0.5rem;
+  z-index: 2;
+  font-size: 10px;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+/* Command palette */
+.palette {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: start center;
+  padding-top: 12vh;
+}
+
+.palette[hidden] {
+  display: none !important;
+}
+
+.palette-backdrop {
+  position: absolute;
+  inset: 0;
+  background: color-mix(in srgb, #000 55%, transparent);
+}
+
+.palette-panel {
+  position: relative;
+  width: min(520px, 92vw);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel);
+  box-shadow: 0 16px 48px color-mix(in srgb, #000 45%, transparent);
+  overflow: hidden;
+}
+
+.palette-input {
+  width: 100%;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  padding: 0.85rem 1rem;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.95rem;
+}
+
+.palette-list {
+  max-height: 320px;
+  overflow: auto;
+  padding: 0.35rem;
+}
+
+.palette-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  padding: 0.55rem 0.7rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.85rem;
+}
+
+.palette-item:hover,
+.palette-item.active {
+  background: var(--accent-dim);
+}
+
+.palette-empty,
+.palette-hint {
+  padding: 0.65rem 0.85rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.palette-hint {
+  border-top: 1px solid var(--border);
+}
+
 @media (max-width: 900px) {
   .workspace {
     grid-template-columns: 1fr;

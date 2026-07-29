@@ -1,23 +1,30 @@
-/** Phase UI-1 host shell: unified tabs, connection strip, status bar, CM6 + xterm WebGL. */
+/** Phase UI-2 host shell: per-tab pane trees, shortcut registry, command palette, virtualized tree. */
 import type { EditorView } from "@codemirror/view";
 import "./styles.css";
 import {
   PROTOCOL_VERSION,
   type ClientMessage,
   type FsEntry,
+  type PtyInfo,
   type ServerMessage,
 } from "./protocol";
-import {
-  $,
-  $button,
-  $input,
-  b64decode,
-  b64encode,
-  basename,
-  escapeHtml,
-} from "./dom";
+import { $, $button, $input, b64decode, b64encode, basename } from "./dom";
 import { createEditorView } from "./editor";
 import { createTerminal, disposeTerminal, type TermBundle } from "./terminal";
+import {
+  MAX_LEAVES_PER_TAB,
+  type PaneNode,
+  type SplitDir,
+  collectLeafIds,
+  directionFromSplitMode,
+  leafCount,
+  nextLeafId,
+  removeLeaf,
+  splitLeaf,
+} from "./panes";
+import { installShortcuts, type ShortcutHandlers, type ShortcutId } from "./shortcuts";
+import { defaultPaletteCommands, openPalette, setPaletteCommands } from "./palette";
+import { VirtualTree } from "./tree";
 
 const SESSION_KEY = "fresh-gui.sessionId";
 const LAYOUT_KEY = "fresh-gui.layout";
@@ -41,9 +48,12 @@ interface PendingEditor extends Pending<OpenedInfo & { rev: number; text: string
 
 interface TerminalTab {
   kind: "terminal";
+  /** Tab id, distinct from any pty id (a tab may host several ptys as leaves). */
   id: string;
   title: string;
-  bundle: TermBundle;
+  paneTree: PaneNode;
+  leaves: Map<string, TermBundle>;
+  activeLeafId: string;
 }
 
 interface EditorTab {
@@ -63,13 +73,18 @@ type Tab = TerminalTab | EditorTab;
 type SplitMode = "horizontal" | "vertical";
 
 interface LayoutBlob {
+  version?: number;
   activeTab?: number;
-  split?: SplitMode | null;
-  splitTab?: number;
   sidebarWidth?: number;
   sidebarCollapsed?: boolean;
-  tabs?: Array<{ kind: "terminal"; id: string; title: string } | { kind: "editor"; id: string; path: string }>;
+  tabs?: Array<
+    | { kind: "terminal"; id: string; title: string; paneTree: PaneNode; activeLeafId: string }
+    | { kind: "editor"; id: string; path: string; preview?: boolean }
+  >;
 }
+
+/** Deferred intent consumed by the next `pty_opened` reply (requests are FIFO on one socket). */
+type PtyIntent = { kind: "newTab" } | { kind: "split"; tabId: string; leafId: string; direction: SplitDir };
 
 const connectionStrip = $("connection-strip");
 const stripToggle = $button("strip-toggle");
@@ -106,6 +121,7 @@ terminalStack.appendChild(terminalPark);
 let ws: WebSocket | null = null;
 let sessionId: string | null = null;
 let reqSeq = 0;
+let tabSeq = 0;
 let hasEditor = false;
 let watchId: string | null = null;
 let stripForceExpanded = false;
@@ -115,13 +131,12 @@ const pendingFs = new Map<string, Pending<{ path: string; entries: FsEntry[] }>>
 const pendingEditor = new Map<string, PendingEditor>();
 const pendingEdit = new Map<string, Pending<number>>();
 const pendingSave = new Map<string, Pending<{ path: string; rev: number }>>();
+const pendingPtyIntents: PtyIntent[] = [];
 
-let selectedPath: string | null = null;
 let treeRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let treeLoading = false;
 let treeLoaded = false;
 let treeNeedsRefresh = false;
-const expandedPaths = new Set<string>();
 let treeQuietUntil = 0;
 
 const WATCH_IGNORE_DIRS = new Set([
@@ -136,14 +151,6 @@ const WATCH_IGNORE_DIRS = new Set([
 
 let tabs: Tab[] = [];
 let activeTabIndex = 0;
-let splitMode: SplitMode | null = null;
-/** Unified tab index of the second terminal pane when split. */
-let splitTabIndex = 1;
-let pendingSplit: SplitMode | null = null;
-
-function isMod(ev: KeyboardEvent): boolean {
-  return ev.metaKey || ev.ctrlKey;
-}
 
 function setStatusLeft(text: string): void {
   statusLeft.textContent = text;
@@ -221,6 +228,7 @@ function toggleSidebar(): void {
   setSidebarCollapsed(!isSidebarCollapsed());
   persistLayout();
   requestAnimationFrame(measurePill);
+  requestAnimationFrame(fitActiveLeaves);
 }
 
 function loadSidebarPrefs(): void {
@@ -239,11 +247,15 @@ function readLayoutBlob(): LayoutBlob {
   }
 }
 
+function applySidebarFromBlob(layout: LayoutBlob): void {
+  if (layout.sidebarWidth) applySidebarWidth(layout.sidebarWidth);
+  if (layout.sidebarCollapsed !== undefined) setSidebarCollapsed(layout.sidebarCollapsed);
+}
+
 function persistLayout(): void {
   const layout: LayoutBlob = {
+    version: 2,
     activeTab: activeTabIndex,
-    split: splitMode,
-    splitTab: splitTabIndex,
     sidebarWidth: Number.parseInt(
       getComputedStyle(document.documentElement).getPropertyValue("--sidebar-width") || "260",
       10,
@@ -251,8 +263,8 @@ function persistLayout(): void {
     sidebarCollapsed: isSidebarCollapsed(),
     tabs: tabs.map((t) =>
       t.kind === "terminal"
-        ? { kind: "terminal", id: t.id, title: t.title }
-        : { kind: "editor", id: t.id, path: t.path },
+        ? { kind: "terminal", id: t.id, title: t.title, paneTree: t.paneTree, activeLeafId: t.activeLeafId }
+        : { kind: "editor", id: t.id, path: t.path, preview: t.preview },
     ),
   };
   const json = JSON.stringify(layout);
@@ -267,6 +279,11 @@ function send(msg: ClientMessage): void {
 function nextRequestId(): string {
   reqSeq += 1;
   return `ui-${reqSeq}`;
+}
+
+function nextTabId(): string {
+  tabSeq += 1;
+  return `term-${tabSeq}`;
 }
 
 function fsList(path: string): Promise<{ path: string; entries: FsEntry[] }> {
@@ -358,19 +375,34 @@ function rejectPendingError(msg: Extract<ServerMessage, { type: "error" }>): voi
   }
 }
 
-function terminalIndices(): number[] {
-  const out: number[] = [];
-  tabs.forEach((t, i) => {
-    if (t.kind === "terminal") out.push(i);
-  });
-  return out;
+function terminalTabs(): TerminalTab[] {
+  return tabs.filter((t): t is TerminalTab => t.kind === "terminal");
 }
 
-function activeTerminalIndex(): number | null {
+function activeTerminalTab(): TerminalTab | null {
   const active = tabs[activeTabIndex];
-  if (active?.kind === "terminal") return activeTabIndex;
-  const terms = terminalIndices();
-  return terms.length ? terms[0] : null;
+  if (active?.kind === "terminal") return active;
+  return terminalTabs()[0] ?? null;
+}
+
+function findLeafOwner(ptyId: string): { tab: TerminalTab; bundle: TermBundle } | null {
+  for (const t of tabs) {
+    if (t.kind === "terminal" && t.leaves.has(ptyId)) {
+      return { tab: t, bundle: t.leaves.get(ptyId)! };
+    }
+  }
+  return null;
+}
+
+function proposedDims(tab: TerminalTab | null): { cols: number; rows: number } {
+  const bundle = tab ? tab.leaves.get(tab.activeLeafId) : undefined;
+  const dims = bundle?.fit.proposeDimensions?.();
+  return { cols: dims?.cols || 80, rows: dims?.rows || 24 };
+}
+
+function requestNewPty(cols: number, rows: number, intent: PtyIntent): void {
+  pendingPtyIntents.push(intent);
+  send({ type: "pty_open", cols, rows });
 }
 
 function measurePill(): void {
@@ -416,36 +448,55 @@ function setWorkspaceControls(enabled: boolean): void {
   splitOffBtn.disabled = !enabled;
 }
 
-function openPtyForDims(cols: number, rows: number): void {
-  send({ type: "pty_open", cols, rows });
-}
-
-function wireTerminalTab(tab: TerminalTab): void {
-  const { term, el } = tab.bundle;
-  el.dataset.ptyId = tab.id;
-  term.onData((data) => {
+function wireTerminalLeaf(ptyId: string, bundle: TermBundle): void {
+  bundle.el.dataset.ptyId = ptyId;
+  bundle.term.onData((data) => {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    send({ type: "pty_data", id: tab.id, data: b64encode(data) });
+    send({ type: "pty_data", id: ptyId, data: b64encode(data) });
   });
-  term.onResize(({ cols, rows }) => {
+  bundle.term.onResize(({ cols, rows }) => {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    send({ type: "pty_resize", id: tab.id, cols, rows });
+    send({ type: "pty_resize", id: ptyId, cols, rows });
   });
 }
 
-function createTerminalTab(ptyId: string, title?: string, opts: { silentActivate?: boolean } = {}): TerminalTab {
-  const bundle = createTerminal();
+function fitBundle(bundle: TermBundle): void {
+  try {
+    bundle.fit.fit();
+  } catch {
+    /* ignore */
+  }
+}
+
+function fitActiveLeaves(): void {
+  const active = tabs[activeTabIndex];
+  if (active?.kind !== "terminal") return;
+  for (const bundle of active.leaves.values()) fitBundle(bundle);
+}
+
+function createTerminalTab(
+  ptyId: string,
+  bundle: TermBundle,
+  opts: { silentActivate?: boolean; title?: string } = {},
+): TerminalTab {
+  const title = opts.title || `sh ${terminalTabs().length + 1}`;
   const tab: TerminalTab = {
     kind: "terminal",
-    id: ptyId,
-    title: title || `sh ${terminalIndices().length + 1}`,
-    bundle,
+    id: nextTabId(),
+    title,
+    paneTree: { type: "leaf", id: ptyId },
+    leaves: new Map([[ptyId, bundle]]),
+    activeLeafId: ptyId,
   };
-  wireTerminalTab(tab);
+  wireTerminalLeaf(ptyId, bundle);
   tabs.push(tab);
   if (!opts.silentActivate) activeTabIndex = tabs.length - 1;
   renderAll();
   persistLayout();
+  requestAnimationFrame(() => {
+    fitBundle(bundle);
+    if (tabs[activeTabIndex] === tab) bundle.term.focus();
+  });
   return tab;
 }
 
@@ -459,6 +510,44 @@ function disposeEditorTab(tab: EditorTab): void {
   tab.host.remove();
 }
 
+function closeWholeTerminalTab(tab: TerminalTab): void {
+  for (const [ptyId, bundle] of tab.leaves) {
+    send({ type: "pty_close", id: ptyId });
+    disposeTerminal(bundle);
+  }
+  const idx = tabs.indexOf(tab);
+  if (idx < 0) return;
+  tabs.splice(idx, 1);
+  if (activeTabIndex >= tabs.length) activeTabIndex = Math.max(0, tabs.length - 1);
+  else if (activeTabIndex > idx) activeTabIndex -= 1;
+  renderAll();
+  persistLayout();
+}
+
+/** Close a single leaf; collapses/removes the tab if it was the last leaf. */
+function closeLeaf(tab: TerminalTab, ptyId: string, opts: { alreadyClosedRemote?: boolean } = {}): void {
+  if (!opts.alreadyClosedRemote) send({ type: "pty_close", id: ptyId });
+  const bundle = tab.leaves.get(ptyId);
+  if (bundle) disposeTerminal(bundle);
+  tab.leaves.delete(ptyId);
+
+  const nextTree = removeLeaf(tab.paneTree, ptyId);
+  const idx = tabs.indexOf(tab);
+  if (nextTree === null || tab.leaves.size === 0) {
+    if (idx >= 0) tabs.splice(idx, 1);
+    if (activeTabIndex >= tabs.length) activeTabIndex = Math.max(0, tabs.length - 1);
+    else if (idx >= 0 && activeTabIndex > idx) activeTabIndex -= 1;
+  } else {
+    tab.paneTree = nextTree;
+    if (tab.activeLeafId === ptyId) {
+      const ids = collectLeafIds(tab.paneTree);
+      tab.activeLeafId = ids[0] ?? tab.activeLeafId;
+    }
+  }
+  renderAll();
+  persistLayout();
+}
+
 function closeTabAt(index: number, opts: { force?: boolean } = {}): void {
   const tab = tabs[index];
   if (!tab) return;
@@ -467,20 +556,46 @@ function closeTabAt(index: number, opts: { force?: boolean } = {}): void {
       if (!confirm(`Discard unsaved changes to ${basename(tab.path)}?`)) return;
     }
     disposeEditorTab(tab);
-  } else {
-    send({ type: "pty_close", id: tab.id });
-    disposeTerminal(tab.bundle);
+    tabs.splice(index, 1);
+    if (activeTabIndex >= tabs.length) activeTabIndex = Math.max(0, tabs.length - 1);
+    else if (activeTabIndex > index) activeTabIndex -= 1;
+    renderAll();
+    persistLayout();
+    return;
   }
-  tabs.splice(index, 1);
-  if (activeTabIndex >= tabs.length) activeTabIndex = Math.max(0, tabs.length - 1);
-  if (activeTabIndex === index && tabs.length) {
-    activeTabIndex = Math.min(index, tabs.length - 1);
+  closeWholeTerminalTab(tab);
+}
+
+/** Mod+W: close only the active pane if the active tab has more than one; otherwise close the tab. */
+function closeActiveTabOrLeaf(): void {
+  const tab = tabs[activeTabIndex];
+  if (!tab) return;
+  if (tab.kind === "terminal" && tab.leaves.size > 1) {
+    closeLeaf(tab, tab.activeLeafId);
+    return;
   }
-  const terms = terminalIndices();
-  if (splitTabIndex >= tabs.length) splitTabIndex = terms.length > 1 ? terms[1] : terms[0] ?? 0;
-  if (terms.length < 2) splitMode = null;
+  closeTabAt(activeTabIndex);
+}
+
+function collapseToActiveLeaf(): void {
+  const tab = activeTerminalTab();
+  if (!tab) return;
+  const others = collectLeafIds(tab.paneTree).filter((id) => id !== tab.activeLeafId);
+  if (others.length === 0) {
+    setStatusLeft("no split");
+    return;
+  }
+  for (const id of others) {
+    send({ type: "pty_close", id });
+    const bundle = tab.leaves.get(id);
+    if (bundle) disposeTerminal(bundle);
+    tab.leaves.delete(id);
+  }
+  tab.paneTree = { type: "leaf", id: tab.activeLeafId };
+  activeTabIndex = tabs.indexOf(tab);
   renderAll();
   persistLayout();
+  setStatusLeft("no split");
 }
 
 function tabLabel(tab: Tab): string {
@@ -503,7 +618,10 @@ function renderTabs(): void {
       if (tab.dirty) el.classList.add("dirty");
     }
     el.setAttribute("role", "tab");
-    el.innerHTML = `<span class="tab-label">${escapeHtml(tabLabel(tab))}</span>`;
+    const label = document.createElement("span");
+    label.className = "tab-label";
+    label.textContent = tabLabel(tab);
+    el.appendChild(label);
     const x = document.createElement("button");
     x.className = "x";
     x.type = "button";
@@ -526,78 +644,108 @@ function renderTabs(): void {
   requestAnimationFrame(measurePill);
 }
 
-function fitTerminalTab(tab: TerminalTab): void {
-  try {
-    tab.bundle.fit.fit();
-  } catch {
-    /* ignore */
+function buildLeafEl(node: Extract<PaneNode, { type: "leaf" }>, tab: TerminalTab): HTMLElement {
+  const bundle = tab.leaves.get(node.id);
+  const leafEl = document.createElement("div");
+  leafEl.className = "pane-leaf" + (node.id === tab.activeLeafId ? " active" : "");
+  leafEl.dataset.leafId = node.id;
+  if (bundle) {
+    const label = document.createElement("div");
+    label.className = "pane-label";
+    label.textContent = tab.title;
+    leafEl.appendChild(label);
+    leafEl.appendChild(bundle.el);
+  }
+  leafEl.addEventListener("mousedown", () => focusLeaf(tab, node.id));
+  return leafEl;
+}
+
+function renderPaneChildren(node: PaneNode, tab: TerminalTab, container: HTMLElement): void {
+  if (node.type === "leaf") {
+    container.appendChild(buildLeafEl(node, tab));
+    return;
+  }
+  for (const child of node.children) {
+    const branch = document.createElement("div");
+    branch.className = "pane-branch";
+    if (child.type === "leaf") {
+      branch.appendChild(buildLeafEl(child, tab));
+    } else {
+      const nested = document.createElement("div");
+      nested.className = `pane-tree ${child.direction === "row" ? "split-row" : "split-col"}`;
+      renderPaneChildren(child, tab, nested);
+      branch.appendChild(nested);
+    }
+    container.appendChild(branch);
   }
 }
 
 function renderPanes(): void {
-  panesEl.innerHTML = "";
-  panesEl.className =
-    splitMode === "horizontal"
-      ? "panes split-horizontal"
-      : splitMode === "vertical"
-        ? "panes split-vertical"
-        : "panes no-split";
-
   terminalPark.innerHTML = "";
+  const active = tabs[activeTabIndex];
+  const activeTermTab = active?.kind === "terminal" ? active : null;
 
-  const terms = terminalIndices();
-  if (!terms.length) return;
-
-  let primary = activeTerminalIndex() ?? terms[0];
-  let secondary = splitTabIndex;
-  if (!terms.includes(primary)) primary = terms[0];
-  if (splitMode && terms.length >= 2) {
-    if (!terms.includes(secondary) || secondary === primary) {
-      secondary = terms.find((idx) => idx !== primary) ?? terms[0];
-      splitTabIndex = secondary;
-    }
-    const indices = [primary, secondary];
-    for (const idx of indices) {
-      const tab = tabs[idx] as TerminalTab;
-      const pane = document.createElement("div");
-      pane.className = "pane";
-      const label = document.createElement("div");
-      label.className = "pane-label";
-      label.textContent = tab.title;
-      pane.appendChild(label);
-      pane.appendChild(tab.bundle.el);
-      panesEl.appendChild(pane);
-      requestAnimationFrame(() => fitTerminalTab(tab));
-    }
-    for (const idx of terms) {
-      if (!indices.includes(idx)) {
-        const tab = tabs[idx] as TerminalTab;
-        terminalPark.appendChild(tab.bundle.el);
-      }
+  panesEl.innerHTML = "";
+  if (activeTermTab) {
+    const root = activeTermTab.paneTree;
+    panesEl.className =
+      root.type === "split" ? `pane-tree ${root.direction === "row" ? "split-row" : "split-col"}` : "pane-tree";
+    renderPaneChildren(root, activeTermTab, panesEl);
+    for (const id of collectLeafIds(root)) {
+      const bundle = activeTermTab.leaves.get(id);
+      if (bundle) requestAnimationFrame(() => fitBundle(bundle));
     }
   } else {
-    const tab = tabs[primary] as TerminalTab;
-    const pane = document.createElement("div");
-    pane.className = "pane";
-    pane.appendChild(tab.bundle.el);
-    panesEl.appendChild(pane);
-    requestAnimationFrame(() => fitTerminalTab(tab));
-    for (const idx of terms) {
-      if (idx !== primary) {
-        const t = tabs[idx] as TerminalTab;
-        terminalPark.appendChild(t.bundle.el);
-      }
-    }
+    panesEl.className = "pane-tree";
   }
+
+  for (const t of tabs) {
+    if (t.kind !== "terminal" || t === activeTermTab) continue;
+    for (const bundle of t.leaves.values()) terminalPark.appendChild(bundle.el);
+  }
+}
+
+function updatePaneActiveClasses(tab: TerminalTab): void {
+  panesEl.querySelectorAll<HTMLElement>(".pane-leaf").forEach((el) => {
+    el.classList.toggle("active", el.dataset.leafId === tab.activeLeafId);
+  });
+}
+
+/** Switch focus to a leaf without rebuilding the pane DOM (avoids xterm re-mount flicker). */
+function focusLeaf(tab: TerminalTab, leafId: string): void {
+  const bundle = tab.leaves.get(leafId);
+  if (tab.activeLeafId !== leafId) {
+    tab.activeLeafId = leafId;
+    updatePaneActiveClasses(tab);
+    persistLayout();
+  }
+  bundle?.term.focus();
+}
+
+function focusPaneRelative(delta: 1 | -1): void {
+  const tab = tabs[activeTabIndex];
+  if (tab?.kind !== "terminal") return;
+  const next = nextLeafId(tab.paneTree, tab.activeLeafId, delta);
+  focusLeaf(tab, next);
+}
+
+function selectTabRelative(delta: 1 | -1): void {
+  if (tabs.length === 0) return;
+  activeTabIndex = (activeTabIndex + delta + tabs.length) % tabs.length;
+  renderAll();
+  persistLayout();
+  focusActiveTab();
 }
 
 function focusActiveTab(): void {
   const active = tabs[activeTabIndex];
   if (!active) return;
   if (active.kind === "terminal") {
+    const bundle = active.leaves.get(active.activeLeafId);
     requestAnimationFrame(() => {
-      fitTerminalTab(active);
-      active.bundle.term.focus();
+      if (!bundle) return;
+      fitBundle(bundle);
+      bundle.term.focus();
     });
   } else {
     active.view.focus();
@@ -614,26 +762,41 @@ function renderAll(): void {
 
 function clearTabs(): void {
   for (const tab of tabs) {
-    if (tab.kind === "terminal") disposeTerminal(tab.bundle);
-    else disposeEditorTab(tab);
+    if (tab.kind === "terminal") {
+      for (const bundle of tab.leaves.values()) disposeTerminal(bundle);
+    } else {
+      disposeEditorTab(tab);
+    }
   }
   tabs = [];
   activeTabIndex = 0;
-  splitTabIndex = 1;
-  splitMode = null;
-  pendingSplit = null;
+  pendingPtyIntents.length = 0;
   panesEl.innerHTML = "";
-  panesEl.className = "panes no-split";
+  panesEl.className = "pane-tree";
   terminalPark.innerHTML = "";
   editorStack.innerHTML = "";
   renderAll();
 }
 
+function setTreeEmptyHint(show: boolean, text = "Connect to load remote tree"): void {
+  treeEl.classList.toggle("empty", show);
+  if (show) treeEl.dataset.emptyText = text;
+  else delete treeEl.dataset.emptyText;
+}
+
+// Selection state lives inside VirtualTree (tree.getSelectedPath()); no duplicate module state needed.
+const tree = new VirtualTree(treeEl, fsList, {
+  onOpenFile: (entry, preview) => {
+    void openEditorTab(entry.path, preview);
+  },
+  onStatus: (text) => setStatusLeft(text),
+  noteInteraction: () => noteTreeInteraction(),
+});
+setTreeEmptyHint(true);
+
 function clearTree(): void {
-  treeEl.innerHTML = "";
+  tree.clear();
   pendingFs.clear();
-  selectedPath = null;
-  expandedPaths.clear();
   treeLoaded = false;
   treeLoading = false;
   treeNeedsRefresh = false;
@@ -684,30 +847,14 @@ async function loadRoot(opts: { silent?: boolean } = {}): Promise<void> {
     return;
   }
   treeLoading = true;
-  if (!silent) {
-    clearTree();
-    treeEl.textContent = "Loading…";
-  }
   try {
-    const listed = await fsList("");
-    const prevSelected = selectedPath;
-    const keepExpanded = new Set(expandedPaths);
-    treeEl.innerHTML = "";
-    const rootLabel = document.createElement("div");
-    rootLabel.className = "tree-item";
-    rootLabel.innerHTML = `<span class="twist"></span><span class="kind">⌂</span><span>${escapeHtml(listed.path)}</span>`;
-    treeEl.appendChild(rootLabel);
-    const children = document.createElement("div");
-    children.className = "tree-children";
-    treeEl.appendChild(children);
-    renderEntries(children, listed.entries);
+    const keepExpanded = silent ? tree.getExpandedPaths() : undefined;
+    await tree.loadRoot({ silent, keepExpanded });
     treeLoaded = true;
-    if (prevSelected) selectedPath = prevSelected;
-    if (keepExpanded.size) await restoreExpanded(children, keepExpanded);
-    if (!silent) setStatusLeft(`session ${sessionId || "?"} · ${listed.path}`);
+    setTreeEmptyHint(false);
   } catch (err) {
-    if (!silent || !treeLoaded) {
-      treeEl.innerHTML = `<div class="tree-empty">${escapeHtml(String(err))}</div>`;
+    if (!treeLoaded) {
+      setStatusLeft(`tree error: ${err instanceof Error ? err.message : String(err)}`);
     }
   } finally {
     treeLoading = false;
@@ -715,123 +862,6 @@ async function loadRoot(opts: { silent?: boolean } = {}): Promise<void> {
       treeNeedsRefresh = false;
       scheduleTreeRefresh();
     }
-  }
-}
-
-async function restoreExpanded(container: HTMLElement, paths: Set<string>): Promise<void> {
-  const rows = [...container.querySelectorAll(":scope > .tree-item")].filter(
-    (el): el is HTMLElement => el instanceof HTMLElement,
-  );
-  for (const row of rows) {
-    const childBox = row.nextElementSibling;
-    if (!(childBox instanceof HTMLElement) || !childBox.classList.contains("tree-children")) continue;
-    const path = row.dataset.path;
-    if (!path || !paths.has(path)) continue;
-    const twist = row.querySelector(".twist");
-    try {
-      if (!childBox.dataset.loaded) {
-        if (twist) twist.textContent = "…";
-        const listed = await fsList(path);
-        childBox.innerHTML = "";
-        renderEntries(childBox, listed.entries);
-        childBox.dataset.loaded = "1";
-      }
-      childBox.hidden = false;
-      if (twist) twist.textContent = "▾";
-      expandedPaths.add(path);
-      await restoreExpanded(childBox, paths);
-    } catch {
-      if (twist) twist.textContent = "▸";
-      expandedPaths.delete(path);
-    }
-  }
-}
-
-function kindIcon(kind: string): string {
-  if (kind === "dir") return "▸";
-  if (kind === "symlink") return "↗";
-  return "·";
-}
-
-function renderEntries(container: HTMLElement, entries: FsEntry[]): void {
-  for (const entry of entries) {
-    const row = document.createElement("div");
-    row.className = "tree-item";
-    row.dataset.path = entry.path;
-    if (selectedPath === entry.path) row.classList.add("selected");
-    const twist = document.createElement("span");
-    twist.className = "twist";
-    twist.textContent = entry.kind === "dir" ? "▸" : "";
-    const kind = document.createElement("span");
-    kind.className = "kind";
-    kind.textContent = kindIcon(entry.kind);
-    const name = document.createElement("span");
-    name.textContent = entry.name;
-    row.append(twist, kind, name);
-    const childBox = document.createElement("div");
-    childBox.className = "tree-children";
-    childBox.hidden = true;
-
-    let fileClickTimer: ReturnType<typeof setTimeout> | null = null;
-
-    row.addEventListener("click", async (ev) => {
-      ev.stopPropagation();
-      noteTreeInteraction();
-      document.querySelectorAll(".tree-item.selected").forEach((el) => el.classList.remove("selected"));
-      row.classList.add("selected");
-      selectedPath = entry.path;
-      setStatusLeft(`${entry.kind}: ${entry.path}`);
-
-      if (entry.kind === "dir") {
-        if (!childBox.dataset.loaded) {
-          twist.textContent = "…";
-          try {
-            const listed = await fsList(entry.path);
-            childBox.innerHTML = "";
-            renderEntries(childBox, listed.entries);
-            childBox.dataset.loaded = "1";
-            childBox.hidden = false;
-            twist.textContent = "▾";
-            expandedPaths.add(entry.path);
-          } catch (err) {
-            twist.textContent = "▸";
-            expandedPaths.delete(entry.path);
-            setStatusLeft(`fs error: ${err instanceof Error ? err.message : String(err)}`);
-          }
-        } else if (childBox.hidden) {
-          childBox.hidden = false;
-          twist.textContent = "▾";
-          expandedPaths.add(entry.path);
-        } else {
-          childBox.hidden = true;
-          twist.textContent = "▸";
-          expandedPaths.delete(entry.path);
-        }
-        return;
-      }
-
-      if (entry.kind === "file") {
-        if (fileClickTimer) clearTimeout(fileClickTimer);
-        fileClickTimer = setTimeout(() => {
-          fileClickTimer = null;
-          void openEditorTab(entry.path, true);
-        }, 220);
-      }
-    });
-
-    if (entry.kind === "file") {
-      row.addEventListener("dblclick", (ev) => {
-        ev.stopPropagation();
-        noteTreeInteraction();
-        if (fileClickTimer) {
-          clearTimeout(fileClickTimer);
-          fileClickTimer = null;
-        }
-        void openEditorTab(entry.path, false);
-      });
-    }
-
-    container.append(row, childBox);
   }
 }
 
@@ -927,12 +957,38 @@ function afterSessionReady(): void {
     .catch(() => startFsWatch());
 }
 
-function applyLayoutFromBlob(layout: LayoutBlob): void {
-  splitMode = layout.split || null;
-  activeTabIndex = layout.activeTab ?? 0;
-  splitTabIndex = layout.splitTab ?? 1;
-  if (layout.sidebarWidth) applySidebarWidth(layout.sidebarWidth);
-  if (layout.sidebarCollapsed !== undefined) setSidebarCollapsed(layout.sidebarCollapsed);
+/** Try to restore a single multi-pane terminal tab whose leaf ids exactly match the reattached ptys. */
+function restoreTerminalTabsFromBlob(blob: LayoutBlob, ptyList: PtyInfo[]): boolean {
+  const ptyIds = ptyList.map((p) => p.id);
+  if (ptyIds.length === 0 || blob.version !== 2 || !Array.isArray(blob.tabs)) return false;
+  try {
+    for (const tb of blob.tabs) {
+      if (tb.kind !== "terminal") continue;
+      const leafIds = collectLeafIds(tb.paneTree);
+      const sameSet = leafIds.length === ptyIds.length && leafIds.every((id) => ptyIds.includes(id));
+      if (!sameSet) continue;
+      const leaves = new Map<string, TermBundle>();
+      for (const id of leafIds) {
+        const bundle = createTerminal();
+        wireTerminalLeaf(id, bundle);
+        leaves.set(id, bundle);
+      }
+      const activeLeafId = leafIds.includes(tb.activeLeafId) ? tb.activeLeafId : leafIds[0];
+      const tab: TerminalTab = {
+        kind: "terminal",
+        id: tb.id || nextTabId(),
+        title: tb.title || "sh 1",
+        paneTree: tb.paneTree,
+        leaves,
+        activeLeafId,
+      };
+      tabs.push(tab);
+      return true;
+    }
+  } catch {
+    /* malformed layout blob; fall back to one tab per pty */
+  }
+  return false;
 }
 
 function onMessage(raw: string): void {
@@ -974,61 +1030,87 @@ function onMessage(raw: string): void {
       $input("session").value = sessionId;
       localStorage.setItem(SESSION_KEY, sessionId);
       afterSessionReady();
-      openPtyForDims(80, 24);
+      requestNewPty(80, 24, { kind: "newTab" });
       setStatusLeft(`session ${sessionId}`);
       updateStripChips();
       break;
-    case "session_attached":
+    case "session_attached": {
       sessionId = msg.session_id;
       $input("session").value = sessionId;
       localStorage.setItem(SESSION_KEY, sessionId);
       clearTabs();
+
+      let blob: LayoutBlob = {};
       if (typeof msg.layout === "string" && msg.layout) {
         try {
-          applyLayoutFromBlob(JSON.parse(msg.layout) as LayoutBlob);
+          blob = JSON.parse(msg.layout) as LayoutBlob;
         } catch {
-          /* ignore bad layout */
+          blob = {};
         }
       } else {
-        applyLayoutFromBlob(readLayoutBlob());
+        blob = readLayoutBlob();
       }
-      for (const p of msg.ptys || []) {
-        createTerminalTab(p.id, `sh ${terminalIndices().length + 1}`, { silentActivate: true });
+      applySidebarFromBlob(blob);
+
+      const ptyList = msg.ptys || [];
+      const restored = restoreTerminalTabsFromBlob(blob, ptyList);
+      if (!restored) {
+        for (const p of ptyList) {
+          const bundle = createTerminal();
+          createTerminalTab(p.id, bundle, { silentActivate: true });
+        }
       }
-      if (terminalIndices().length === 0) openPtyForDims(80, 24);
-      else {
-        activeTabIndex = Math.min(activeTabIndex, tabs.length - 1);
+
+      if (terminalTabs().length === 0) {
+        requestNewPty(80, 24, { kind: "newTab" });
+      } else {
+        activeTabIndex = Math.min(Math.max(blob.activeTab ?? 0, 0), tabs.length - 1);
         renderAll();
+        persistLayout();
       }
       afterSessionReady();
-      setStatusLeft(`reattached ${sessionId} (${(msg.ptys || []).length} ptys)`);
+      setStatusLeft(`reattached ${sessionId} (${ptyList.length} ptys)`);
       updateStripChips();
       break;
+    }
     case "pty_opened": {
-      const tab = createTerminalTab(msg.id, `sh ${terminalIndices().length}`);
-      if (pendingSplit && terminalIndices().length >= 2) {
-        splitMode = pendingSplit;
-        const terms = terminalIndices();
-        splitTabIndex = terms[terms.length - 1];
-        pendingSplit = null;
-        renderPanes();
-        persistLayout();
-        setStatusLeft(`split ${splitMode}`);
+      const intent = pendingPtyIntents.shift() ?? { kind: "newTab" as const };
+      const bundle = createTerminal();
+      let handled = false;
+      if (intent.kind === "split") {
+        const tab = tabs.find((t): t is TerminalTab => t.kind === "terminal" && t.id === intent.tabId);
+        if (tab) {
+          const nextTree = splitLeaf(tab.paneTree, intent.leafId, msg.id, intent.direction);
+          if (nextTree) {
+            tab.paneTree = nextTree;
+            tab.leaves.set(msg.id, bundle);
+            tab.activeLeafId = msg.id;
+            wireTerminalLeaf(msg.id, bundle);
+            activeTabIndex = tabs.indexOf(tab);
+            renderAll();
+            persistLayout();
+            setStatusLeft("split pane added");
+            requestAnimationFrame(() => {
+              fitBundle(bundle);
+              bundle.term.focus();
+            });
+            handled = true;
+          } else {
+            setStatusLeft(`max ${MAX_LEAVES_PER_TAB} panes per tab; opened new tab instead`);
+          }
+        }
       }
-      requestAnimationFrame(() => {
-        fitTerminalTab(tab);
-        if (tabs[activeTabIndex]?.kind === "terminal") tab.bundle.term.focus();
-      });
+      if (!handled) createTerminalTab(msg.id, bundle);
       break;
     }
     case "pty_data": {
-      const tab = tabs.find((t) => t.kind === "terminal" && t.id === msg.id) as TerminalTab | undefined;
-      if (tab) tab.bundle.term.write(b64decode(msg.data));
+      const owner = findLeafOwner(msg.id);
+      if (owner) owner.bundle.term.write(b64decode(msg.data));
       break;
     }
     case "pty_closed": {
-      const idx = tabs.findIndex((t) => t.kind === "terminal" && t.id === msg.id);
-      if (idx >= 0) closeTabAt(idx, { force: true });
+      const owner = findLeafOwner(msg.id);
+      if (owner) closeLeaf(owner.tab, msg.id, { alreadyClosedRemote: true });
       break;
     }
     case "fs_listed": {
@@ -1137,7 +1219,7 @@ function disconnect(): void {
   pendingSave.clear();
   clearTabs();
   clearTree();
-  treeEl.innerHTML = '<div class="tree-empty">Connect to load remote tree</div>';
+  setTreeEmptyHint(true);
   connectBtn.disabled = false;
   disconnectBtn.disabled = true;
   setWorkspaceControls(false);
@@ -1173,28 +1255,32 @@ function connect(): void {
   ws.addEventListener("error", () => setStatusLeft("websocket error"));
 }
 
+function openNewTerminalTab(): void {
+  if (!connected) return;
+  const dims = proposedDims(activeTerminalTab());
+  requestNewPty(dims.cols, dims.rows, { kind: "newTab" });
+}
+
 function requestSplit(mode: SplitMode): void {
-  const terms = terminalIndices();
-  if (terms.length < 1) {
+  if (!connected) return;
+  const tab = activeTerminalTab();
+  if (!tab) {
     setStatusLeft("open a shell first");
     return;
   }
-  if (terms.length < 2) {
-    pendingSplit = mode;
-    setStatusLeft(`opening second shell for ${mode} split…`);
-    const primary = tabs[terms[0]] as TerminalTab;
-    const dims = primary.bundle.fit.proposeDimensions?.() || { cols: 80, rows: 24 };
-    openPtyForDims(dims.cols || 80, dims.rows || 24);
+  if (leafCount(tab.paneTree) >= MAX_LEAVES_PER_TAB) {
+    setStatusLeft(`max ${MAX_LEAVES_PER_TAB} panes per tab`);
     return;
   }
-  splitMode = mode;
-  const primary = activeTerminalIndex() ?? terms[0];
-  if (splitTabIndex === primary || !terms.includes(splitTabIndex)) {
-    splitTabIndex = terms.find((i) => i !== primary) ?? terms[0];
-  }
-  renderPanes();
-  persistLayout();
-  setStatusLeft(`split ${mode}`);
+  const dims = proposedDims(tab);
+  const direction = directionFromSplitMode(mode);
+  setStatusLeft(`opening pane (${mode})…`);
+  requestNewPty(dims.cols, dims.rows, {
+    kind: "split",
+    tabId: tab.id,
+    leafId: tab.activeLeafId,
+    direction,
+  });
 }
 
 function setupSidebarResizer(): void {
@@ -1225,6 +1311,7 @@ function setupSidebarResizer(): void {
     sidebarResizer.classList.remove("dragging");
     persistLayout();
     requestAnimationFrame(measurePill);
+    requestAnimationFrame(fitActiveLeaves);
   });
 }
 
@@ -1238,71 +1325,39 @@ stripCompact.addEventListener("click", expandStrip);
 editorSaveBtn.addEventListener("click", () => {
   void saveActiveEditor();
 });
-newTabBtn.addEventListener("click", () => {
-  const idx = activeTerminalIndex();
-  const dims =
-    (idx !== null ? (tabs[idx] as TerminalTab).bundle.fit.proposeDimensions?.() : null) ||
-    { cols: 80, rows: 24 };
-  openPtyForDims(dims.cols || 80, dims.rows || 24);
-});
+newTabBtn.addEventListener("click", openNewTerminalTab);
 splitHBtn.addEventListener("click", () => requestSplit("horizontal"));
 splitVBtn.addEventListener("click", () => requestSplit("vertical"));
-splitOffBtn.addEventListener("click", () => {
-  splitMode = null;
-  pendingSplit = null;
-  renderPanes();
-  persistLayout();
-  setStatusLeft("no split");
-});
+splitOffBtn.addEventListener("click", collapseToActiveLeaf);
 sidebarToggle.addEventListener("click", toggleSidebar);
 
 tabsEl.addEventListener("scroll", () => requestAnimationFrame(measurePill));
 
-window.addEventListener("keydown", (ev) => {
-  if (isMod(ev) && ev.key === "s") {
-    const active = tabs[activeTabIndex];
-    if (active?.kind === "editor" && active.dirty) {
-      ev.preventDefault();
-      void saveActiveEditor();
-    }
-    return;
-  }
-  if (isMod(ev) && ev.key === "t") {
-    ev.preventDefault();
-    if (!connected) return;
-    const idx = activeTerminalIndex();
-    const dims =
-      (idx !== null ? (tabs[idx] as TerminalTab).bundle.fit.proposeDimensions?.() : null) ||
-      { cols: 80, rows: 24 };
-    openPtyForDims(dims.cols || 80, dims.rows || 24);
-    return;
-  }
-  if (isMod(ev) && ev.key === "w") {
-    if (tabs.length === 0) return;
-    ev.preventDefault();
-    closeTabAt(activeTabIndex);
-    return;
-  }
-  if (isMod(ev) && ev.key === "d" && ev.shiftKey) {
-    ev.preventDefault();
-    if (connected) requestSplit("vertical");
-    return;
-  }
-  if (isMod(ev) && ev.key === "d" && !ev.shiftKey) {
-    ev.preventDefault();
-    if (connected) requestSplit("horizontal");
-    return;
-  }
-  if (isMod(ev) && ev.key === "b") {
-    ev.preventDefault();
-    toggleSidebar();
-  }
-});
+const shortcutHandlers: ShortcutHandlers = {
+  "commandPalette.open": () => openPalette(),
+  "tab.new": () => openNewTerminalTab(),
+  "tab.close": () => closeActiveTabOrLeaf(),
+  "tab.next": () => selectTabRelative(1),
+  "tab.prev": () => selectTabRelative(-1),
+  "pane.splitRight": () => requestSplit("horizontal"),
+  "pane.splitDown": () => requestSplit("vertical"),
+  "pane.focusNext": () => focusPaneRelative(1),
+  "pane.focusPrev": () => focusPaneRelative(-1),
+  "sidebar.toggle": () => toggleSidebar(),
+  "editor.save": () => {
+    void saveActiveEditor();
+  },
+};
+
+function runShortcutId(id: ShortcutId): void {
+  shortcutHandlers[id]?.(new KeyboardEvent("keydown"));
+}
+
+installShortcuts(shortcutHandlers);
+setPaletteCommands(defaultPaletteCommands(runShortcutId));
 
 window.addEventListener("resize", () => {
-  for (const tab of tabs) {
-    if (tab.kind === "terminal") fitTerminalTab(tab);
-  }
+  fitActiveLeaves();
   requestAnimationFrame(measurePill);
 });
 

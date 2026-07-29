@@ -51,21 +51,19 @@
           <h2>Files</h2>
           <button id="sidebar-toggle" type="button" title="Toggle sidebar (Mod+B)">‹</button>
         </div>
-        <div id="tree" class="tree">
-          <div class="tree-empty">Connect to load remote tree</div>
-        </div>
+        <div id="tree" class="tree"></div>
       </aside>
       <div id="sidebar-resizer" class="sidebar-resizer" title="Drag to resize"></div>
 
       <div id="main-col" class="main-col">
         <div id="tabs-bar" class="tabs-bar">
           <div class="tabs-actions">
-            <button id="new-tab" type="button" disabled title="New terminal (Mod+T)">+</button>
+            <button id="new-tab" type="button" disabled title="New terminal tab (Mod+T)">+</button>
             <button
               id="split-h"
               type="button"
               disabled
-              title="Split shells side by side (Mod+D)"
+              title="Split pane right (Mod+D)"
             >
               ‖
             </button>
@@ -73,11 +71,11 @@
               id="split-v"
               type="button"
               disabled
-              title="Split shells stacked (Mod+Shift+D)"
+              title="Split pane down (Mod+Shift+D)"
             >
               ═
             </button>
-            <button id="split-off" type="button" disabled title="No split">▢</button>
+            <button id="split-off" type="button" disabled title="Keep only active pane">▢</button>
             <button
               id="editor-save"
               type="button"
@@ -98,7 +96,7 @@
             Connect to a backend to open a session
           </div>
           <div id="terminal-stack" class="stack" hidden>
-            <div id="panes" class="panes no-split"></div>
+            <div id="panes" class="pane-tree"></div>
           </div>
           <div id="editor-stack" class="stack" hidden></div>
         </div>
