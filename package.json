@@ -1,7 +1,7 @@
 {
   "name": "fresh-gui",
   "private": true,
-  "version": "2026.729.9",
+  "version": "2026.729.10",
   "description": "Workspace helpers; Windows NSIS/MSI packaging lives in crates/fresh-gui-desktop",
   "scripts": {
     "desktop:dev": "npm --prefix crates/fresh-gui-desktop run dev",
