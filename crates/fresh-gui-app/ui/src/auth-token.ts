@@ -31,20 +31,19 @@ export function clearCachedAuthToken(): void {
 }
 
 /**
- * Prefill `#token` from `?token=` (startup banner URLs), cache it for reloads,
- * then strip the query string from the address bar.
+ * Read `?token=` from the startup banner URL, cache it for reloads, then strip
+ * the query string from the address bar. Returns the token when present.
  */
-export function consumeTokenQueryParam(tokenInput: HTMLInputElement): boolean {
+export function consumeTokenQueryParam(): string | null {
   try {
     const params = new URLSearchParams(window.location.search);
     const token = params.get("token");
-    if (!token) return false;
-    tokenInput.value = token;
+    if (!token) return null;
     cacheAuthToken(token);
     const next = `${window.location.pathname}${window.location.hash}`;
     window.history.replaceState({}, "", next);
-    return true;
+    return token;
   } catch {
-    return false;
+    return null;
   }
 }

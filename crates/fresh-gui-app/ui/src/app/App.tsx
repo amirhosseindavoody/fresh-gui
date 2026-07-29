@@ -1,6 +1,5 @@
 import { useEffect } from "react";
 import {
-  ChevronDown,
   Columns2,
   Files,
   Palette,
@@ -12,9 +11,7 @@ import {
   Square,
 } from "lucide-react";
 import { bootstrapAde } from "@/ade/bootstrap";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
 import { cn } from "@/lib/utils";
 
@@ -33,66 +30,6 @@ export function App() {
 
   return (
     <>
-      <header id="connection-strip" className="connection-strip expanded">
-        <div className="brand">fresh-gui</div>
-        <Button
-          id="strip-toggle"
-          className="strip-toggle"
-          type="button"
-          variant="ghost"
-          size="icon-xs"
-          title="Expand or compact connection strip"
-          hidden
-        >
-          <ChevronDown aria-hidden />
-        </Button>
-        <div id="strip-compact" className="strip-compact" hidden>
-          <Badge id="strip-host" variant="secondary" className="strip-chip rounded-md font-normal">
-            —
-          </Badge>
-          <Badge
-            id="strip-session"
-            variant="outline"
-            className="strip-chip mono rounded-md font-mono font-normal"
-          >
-            —
-          </Badge>
-          <Badge
-            id="strip-state"
-            variant="outline"
-            className="strip-chip state rounded-md font-normal"
-          >
-            disconnected
-          </Badge>
-        </div>
-        <div id="strip-fields" className="strip-fields">
-          <label>
-            Backend WS
-            <Input id="url" defaultValue="" spellCheck={false} placeholder="ws://host/ws" />
-          </label>
-          <label>
-            Token
-            <Input
-              id="token"
-              type="password"
-              placeholder="from startup banner / ?token="
-              spellCheck={false}
-              autoComplete="off"
-            />
-          </label>
-          <label>
-            Session
-            <Input id="session" placeholder="empty = create new" spellCheck={false} />
-          </label>
-          <Button id="connect" type="button" size="sm">
-            Connect
-          </Button>
-          <Button id="disconnect" type="button" variant="outline" size="sm" disabled>
-            Disconnect
-          </Button>
-        </div>
-      </header>
-
       <div id="workspace" className="workspace">
         <nav id="activity-bar" className="activity-bar" aria-label="Activity">
           <Button
@@ -223,7 +160,7 @@ export function App() {
 
           <div id="stacks" className="stacks">
             <div id="empty-stack" className="empty-stack">
-              Connect to a backend to open a session
+              Open the printed Local access URL to connect
             </div>
             <div id="terminal-stack" className="stack" hidden>
               <div id="panes" className="pane-tree" />

@@ -170,7 +170,7 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 
 ### Phase UI — Host chrome polish (see [UI.md](./UI.md))
 
-- **UI-1 ✅** — Terax-inspired chrome: always-on connection strip, status bar, unified terminal/editor tabs, tokenized theme, CodeMirror 6, xterm WebGL, tab pill, collapsible sidebar, dirty/preview affordances.
+- **UI-1 ✅** — Terax-inspired chrome: status bar, unified terminal/editor tabs, tokenized theme, CodeMirror 6, xterm WebGL, tab pill, collapsible sidebar, dirty/preview affordances (silent `?token=` auto-connect; no top connect form).
 - **UI-2 ✅** — per-tab recursive pane trees (max 4 leaves), shortcut registry + command palette, virtualized explorer, richer `layout_set` blob (see [UI.md](./UI.md)).
 - **UI-3 ✅** — OSC 7 cwd, search, activity bar, lightweight file badges, system/light/dark theme, settings via `config.json` (see [UI.md](./UI.md)).
 - Do not conflate with packaging polish below.
