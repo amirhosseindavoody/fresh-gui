@@ -16,7 +16,8 @@ pub struct PtySession {
     id: String,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    _child_killer: Arc<Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
+    /// Owned child so [`ChildKiller::kill`] can escalate SIGHUP → SIGKILL (Fresh shutdown).
+    child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
 }
 
 impl PtySession {
@@ -71,7 +72,6 @@ impl PtySession {
             .slave
             .spawn_command(cmd)
             .with_context(|| format!("spawn shell {shell}"))?;
-        let killer = child.clone_killer();
 
         let mut reader = pair
             .master
@@ -107,8 +107,26 @@ impl PtySession {
             id,
             master,
             writer: Arc::new(Mutex::new(writer)),
-            _child_killer: Arc::new(Mutex::new(killer)),
+            child: Mutex::new(child),
         })
+    }
+
+    /// Terminate the shell process (Fresh `ChildKiller::kill` on shutdown).
+    ///
+    /// Uses the owned PTY child so unix kill can escalate from SIGHUP to SIGKILL
+    /// (a cloned killer alone only sends SIGHUP).
+    pub fn kill(&self) {
+        match self.child.lock() {
+            Ok(mut child) => {
+                if let Err(err) = child.kill() {
+                    warn!(pty = %self.id, %err, "pty child kill failed");
+                } else {
+                    debug!(pty = %self.id, "pty child killed");
+                }
+                let _ = child.try_wait();
+            }
+            Err(_) => warn!(pty = %self.id, "pty child lock poisoned"),
+        }
     }
 
     pub fn write_all(&self, data: &[u8]) -> Result<()> {
