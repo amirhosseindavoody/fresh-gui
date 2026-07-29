@@ -184,7 +184,19 @@ async fn handle_client_msg(
                     message: err.to_string(),
                 })?;
 
-            let id_for_task = id.clone();
+            // Announce the PTY before forwarding any output. The reader thread may
+            // already be buffering bytes on `pty_out_rx`; do not drain them onto
+            // `out_tx` until `PtyOpened` is on the wire, or clients waiting in
+            // `open_pty` can see `PtyData` first and fail.
+            ptys.lock().await.insert(id.clone(), session);
+            send_msg(sink, &Message::PtyOpened { id: id.clone() })
+                .await
+                .map_err(|_| Message::Error {
+                    code: "send_failed".into(),
+                    message: "failed to send PtyOpened".into(),
+                })?;
+
+            let id_for_task = id;
             let out_tx2 = out_tx.clone();
             tokio::spawn(async move {
                 while let Some(bytes) = pty_out_rx.recv().await {
@@ -204,14 +216,6 @@ async fn handle_client_msg(
                     reason: Some("eof".into()),
                 });
             });
-
-            ptys.lock().await.insert(id.clone(), session);
-            send_msg(sink, &Message::PtyOpened { id })
-                .await
-                .map_err(|_| Message::Error {
-                    code: "send_failed".into(),
-                    message: "failed to send PtyOpened".into(),
-                })?;
             Ok(())
         }
         Message::PtyData { id, data } => {

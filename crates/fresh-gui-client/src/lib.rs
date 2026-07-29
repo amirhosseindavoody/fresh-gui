@@ -113,7 +113,14 @@ impl Client {
                 Message::Error { code, message } => {
                     bail!("pty open failed: {code}: {message}")
                 }
-                Message::Pong { .. } | Message::Ping { .. } => continue,
+                // Ignore control / unrelated traffic while waiting for the open ack.
+                // Backend must still send `PtyOpened` before this PTY's `PtyData`
+                // (see server PtyOpen handler) so we do not drop banner bytes here.
+                Message::Pong { .. }
+                | Message::Ping { .. }
+                | Message::AuthOk
+                | Message::FsListed { .. }
+                | Message::FsStatResult { .. } => continue,
                 other => bail!("unexpected while opening pty: {other:?}"),
             }
         }
