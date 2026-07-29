@@ -78,6 +78,24 @@
   --syn-meta: #8b949e;
   --syn-invalid: #f85149;
 
+  /* shadcn semantic bridge → Primer surfaces (keeps --muted as text color) */
+  --background: var(--bg);
+  --foreground: var(--text);
+  --card: var(--panel);
+  --card-foreground: var(--text);
+  --popover: var(--bg-elevated);
+  --popover-foreground: var(--text);
+  --primary: var(--accent);
+  --primary-foreground: #ffffff;
+  --secondary: var(--panel-2);
+  --secondary-foreground: var(--text);
+  --muted-foreground: var(--muted);
+  --accent-foreground: var(--text);
+  --destructive: var(--danger);
+  --input: var(--border);
+  --ring: var(--accent);
+  --radius: var(--radius-md);
+
   /* Explorer */
   --tree-row-height: 22px;
   --tree-indent: 12px;
