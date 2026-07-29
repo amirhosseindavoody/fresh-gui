@@ -79,6 +79,6 @@ Default path: `$XDG_CONFIG_HOME/fresh-gui/config.json` or `~/.config/fresh-gui/c
 }
 ```
 
-Missing file → built-in defaults (`zsh`, system theme, primer palette, hidden dotfiles / `.git`). First **Settings** / `Mod+,` open creates the documented template. Empty shell `args` keep interactive / OSC 7 setup; non-empty args are passed through. JSONC (`//` / `/* */`) is accepted. Named `palette` values match Fresh editor theme names where applicable (colors mapped onto host CSS tokens).
+Missing file → built-in defaults (`zsh`, system theme, primer palette, hidden dotfiles / `.git`). First **Settings** / `Mod+,` open creates the documented template; later opens also insert any newly added default keys that are missing from an existing file (existing values and comments are kept). Empty shell `args` keep interactive / OSC 7 setup; non-empty args are passed through. JSONC (`//` / `/* */`) is accepted. Named `palette` values match Fresh editor theme names where applicable (colors mapped onto host CSS tokens).
 
 See [docs/DESIGN.md](../../docs/DESIGN.md) and [docs/SECURITY.md](../../docs/SECURITY.md).

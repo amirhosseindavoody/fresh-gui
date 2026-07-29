@@ -252,18 +252,58 @@ impl Config {
     }
 
     /// Create the config file (and parent dir) with the documented template if missing.
-    pub fn ensure_file(path: &Path) -> Result<()> {
-        if path.is_file() {
-            return Ok(());
+    ///
+    /// When the file already exists, inserts any keys present in
+    /// [`DEFAULT_CONFIG_TEMPLATE`] that are absent from the file. Existing
+    /// keys/values are never overwritten. Returns `true` when the file was
+    /// created or modified.
+    pub fn ensure_file(path: &Path) -> Result<bool> {
+        if !path.is_file() {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("create config dir {}", parent.display()))?;
+            }
+            fs::write(path, DEFAULT_CONFIG_TEMPLATE)
+                .with_context(|| format!("write default config {}", path.display()))?;
+            info!(path = %path.display(), "wrote default config.json");
+            return Ok(true);
         }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create config dir {}", parent.display()))?;
+
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("read config {}", path.display()))?;
+        if text.trim().is_empty() {
+            fs::write(path, DEFAULT_CONFIG_TEMPLATE)
+                .with_context(|| format!("write default config {}", path.display()))?;
+            info!(path = %path.display(), "wrote default config.json (was empty)");
+            return Ok(true);
         }
-        fs::write(path, DEFAULT_CONFIG_TEMPLATE)
-            .with_context(|| format!("write default config {}", path.display()))?;
-        info!(path = %path.display(), "wrote default config.json");
-        Ok(())
+
+        let defaults = parse_jsonc_value(DEFAULT_CONFIG_TEMPLATE)
+            .context("parse default config template")?;
+        let mut existing = match parse_jsonc_value(&text) {
+            Ok(v) => v,
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    %err,
+                    "config exists but could not be parsed — leaving file untouched"
+                );
+                return Ok(false);
+            }
+        };
+
+        if !merge_missing_json(&mut existing, &defaults) {
+            return Ok(false);
+        }
+
+        let output = render_merged_config_text(&text, &existing);
+        fs::write(path, output)
+            .with_context(|| format!("write hydrated config {}", path.display()))?;
+        info!(
+            path = %path.display(),
+            "added missing default keys to config.json"
+        );
+        Ok(true)
     }
 
     fn normalize(&mut self) {
@@ -350,6 +390,112 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .map(PathBuf::from)
+}
+
+/// Parse JSONC into a [`serde_json::Value`] (comments / trailing commas via strip).
+fn parse_jsonc_value(text: &str) -> Result<serde_json::Value> {
+    let json = strip_jsonc(text.trim());
+    serde_json::from_str(&json).context("parse jsonc value")
+}
+
+/// Recursively insert keys from `defaults` that are missing in `existing`.
+/// Never replaces an existing key (including `null` / wrong types).
+/// Returns whether any key was inserted.
+pub fn merge_missing_json(
+    existing: &mut serde_json::Value,
+    defaults: &serde_json::Value,
+) -> bool {
+    use serde_json::Value;
+    match (existing, defaults) {
+        (Value::Object(existing_map), Value::Object(defaults_map)) => {
+            let mut changed = false;
+            for (key, default_value) in defaults_map {
+                match existing_map.get_mut(key) {
+                    Some(existing_value) => {
+                        changed |= merge_missing_json(existing_value, default_value);
+                    }
+                    None => {
+                        existing_map.insert(key.clone(), default_value.clone());
+                        changed = true;
+                    }
+                }
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// Write `merged` back, preserving comments/formatting from `existing_text` when possible
+/// (same approach as Fresh’s JSONC CST reconcile).
+fn render_merged_config_text(existing_text: &str, merged: &serde_json::Value) -> String {
+    if let Some(text) = reconcile_preserving_comments(existing_text, merged) {
+        return text;
+    }
+    serde_json::to_string_pretty(merged).unwrap_or_else(|_| merged.to_string())
+}
+
+fn reconcile_preserving_comments(existing: &str, clean: &serde_json::Value) -> Option<String> {
+    use jsonc_parser::cst::CstRootNode;
+    use serde_json::Value;
+
+    let Value::Object(target) = clean else {
+        return None;
+    };
+    let root = CstRootNode::parse(existing, &Default::default()).ok()?;
+    root.value()?.as_object()?;
+    let obj = root.object_value_or_set();
+    reconcile_cst_object(&obj, target);
+    Some(root.to_string())
+}
+
+fn reconcile_cst_object(
+    obj: &jsonc_parser::cst::CstObject,
+    target: &serde_json::Map<String, serde_json::Value>,
+) {
+    use serde_json::Value;
+
+    // Do not remove user keys that are absent from defaults — only fill gaps.
+    for (key, new_value) in target {
+        match obj.get(key) {
+            Some(prop) => {
+                let current = prop.value().and_then(|n| n.to_serde_value());
+                if current.as_ref() == Some(new_value) {
+                    continue;
+                }
+                match (new_value, prop.value().and_then(|n| n.as_object())) {
+                    (Value::Object(child_target), Some(child_obj)) => {
+                        reconcile_cst_object(&child_obj, child_target);
+                    }
+                    _ => {
+                        // Existing non-object value: leave it (never override).
+                    }
+                }
+            }
+            None => {
+                obj.append(key, json_value_to_cst_input(new_value));
+            }
+        }
+    }
+}
+
+fn json_value_to_cst_input(value: &serde_json::Value) -> jsonc_parser::cst::CstInputValue {
+    use jsonc_parser::cst::CstInputValue;
+    use serde_json::Value;
+    match value {
+        Value::Null => CstInputValue::Null,
+        Value::Bool(b) => CstInputValue::Bool(*b),
+        Value::Number(n) => CstInputValue::Number(n.to_string()),
+        Value::String(s) => CstInputValue::String(s.clone()),
+        Value::Array(arr) => {
+            CstInputValue::Array(arr.iter().map(json_value_to_cst_input).collect())
+        }
+        Value::Object(map) => CstInputValue::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), json_value_to_cst_input(v)))
+                .collect(),
+        ),
+    }
 }
 
 /// Minimal JSONC stripper (line `//` and block `/* */`); strings are left intact.
@@ -465,12 +611,96 @@ mod tests {
     fn ensure_file_writes_template() {
         let dir = tempfile_dir();
         let path = dir.join("nested").join("config.json");
-        Config::ensure_file(&path).unwrap();
+        assert!(Config::ensure_file(&path).unwrap());
         assert!(path.is_file());
         let cfg = Config::load_from_path(&path).unwrap();
         assert_eq!(cfg.resolve_shell().0, "zsh");
         assert_eq!(cfg.ui.theme, "system");
         assert_eq!(cfg.ui.palette, "primer");
+        assert!(!Config::ensure_file(&path).unwrap());
+    }
+
+    #[test]
+    fn ensure_file_adds_missing_keys_without_overriding() {
+        let dir = tempfile_dir();
+        let path = dir.join("config.json");
+        fs::write(
+            &path,
+            r#"{
+  // keep this comment
+  "ui": {
+    "theme": "light", // mine
+    "terminalFontSize": 18
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        assert!(Config::ensure_file(&path).unwrap());
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("keep this comment"),
+            "comments should be preserved:\n{text}"
+        );
+        assert!(
+            text.contains("\"theme\": \"light\""),
+            "existing theme must not be overridden:\n{text}"
+        );
+        assert!(
+            text.contains("\"terminalFontSize\": 18"),
+            "existing font size must not be overridden:\n{text}"
+        );
+        assert!(
+            text.contains("\"palette\""),
+            "missing palette should be inserted:\n{text}"
+        );
+        assert!(
+            text.contains("\"fontWeight\""),
+            "missing fontWeight should be inserted:\n{text}"
+        );
+        assert!(
+            text.contains("\"showDotfiles\""),
+            "missing showDotfiles should be inserted:\n{text}"
+        );
+        assert!(
+            text.contains("\"terminal\""),
+            "missing terminal section should be inserted:\n{text}"
+        );
+
+        let cfg = Config::load_from_path(&path).unwrap();
+        assert_eq!(cfg.ui.theme, "light");
+        assert_eq!(cfg.ui.terminal_font_size, 18);
+        assert_eq!(cfg.ui.palette, "primer");
+        assert_eq!(cfg.ui.font_weight, 400);
+        assert_eq!(cfg.resolve_shell().0, "zsh");
+
+        // Second call is a no-op.
+        assert!(!Config::ensure_file(&path).unwrap());
+    }
+
+    #[test]
+    fn merge_missing_json_only_fills_gaps() {
+        use serde_json::json;
+        let mut existing = json!({
+            "ui": { "theme": "dark", "webgl": false },
+            "extra": 1
+        });
+        let defaults = json!({
+            "ui": {
+                "theme": "system",
+                "palette": "primer",
+                "webgl": true
+            },
+            "terminal": { "shell": { "command": "zsh", "args": [] } }
+        });
+        assert!(merge_missing_json(&mut existing, &defaults));
+        assert_eq!(existing["ui"]["theme"], "dark");
+        assert_eq!(existing["ui"]["webgl"], false);
+        assert_eq!(existing["ui"]["palette"], "primer");
+        assert_eq!(existing["extra"], 1);
+        assert_eq!(existing["terminal"]["shell"]["command"], "zsh");
+        assert!(!merge_missing_json(&mut existing, &defaults));
     }
 
     #[test]
@@ -526,10 +756,10 @@ mod tests {
 
     fn tempfile_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "fresh-gui-config-test-{}",
-            std::process::id()
+            "fresh-gui-config-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
         ));
-        let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
     }

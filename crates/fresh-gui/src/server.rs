@@ -724,9 +724,10 @@ async fn handle_client_msg(
     }
 }
 
-/// Resolve an editor open: settings `config.json` is always allowed (and
-/// created on first open); everything else uses Fresh path/`cwd` resolution
-/// inside the FS sandbox (+ authorized terminal cwds).
+/// Resolve an editor open: settings `config.json` is always allowed (created
+/// on first open, and hydrated with any missing default keys); everything else
+/// uses Fresh path/`cwd` resolution inside the FS sandbox (+ authorized
+/// terminal cwds).
 async fn resolve_editor_open(
     state: &AppState,
     path: &str,
@@ -743,7 +744,22 @@ async fn resolve_editor_open(
         || path_part == state.config_path.display().to_string()
         || std::path::Path::new(&path_part) == state.config_path.as_path()
     {
-        Config::ensure_file(&state.config_path)?;
+        // Create the file if needed, and fill in newly added default keys
+        // without overriding the user's existing values.
+        if Config::ensure_file(&state.config_path)? {
+            match Config::load_from_path(&state.config_path) {
+                Ok(cfg) => {
+                    *state.config.write().expect("config lock") = cfg;
+                }
+                Err(err) => {
+                    warn!(
+                        path = %state.config_path.display(),
+                        %err,
+                        "hydrated config on disk but reload failed"
+                    );
+                }
+            }
+        }
         return Ok(crate::path_open::ResolvedOpen {
             path: state
                 .config_path

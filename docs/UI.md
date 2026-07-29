@@ -173,7 +173,7 @@ Defaults follow [Terax `shortcuts.ts`](https://github.com/crynta/terax-ai/blob/m
 | Copy (terminal) | `Mod+C` | Copies when text is selected (mouse drag); otherwise sends interrupt |
 | Paste (terminal) | `Mod+V` | System clipboard → PTY (bracketed paste when supported) |
 | Command palette | `Mod+P` | |
-| Open settings | `Mod+,` | Opens backend `config.json` in an editor tab |
+| Open settings | `Mod+,` | Opens backend `config.json` in an editor tab; missing default keys are added (existing values kept) |
 | Connect / disconnect | — | Primary in strip; disconnect keeps remote session |
 
 **Context menus:** right-click a tab or file-tree row to copy absolute path, relative path (vs workspace root), or file name; tabs also offer Close.
