@@ -1,0 +1,3 @@
+[submodule "vendor/fresh"]
+	path = vendor/fresh
+	url = https://github.com/amirhosseindavoody/fresh.git

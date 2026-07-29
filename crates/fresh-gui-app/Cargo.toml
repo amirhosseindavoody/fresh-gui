@@ -1,0 +1,22 @@
+[package]
+name = "fresh-gui-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Host GUI shell for fresh-gui (Windows MVP)"
+readme = "README.md"
+
+[[bin]]
+name = "fresh-gui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+fresh-gui-client = { workspace = true }
+fresh-gui-protocol = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

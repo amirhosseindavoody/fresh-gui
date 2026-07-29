@@ -1,0 +1,16 @@
+[package]
+name = "fresh-gui-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Host-side connection client for fresh-gui"
+readme = "README.md"
+
+[dependencies]
+anyhow = { workspace = true }
+fresh-gui-protocol = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

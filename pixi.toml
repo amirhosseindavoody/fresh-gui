@@ -1,0 +1,21 @@
+[workspace]
+authors = ["Amirhossein Davoody <amirhossein.davoody@gmail.com>"]
+channels = ["conda-forge"]
+description = "Terminal-first ADE GUI (host) with remote Fresh backend"
+name = "fresh-gui"
+platforms = ["linux-64"]
+version = "2026.728.1"
+
+[tasks]
+check = "cargo check --workspace"
+test = "cargo test --workspace"
+build = "cargo build --workspace"
+clippy = "cargo clippy --workspace --all-targets -- -D warnings"
+fmt = "cargo fmt --all"
+fmt-check = "cargo fmt --all -- --check"
+backend = "cargo run -p fresh-gui-backend --"
+app = "cargo run -p fresh-gui-app --"
+update-version = "scripts/update-version.sh"
+
+[dependencies]
+rust = ">=1.97.1,<1.98"

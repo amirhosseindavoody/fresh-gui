@@ -1,0 +1,16 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# Rust / Cargo
+/target/
+**/*.rs.bk
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Built conda packages
+dist/
