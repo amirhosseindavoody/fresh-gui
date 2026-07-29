@@ -1,6 +1,7 @@
-# Default variants for pixi / rattler-build outside conda-forge pinning.
+# Default variants for rattler-build outside conda-forge pinning.
 # Required so ${{ stdlib('c') }} / ${{ compiler(...) }} resolve for
-# `pixi global install --git` (see prefix-dev/pixi#5272).
+# `pixi global install --git` / `--path` (see prefix-dev/pixi#5272).
+# Lives next to recipe.yaml so source consumers pick it up without pixi.toml.
 c_stdlib:
   - if: linux
     then: sysroot
