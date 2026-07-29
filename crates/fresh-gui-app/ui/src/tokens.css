@@ -28,7 +28,9 @@
   --term-bg: #010409;
   --term-fg: #e6edf3;
   --term-cursor: #3fb950;
-  --term-selection: color-mix(in srgb, var(--accent) 33%, transparent);
+  /* Opaque enough for canvas selection (xterm does not soft-blend well). */
+  --term-selection: #3fb95080;
+  --term-selection-fg: #ffffff;
 }
 
 :root[data-theme="light"] {
@@ -49,5 +51,7 @@
   --term-bg: #f6f8fa;
   --term-fg: #1f2328;
   --term-cursor: #1a7f37;
-  --term-selection: color-mix(in srgb, var(--accent) 33%, transparent);
+  /* Stronger than accent@33% — that was nearly invisible on #f6f8fa. */
+  --term-selection: #2da44ea6;
+  --term-selection-fg: #0a1628;
 }
