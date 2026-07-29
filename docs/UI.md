@@ -149,6 +149,8 @@ Primer-inspired dark/light surfaces live in `src/tokens.css` (palette `primer`).
 }
 ```
 
+Pick a palette from the activity bar swatch, or **Mod+Shift+P** → “Color Palette…”. Choices apply immediately and are written to `config.json` when connected.
+
 Motion: 2–3 intentional uses — tab pill slide, sidebar collapse, panel focus ring. No perpetual ambient animation.
 
 ## 6. Interaction map
@@ -171,7 +173,7 @@ Defaults follow [Terax `shortcuts.ts`](https://github.com/crynta/terax-ai/blob/m
 | Copy (terminal) | `Mod+C` | Copies when text is selected (mouse drag); otherwise sends interrupt |
 | Paste (terminal) | `Mod+V` | System clipboard → PTY (bracketed paste when supported) |
 | Command palette | `Mod+P` | |
-| Open settings | `Mod+,` | Opens backend `config.json` in an editor tab |
+| Open settings | `Mod+,` | Opens backend `config.json` in an editor tab; missing default keys are added (existing values kept) |
 | Connect / disconnect | — | Primary in strip; disconnect keeps remote session |
 
 **Context menus:** right-click a tab or file-tree row to copy absolute path, relative path (vs workspace root), or file name; tabs also offer Close.

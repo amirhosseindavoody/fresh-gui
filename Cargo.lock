@@ -1455,6 +1455,7 @@ dependencies = [
  "fresh-gui-client",
  "fresh-gui-protocol",
  "futures-util",
+ "jsonc-parser",
  "notify 7.0.0",
  "portable-pty",
  "serde",

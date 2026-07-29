@@ -3,6 +3,7 @@ import {
   ChevronDown,
   Columns2,
   Files,
+  Palette,
   PanelLeftClose,
   Plus,
   Rows2,
@@ -104,6 +105,16 @@ export function App() {
             aria-pressed={true}
           >
             <Files className="activity-glyph size-4" aria-hidden />
+          </Button>
+          <Button
+            id="activity-palette"
+            className="activity-btn"
+            type="button"
+            variant="ghost"
+            size="icon"
+            title="Color palette (Mod+Shift+P → Color Palette)"
+          >
+            <Palette className="activity-glyph size-4" aria-hidden />
           </Button>
           <div className="activity-spacer" />
           <Button

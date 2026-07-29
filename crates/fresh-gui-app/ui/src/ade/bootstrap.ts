@@ -34,11 +34,13 @@ import {
   defaultPaletteCommands,
   openGotoFile,
   openPalette,
+  openPaletteWithQuery,
   setGotoFileHandler,
   setPaletteCommands,
+  type PaletteCommand,
 } from "../palette";
 import { VirtualTree } from "../tree";
-import { applyPalette, paletteLabel } from "../palettes";
+import { applyPalette, listPalettes, paletteLabel, type PaletteId } from "../palettes";
 import { getResolvedTheme, initTheme, onResolvedThemeChange, resolveTheme } from "../theme";
 import {
   applyUiChrome,
@@ -155,6 +157,7 @@ let splitVBtn: HTMLButtonElement;
 let splitOffBtn: HTMLButtonElement;
 let findBtn: HTMLButtonElement;
 let activityExplorer: HTMLButtonElement;
+let activityPalette: HTMLButtonElement;
 let activitySettings: HTMLButtonElement;
 
 let uiSettings: UiSettings = loadSettings();
@@ -519,6 +522,20 @@ function titleFromCwd(cwd: string | undefined, fallback: string): string {
   return base || fallback;
 }
 
+/** Browser tab title: active working directory (or editor file) — product name. */
+function syncDocumentTitle(): void {
+  const active = tabs[activeTabIndex];
+  let head: string | null = null;
+  if (active?.kind === "terminal") {
+    const cwd = active.leaves.get(active.activeLeafId)?.cwd || lastTerminalCwd;
+    if (cwd) head = titleFromCwd(cwd, "");
+  } else if (active?.kind === "editor") {
+    head = basename(active.path) || null;
+  }
+  if (!head && lastTerminalCwd) head = titleFromCwd(lastTerminalCwd, "");
+  document.title = head ? `${head} — fresh-gui` : "fresh-gui";
+}
+
 /** Last known terminal leaf cwd (Terax: explorer + new shells follow this, not editor folder). */
 let lastTerminalCwd: string | null = null;
 let explorerSyncGen = 0;
@@ -604,7 +621,10 @@ function applyLeafCwd(tab: TerminalTab, ptyId: string, cwd: string): void {
     tab.title = titleFromCwd(cwd, tab.title);
     renderTabs();
     lastTerminalCwd = cwd;
-    if (tabs[activeTabIndex] === tab) setStatusLeft(cwd);
+    if (tabs[activeTabIndex] === tab) {
+      setStatusLeft(cwd);
+      syncDocumentTitle();
+    }
     syncExplorerToCwd(cwd);
   }
 
@@ -678,7 +698,72 @@ function applyUiSettings(next: UiSettings): void {
     showDotfiles: next.showDotfiles,
     showGitDirs: next.showGitDirs,
   });
+  if (prev.palette !== next.palette) refreshPaletteCommands?.();
   requestAnimationFrame(fitActiveLeaves);
+}
+
+/** Patch `ui.palette` in a config.json document (JSONC-tolerant string replace). */
+function patchPaletteInConfigText(text: string, palette: PaletteId): string {
+  if (/"palette"\s*:/.test(text)) {
+    return text.replace(/("palette"\s*:\s*")([^"]*)(")/, `$1${palette}$3`);
+  }
+  if (/"ui"\s*:\s*\{/.test(text)) {
+    return text.replace(/("ui"\s*:\s*\{)/, `$1\n    "palette": "${palette}",`);
+  }
+  // Bare / empty config — write a minimal ui block the backend template understands.
+  const trimmed = text.trim();
+  if (!trimmed || trimmed === "{}") {
+    return `{\n  "ui": {\n    "palette": "${palette}"\n  }\n}\n`;
+  }
+  return text;
+}
+
+async function persistPaletteToConfig(palette: PaletteId): Promise<void> {
+  if (!configPath) throw new Error("no config path");
+  const existing = tabs.find(
+    (t): t is EditorTab => t.kind === "editor" && isConfigPath(t.path),
+  );
+  if (existing) {
+    const next = patchPaletteInConfigText(existing.view.state.doc.toString(), palette);
+    existing.suppressChange = true;
+    existing.view.dispatch({
+      changes: { from: 0, to: existing.view.state.doc.length, insert: next },
+    });
+    existing.suppressChange = false;
+    existing.dirty = true;
+    const revAfterEdit = await bufferEdit(existing.bufferId, existing.rev, next);
+    existing.rev = revAfterEdit;
+    const saved = await bufferSave(existing.bufferId, existing.rev);
+    existing.rev = saved.rev;
+    existing.dirty = false;
+    existing.preview = false;
+    renderAll();
+    return;
+  }
+  const opened = await editorOpen(configPath, { preview: false });
+  const next = patchPaletteInConfigText(opened.text, palette);
+  const revAfterEdit = await bufferEdit(opened.buffer_id, opened.rev, next);
+  await bufferSave(opened.buffer_id, revAfterEdit);
+}
+
+/** Filled inside `bootstrapAde` so command palette can list shortcuts + palettes. */
+let refreshPaletteCommands: (() => void) | null = null;
+
+async function choosePalette(id: PaletteId): Promise<void> {
+  applyUiSettings({ ...uiSettings, palette: id });
+  refreshPaletteCommands?.();
+  if (!connected || !hasEditor || !configPath) {
+    setStatusLeft(`palette · ${paletteLabel(id)}`);
+    return;
+  }
+  try {
+    await persistPaletteToConfig(id);
+    setStatusLeft(`palette · ${paletteLabel(id)} · saved to config`);
+  } catch (err) {
+    setStatusLeft(
+      `palette · ${paletteLabel(id)} · applied locally (${err instanceof Error ? err.message : String(err)})`,
+    );
+  }
 }
 
 function pathsEqual(a: string, b: string): boolean {
@@ -1038,6 +1123,7 @@ function renderTabs(): void {
       renderAll();
       persistLayout();
       syncExplorerToActiveContext();
+      syncDocumentTitle();
       focusActiveTab();
     });
     el.addEventListener("contextmenu", (ev) => {
@@ -1047,6 +1133,7 @@ function renderTabs(): void {
       renderAll();
       persistLayout();
       syncExplorerToActiveContext();
+      syncDocumentTitle();
 
       const items: ContextMenuItem[] = [];
       if (tab.kind === "editor") {
@@ -1148,6 +1235,7 @@ function focusLeaf(tab: TerminalTab, leafId: string): void {
     persistLayout();
     const cwd = bundle?.cwd;
     if (cwd && tabs[activeTabIndex] === tab) syncExplorerToCwd(cwd);
+    if (tabs[activeTabIndex] === tab) syncDocumentTitle();
   }
   bundle?.term.focus();
 }
@@ -1165,6 +1253,7 @@ function selectTabRelative(delta: 1 | -1): void {
   renderAll();
   persistLayout();
   syncExplorerToActiveContext();
+  syncDocumentTitle();
   focusActiveTab();
 }
 
@@ -1209,6 +1298,7 @@ function renderAll(): void {
   updateSaveButton();
   updateStatusRight();
   syncSearchTarget();
+  syncDocumentTitle();
 }
 
 function clearTabs(): void {
@@ -1787,6 +1877,7 @@ function disconnect(): void {
   lastTerminalCwd = null;
   explorerSyncGen += 1;
   setTreeEmptyHint(true);
+  syncDocumentTitle();
   connectBtn.disabled = false;
   disconnectBtn.disabled = true;
   setWorkspaceControls(false);
@@ -1918,6 +2009,7 @@ export function bootstrapAde(): void {
   splitOffBtn = $button("split-off");
   findBtn = $button("find-btn");
   activityExplorer = $button("activity-explorer");
+  activityPalette = $button("activity-palette");
   activitySettings = $button("activity-settings");
 
   initTheme();
@@ -1968,6 +2060,9 @@ activityExplorer.addEventListener("click", () => {
   toggleSidebar();
   if (!isSidebarCollapsed()) treeEl.focus();
 });
+activityPalette.addEventListener("click", () => {
+  openPaletteWithQuery("Color Palette");
+});
 activitySettings.addEventListener("click", () => {
   void openSettingsFile();
 });
@@ -2002,8 +2097,31 @@ function runShortcutId(id: ShortcutId): void {
   shortcutHandlers[id]?.(new KeyboardEvent("keydown"));
 }
 
+function colorPaletteCommands(): PaletteCommand[] {
+  const current = uiSettings.palette;
+  return listPalettes().map(({ id, label }) => ({
+    id: `palette.${id}`,
+    label: id === current ? `Color Palette: ${label} (current)` : `Color Palette: ${label}`,
+    run: () => {
+      void choosePalette(id);
+    },
+  }));
+}
+
+refreshPaletteCommands = () => {
+  setPaletteCommands([
+    ...defaultPaletteCommands(runShortcutId),
+    {
+      id: "palette.pick",
+      label: "Preferences: Color Palette…",
+      run: () => openPaletteWithQuery("Color Palette"),
+    },
+    ...colorPaletteCommands(),
+  ]);
+};
+
 installShortcuts(shortcutHandlers);
-setPaletteCommands(defaultPaletteCommands(runShortcutId));
+refreshPaletteCommands();
 setGotoFileHandler((path) => {
   void openEditorTab(path, {
     preview: false,
@@ -2039,6 +2157,7 @@ loadSidebarPrefs();
 updateStripLayout();
 updateStatusRight();
 setStatusLeft("disconnected");
+syncDocumentTitle();
 
 function defaultWsUrl(): string {
   // Vite dev UI is on :1420; backend stays on :7420.
