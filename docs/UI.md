@@ -2,7 +2,7 @@
 
 Product UI for the **local host** ADE shell. Architecture and protocol: [DESIGN.md](./DESIGN.md). Overview for users: [README.md](../README.md).
 
-**Status:** UI-1–UI-3 are in use in `crates/fresh-gui-app/ui` — connection strip, status bar, unified terminal/editor tabs, CodeMirror 6, xterm WebGL, pane trees, shortcuts + palette, virtualized tree, OSC 7 cwd, find, activity bar, system/light/dark theme + named color palettes + typography via `config.json`, path context menus.
+**Status:** UI-1–UI-3 are in use in `crates/fresh-gui-app/ui` — status bar, unified terminal/editor tabs, CodeMirror 6, xterm WebGL, pane trees, shortcuts + palette, virtualized tree, OSC 7 cwd, find, activity bar, system/light/dark theme + named color palettes + typography via `config.json`, path context menus. Connection is silent (`?token=` / sessionStorage auto-connect); no top connect form.
 
 This doc keeps the IA, visual language, and interaction map for ongoing polish. It is not a backlog of unfinished MVP chrome.
 
@@ -44,9 +44,7 @@ Inspired by Terax’s public UI / [TERAX.md](https://github.com/crynta/terax-ai/
 ### 3.1 Regions (target)
 
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│  Title / connection strip (compact)     [session] [● connected] [⋯]     │
-├────┬─────────────────────────────────────────────────────────┬───────────┤
+┌────┬─────────────────────────────────────────────────────────┬───────────┐
 │ A  │  Tab bar  [ term ] [ term ] [ file.rs • ]  [+]  [split] │  (rail)   │
 │ c  ├─────────────────────────────────────────────────────────┤  reserved │
 │ t  │                                                         │  closed   │
@@ -54,41 +52,39 @@ Inspired by Terax’s public UI / [TERAX.md](https://github.com/crynta/terax-ai/
 │ v  │              + nested pane tree when split              │  default  │
 │ i  │                                                         │           │
 │ t  │                                                         │           │
-│ y │                                                         │           │
+│ y  │                                                         │           │
 │    │                                                         │           │
 ├────┴─────────────────────────────────────────────────────────┴───────────┤
-│  Status: ~/proj · session abc123 · editor · fs_watch · latency optional │
+│  Status: online · session abc123 · editor · fs · watch                  │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
 | Region | Role |
 |--------|------|
-| **Connection strip** | **Always on** (not a disconnect-only modal). Backend URL, auth, Connect/Disconnect stay in a top strip. After connect the strip stays visible but **compacts** to a quiet chip row (host + session id + status); expand inline to edit URL/token without leaving the workspace. |
 | **Activity / sidebar** | Activity bar (Explorer + Settings). Sidebar hosts the file tree; collapsible; width persisted in layout blob. |
 | **Tab bar** | All document surfaces. New tab = new PTY by default. Double-click file opens/focuses an **editor tab** (not a permanent bottom pane). |
 | **Main stack** | One visible tab; inactive tabs hidden (`visibility` / `content-visibility`), not unmounted. |
 | **Right rail** | Reserved width 0. Do not build AI chrome here for MVP. |
-| **Status bar** | Remote cwd/root, session id (truncated), capability pills, dirty count, optional RTT. |
+| **Status bar** | Connection / session / capability pills, dirty count; left side shows live status messages. |
 
 ### 3.2 First viewport rules
 
 After a successful attach:
 
 1. Focus lands in the active terminal pane.
-2. Connection strip stays present but compact — not a full form competing with the terminal.
+2. No connection form in the chrome — auth comes from `?token=` / tab `sessionStorage`.
 3. No marketing copy, stats strips, or floating badges on the workspace.
-4. Brand mark may appear small in the strip or about dialog — never as a hero competing with the terminal.
 
-Before the first successful connect, the strip is expanded (URL / token / Connect) and the main stack shows a calm empty state (“Connect to a backend”) — not a SaaS landing page.
+Before the first successful connect, the main stack shows a calm empty state (“Open the printed Local access URL to connect”).
 
 ### 3.3 Resolved UI decisions
 
 | Topic | Decision |
 |-------|----------|
-| **Connect UX** | Always-on strip (compact when connected; expand inline to edit). No modal-only connect flow. |
+| **Connect UX** | Silent auto-connect from printed `?token=` URL (cached in `sessionStorage` for reload). Status bar shows connection; Disconnect / Reconnect via command palette. No top connect form. |
 | **Default keybindings** | Match **Terax** pane/tab shortcuts (see §6). Remappable later via settings. |
 | **File tree icons** | Lightweight inline SVG icons + typed color tones (`src/icons.ts`); VS Code–style indent guides and chevrons in the virtualized tree. No full Material icon pack. |
-| **UI framework** | **React 19 + Tailwind v4 + shadcn/ui** for shell chrome (strip, activity, tabs actions, status). Imperative ADE controller (`bootstrapAde`) still owns protocol, xterm, CodeMirror, and the virtualized tree — attached to stable DOM ids from the React shell. |
+| **UI framework** | **React 19 + Tailwind v4 + shadcn/ui** for shell chrome (activity, tabs actions, status). Imperative ADE controller (`bootstrapAde`) still owns protocol, xterm, CodeMirror, and the virtualized tree — attached to stable DOM ids from the React shell. |
 | **Large trees (~10k files)** | Host concern: keep lazy one-level `fs_list`; **row virtualization** (`VirtualTree`) + watch discipline. Backend `fs_watch` skips `.git` / `target` / `node_modules` / … when installing recursive watches (and runs install off the WS task) so PTY I/O is not stalled. Do not replace the explorer with a naive React row list. |
 | **Editor authority UX** | **Quiet day-to-day:** normal file-tab chrome (path, dirty `•`, save). Surface remote/Fresh authority only on **connection state**, **save errors**, and **conflicts** — not permanent “remote buffer” badging. |
 
@@ -122,7 +118,7 @@ type PaneNode =
 | Flat `tabs[]` of PTYs only | **UI-1:** unified `terminal` \| `editor` tabs |
 | Global H/V “two shells” split | **UI-2 ✅:** per-tab recursive `PaneNode` splits (max 4 leaves) |
 | Editor docked under terminals | **UI-1:** `editor` tabs in the same bar |
-| Connect fields always large | **UI-1:** compact strip when connected |
+| Connect fields always large | **Removed:** silent auto-connect; no top form |
 
 ## 5. Visual language
 
@@ -174,7 +170,7 @@ Defaults follow [Terax `shortcuts.ts`](https://github.com/crynta/terax-ai/blob/m
 | Paste (terminal) | `Mod+V` | System clipboard → PTY (bracketed paste when supported) |
 | Command palette | `Mod+P` | |
 | Open settings | `Mod+,` | Opens backend `config.json` in an editor tab; missing default keys are added (existing values kept) |
-| Connect / disconnect | — | Primary in strip; disconnect keeps remote session. Reload reuses `sessionStorage` token + `localStorage` session id after `?token=` is stripped |
+| Connect / disconnect | — | Auto-connect via `?token=` / `sessionStorage`; Disconnect / Reconnect in command palette. Disconnect keeps remote session |
 
 **Context menus:** right-click a tab or file-tree row to copy absolute path, relative path (vs workspace root), or file name; tabs also offer Close.
 
@@ -192,7 +188,7 @@ Connection errors and auth failures use inline strip status; never modal loops.
 
 | Current (`ui/src`) | Role |
 |--------------------|------|
-| Connection inputs in `main.ts` | Always-on strip (compacts when connected) |
+| Connection inputs in `main.ts` | Removed — silent auto-connect + status bar |
 | `#tabs` + split buttons | Unified terminal / editor tabs |
 | `#panes` / `panes.ts` | Per-tab recursive pane tree |
 | `terminal.ts` | xterm + WebGL + OSC 7 |
@@ -209,7 +205,7 @@ Connection errors and auth failures use inline strip status; never modal loops.
 - Fit/resize only the visible leaves; debounce resize storms.
 - Tree refresh stays silent (no “Loading…” flash); preserve expand/selection (already started).
 - Large directories: expand stays **lazy** (one `fs_list` per opened dir). When a visible folder can expose thousands of rows, **virtualize** the tree viewport (mount only visible rows). Backend recursive `fs_watch` skips ignored trees before registering inotify watches; the host still applies Debounced/`WATCH_IGNORE`-style filtering so residual `fs_changed` events do not rebuild the world.
-- Save conflicts: when backend grows mtime/CAS errors, show overwrite UI — never silent last-writer-wins (Terax editor lesson). Day-to-day editor chrome stays local-feeling; remote authority appears in the connection strip / status and on save or conflict failures only.
+- Save conflicts: when backend grows mtime/CAS errors, show overwrite UI — never silent last-writer-wins (Terax editor lesson). Day-to-day editor chrome stays local-feeling; remote authority appears in the status bar and on save or conflict failures only.
 
 ## 8. Stack decision
 
@@ -227,7 +223,7 @@ Connection errors and auth failures use inline strip status; never modal loops.
 
 ### Phase UI-1 — Chrome + unified surfaces ✅
 
-- Collapsible connection strip; status bar.
+- Status bar (connection / session / capabilities).
 - Tokenized theme; restyle tree / tabs / panes without new features.
 - Editor becomes tabs (remove permanent bottom dock).
 - CodeMirror 6 + xterm WebGL.

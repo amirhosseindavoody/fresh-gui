@@ -81,13 +81,12 @@ body {
 
 #root {
   display: grid;
-  grid-template-rows: auto 1fr var(--statusbar-height);
+  grid-template-rows: 1fr var(--statusbar-height);
   height: 100%;
   min-height: 100%;
   overflow: hidden;
 }
 
-.brand,
 .sidebar-head h2,
 .statusbar {
   font-weight: var(--font-ui-weight);
@@ -121,119 +120,8 @@ input:not([data-slot="input"]):focus-visible {
   outline-offset: 1px;
 }
 
-label {
-  display: flex;
-  flex-direction: column;
-  gap: 0.2rem;
-  font-size: 0.7rem;
-  color: var(--muted);
-}
-
-input:not([data-slot="input"]) {
-  min-width: 11rem;
-  padding: 0.4rem 0.55rem;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg);
-  color: var(--text);
-  font: inherit;
-  font-size: 0.85rem;
-}
-
-input#session {
-  min-width: 16rem;
-  font-family: var(--font-mono);
-  font-size: 12px;
-}
-
-#strip-fields [data-slot="input"] {
-  min-width: 11rem;
-  height: 2rem;
-  font-size: 0.85rem;
-}
-
-#strip-fields #session[data-slot="input"] {
-  min-width: 16rem;
-  font-family: var(--font-mono);
-  font-size: 12px;
-}
-
 .mono {
   font-family: var(--font-mono);
-}
-
-/* —— Connection strip —— */
-.connection-strip {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.55rem;
-  align-items: center;
-  padding: 0.55rem 0.85rem;
-  border-bottom: 1px solid var(--border);
-  background: color-mix(in srgb, var(--panel) 92%, transparent);
-  backdrop-filter: blur(10px);
-  z-index: 5;
-}
-
-.brand {
-  font-family: var(--font-mono);
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  margin-right: 0.25rem;
-}
-
-.strip-toggle {
-  padding: 0.2rem 0.45rem;
-  line-height: 1;
-}
-
-.strip-compact {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.4rem;
-  align-items: center;
-}
-
-.strip-chip {
-  font-size: 0.75rem;
-  padding: 0.2rem 0.5rem;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--bg-elevated);
-  color: var(--muted);
-  max-width: 18rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.strip-chip.state.connected {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
-}
-
-.strip-fields {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.55rem;
-  align-items: end;
-  flex: 1;
-}
-
-.connection-strip.compact .strip-fields {
-  display: none;
-}
-
-.connection-strip.compact .strip-compact {
-  display: flex;
-}
-
-.connection-strip.expanded .strip-compact {
-  display: none;
-}
-
-.connection-strip.compact #strip-toggle {
-  transform: rotate(-90deg);
 }
 
 /* —— Workspace —— */

@@ -7,7 +7,7 @@ import {
   type PtyInfo,
   type ServerMessage,
 } from "../protocol";
-import { $, $button, $input, b64decode, b64encode, basename, relativePath } from "../dom";
+import { $, $button, b64decode, b64encode, basename, relativePath } from "../dom";
 import { applyEditorFontSize, applyEditorTheme, createEditorView, openEditorSearch, revealEditorLocation } from "../editor";
 import { isMarkdownPath, updateMarkdownPreview } from "../markdown-preview";
 import {
@@ -135,14 +135,6 @@ interface LayoutBlob {
 /** Deferred intent consumed by the next `pty_opened` reply (requests are FIFO on one socket). */
 type PtyIntent = { kind: "newTab" } | { kind: "split"; tabId: string; leafId: string; direction: SplitDir };
 
-let connectionStrip: HTMLElement;
-let stripToggle: HTMLButtonElement;
-let stripCompact: HTMLElement;
-let stripHost: HTMLElement;
-let stripSession: HTMLElement;
-let stripState: HTMLElement;
-let connectBtn: HTMLButtonElement;
-let disconnectBtn: HTMLButtonElement;
 let workspaceEl: HTMLElement;
 let sidebarToggle: HTMLButtonElement;
 let sidebarResizer: HTMLElement;
@@ -178,8 +170,14 @@ let reqSeq = 0;
 let tabSeq = 0;
 let hasEditor = false;
 let watchId: string | null = null;
-let stripForceExpanded = false;
 let connected = false;
+
+/** Backend WebSocket URL (derived from page origin / Vite default — no connect form). */
+let wsUrl = "";
+/** Bearer token from `?token=` / sessionStorage cache. */
+let authToken = "";
+/** Preferred session id for attach (localStorage-backed). */
+let preferredSessionId = "";
 
 const pendingFs = new Map<string, Pending<{ path: string; entries: FsEntry[] }>>();
 const pendingFsAuth = new Map<string, Pending<{ path: string }>>();
@@ -222,52 +220,17 @@ function setStatusLeft(text: string): void {
 function updateStatusRight(): void {
   const caps: string[] = [];
   if (connected) caps.push("online");
+  else if (ws) caps.push("connecting");
+  if (sessionId) {
+    caps.push(sessionId.length > 12 ? `${sessionId.slice(0, 12)}…` : sessionId);
+  }
   if (hasEditor) caps.push("editor");
   if (connected) caps.push("fs");
   if (watchId) caps.push("watch");
   const dirty = tabs.filter((t) => t.kind === "editor" && t.dirty).length;
   if (dirty > 0) caps.push(`${dirty} dirty`);
   statusRight.textContent = caps.join(" · ");
-}
-
-function updateStripChips(): void {
-  const url = $input("url").value.trim();
-  stripHost.textContent = url || "—";
-  stripHost.title = url;
-  stripSession.textContent = sessionId ? sessionId.slice(0, 12) + (sessionId.length > 12 ? "…" : "") : "—";
-  stripSession.title = sessionId || "";
-  stripState.textContent = connected ? "connected" : ws ? "connecting" : "disconnected";
-  stripState.classList.toggle("connected", connected);
-}
-
-function updateStripLayout(): void {
-  if (!connected) {
-    connectionStrip.classList.remove("compact");
-    connectionStrip.classList.add("expanded");
-    stripToggle.hidden = true;
-    stripCompact.hidden = true;
-    return;
-  }
-  stripToggle.hidden = false;
-  stripCompact.hidden = false;
-  updateStripChips();
-  if (stripForceExpanded) {
-    connectionStrip.classList.remove("compact");
-    connectionStrip.classList.add("expanded");
-  } else {
-    connectionStrip.classList.add("compact");
-    connectionStrip.classList.remove("expanded");
-  }
-}
-
-function expandStrip(): void {
-  stripForceExpanded = true;
-  updateStripLayout();
-}
-
-function compactStrip(): void {
-  stripForceExpanded = false;
-  updateStripLayout();
+  statusRight.title = sessionId ? `session ${sessionId}` : "";
 }
 
 function applySidebarWidth(width: number): void {
@@ -856,7 +819,7 @@ function updateStacks(): void {
   emptyStack.hidden = connected && hasTabs;
   emptyStack.textContent = connected
     ? "Open a terminal or file to get started"
-    : "Connect to a backend to open a session";
+    : "Open the printed Local access URL to connect";
   const active = tabs[activeTabIndex];
   terminalStack.hidden = !connected || active?.kind !== "terminal";
   editorStack.hidden = !connected || active?.kind !== "editor";
@@ -1590,7 +1553,6 @@ async function saveActiveEditor(): Promise<void> {
 function afterSessionReady(): void {
   connected = true;
   setWorkspaceControls(true);
-  updateStripLayout();
   updateStatusRight();
   loadRoot()
     .then(() => startFsWatch())
@@ -1655,36 +1617,35 @@ function onMessage(raw: string): void {
         capabilities: ["ping", "pty", "fs", "session", "editor", "scene"],
       });
       {
-        const token = $input("token").value;
-        if (token) send({ type: "auth", token });
+        if (authToken) send({ type: "auth", token: authToken });
         else beginSession();
       }
       setStatusLeft(`hello from ${msg.implementation}${hasEditor ? " · editor" : " · no editor"}`);
       updateStatusRight();
       break;
     case "auth_ok": {
-      const token = $input("token").value.trim();
-      if (token) cacheAuthToken(token);
+      if (authToken) cacheAuthToken(authToken);
       beginSession();
       setStatusLeft("authenticated");
       break;
     }
     case "auth_error":
       clearCachedAuthToken();
+      authToken = "";
       setStatusLeft(`auth failed: ${msg.message}`);
       break;
     case "session_created":
       sessionId = msg.session_id;
-      $input("session").value = sessionId;
+      preferredSessionId = sessionId;
       localStorage.setItem(SESSION_KEY, sessionId);
       afterSessionReady();
       requestNewPty(80, 24, { kind: "newTab" });
       setStatusLeft(`session ${sessionId}`);
-      updateStripChips();
+      updateStatusRight();
       break;
     case "session_attached": {
       sessionId = msg.session_id;
-      $input("session").value = sessionId;
+      preferredSessionId = sessionId;
       localStorage.setItem(SESSION_KEY, sessionId);
       clearTabs();
 
@@ -1718,7 +1679,7 @@ function onMessage(raw: string): void {
       }
       afterSessionReady();
       setStatusLeft(`reattached ${sessionId} (${ptyList.length} ptys)`);
-      updateStripChips();
+      updateStatusRight();
       break;
     }
     case "pty_opened": {
@@ -1841,7 +1802,7 @@ function onMessage(raw: string): void {
       rejectPendingError(msg);
       if (msg.code === "session_attach_failed") {
         localStorage.removeItem(SESSION_KEY);
-        $input("session").value = "";
+        preferredSessionId = "";
         setStatusLeft(`${msg.code}: ${msg.message}; creating new session…`);
         send({ type: "session_create", layout: localStorage.getItem(LAYOUT_KEY) || undefined });
         break;
@@ -1854,9 +1815,9 @@ function onMessage(raw: string): void {
 }
 
 function beginSession(): void {
-  const wanted = $input("session").value.trim() || localStorage.getItem(SESSION_KEY) || "";
+  const wanted = preferredSessionId.trim() || localStorage.getItem(SESSION_KEY) || "";
   if (wanted) {
-    $input("session").value = wanted;
+    preferredSessionId = wanted;
     send({ type: "session_attach", session_id: wanted });
   } else {
     send({ type: "session_create", layout: localStorage.getItem(LAYOUT_KEY) || undefined });
@@ -1878,7 +1839,6 @@ function disconnect(): void {
   sessionId = null;
   hasEditor = false;
   configPath = null;
-  stripForceExpanded = false;
   pendingEditor.clear();
   pendingEdit.clear();
   pendingSave.clear();
@@ -1888,24 +1848,24 @@ function disconnect(): void {
   explorerSyncGen += 1;
   setTreeEmptyHint(true);
   syncDocumentTitle();
-  connectBtn.disabled = false;
-  disconnectBtn.disabled = true;
   setWorkspaceControls(false);
-  updateStripLayout();
   updateStatusRight();
   setStatusLeft("disconnected (session kept on backend if created)");
 }
 
 function connect(): void {
   disconnect();
-  const url = $input("url").value.trim();
+  const url = wsUrl.trim();
+  if (!url) {
+    setStatusLeft("no backend URL");
+    return;
+  }
   setStatusLeft(`connecting ${url}…`);
+  updateStatusRight();
   ws = new WebSocket(url);
   ws.addEventListener("open", () => {
-    connectBtn.disabled = true;
-    disconnectBtn.disabled = false;
     setStatusLeft("socket open, waiting for hello…");
-    updateStripChips();
+    updateStatusRight();
   });
   ws.addEventListener("message", (ev) => {
     if (typeof ev.data === "string") onMessage(ev.data);
@@ -1913,10 +1873,7 @@ function connect(): void {
   ws.addEventListener("close", () => {
     connected = false;
     sessionId = null;
-    connectBtn.disabled = false;
-    disconnectBtn.disabled = true;
     setWorkspaceControls(false);
-    updateStripLayout();
     updateStatusRight();
     setStatusLeft("disconnected (session kept on backend if created)");
   });
@@ -1991,14 +1948,6 @@ export function bootstrapAde(): void {
   if (bootstrapped) return;
   bootstrapped = true;
 
-  connectionStrip = $("connection-strip");
-  stripToggle = $button("strip-toggle");
-  stripCompact = $("strip-compact");
-  stripHost = $("strip-host");
-  stripSession = $("strip-session");
-  stripState = $("strip-state");
-  connectBtn = $button("connect");
-  disconnectBtn = $button("disconnect");
   workspaceEl = $("workspace");
   sidebarToggle = $button("sidebar-toggle");
   sidebarResizer = $("sidebar-resizer");
@@ -2047,13 +1996,6 @@ export function bootstrapAde(): void {
   });
   setTreeEmptyHint(true);
 
-connectBtn.addEventListener("click", connect);
-disconnectBtn.addEventListener("click", disconnect);
-stripToggle.addEventListener("click", () => {
-  if (stripForceExpanded) compactStrip();
-  else expandStrip();
-});
-stripCompact.addEventListener("click", expandStrip);
 editorSaveBtn.addEventListener("click", () => {
   void saveActiveEditor();
 });
@@ -2122,6 +2064,16 @@ refreshPaletteCommands = () => {
   setPaletteCommands([
     ...defaultPaletteCommands(runShortcutId),
     {
+      id: "connection.reconnect",
+      label: "Connection: Reconnect",
+      run: () => connect(),
+    },
+    {
+      id: "connection.disconnect",
+      label: "Connection: Disconnect",
+      run: () => disconnect(),
+    },
+    {
       id: "palette.pick",
       label: "Preferences: Color Palette…",
       run: () => openPaletteWithQuery("Color Palette"),
@@ -2164,7 +2116,6 @@ window.addEventListener("keydown", (ev) => {
 });
 
 loadSidebarPrefs();
-updateStripLayout();
 updateStatusRight();
 setStatusLeft("disconnected");
 syncDocumentTitle();
@@ -2182,20 +2133,15 @@ function defaultWsUrl(): string {
   return "ws://127.0.0.1:7420/ws";
 }
 
-$input("url").value = defaultWsUrl();
+wsUrl = defaultWsUrl();
+preferredSessionId = localStorage.getItem(SESSION_KEY) || "";
 
-const savedSession = localStorage.getItem(SESSION_KEY);
-if (savedSession) $input("session").value = savedSession;
-
-const tokenFromUrl = consumeTokenQueryParam($input("token"));
-if (!tokenFromUrl) {
-  const cached = loadCachedAuthToken();
-  if (cached) $input("token").value = cached;
-}
+const tokenFromUrl = consumeTokenQueryParam();
+authToken = tokenFromUrl || loadCachedAuthToken() || "";
 
 // Auto-connect from a fresh `?token=` link, or after reload when the token
 // was cached (URL is stripped after first use).
-const shouldAutoConnect = tokenFromUrl || !!$input("token").value.trim();
+const shouldAutoConnect = !!authToken;
 
 setupSidebarResizer();
 renderAll();

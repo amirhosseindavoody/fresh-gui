@@ -86,11 +86,12 @@ listen fallback).
 
 ### 3.4 Frontend convenience
 
-The UI's `?token=` query param (if present) pre-fills the **Token** field and
-auto-connects, so pasting either printed URL into a browser “just works”
-without manually copying the token into the connect form. The query param is
-stripped from the visible address bar via `history.replaceState` right after
-it's read, so it doesn't linger in browser history / autocomplete.
+The UI's `?token=` query param (if present) is read on load and used to
+auto-connect — pasting either printed URL into a browser “just works”. The
+query param is stripped from the visible address bar via
+`history.replaceState` right after it's read, so it doesn't linger in browser
+history / autocomplete. There is no connect form; connection status lives in
+the status bar, and Disconnect / Reconnect are command-palette actions.
 
 After a successful read (and after `auth_ok`), the token is also kept in
 **`sessionStorage`** (`fresh-gui.authToken`) for this browser tab. Reloading
@@ -113,7 +114,7 @@ this flag; it is not part of the normal operator flow.
 |------|---------------------|
 | **Token visible via `ps aux` if passed as `--token` on the CLI** | Other users on a shared host can see full command lines of any process. Prefer `FRESH_GUI_TOKEN` or (best) let it auto-generate — neither appears in `ps` output. Documented in README. |
 | **Token in shell/browser history** | It's printed once to the terminal and appears in the URL if you paste the printed link. Treat it like a password: don't paste it into chat/tickets, and restart the process (new random token) if you suspect it leaked. The frontend strips it from the address bar after first use to reduce lingering exposure. |
-| **Token in `sessionStorage` for reload reconnect** | Needed so reload can auth after `?token=` is stripped. Scoped to the tab (cleared when the tab closes), wiped on `auth_error`, and never logged. Same XSS surface as the Token input field while the tab is open. |
+| **Token in `sessionStorage` for reload reconnect** | Needed so reload can auth after `?token=` is stripped. Scoped to the tab (cleared when the tab closes), wiped on `auth_error`, and never logged. Accessible to page script (same XSS class as any in-memory secret). |
 | **Token in logs/terminal scrollback** | Kept out of `tracing` (which may be centrally aggregated, e.g. journald); it still hits the operator's own terminal scrollback by design (that's the delivery mechanism), so avoid running under a shared/logged terminal multiplexer session. |
 | **Token comparison timing** | Equal-length compares use a byte-wise XOR fold; length mismatches still short-circuit. In practice the token travels only over loopback or an SSH tunnel, and 122 bits of entropy makes brute forcing infeasible. |
 | **SSH tunnel security depends on normal SSH host/key verification** | No new risk introduced — same trust model as any other SSH usage. Verify host keys as usual; don't blindly accept unknown host keys. |
