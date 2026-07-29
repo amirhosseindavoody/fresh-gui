@@ -4,6 +4,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { SearchAddon } from "@xterm/addon-search";
 import type { UiSettings } from "./settings";
 import { parseOsc7 } from "./osc7";
+import { xtermThemeFromCss } from "./theme";
 
 export { parseOsc7 };
 
@@ -18,6 +19,11 @@ export interface TermBundle {
   oscCarry: { buf: string };
 }
 
+/** Apply the current CSS token palette to an open xterm instance. */
+export function applyTerminalTheme(bundle: TermBundle): void {
+  bundle.term.options.theme = xtermThemeFromCss();
+}
+
 export function createTerminal(
   opts: {
     settings?: UiSettings;
@@ -28,24 +34,11 @@ export function createTerminal(
   const fontSize = settings?.terminalFontSize ?? 14;
   const preferWebgl = settings?.webgl !== false;
 
-  const dark = (settings?.theme ?? "dark") !== "light";
   const term = new Terminal({
     cursorBlink: true,
     fontFamily: '"IBM Plex Mono", ui-monospace, monospace',
     fontSize,
-    theme: dark
-      ? {
-          background: "#010409",
-          foreground: "#e6edf3",
-          cursor: "#3fb950",
-          selectionBackground: "#3fb95055",
-        }
-      : {
-          background: "#f6f8fa",
-          foreground: "#1f2328",
-          cursor: "#1a7f37",
-          selectionBackground: "#1a7f3755",
-        },
+    theme: xtermThemeFromCss(),
   });
   const fit = new FitAddon();
   term.loadAddon(fit);

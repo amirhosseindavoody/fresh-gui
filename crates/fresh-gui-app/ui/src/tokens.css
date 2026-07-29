@@ -24,6 +24,11 @@
   --sidebar-width: 260px;
   --activity-width: 44px;
   --resizer: 4px;
+  /* Terminal / pane surfaces — keep in sync with xtermThemeFromCss() */
+  --term-bg: #010409;
+  --term-fg: #e6edf3;
+  --term-cursor: #3fb950;
+  --term-selection: color-mix(in srgb, var(--accent) 33%, transparent);
 }
 
 :root[data-theme="light"] {
@@ -41,4 +46,8 @@
   --danger: #cf222e;
   --warning: #9a6700;
   --focus-ring: color-mix(in srgb, var(--accent) 45%, transparent);
+  --term-bg: #f6f8fa;
+  --term-fg: #1f2328;
+  --term-cursor: #1a7f37;
+  --term-selection: color-mix(in srgb, var(--accent) 33%, transparent);
 }

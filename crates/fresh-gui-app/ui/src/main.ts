@@ -9,9 +9,10 @@ import {
   type ServerMessage,
 } from "./protocol";
 import { $, $button, $input, b64decode, b64encode, basename } from "./dom";
-import { applyEditorFontSize, createEditorView, openEditorSearch } from "./editor";
+import { applyEditorFontSize, applyEditorTheme, createEditorView, openEditorSearch } from "./editor";
 import {
   applyTerminalFontSize,
+  applyTerminalTheme,
   createTerminal,
   disposeTerminal,
   type TermBundle,
@@ -31,7 +32,7 @@ import {
 import { installShortcuts, type ShortcutHandlers, type ShortcutId } from "./shortcuts";
 import { defaultPaletteCommands, openPalette, setPaletteCommands } from "./palette";
 import { VirtualTree } from "./tree";
-import { applyTheme, initTheme } from "./theme";
+import { applyTheme, getResolvedTheme, initTheme, onResolvedThemeChange, resolveTheme } from "./theme";
 import {
   loadSettings,
   openSettings,
@@ -593,36 +594,32 @@ function focusFind(): void {
 }
 
 function applyUiSettings(next: UiSettings): void {
-  const themeChanged = next.theme !== uiSettings.theme;
+  const prevResolved = resolveTheme(uiSettings.theme);
   uiSettings = next;
+  applyTheme(next.theme);
+  const resolved = resolveTheme(next.theme);
+  const themeChanged = resolved !== prevResolved;
+  restyleOpenPanes(resolved, themeChanged);
+  requestAnimationFrame(fitActiveLeaves);
+  if (themeChanged || next.theme !== "system") {
+    const label =
+      next.theme === "system" ? `system (${resolved})` : next.theme;
+    setStatusLeft(`theme: ${label}`);
+  }
+}
+
+/** Restyle open terminals/editors to match the resolved chrome theme. */
+function restyleOpenPanes(resolved: ReturnType<typeof resolveTheme>, themeChanged: boolean): void {
   for (const tab of tabs) {
     if (tab.kind === "terminal") {
       for (const bundle of tab.leaves.values()) {
-        applyTerminalFontSize(bundle, next.terminalFontSize);
-        if (themeChanged) {
-          const dark = next.theme !== "light";
-          bundle.term.options.theme = dark
-            ? {
-                background: "#010409",
-                foreground: "#e6edf3",
-                cursor: "#3fb950",
-                selectionBackground: "#3fb95055",
-              }
-            : {
-                background: "#f6f8fa",
-                foreground: "#1f2328",
-                cursor: "#1a7f37",
-                selectionBackground: "#1a7f3755",
-              };
-        }
+        applyTerminalFontSize(bundle, uiSettings.terminalFontSize);
+        if (themeChanged) applyTerminalTheme(bundle);
       }
     } else {
-      applyEditorFontSize(tab.view, next.editorFontSize);
+      applyEditorFontSize(tab.view, uiSettings.editorFontSize);
+      if (themeChanged) applyEditorTheme(tab.view, resolved);
     }
-  }
-  requestAnimationFrame(fitActiveLeaves);
-  if (themeChanged) {
-    setStatusLeft(`theme: ${next.theme} (new terminals/editors pick up full chrome)`);
   }
 }
 
@@ -1144,7 +1141,7 @@ async function openEditorTab(path: string, preview: boolean): Promise<void> {
       renderTabs();
       updateSaveButton();
       updateStatusRight();
-    }, { fontSize: uiSettings.editorFontSize, theme: uiSettings.theme });
+    }, { fontSize: uiSettings.editorFontSize, theme: getResolvedTheme() });
 
     tabRef = {
       kind: "editor",
@@ -1621,6 +1618,13 @@ function runShortcutId(id: ShortcutId): void {
 installShortcuts(shortcutHandlers);
 setPaletteCommands(defaultPaletteCommands(runShortcutId));
 setSettingsChangeHandler(applyUiSettings);
+
+// OS theme flips while preference is "system" → restyle open panes.
+onResolvedThemeChange((resolved) => {
+  if (uiSettings.theme !== "system") return;
+  restyleOpenPanes(resolved, true);
+  requestAnimationFrame(fitActiveLeaves);
+});
 
 window.addEventListener("resize", () => {
   fitActiveLeaves();

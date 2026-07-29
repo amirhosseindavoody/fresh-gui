@@ -418,7 +418,7 @@ input#session {
   flex: 1;
   min-height: 0;
   min-width: 0;
-  background: #010409;
+  background: var(--term-bg);
 }
 
 .stack {
@@ -464,7 +464,7 @@ input#session {
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   overflow: hidden;
-  background: #010409;
+  background: var(--term-bg);
   min-height: 0;
   position: relative;
 }
@@ -644,7 +644,7 @@ input#session {
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   overflow: hidden;
-  background: #010409;
+  background: var(--term-bg);
   position: relative;
   margin: 0.2rem;
 }

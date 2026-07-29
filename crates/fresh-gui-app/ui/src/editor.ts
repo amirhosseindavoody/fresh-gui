@@ -9,8 +9,10 @@ import { javascript } from "@codemirror/lang-javascript";
 import { python } from "@codemirror/lang-python";
 import { markdown } from "@codemirror/lang-markdown";
 import type { Extension } from "@codemirror/state";
+import type { ResolvedTheme } from "./theme";
 
 const fontSizeCompartment = new Compartment();
+const themeCompartment = new Compartment();
 
 function langForPath(path: string): Extension | null {
   const lower = path.toLowerCase();
@@ -30,12 +32,16 @@ function langForPath(path: string): Extension | null {
   return null;
 }
 
+function editorThemeExtension(theme: ResolvedTheme): Extension {
+  return theme === "dark" ? oneDark : [];
+}
+
 export function createEditorView(
   parent: HTMLElement,
   text: string,
   path: string,
   onDocChange: () => void,
-  opts: { fontSize?: number; theme?: "dark" | "light" } = {},
+  opts: { fontSize?: number; theme?: ResolvedTheme } = {},
 ): EditorView {
   const fontSize = opts.fontSize ?? 14;
   const theme = opts.theme ?? "dark";
@@ -51,11 +57,11 @@ export function createEditorView(
       "&": { height: "100%", fontSize: `${fontSize}px` },
       ".cm-scroller": { overflow: "auto", fontFamily: "var(--font-mono)" },
     })),
+    themeCompartment.of(editorThemeExtension(theme)),
     EditorView.updateListener.of((update) => {
       if (update.docChanged) onDocChange();
     }),
   ];
-  if (theme === "dark") extensions.push(oneDark);
   if (lang) extensions.push(lang);
 
   return new EditorView({
@@ -79,5 +85,11 @@ export function applyEditorFontSize(view: EditorView, fontSize: number): void {
         ".cm-scroller": { overflow: "auto", fontFamily: "var(--font-mono)" },
       }),
     ),
+  });
+}
+
+export function applyEditorTheme(view: EditorView, theme: ResolvedTheme): void {
+  view.dispatch({
+    effects: themeCompartment.reconfigure(editorThemeExtension(theme)),
   });
 }

@@ -1,18 +1,24 @@
 /** Host UI settings (fonts / renderer / theme) — web modal for browser + Tauri. */
 
-import { applyTheme, getTheme, type ThemeId } from "./theme";
+import {
+  applyTheme,
+  getThemePreference,
+  parseThemePreference,
+  type ThemePreference,
+} from "./theme";
 
 const SETTINGS_KEY = "fresh-gui.settings";
 
 export type UiSettings = {
-  theme: ThemeId;
+  /** Stored preference; resolve with `resolveTheme` for chrome / xterm. */
+  theme: ThemePreference;
   terminalFontSize: number;
   editorFontSize: number;
   webgl: boolean;
 };
 
 const DEFAULTS: UiSettings = {
-  theme: "dark",
+  theme: "system",
   terminalFontSize: 14,
   editorFontSize: 14,
   webgl: true,
@@ -24,16 +30,16 @@ let onChange: ((s: UiSettings) => void) | null = null;
 export function loadSettings(): UiSettings {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
-    if (!raw) return { ...DEFAULTS, theme: getTheme() };
+    if (!raw) return { ...DEFAULTS, theme: getThemePreference() };
     const parsed = JSON.parse(raw) as Partial<UiSettings>;
     return {
-      theme: parsed.theme === "light" ? "light" : "dark",
+      theme: parseThemePreference(parsed.theme),
       terminalFontSize: clamp(parsed.terminalFontSize ?? DEFAULTS.terminalFontSize, 10, 28),
       editorFontSize: clamp(parsed.editorFontSize ?? DEFAULTS.editorFontSize, 10, 28),
       webgl: parsed.webgl !== false,
     };
   } catch {
-    return { ...DEFAULTS, theme: getTheme() };
+    return { ...DEFAULTS, theme: getThemePreference() };
   }
 }
 
@@ -65,8 +71,9 @@ function ensureDom(): void {
       <div class="settings-body">
         <label>Theme
           <select id="settings-theme">
-            <option value="dark">Dark</option>
+            <option value="system">System</option>
             <option value="light">Light</option>
+            <option value="dark">Dark</option>
           </select>
         </label>
         <label>Terminal font size
@@ -104,7 +111,7 @@ function readForm(): UiSettings {
   const edEl = document.getElementById("settings-editor-font") as HTMLInputElement;
   const webglEl = document.getElementById("settings-webgl") as HTMLInputElement;
   return {
-    theme: themeEl.value === "light" ? "light" : "dark",
+    theme: parseThemePreference(themeEl.value),
     terminalFontSize: clamp(Number(termEl.value) || 14, 10, 28),
     editorFontSize: clamp(Number(edEl.value) || 14, 10, 28),
     webgl: webglEl.checked,
