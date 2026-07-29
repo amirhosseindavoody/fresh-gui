@@ -32,5 +32,6 @@ fresh-gui-backend
 - `--root` / `FRESH_GUI_FS_ROOT` — sandbox for `fs` and editor open (default: current directory)
 - `--ui-dir` / `FRESH_GUI_UI_DIR` — override UI assets directory
 - `--no-ui` / `FRESH_GUI_NO_UI` — disable static UI
+- `--public-host` / `FRESH_GUI_PUBLIC_HOST` — hostname in startup UI/WS URLs; when unset, uses an assigned FQDN (`hostname -f` / `HOSTNAME` / `FRESH_GUI_DOMAIN`) if one looks like a real domain
 
 See [docs/DESIGN.md](../../docs/DESIGN.md).
