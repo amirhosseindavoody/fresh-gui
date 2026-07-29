@@ -1,10 +1,22 @@
 # Windows host packaging (Tauri)
 
-The Windows MVP host is `fresh-gui-desktop` (Tauri 2). The installer is **NSIS** (`.exe`).
+The Windows MVP host is `fresh-gui-desktop` (Tauri 2). Installers are **NSIS** (`.exe`) and **MSI** (WiX).
 
-## Why not MSI?
+## Version mapping (CalVer → WiX)
 
-WiX/MSI requires each of major/minor ≤ **255**. Our CalVer `YYYY.MMDD.N` (e.g. `2026.728.1`) exceeds that (`2026` and often `MMDD`). NSIS accepts CalVer filenames and is the supported Windows channel for now. MSI can return later with a mapped SemVer if needed.
+Cargo / pixi keep CalVer `YYYY.MMDD.N` (e.g. `2026.728.1`).
+
+WiX `ProductVersion` requires major/minor ≤ **255** and build ≤ **65535**, so the Tauri bundle version in `tauri.conf.json` is a mapped form:
+
+| CalVer `YYYY.MMDD.N` | Bundle / MSI version |
+|----------------------|----------------------|
+| `YYYY`               | `YYYY - 2000` (major) |
+| `MMDD / 100`         | month (minor) |
+| `MMDD % 100`, `N`    | `day * 1000 + N` (build) |
+
+Example: `2026.728.1` → **`26.7.28001`**.
+
+`scripts/update-version.sh` updates Cargo/pixi CalVer and rewrites this mapped version into `crates/fresh-gui-desktop/tauri.conf.json` and `package.json`.
 
 ## Local build (on Windows)
 
@@ -16,18 +28,15 @@ npm ci
 npm run build:windows
 ```
 
-Artifact:
+Artifacts (under the **repo root** `target\`):
 
-`target/release/bundle/nsis/fresh-gui_*_x64-setup.exe`
-
-(Paths are under the **repo root** `target\`, not under the crate.)
-
-Note: the Rust package lives at `crates/fresh-gui-desktop`; `tauri.conf.json` sets `frontendDist` to `../fresh-gui-app/ui`.
+- `target/release/bundle/nsis/fresh-gui_*_x64-setup.exe`
+- `target/release/bundle/msi/fresh-gui_*_x64_en-US.msi`
 
 ## CI
 
-GitHub Actions workflow [`.github/workflows/windows-tauri.yml`](../.github/workflows/windows-tauri.yml) builds the NSIS installer on `windows-latest` and uploads it as an artifact.
+GitHub Actions workflow [`.github/workflows/windows-tauri.yml`](../.github/workflows/windows-tauri.yml) builds NSIS + MSI on `windows-latest` and uploads artifacts.
 
 ## Scope note
 
-Full polish (code signing, auto-update) remains Phase 4. This packaging path produces an unsigned NSIS installer suitable for MVP distribution and testing.
+Full polish (code signing, auto-update) remains Phase 4. This packaging path produces unsigned installers suitable for MVP distribution and testing.

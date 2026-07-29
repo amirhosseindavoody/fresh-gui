@@ -14,10 +14,10 @@ npm ci
 npm run dev
 ```
 
-## Windows NSIS installer
+## Windows installers (NSIS + MSI)
 
 ```powershell
 npm run build:windows
 ```
 
-See [docs/WINDOWS.md](../../docs/WINDOWS.md) (NSIS only; MSI incompatible with CalVer).
+Bundle version is mapped from workspace CalVer for WiX (see [docs/WINDOWS.md](../../docs/WINDOWS.md)).

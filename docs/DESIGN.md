@@ -135,8 +135,8 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 ### Phase 1 / packaging — Windows Tauri installers ✅ (unsigned MVP)
 
 - Brought forward from Phase 4 for MVP host distribution.
-- **NSIS only** via `crates/fresh-gui-desktop` (`npm run build:windows`); CI: `.github/workflows/windows-tauri.yml`.
-- MSI/WiX skipped: ProductVersion major/minor must be ≤ 255; CalVer `YYYY.MMDD.N` does not fit (see `docs/WINDOWS.md`).
+- NSIS + MSI via `crates/fresh-gui-desktop` (`npm run build:windows`); CI: `.github/workflows/windows-tauri.yml`.
+- Bundle version is a WiX-safe mapping of CalVer (e.g. `2026.728.1` → `26.7.28001`); see `docs/WINDOWS.md`.
 - Code signing + auto-update remain Phase 4.
 
 ### Phase 2 — Multi-tab / splits + session detach
@@ -151,7 +151,7 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 ### Phase 4 — Polish / packaging
 
 - Code signing, Linux backend package, auto-update story, hardening.
-- (Unsigned Windows NSIS already available from Phase 1 packaging; MSI optional later with a mapped SemVer.)
+- (Unsigned Windows NSIS + MSI already available from Phase 1 packaging.)
 
 ## 7. Development Environment
 

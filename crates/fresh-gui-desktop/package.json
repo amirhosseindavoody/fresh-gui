@@ -1,13 +1,13 @@
 {
   "name": "fresh-gui-desktop",
   "private": true,
-  "version": "2026.728.1",
-  "description": "Tauri 2 host + Windows NSIS packaging for fresh-gui",
+  "version": "26.7.28001",
+  "description": "Tauri 2 host + Windows NSIS/MSI packaging for fresh-gui",
   "scripts": {
     "tauri": "tauri",
     "dev": "tauri dev",
     "build": "tauri build",
-    "build:windows": "tauri build --bundles nsis"
+    "build:windows": "tauri build --bundles nsis,msi"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"
