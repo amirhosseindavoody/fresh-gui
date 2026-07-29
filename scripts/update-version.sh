@@ -21,6 +21,7 @@ RECIPE_YAML="$ROOT/recipe/recipe.yaml"
 TAURI_CONF="$ROOT/crates/fresh-gui-desktop/tauri.conf.json"
 DESKTOP_PKG="$ROOT/crates/fresh-gui-desktop/package.json"
 UI_PKG="$ROOT/crates/fresh-gui-app/ui/package.json"
+ROOT_PKG="$ROOT/package.json"
 
 today_prefix() {
   local year month day mmdd
@@ -236,6 +237,20 @@ main() {
       { print }
     ' "$UI_PKG" >"$ui_tmp"
     mv "$ui_tmp" "$UI_PKG"
+  fi
+
+  if [[ -f "$ROOT_PKG" ]]; then
+    local root_tmp
+    root_tmp="$(mktemp)"
+    awk -v ver="$new_version" '
+      BEGIN { done = 0 }
+      !done && /"version":/ {
+        sub(/"version": "[^"]*"/, "\"version\": \"" ver "\"")
+        done = 1
+      }
+      { print }
+    ' "$ROOT_PKG" >"$root_tmp"
+    mv "$root_tmp" "$ROOT_PKG"
   fi
 
   # Keep Cargo.lock in sync so `cargo build --locked` works (e.g. git source builds).

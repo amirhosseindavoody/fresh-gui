@@ -106,7 +106,12 @@ CalVer `YYYY.MMDD.N` (e.g. `2026.728.1`):
 
 ```bash
 pixi run update-version
+# or: ./scripts/update-version.sh --set 2026.729.1
 ```
+
+On every push to `main`, [.github/workflows/release-backend.yml](./.github/workflows/release-backend.yml) bumps the version, builds the linux-64 `fresh-gui-backend` pixi package (`pixi run package`), tags `vYYYY.MMDD.N`, and publishes a [GitHub Release](https://github.com/amirhosseindavoody/fresh-gui/releases) with the `.conda` artifact + checksums. You can also run the workflow manually (`workflow_dispatch`) and optionally skip the bump or set an explicit version.
+
+If `main` is protected, allow GitHub Actions to push version-bump commits (or bypass for `github-actions[bot]`).
 
 ## License
 
