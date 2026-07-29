@@ -54,9 +54,9 @@ about:
   repository: https://github.com/amirhosseindavoody/fresh-gui
   summary: Linux remote daemon for fresh-gui (browser UI + PTY shells over WebSocket)
   description: |
-    Installable Linux binary equivalent to `pixi run serve`: serves the host web UI
-    and WebSocket ADE API so you can open shells from a browser (or any host that
-    can reach the URL) before using the native GUI client.
+    Installable Linux binary equivalent to `pixi run serve` / `pixi run serve-release`:
+    serves the host web UI and WebSocket ADE API so you can open shells from a
+    browser (or any host that can reach the URL) before using the native GUI client.
 
     Platform: linux-64 only. Install on the remote Linux machine, not the Windows host GUI.
   license: GPL-2.0-only
