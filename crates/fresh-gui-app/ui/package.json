@@ -1,7 +1,7 @@
 {
   "name": "fresh-gui-ui",
   "private": true,
-  "version": "2026.729.17",
+  "version": "2026.729.18",
   "type": "module",
   "packageManager": "bun@1.3.11",
   "scripts": {
