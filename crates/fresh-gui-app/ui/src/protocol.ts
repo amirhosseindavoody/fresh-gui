@@ -71,8 +71,13 @@ export type ClientMessage =
 
 export type HelloUiMsg = {
   theme?: string;
+  palette?: string;
   terminalFontSize?: number;
   editorFontSize?: number;
+  fontWeight?: number;
+  monoFontWeight?: number;
+  fontFamily?: string;
+  monoFontFamily?: string;
   webgl?: boolean;
   showDotfiles?: boolean;
   showGitDirs?: boolean;

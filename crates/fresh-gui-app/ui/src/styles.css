@@ -47,6 +47,7 @@ body {
     var(--bg);
   color: var(--text);
   font-family: var(--font-ui);
+  font-weight: var(--font-ui-weight);
 }
 
 body {
@@ -54,6 +55,12 @@ body {
   grid-template-rows: auto 1fr var(--statusbar-height);
   min-height: 100%;
   overflow: hidden;
+}
+
+.brand,
+.sidebar-head h2,
+.statusbar {
+  font-weight: var(--font-ui-weight);
 }
 
 button {

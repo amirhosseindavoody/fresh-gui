@@ -82,8 +82,13 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         let cfg = state.config.read().expect("config lock");
         HelloUi {
             theme: cfg.ui.theme.clone(),
+            palette: cfg.ui.palette.clone(),
             terminal_font_size: cfg.ui.terminal_font_size,
             editor_font_size: cfg.ui.editor_font_size,
+            font_weight: cfg.ui.font_weight,
+            mono_font_weight: cfg.ui.mono_font_weight,
+            font_family: cfg.ui.font_family.clone(),
+            mono_font_family: cfg.ui.mono_font_family.clone(),
             webgl: cfg.ui.webgl,
             show_dotfiles: cfg.ui.show_dotfiles,
             show_git_dirs: cfg.ui.show_git_dirs,

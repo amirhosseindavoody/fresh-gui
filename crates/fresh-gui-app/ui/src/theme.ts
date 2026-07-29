@@ -144,3 +144,19 @@ export function monoFontFromCss(): string {
   const v = getComputedStyle(document.documentElement).getPropertyValue("--font-mono").trim();
   return v || '"IBM Plex Mono", ui-monospace, monospace';
 }
+
+/** Regular mono weight from `--font-mono-weight` (default 400). */
+export function monoFontWeightFromCss(): number {
+  const v = getComputedStyle(document.documentElement).getPropertyValue("--font-mono-weight").trim();
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 400;
+}
+
+/** Bold mono weight from `--font-mono-weight-bold` (default 600). */
+export function monoFontWeightBoldFromCss(): number {
+  const v = getComputedStyle(document.documentElement)
+    .getPropertyValue("--font-mono-weight-bold")
+    .trim();
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 600;
+}

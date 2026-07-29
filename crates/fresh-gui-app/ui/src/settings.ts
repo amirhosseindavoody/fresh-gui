@@ -1,5 +1,6 @@
 /** Host UI settings parsed from backend `config.json` (`ui` section). */
 
+import { applyPalette, parsePaletteId, type PaletteId } from "./palettes";
 import {
   applyTheme,
   getThemePreference,
@@ -9,11 +10,27 @@ import {
 
 const SETTINGS_KEY = "fresh-gui.settings";
 
+const DEFAULT_UI_FONT = '"IBM Plex Sans", "Segoe UI", system-ui, sans-serif';
+const DEFAULT_MONO_FONT = '"IBM Plex Mono", ui-monospace, monospace';
+
 export type UiSettings = {
-  /** Stored preference; resolve with `resolveTheme` for chrome / xterm. */
+  /** Stored preference; resolve with `resolveTheme` for chrome / xterm when palette is primer. */
   theme: ThemePreference;
+  /**
+   * Color pack. `primer` follows `theme` (system/light/dark).
+   * Other ids match Fresh editor theme names (mapped onto host CSS tokens).
+   */
+  palette: PaletteId;
   terminalFontSize: number;
   editorFontSize: number;
+  /** UI chrome font weight (100–900). */
+  fontWeight: number;
+  /** Terminal + editor monospace weight (100–900). */
+  monoFontWeight: number;
+  /** Optional UI font family CSS value; empty → IBM Plex Sans. */
+  fontFamily: string;
+  /** Optional mono font family CSS value; empty → IBM Plex Mono. */
+  monoFontFamily: string;
   webgl: boolean;
   /** Show names starting with `.` (except `.git`, controlled by `showGitDirs`). */
   showDotfiles: boolean;
@@ -23,8 +40,13 @@ export type UiSettings = {
 
 export type HelloUi = {
   theme?: string;
+  palette?: string;
   terminalFontSize?: number;
   editorFontSize?: number;
+  fontWeight?: number;
+  monoFontWeight?: number;
+  fontFamily?: string;
+  monoFontFamily?: string;
   webgl?: boolean;
   showDotfiles?: boolean;
   showGitDirs?: boolean;
@@ -32,8 +54,13 @@ export type HelloUi = {
 
 const DEFAULTS: UiSettings = {
   theme: "system",
+  palette: "primer",
   terminalFontSize: 14,
   editorFontSize: 14,
+  fontWeight: 400,
+  monoFontWeight: 400,
+  fontFamily: "",
+  monoFontFamily: "",
   webgl: true,
   showDotfiles: false,
   showGitDirs: false,
@@ -58,23 +85,69 @@ function readBool(
   return value !== false;
 }
 
+function readNumber(
+  partial: Partial<UiSettings> | HelloUi | null | undefined,
+  key: keyof UiSettings,
+  fallback: number,
+): number {
+  if (!partial || !(key in partial)) return fallback;
+  const value = (partial as Record<string, unknown>)[key];
+  if (value == null) return fallback;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function readString(
+  partial: Partial<UiSettings> | HelloUi | null | undefined,
+  key: "fontFamily" | "monoFontFamily",
+  fallback: string,
+): string {
+  if (!partial || !(key in partial)) return fallback;
+  const value = (partial as Record<string, unknown>)[key];
+  if (typeof value !== "string") return fallback;
+  return value.trim();
+}
+
+/** Snap font weight to a CSS-friendly 100-step in 100–900. */
+export function normalizeFontWeight(value: unknown, fallback = 400): number {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  const clamped = clamp(Math.round(n), 100, 900);
+  return Math.round(clamped / 100) * 100;
+}
+
 export function normalizeUiSettings(partial: Partial<UiSettings> | HelloUi | null | undefined): UiSettings {
   const themeRaw =
     partial && "theme" in partial && partial.theme != null
       ? partial.theme
       : DEFAULTS.theme;
-  const term =
-    partial && "terminalFontSize" in partial && partial.terminalFontSize != null
-      ? Number(partial.terminalFontSize)
-      : DEFAULTS.terminalFontSize;
-  const ed =
-    partial && "editorFontSize" in partial && partial.editorFontSize != null
-      ? Number(partial.editorFontSize)
-      : DEFAULTS.editorFontSize;
+  const paletteRaw =
+    partial && "palette" in partial && partial.palette != null
+      ? partial.palette
+      : DEFAULTS.palette;
   return {
     theme: parseThemePreference(themeRaw),
-    terminalFontSize: clamp(Number.isFinite(term) ? term : DEFAULTS.terminalFontSize, 10, 28),
-    editorFontSize: clamp(Number.isFinite(ed) ? ed : DEFAULTS.editorFontSize, 10, 28),
+    palette: parsePaletteId(paletteRaw),
+    terminalFontSize: clamp(
+      readNumber(partial, "terminalFontSize", DEFAULTS.terminalFontSize),
+      10,
+      28,
+    ),
+    editorFontSize: clamp(
+      readNumber(partial, "editorFontSize", DEFAULTS.editorFontSize),
+      10,
+      28,
+    ),
+    fontWeight: normalizeFontWeight(
+      partial && "fontWeight" in partial ? partial.fontWeight : DEFAULTS.fontWeight,
+      DEFAULTS.fontWeight,
+    ),
+    monoFontWeight: normalizeFontWeight(
+      partial && "monoFontWeight" in partial ? partial.monoFontWeight : DEFAULTS.monoFontWeight,
+      DEFAULTS.monoFontWeight,
+    ),
+    fontFamily: readString(partial, "fontFamily", DEFAULTS.fontFamily),
+    monoFontFamily: readString(partial, "monoFontFamily", DEFAULTS.monoFontFamily),
     webgl: readBool(partial, "webgl", DEFAULTS.webgl),
     showDotfiles: readBool(partial, "showDotfiles", DEFAULTS.showDotfiles),
     showGitDirs: readBool(partial, "showGitDirs", DEFAULTS.showGitDirs),
@@ -92,9 +165,30 @@ export function loadSettings(): UiSettings {
   }
 }
 
+/** Apply palette + typography CSS vars from settings (does not persist). */
+export function applyUiChrome(settings: UiSettings): void {
+  const root = document.documentElement;
+  applyTheme(settings.theme);
+  const forced = applyPalette(settings.palette, root);
+  // Named Fresh packs pin appearance; primer keeps the resolved theme mode.
+  if (forced) {
+    root.dataset.theme = forced;
+  }
+
+  const uiFont = settings.fontFamily || DEFAULT_UI_FONT;
+  const monoFont = settings.monoFontFamily || DEFAULT_MONO_FONT;
+  root.style.setProperty("--font-ui", uiFont);
+  root.style.setProperty("--font-mono", monoFont);
+  root.style.setProperty("--font-ui-weight", String(settings.fontWeight));
+  root.style.setProperty("--font-mono-weight", String(settings.monoFontWeight));
+  // Bold faces sit two steps above the regular mono weight (capped).
+  const bold = Math.min(900, settings.monoFontWeight + 200);
+  root.style.setProperty("--font-mono-weight-bold", String(bold));
+}
+
 export function saveSettings(s: UiSettings): void {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
-  applyTheme(s.theme);
+  applyUiChrome(s);
 }
 
 /** Strip JSONC comments (same rules as the backend). */
@@ -146,3 +240,5 @@ export function uiSettingsFromConfigText(text: string): UiSettings {
   const parsed = JSON.parse(stripJsonc(trimmed)) as { ui?: Partial<UiSettings> };
   return normalizeUiSettings(parsed.ui);
 }
+
+export { DEFAULT_UI_FONT, DEFAULT_MONO_FONT };
