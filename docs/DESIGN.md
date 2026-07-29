@@ -1,6 +1,6 @@
 # fresh-gui Design
 
-Terminal-first IDE GUI on the **local host**, powered by a **remote Fresh editor backend**. Product inspiration: [Terax](https://github.com/crynta/terax-ai). Backend performance and semantics: [Fresh](https://github.com/sinelaw/fresh) crates (local clone: `/home/amirhossein/fresh`). Repo logistics mirror [pixi-mise](https://github.com/amirhosseindavoody/pixi-mise): Pixi-managed Rust workspace, `docs/` for design, phased implementation.
+Terminal-first IDE GUI on the **local host**, powered by a **remote Fresh editor backend**. Product inspiration: [Terax](https://github.com/crynta/terax-ai). Backend performance and semantics: [Fresh](https://github.com/sinelaw/fresh). Repo logistics mirror [pixi-mise](https://github.com/amirhosseindavoody/pixi-mise): Pixi-managed Rust workspace, `docs/` for design, phased implementation. User-facing install and usage: [README.md](../README.md).
 
 ## 1. Problem
 
@@ -29,7 +29,7 @@ Developers often keep a Windows (or macOS) laptop as the interactive machine and
 - Replacing Fresh’s TUI or shipping as a fork of Fresh itself.
 - macOS / Linux host GUI (post-MVP; architecture should not block them).
 - Multi-user collaborative editing.
-- Packaging to winget / conda-forge on day one (scaffold may reserve `recipe/` later).
+- Packaging to winget / conda-forge on day one (Pixi/`recipe/` package and GitHub Releases cover the Linux daemon; broader channel publishing is later).
 
 ## 3. Prior Art
 
@@ -172,18 +172,18 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 
 - **UI-1 ✅** — Terax-inspired chrome: always-on connection strip, status bar, unified terminal/editor tabs, tokenized theme, CodeMirror 6, xterm WebGL, tab pill, collapsible sidebar, dirty/preview affordances.
 - **UI-2 ✅** — per-tab recursive pane trees (max 4 leaves), shortcut registry + command palette, virtualized explorer, richer `layout_set` blob (see [UI.md](./UI.md)).
-- **UI-3 ✅** — OSC 7 cwd, search, activity bar, lightweight file badges, light theme, settings modal (see [UI.md](./UI.md)).
+- **UI-3 ✅** — OSC 7 cwd, search, activity bar, lightweight file badges, system/light/dark theme, settings via `config.json` (see [UI.md](./UI.md)).
 - Do not conflate with packaging polish below.
 
 ### Phase 4 — Polish / packaging
 
-- Code signing, Linux backend package, auto-update story, hardening.
-- **Linux backend Pixi package (scaffold):** `[package]` + `recipe/` builds installable
+- Code signing, auto-update story, hardening.
+- **Linux backend Pixi package ✅:** `[package]` + `recipe/` builds installable
   `fresh-gui-backend` with UI under `share/fresh-gui/ui`
-  (`pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git`
-  / `pixi run package`) — same role as `pixi run serve` for browser shells before the
-  native GUI client. Recipe fetches the pinned Fresh tree via `vendor/fresh.rev` when
-  git submodules are not initialized (typical for `--git` installs).
+  (`pixi global install --git …` / GitHub Releases `.conda` / `pixi run package`).
+  Recipe fetches the pinned Fresh tree via `vendor/fresh.rev` when git submodules
+  are not initialized. CI on `main` bumps CalVer and publishes Releases
+  (`.github/workflows/release-backend.yml`).
 - (Unsigned Windows NSIS + MSI already available from Phase 1 packaging.)
 - Host **visual** polish is Phase UI / [UI.md](./UI.md), not this section.
 
@@ -205,7 +205,7 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 
 ### Versioning
 
-CalVer compatible with Cargo: `YYYY.MMDD.N` (e.g. `2026.728.1`). `scripts/update-version.sh` bumps workspace manifests.
+CalVer compatible with Cargo: `YYYY.MMDD.N` (e.g. `2026.728.1`). `scripts/update-version.sh` bumps workspace manifests; CI on `main` also bumps and publishes backend Releases.
 
 ## 8. Security (baseline)
 

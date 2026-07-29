@@ -1,8 +1,10 @@
 # fresh-gui Host UI
 
-Product UI for the **local host** ADE shell. Architecture and protocol live in [DESIGN.md](./DESIGN.md). This document defines **what the UI should become**, borrowing layout and interaction patterns from [Terax](https://github.com/crynta/terax-ai) while staying honest about our remote-backend split.
+Product UI for the **local host** ADE shell. Architecture and protocol: [DESIGN.md](./DESIGN.md). Overview for users: [README.md](../README.md).
 
-**Status:** UI-1 through UI-3 shipped in `crates/fresh-gui-app/ui` (connection strip, status bar, unified terminal/editor tabs, CodeMirror 6, xterm WebGL, per-tab recursive pane trees, shortcut registry + command palette, virtualized file tree, OSC 7 cwd, find bar, activity bar, light theme + settings). Architecture/protocol: [DESIGN.md](./DESIGN.md).
+**Status:** UI-1–UI-3 are in use in `crates/fresh-gui-app/ui` — connection strip, status bar, unified terminal/editor tabs, CodeMirror 6, xterm WebGL, pane trees, shortcuts + palette, virtualized tree, OSC 7 cwd, find, activity bar, system/light/dark theme via `config.json`, path context menus.
+
+This doc keeps the IA, visual language, and interaction map for ongoing polish. It is not a backlog of unfinished MVP chrome.
 
 ## 1. Goals
 
@@ -22,13 +24,13 @@ Inspired by Terax’s public UI / [TERAX.md](https://github.com/crynta/terax-ai/
 | Unified tab bar over content stacks | **Yes** | Tabs are `terminal` \| `editor` (more kinds later) |
 | Tabs stay mounted / hidden, not destroyed | **Yes** | Keeps remote PTYs and xterm buffers alive |
 | Recursive pane tree (row/col splits, max ~4 leaves) | **Yes (UI-2)** | Replace today’s “two-pane only” split |
-| Collapsible explorer + activity-style sidebar | **Yes** | Start with explorer only; activity icons later |
+| Collapsible explorer + activity-style sidebar | **Yes** | Explorer + Settings (opens `config.json`) |
 | Status bar (cwd, branch, indicators) | **Yes** | Show remote root / session / connection |
-| Header search that adapts to terminal vs editor | **Later** | After unified tabs |
+| Header search that adapts to terminal vs editor | **Yes (UI-3)** | Find bar for terminal / editor |
 | Sliding “pill” active-tab indicator | **Yes** | Cheap polish, high perceived quality |
-| CodeMirror 6 + language registry | **Yes (UI-1)** | Move off CM5 |
-| xterm WebGL renderer | **Yes (UI-1)** | Match Terax performance story |
-| Theme engine + CSS variables | **Yes** | One token set driving chrome + terminal + editor |
+| CodeMirror 6 + language registry | **Yes (UI-1)** | |
+| xterm WebGL renderer | **Yes (UI-1)** | |
+| Theme engine + CSS variables | **Yes** | Tokens + xterm/editor follow resolved theme |
 | AI chat rail, agent diffs, composer | **No (MVP)** | Explicit non-goal in DESIGN §2 |
 | Source control / git graph | **Later** | Needs protocol + UX design of its own |
 | Web preview / markdown tabs | **Later** | Optional tab kinds after editor tabs land |
@@ -172,31 +174,37 @@ Defaults follow [Terax `shortcuts.ts`](https://github.com/crynta/terax-ai/blob/m
 | Split pane down | `Mod+Shift+D` | |
 | Focus next / prev pane | `Mod+]` / `Mod+[` | |
 | Swap pane | `Mod+Alt+Arrow` | |
-| Save buffer | `Mod+S` | Already exists |
-| Toggle sidebar | `Mod+B` (and `Mod+Shift+B`) | Terax: plain `Mod+B` may yield to focused terminal |
-| Command palette | `Mod+P` | UI-2+ (Terax); find-in-files later `Mod+Shift+P` / content search |
+| Save buffer | `Mod+S` | Editor tabs; also saves settings `config.json` |
+| Toggle sidebar | `Mod+B` (and `Mod+Shift+B`) | |
+| Find | `Mod+F` | Terminal buffer or editor search |
+| Command palette | `Mod+P` | |
+| Open settings | `Mod+,` | Opens backend `config.json` in an editor tab |
 | Connect / disconnect | — | Primary in strip; disconnect keeps remote session |
 
-**Windows note:** `Ctrl+D` is also shell EOF. Prefer Terax behavior: shortcut wins when the host handles it for split; document that users who need raw EOF can remap. Do not silently switch to VS Code `\` bindings.
+**Context menus:** right-click a tab or file-tree row to copy absolute path, relative path (vs workspace root), or file name; tabs also offer Close.
 
-Tree: expand/collapse, open file (preview), pin on edit, keyboard nav (UI-2). Dirty editors show `•` in the tab label (Terax-style).
+**Windows note:** `Ctrl+D` is also shell EOF. Prefer Terax behavior: shortcut wins when the host handles it for split; users who need raw EOF can remap. Do not silently switch to VS Code `\` bindings.
 
-Connection errors and auth failures use inline strip status + optional toast; never modal loops.
+Tree: expand/collapse, open file (preview), pin on edit, keyboard nav. Dirty editors show `•` in the tab label. Theme preference defaults to **system**; light/dark override and fonts live in `config.json` (not a settings modal).
+
+Connection errors and auth failures use inline strip status; never modal loops.
 
 ## 7. Component inventory
 
 ### 7.1 Current → target
 
-| Current (`ui/src`) | Target module |
-|--------------------|---------------|
-| Header inputs in `main.ts` | `chrome/ConnectionStrip` |
-| `#tabs` + split buttons | `tabs/TabBar` + `tabs/model` |
-| `#panes` two-up grid | `terminal/PaneTreeView` |
-| xterm create/fit | `terminal/TerminalStack` (WebGL) |
-| `#tree` | `explorer/FileTree` |
-| `#editor-panel` dock | **Done (UI-1):** editor tabs in `#editor-stack` (CM6) |
-| ad-hoc CSS | `styles/tokens.css` + region CSS |
-| protocol types | keep `protocol.ts`; add layout types |
+| Current (`ui/src`) | Role |
+|--------------------|------|
+| Connection inputs in `main.ts` | Always-on strip (compacts when connected) |
+| `#tabs` + split buttons | Unified terminal / editor tabs |
+| `#panes` / `panes.ts` | Per-tab recursive pane tree |
+| `terminal.ts` | xterm + WebGL + OSC 7 |
+| `tree.ts` | Virtualized explorer + context menu hook |
+| `#editor-stack` / `editor.ts` | CodeMirror 6 editor tabs |
+| `settings.ts` + backend `config.json` | Theme / fonts / shell (no modal) |
+| `context-menu.ts` | Tab + tree path actions |
+| `tokens.css` + region CSS | Shared chrome / terminal tokens |
+| `protocol.ts` | ADE message shapes |
 
 ### 7.2 Shell quality bar (from Terax, adapted)
 
@@ -247,10 +255,11 @@ Connection errors and auth failures use inline strip status + optional toast; ne
 - Lightweight file-type badges in the virtualized tree (`src/icons.ts`) — no heavy icon pack.
 - Skipped `fs_list` pagination for now — row virtualization covers large trees; revisit only if a single directory listing becomes a protocol bottleneck.
 - Theme preference (`system` / `light` / `dark`) + CSS tokens (`data-theme` resolved). Settings live in backend `config.json` (`ui` + `terminal.shell`); the activity-bar / `Mod+,` entry opens that file in the editor (no modal).
+- Path context menus on tabs and the file tree (copy absolute / relative / name).
 
 ### Out of UI phases (stay in DESIGN Phase 4+)
 
-- Code signing, auto-update, Linux backend packages.
+- Code signing, auto-update for the Windows host.
 - AI rail, git graph, web preview, spaces — separate design spikes if/when wanted.
 
 ## 10. Non-goals (UI)
