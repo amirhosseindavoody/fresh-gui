@@ -492,18 +492,209 @@ input#session {
 }
 
 .editor-host {
+  display: flex;
+  flex-direction: column;
   flex: 1;
   min-height: 0;
   overflow: hidden;
+  position: relative;
 }
 
 .editor-host .cm-editor {
-  height: 100%;
+  flex: 1;
+  min-height: 0;
+  height: auto;
   font-size: 14px;
 }
 
 .editor-host .cm-scroller {
   font-family: var(--font-mono);
+}
+
+.editor-host.md-preview-active .cm-editor {
+  display: none !important;
+}
+
+.editor-host .md-preview {
+  display: none;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 1.25rem 1.5rem 2rem;
+  color: var(--text);
+  background: var(--bg-elevated);
+  font-family: var(--font-ui);
+  font-size: 0.95rem;
+  line-height: 1.55;
+}
+
+.editor-host.md-preview-active .md-preview {
+  display: block;
+}
+
+.md-preview > :first-child {
+  margin-top: 0;
+}
+
+.md-preview > :last-child {
+  margin-bottom: 0;
+}
+
+.md-preview h1,
+.md-preview h2,
+.md-preview h3,
+.md-preview h4,
+.md-preview h5,
+.md-preview h6 {
+  margin: 1.25em 0 0.5em;
+  line-height: 1.25;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.md-preview h1 {
+  font-size: 1.75rem;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--border);
+}
+
+.md-preview h2 {
+  font-size: 1.4rem;
+  padding-bottom: 0.25em;
+  border-bottom: 1px solid var(--border);
+}
+
+.md-preview h3 {
+  font-size: 1.2rem;
+}
+
+.md-preview p,
+.md-preview ul,
+.md-preview ol,
+.md-preview blockquote,
+.md-preview pre,
+.md-preview table {
+  margin: 0.75em 0;
+}
+
+.md-preview ul,
+.md-preview ol {
+  padding-left: 1.5em;
+}
+
+.md-preview li + li {
+  margin-top: 0.25em;
+}
+
+.md-preview a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.md-preview a:hover {
+  color: color-mix(in srgb, var(--accent) 80%, var(--text));
+}
+
+.md-preview code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  padding: 0.15em 0.35em;
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.md-preview pre {
+  padding: 0.85rem 1rem;
+  overflow: auto;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.md-preview pre code {
+  padding: 0;
+  background: transparent;
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+
+.md-preview blockquote {
+  margin-left: 0;
+  padding: 0.15rem 0 0.15rem 0.9rem;
+  border-left: 3px solid var(--border-strong);
+  color: var(--muted);
+}
+
+.md-preview hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 1.5em 0;
+}
+
+.md-preview table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.md-preview th,
+.md-preview td {
+  border: 1px solid var(--border);
+  padding: 0.4rem 0.65rem;
+  text-align: left;
+}
+
+.md-preview th {
+  background: var(--panel);
+  font-weight: 600;
+}
+
+.md-preview img {
+  max-width: 100%;
+  height: auto;
+}
+
+.md-preview input[type="checkbox"] {
+  margin-right: 0.4em;
+}
+
+.md-preview .katex-display {
+  margin: 1em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.15em 0;
+}
+
+.md-preview .katex {
+  font-size: 1.05em;
+}
+
+.md-preview pre.mermaid {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 1rem;
+  text-align: center;
+  overflow: auto;
+}
+
+.md-preview pre.mermaid svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.md-preview pre.mermaid.md-mermaid-error {
+  color: var(--danger);
+  text-align: left;
+  white-space: pre-wrap;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+}
+
+.md-preview .md-math-error {
+  color: var(--danger);
 }
 
 .statusbar {
