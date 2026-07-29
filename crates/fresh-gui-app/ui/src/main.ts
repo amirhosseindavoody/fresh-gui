@@ -175,6 +175,7 @@ let treeLoaded = false;
 let treeNeedsRefresh = false;
 let treeQuietUntil = 0;
 
+/** Keep in sync with backend `WATCH_IGNORE_DIRS` in `fs_watch.rs`. */
 const WATCH_IGNORE_DIRS = new Set([
   ".git",
   "target",
@@ -183,6 +184,12 @@ const WATCH_IGNORE_DIRS = new Set([
   "vendor",
   ".cursor",
   "dist",
+  ".hg",
+  ".svn",
+  "__pycache__",
+  ".next",
+  ".cache",
+  "build",
 ]);
 
 let tabs: Tab[] = [];
@@ -1229,6 +1236,9 @@ function scheduleTreeRefresh(): void {
 
 function startFsWatch(): void {
   const request_id = nextRequestId();
+  // Recursive on the sandbox root; the backend skips heavyweight trees
+  // (.git/target/node_modules/…) when installing watches so large workspaces
+  // do not stall the PTY WebSocket during shell startup.
   send({ type: "fs_watch", request_id, path: "", recursive: true });
 }
 
