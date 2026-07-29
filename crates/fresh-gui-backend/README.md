@@ -8,12 +8,12 @@ Linux remote daemon: WebSocket ADE API + detachable sessions + PTY + filesystem 
 pixi run ui-install   # once (dev)
 pixi run serve        # build UI + start (http://127.0.0.1:7420/ + ws://…/ws)
 
-pixi run backend -- --listen 127.0.0.1:7420 --token secret --root /path/to/project
+pixi run backend -- --listen 127.0.0.1:7420 --root /path/to/project
 pixi run backend -- --no-editor   # omit editor capability
 pixi run backend -- --no-ui       # WebSocket + /healthz only
 ```
 
-Open the printed **UI** URL in a browser (not the `ws://` line).
+Open the printed **Local access** URL (includes `?token=`) in a browser — not the bare `ws://` line. A bearer token is always required (auto-generated when unset). Prefer `FRESH_GUI_TOKEN` over `--token` so the secret does not appear in `ps`.
 
 ## Install
 
@@ -41,7 +41,8 @@ Sessions own PTYs; disconnect detaches the subscriber but keeps shells running f
 | Flag / env | Meaning |
 |------------|---------|
 | `--listen` / `FRESH_GUI_LISTEN` | Bind address (default `127.0.0.1:7420`; scans next ports unless `--strict-listen`) |
-| `--token` / `FRESH_GUI_TOKEN` | Auth token (required for non-loopback) |
+| `--token` / `FRESH_GUI_TOKEN` | Auth token (prefer env over flag). When unset, a random per-process token is generated and printed once |
+| `--allow-no-auth` / `FRESH_GUI_ALLOW_NO_AUTH` | Disable auth (**loopback only**; for local tests — not a normal run mode) |
 | `--root` / `FRESH_GUI_FS_ROOT` | FS + editor sandbox (default: cwd) |
 | `--ui-dir` / `FRESH_GUI_UI_DIR` | Override UI assets directory |
 | `--no-ui` / `FRESH_GUI_NO_UI` | API only |

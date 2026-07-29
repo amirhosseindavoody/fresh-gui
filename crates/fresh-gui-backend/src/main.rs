@@ -30,7 +30,7 @@ const LISTEN_PORT_FALLBACK_SPAN: u16 = 64;
 #[derive(Debug, Parser)]
 #[command(name = "fresh-gui-backend", version, about = "Remote daemon for fresh-gui")]
 struct Args {
-    /// Listen address. Non-loopback binds require `--token`.
+    /// Listen address (default loopback). Prefer SSH tunnels over non-loopback binds.
     /// If the port is busy, the next free ports on the same host are tried
     /// (unless `--strict-listen`).
     #[arg(long, default_value = "127.0.0.1:7420", env = "FRESH_GUI_LISTEN")]
@@ -40,10 +40,16 @@ struct Args {
     #[arg(long, env = "FRESH_GUI_STRICT_LISTEN")]
     strict_listen: bool,
 
-    /// Shared auth token (also `FRESH_GUI_TOKEN`). Required for non-loopback binds.
-    /// On loopback, if set, clients must present the same token.
+    /// Shared auth token (also `FRESH_GUI_TOKEN`). Prefer the env var over this flag so
+    /// the secret does not appear in `ps` output. When unset, a random token is
+    /// generated for this process (printed once in the startup banner).
     #[arg(long, env = "FRESH_GUI_TOKEN")]
     token: Option<String>,
+
+    /// Disable auth (loopback binds only). For local integration tests — never use
+    /// as a normal run mode.
+    #[arg(long, env = "FRESH_GUI_ALLOW_NO_AUTH")]
+    allow_no_auth: bool,
 
     /// Sandbox root for read-only `fs` listing and editor open (default: current directory).
     #[arg(long, env = "FRESH_GUI_FS_ROOT")]
@@ -85,13 +91,20 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let loopback = args.listen.ip().is_loopback();
-    let token = args.token.filter(|t| !t.is_empty());
+    let AuthSetup { token, require_auth } =
+        resolve_auth(loopback, args.token.as_deref(), args.allow_no_auth)?;
 
-    if !loopback && token.is_none() {
-        bail!(
-            "non-loopback listen ({}) requires --token / FRESH_GUI_TOKEN",
-            args.listen
+    if !loopback {
+        warn!(
+            listen = %args.listen,
+            "non-loopback bind — prefer 127.0.0.1 + an SSH tunnel; the token still protects the ADE handshake"
         );
+    }
+    if args.allow_no_auth {
+        warn!("--allow-no-auth: authentication disabled (loopback test mode only)");
+        eprintln!();
+        eprintln!("  WARNING: --allow-no-auth is enabled (no bearer token). Loopback test mode only.");
+        eprintln!();
     }
 
     let root_path = args
@@ -102,8 +115,6 @@ async fn main() -> Result<()> {
     let (config, config_path) = Config::load(args.config.as_deref()).context("load config")?;
     let (default_shell, _) = config.resolve_shell();
     let config = Arc::new(std::sync::RwLock::new(config));
-
-    let require_auth = !loopback || token.is_some();
 
     // Bind before spawning Fresh so a busy port fails cleanly (no editor teardown panic).
     let (listener, bound) = bind_listen(args.listen, args.strict_listen).await?;
@@ -116,7 +127,7 @@ async fn main() -> Result<()> {
     };
 
     let state = Arc::new(AppState {
-        token,
+        token: token.clone(),
         require_auth,
         fs_root,
         sessions: SessionStore::new(),
@@ -145,6 +156,52 @@ async fn main() -> Result<()> {
         "starting fresh-gui-backend"
     );
     // Plain lines so the launch URL is obvious in `pixi run serve` output.
+    // The token is printed here once (operator terminal only) — never via tracing.
+    print_startup_banner(bound, &http_url, &ws_url, token.as_deref());
+
+    server::serve_listener(listener, state, ui_dir, &http_url, &ws_url)
+        .await
+        .context("server exited with error")
+}
+
+#[derive(Debug)]
+struct AuthSetup {
+    token: Option<String>,
+    require_auth: bool,
+}
+
+/// Resolve the process auth token and whether clients must present it.
+fn resolve_auth(
+    loopback: bool,
+    explicit_token: Option<&str>,
+    allow_no_auth: bool,
+) -> Result<AuthSetup> {
+    if allow_no_auth {
+        if !loopback {
+            bail!("--allow-no-auth is only permitted on loopback binds (got a non-loopback listen)");
+        }
+        return Ok(AuthSetup {
+            token: None,
+            require_auth: false,
+        });
+    }
+
+    let token = match explicit_token.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => t.to_owned(),
+        None => uuid::Uuid::new_v4().simple().to_string(),
+    };
+    Ok(AuthSetup {
+        token: Some(token),
+        require_auth: true,
+    })
+}
+
+fn print_startup_banner(
+    bound: SocketAddr,
+    http_url: &str,
+    ws_url: &str,
+    token: Option<&str>,
+) {
     println!();
     println!("  fresh-gui ready");
     println!("  UI:  {http_url}");
@@ -156,11 +213,36 @@ async fn main() -> Result<()> {
     {
         println!("  bind: {bound} (loopback — reach the domain via proxy/tunnel if needed)");
     }
-    println!();
 
-    server::serve_listener(listener, state, ui_dir, &http_url, &ws_url)
-        .await
-        .context("server exited with error")
+    if let Some(token) = token {
+        let port = bound.port();
+        let local = format!("http://127.0.0.1:{port}/?token={token}");
+        let user = ssh_tunnel_user();
+        let host = ssh_tunnel_host();
+        println!();
+        println!("  Local access (this machine):");
+        println!("    {local}");
+        println!();
+        println!(
+            "  From another machine (e.g. your laptop) — SSH tunnel, nothing exposed to the network:"
+        );
+        println!("    ssh -L {port}:127.0.0.1:{port} {user}@{host}");
+        println!("    then open: {local}");
+    }
+    println!();
+}
+
+fn ssh_tunnel_user() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "user".to_owned())
+}
+
+fn ssh_tunnel_host() -> String {
+    assigned_host_domain().unwrap_or_else(|| "your-server".to_owned())
 }
 
 /// Bind `preferred`, or the next free ports on the same IP when busy.
@@ -389,7 +471,7 @@ fn ui_dir_candidates() -> Vec<PathBuf> {
 mod tests {
     use super::{
         display_host_port, format_host_port, host_has_port, is_assigned_domain, public_urls,
-        ui_dir_candidates,
+        resolve_auth, ui_dir_candidates,
     };
     use std::net::SocketAddr;
 
@@ -443,5 +525,34 @@ mod tests {
         // Without an assigned domain / explicit host, keep the bound address.
         let shown = display_host_port(bound, None);
         assert!(shown.contains("7420"), "{shown}");
+    }
+
+    #[test]
+    fn resolve_auth_auto_generates_token_by_default() {
+        let setup = resolve_auth(true, None, false).unwrap();
+        assert!(setup.require_auth);
+        let token = setup.token.expect("token");
+        assert_eq!(token.len(), 32);
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn resolve_auth_keeps_explicit_token() {
+        let setup = resolve_auth(true, Some("  pinned-secret  "), false).unwrap();
+        assert!(setup.require_auth);
+        assert_eq!(setup.token.as_deref(), Some("pinned-secret"));
+    }
+
+    #[test]
+    fn resolve_auth_allow_no_auth_loopback_only() {
+        let setup = resolve_auth(true, None, true).unwrap();
+        assert!(!setup.require_auth);
+        assert!(setup.token.is_none());
+
+        let err = resolve_auth(false, None, true).unwrap_err();
+        assert!(
+            err.to_string().contains("allow-no-auth"),
+            "unexpected error: {err}"
+        );
     }
 }

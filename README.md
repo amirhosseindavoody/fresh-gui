@@ -19,26 +19,37 @@ fresh-gui-backend
 The process prints something like:
 
 ```text
+  fresh-gui ready
   UI:  http://127.0.0.1:7420/
   WS:  ws://127.0.0.1:7420/ws
+
+  Local access (this machine):
+    http://127.0.0.1:7420/?token=<token>
+
+  From another machine (e.g. your laptop) — SSH tunnel, nothing exposed to the network:
+    ssh -L 7420:127.0.0.1:7420 user@your-server
+    then open: http://127.0.0.1:7420/?token=<token>
 ```
 
-Open the **UI** URL in a browser and click **Connect**. (The `ws://` line is for the client — you do not browse it.)
+Open the **Local access** URL (token is embedded; the UI auto-connects). A bearer token is **always required**, including on loopback — on shared hosts every local account can reach `127.0.0.1`. When you do not pass `--token` / `FRESH_GUI_TOKEN`, the process generates a random token and prints it once in that banner (never written to disk or structured logs). Prefer `FRESH_GUI_TOKEN=…` over `--token` so the secret does not show up in `ps`.
 
 Works on older enterprise glibc (2.28+).
 
 ### From your laptop over SSH
 
+Keep the backend on loopback and use the printed SSH tunnel command (or the equivalent):
+
 ```bash
 # on the server
-fresh-gui-backend --listen 127.0.0.1:7420 --token secret --root "$PWD"
+cd /path/to/your/project
+fresh-gui-backend
 
-# on your laptop
+# on your laptop (from the banner)
 ssh -L 7420:127.0.0.1:7420 user@server
-# browser → http://127.0.0.1:7420/  (paste the same token if you set one)
+# browser → the printed http://127.0.0.1:7420/?token=… URL
 ```
 
-Non-loopback binds require `--token` / `FRESH_GUI_TOKEN`. On loopback, a token is optional unless you set one.
+Do not bind publicly by default. Non-loopback listens still require a token and log a warning; SSH tunnel + loopback is the supported remote path.
 
 ## Using the UI
 

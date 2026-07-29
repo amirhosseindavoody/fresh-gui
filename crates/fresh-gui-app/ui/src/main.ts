@@ -1855,5 +1855,26 @@ $input("url").value = defaultWsUrl();
 const savedSession = localStorage.getItem(SESSION_KEY);
 if (savedSession) $input("session").value = savedSession;
 
+/** Prefill token from `?token=` (printed startup URLs), then strip it from the address bar. */
+function consumeTokenQueryParam(): boolean {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const token = params.get("token");
+    if (!token) return false;
+    $input("token").value = token;
+    const next = `${window.location.pathname}${window.location.hash}`;
+    window.history.replaceState({}, "", next);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const shouldAutoConnect = consumeTokenQueryParam();
+
 setupSidebarResizer();
 renderAll();
+
+if (shouldAutoConnect) {
+  connect();
+}

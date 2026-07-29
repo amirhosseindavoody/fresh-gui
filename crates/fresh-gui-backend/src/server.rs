@@ -182,8 +182,8 @@ async fn handle_client_msg(
         }
         Message::Auth { token } => {
             let ok = match &state.token {
-                Some(expected) => expected == &token,
-                None => true,
+                Some(expected) => tokens_equal(expected, &token),
+                None => !state.require_auth,
             };
             if ok {
                 *authed = true;
@@ -732,6 +732,18 @@ fn require_auth(authed: bool) -> Result<(), Message> {
             message: "send auth first".into(),
         })
     }
+}
+
+/// Best-effort constant-time compare (still short-circuits on length mismatch).
+fn tokens_equal(expected: &str, presented: &str) -> bool {
+    if expected.len() != presented.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in expected.bytes().zip(presented.bytes()) {
+        diff |= a ^ b;
+    }
+    diff == 0
 }
 
 fn require_session(session_id: &Option<String>) -> Result<String, Message> {
