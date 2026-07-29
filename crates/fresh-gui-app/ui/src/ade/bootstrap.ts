@@ -56,6 +56,12 @@ import {
   openContextMenu,
   type ContextMenuItem,
 } from "../context-menu";
+import {
+  cacheAuthToken,
+  clearCachedAuthToken,
+  consumeTokenQueryParam,
+  loadCachedAuthToken,
+} from "../auth-token";
 
 const SESSION_KEY = "fresh-gui.sessionId";
 const LAYOUT_KEY = "fresh-gui.layout";
@@ -1656,11 +1662,15 @@ function onMessage(raw: string): void {
       setStatusLeft(`hello from ${msg.implementation}${hasEditor ? " · editor" : " · no editor"}`);
       updateStatusRight();
       break;
-    case "auth_ok":
+    case "auth_ok": {
+      const token = $input("token").value.trim();
+      if (token) cacheAuthToken(token);
       beginSession();
       setStatusLeft("authenticated");
       break;
+    }
     case "auth_error":
+      clearCachedAuthToken();
       setStatusLeft(`auth failed: ${msg.message}`);
       break;
     case "session_created":
@@ -2177,22 +2187,15 @@ $input("url").value = defaultWsUrl();
 const savedSession = localStorage.getItem(SESSION_KEY);
 if (savedSession) $input("session").value = savedSession;
 
-/** Prefill token from `?token=` (printed startup URLs), then strip it from the address bar. */
-function consumeTokenQueryParam(): boolean {
-  try {
-    const params = new URLSearchParams(window.location.search);
-    const token = params.get("token");
-    if (!token) return false;
-    $input("token").value = token;
-    const next = `${window.location.pathname}${window.location.hash}`;
-    window.history.replaceState({}, "", next);
-    return true;
-  } catch {
-    return false;
-  }
+const tokenFromUrl = consumeTokenQueryParam($input("token"));
+if (!tokenFromUrl) {
+  const cached = loadCachedAuthToken();
+  if (cached) $input("token").value = cached;
 }
 
-const shouldAutoConnect = consumeTokenQueryParam();
+// Auto-connect from a fresh `?token=` link, or after reload when the token
+// was cached (URL is stripped after first use).
+const shouldAutoConnect = tokenFromUrl || !!$input("token").value.trim();
 
 setupSidebarResizer();
 renderAll();

@@ -15,7 +15,7 @@ pixi run backend -- --no-editor   # omit editor capability
 pixi run backend -- --no-ui       # WebSocket + /healthz only
 ```
 
-Open the printed **Local access** URL (includes `?token=`) in a browser — not the bare `ws://` line. A bearer token is always required (auto-generated when unset). Prefer `FRESH_GUI_TOKEN` over `--token` so the secret does not appear in `ps`.
+Open the printed **Local access** URL (includes `?token=`) in a browser — not the bare `ws://` line. A bearer token is always required (auto-generated when unset). Prefer `FRESH_GUI_TOKEN` over `--token` so the secret does not appear in `ps`. After connect, the UI caches the token in tab `sessionStorage` so a reload can re-auth and reattach the session without keeping `?token=` in the URL.
 
 ## Install
 
