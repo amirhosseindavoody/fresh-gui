@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and install fresh-gui-backend + host UI assets (Linux package).
+# Build and install fresh-gui + host UI assets (Linux package).
 set -euo pipefail
 
 : "${PREFIX:?PREFIX must be set}"
@@ -61,7 +61,7 @@ echo "Building host UI…"
   test -f dist/index.html
 )
 
-echo "Installing fresh-gui-backend…"
+echo "Installing fresh-gui…"
 export CARGO_PROFILE_RELEASE_STRIP="${CARGO_PROFILE_RELEASE_STRIP:-symbols}"
 # Prefer thin LTO: fat LTO can OOM on smaller cloud/VPS machines during install.
 export CARGO_PROFILE_RELEASE_LTO="${CARGO_PROFILE_RELEASE_LTO:-thin}"
@@ -69,9 +69,9 @@ cargo auditable install \
   --locked \
   --force \
   --no-track \
-  --bin fresh-gui-backend \
+  --bin fresh-gui \
   --root "${PREFIX}" \
-  --path crates/fresh-gui-backend
+  --path crates/fresh-gui
 
 echo "Installing UI assets…"
 mkdir -p "${PREFIX}/share/fresh-gui/ui"

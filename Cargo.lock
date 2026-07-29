@@ -1444,22 +1444,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fresh-gui-app"
-version = "2026.729.7"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "fresh-gui-client",
- "fresh-gui-protocol",
- "tokio",
- "tower-http",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "fresh-gui-backend"
+name = "fresh-gui"
 version = "2026.729.7"
 dependencies = [
  "anyhow",
@@ -1479,6 +1464,21 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "fresh-gui-app"
+version = "2026.729.7"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "fresh-gui-client",
+ "fresh-gui-protocol",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

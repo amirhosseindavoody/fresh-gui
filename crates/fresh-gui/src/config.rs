@@ -1,4 +1,4 @@
-//! JSON config for `fresh-gui-backend` (+ host UI prefs).
+//! JSON config for `fresh-gui` (+ host UI prefs).
 //!
 //! Mirrors Fresh editor’s user-facing shape for the terminal shell
 //! (`terminal.shell.{command,args}`) and stores host chrome under `ui.*`.

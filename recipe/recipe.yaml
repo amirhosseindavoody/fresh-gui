@@ -10,7 +10,7 @@ context:
   version: 2026.729.7
 
 package:
-  name: fresh-gui-backend
+  name: fresh-gui
   version: ${{ version }}
 
 source:
@@ -39,12 +39,12 @@ requirements:
 
 tests:
   - script:
-      - fresh-gui-backend --help
-      - fresh-gui-backend --version
+      - fresh-gui --help
+      - fresh-gui --version
       - test -f "${PREFIX}/share/fresh-gui/ui/index.html"
   - package_contents:
       bin:
-        - fresh-gui-backend
+        - fresh-gui
       files:
         exists:
           - share/fresh-gui/ui/index.html

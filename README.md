@@ -13,7 +13,7 @@ pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git
 # or a release tag / .conda from https://github.com/amirhosseindavoody/fresh-gui/releases
 
 cd /path/to/your/project
-fresh-gui-backend
+fresh-gui
 ```
 
 The process prints something like:
@@ -42,7 +42,7 @@ Keep the backend on loopback and use the printed SSH tunnel command (or the equi
 ```bash
 # on the server
 cd /path/to/your/project
-fresh-gui-backend
+fresh-gui
 
 # on your laptop (from the banner)
 ssh -L 7420:127.0.0.1:7420 user@server
@@ -125,12 +125,12 @@ Useful tasks: `pixi run check`, `test`, `build`, `ui` (Vite hot reload on `:1420
 
 | Piece | Role |
 |-------|------|
-| `fresh-gui-backend` | Linux daemon (PTY, FS, Fresh editor, embedded UI) |
+| `fresh-gui` | Linux daemon (PTY, FS, Fresh editor, embedded UI) |
 | `fresh-gui-app` / `ui/` | Browser UI + small CLI |
 | `fresh-gui-desktop` | Windows Tauri host |
 | `fresh-gui-protocol` / `fresh-gui-client` | Shared wire format + client library |
 
-Deeper design notes: [docs/DESIGN.md](./docs/DESIGN.md), [docs/SECURITY.md](./docs/SECURITY.md), [docs/UI.md](./docs/UI.md). Backend flags and packaging: [crates/fresh-gui-backend/README.md](./crates/fresh-gui-backend/README.md).
+Deeper design notes: [docs/DESIGN.md](./docs/DESIGN.md), [docs/SECURITY.md](./docs/SECURITY.md), [docs/UI.md](./docs/UI.md). Backend flags and packaging: [crates/fresh-gui/README.md](./crates/fresh-gui/README.md).
 
 ## Releases
 

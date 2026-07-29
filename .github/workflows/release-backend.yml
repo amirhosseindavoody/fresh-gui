@@ -1,4 +1,4 @@
-# Bump CalVer, build the linux-64 fresh-gui-backend pixi package, and publish
+# Bump CalVer, build the linux-64 fresh-gui pixi package, and publish
 # a GitHub Release with the .conda artifact.
 #
 # Triggers on every push to main (merge) and on manual dispatch.
@@ -107,13 +107,13 @@ jobs:
           mkdir -p dist
           pixi run package
           ls -lah dist
-          test -n "$(find dist -maxdepth 1 -name 'fresh-gui-backend-*.conda' -print -quit)"
+          test -n "$(find dist -maxdepth 1 -name 'fresh-gui-*.conda' -print -quit)"
 
       - name: Checksums
         run: |
           set -euo pipefail
           cd dist
-          sha256sum fresh-gui-backend-*.conda | tee SHA256SUMS
+          sha256sum fresh-gui-*.conda | tee SHA256SUMS
 
       - name: Commit version bump and push tag
         env:
@@ -145,7 +145,7 @@ jobs:
           done
 
           # Tag the commit that landed on main (after any rebase).
-          git tag -f -a "${TAG}" -m "fresh-gui-backend ${VERSION}"
+          git tag -f -a "${TAG}" -m "fresh-gui ${VERSION}"
           if ! git push origin "${TAG}"; then
             echo "Tag ${TAG} may already exist on origin; continuing"
           fi
@@ -160,7 +160,7 @@ jobs:
 
           NOTES="$(mktemp)"
           {
-            echo "## fresh-gui-backend \`${VERSION}\`"
+            echo "## fresh-gui \`${VERSION}\`"
             echo
             echo "Linux remote daemon (browser UI + WebSocket PTYs), packaged for **linux-64**."
             echo
@@ -168,8 +168,8 @@ jobs:
             echo
             echo '```bash'
             echo "# download the .conda asset, then:"
-            echo "pixi global install ./fresh-gui-backend-${VERSION}-*.conda"
-            echo "fresh-gui-backend --help"
+            echo "pixi global install ./fresh-gui-${VERSION}-*.conda"
+            echo "fresh-gui --help"
             echo '```'
             echo
             echo "Or install from git at this tag:"
@@ -183,12 +183,12 @@ jobs:
 
           if gh release view "${TAG}" >/dev/null 2>&1; then
             echo "Release ${TAG} already exists — uploading assets"
-            gh release upload "${TAG}" dist/fresh-gui-backend-*.conda dist/SHA256SUMS --clobber
+            gh release upload "${TAG}" dist/fresh-gui-*.conda dist/SHA256SUMS --clobber
           else
             gh release create "${TAG}" \
-              dist/fresh-gui-backend-*.conda \
+              dist/fresh-gui-*.conda \
               dist/SHA256SUMS \
-              --title "fresh-gui-backend ${VERSION}" \
+              --title "fresh-gui ${VERSION}" \
               --notes-file "${NOTES}" \
               --verify-tag
           fi

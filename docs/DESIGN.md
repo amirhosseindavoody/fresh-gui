@@ -61,7 +61,7 @@ Logistics template: `pixi.toml` + Cargo workspace under `crates/`, `docs/DESIGN.
 ┌─────────────────────────────┐         ┌──────────────────────────────────┐
 │  Host (Windows MVP)         │         │  Remote (Linux MVP)              │
 │                             │  TLS /  │                                  │
-│  fresh-gui-app              │  SSH    │  fresh-gui-backend               │
+│  fresh-gui-app              │  SSH    │  fresh-gui               │
 │    layout, tabs, chrome     │◄───────►│    wraps Fresh session / Editor  │
 │    terminal renderer        │  proto  │    PTY, files, LSP, buffers      │
 │                             │         │                                  │
@@ -79,17 +79,17 @@ Logistics template: `pixi.toml` + Cargo workspace under `crates/`, `docs/DESIGN.
 | Crate | Binary? | Platform (MVP) | Responsibility |
 |-------|---------|----------------|----------------|
 | `fresh-gui-protocol` | no | all | Versioned messages, capability negotiation, errors |
-| `fresh-gui-backend` | yes (`fresh-gui-backend`) | linux | Daemon: bind transport, host Fresh session(s), serve protocol |
+| `fresh-gui` | yes (`fresh-gui`) | linux | Daemon: bind transport, host Fresh session(s), serve protocol |
 | `fresh-gui-client` | no | all (host) | Dial, auth, reconnect, typed RPC / streams |
-| `fresh-gui-app` | yes (`fresh-gui`) | all | CLI (`ping`/`smoke`/`attach`/`serve-ui`) + Vite/TS UI (`ui/`) |
+| `fresh-gui-app` | yes (`fresh-gui-app`) | all | CLI (`ping`/`smoke`/`attach`/`serve-ui`) + Vite/TS UI (`ui/`) |
 | `fresh-gui-desktop` | yes (`fresh-gui-desktop`) | windows | Tauri 2 window loading `fresh-gui-app/ui` |
 
 Dev machines (e.g. WSL) may build backend + protocol + client locally; the Windows GUI is cross-built or built on Windows CI / a Windows host.
 
 ### 4.2 Process model
 
-1. Operator starts **`fresh-gui-backend`** on the Linux remote (systemd user unit, `pixi run`, or SSH remote-command).
-2. Operator starts **`fresh-gui`** on Windows, enters host:port (or SSH jump), authenticates.
+1. Operator starts **`fresh-gui`** on the Linux remote (systemd user unit, `pixi run`, or SSH remote-command).
+2. Operator starts **`fresh-gui-desktop`** (or the browser UI) on the host, enters host:port (or SSH jump), authenticates.
 3. GUI opens one or more **sessions** (working directory / project). Backend creates or attaches a Fresh editor session.
 4. Terminal panes map to remote PTYs managed by Fresh (or a thin PTY bridge if MVP scopes editor later—see open decisions).
 5. Disconnect leaves the remote session running when the backend supports detach (align with Fresh session daemon semantics where possible).
@@ -122,7 +122,7 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 
 - Backend exposes authenticated PTY create/read/write/resize over WebSocket (`/ws`).
 - Host: Tauri 2 crate (`fresh-gui-desktop`) loads the Vite-built UI (`ui/dist`); Linux/WSL can use `pixi run serve` (backend embeds `ui/dist` on the same port as `/ws`) or `pixi run ui` (Vite) when iterating on chrome.
-- Host CLI: `fresh-gui ping|smoke|attach` via `fresh-gui-client`.
+- Host CLI: `fresh-gui-app ping|smoke|attach` via `fresh-gui-client`.
 - Integration test: `pty_smoke_echo`.
 - Remaining / follow-ups: reconnect UX polish, measured latency on real SSH forwards.
 
@@ -179,7 +179,7 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 
 - Code signing, auto-update story, hardening.
 - **Linux backend Pixi package ✅:** `[package]` + `recipe/` builds installable
-  `fresh-gui-backend` with UI under `share/fresh-gui/ui`
+  `fresh-gui` with UI under `share/fresh-gui/ui`
   (`pixi global install --git …` / GitHub Releases `.conda` / `pixi run package`).
   Recipe fetches the pinned Fresh tree via `vendor/fresh.rev` when git submodules
   are not initialized. CI on `main` bumps CalVer and publishes Releases
@@ -201,7 +201,7 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 
 ### Fresh dependency
 
-**Resolved (D3):** git submodule at `vendor/fresh`, pinned by commit SHA. Backend Cargo deps use `path = "../../vendor/fresh/crates/…"`. Phase 3a links `fresh-editor` (`runtime`) into `fresh-gui-backend`; workspace `exclude = ["vendor/fresh"]` keeps Fresh’s own workspace metadata.
+**Resolved (D3):** git submodule at `vendor/fresh`, pinned by commit SHA. Backend Cargo deps use `path = "../../vendor/fresh/crates/…"`. Phase 3a links `fresh-editor` (`runtime`) into `fresh-gui`; workspace `exclude = ["vendor/fresh"]` keeps Fresh’s own workspace metadata.
 
 ### Versioning
 
@@ -308,7 +308,7 @@ fresh-gui/
     fresh/                # git submodule (pinned rev; see D3)
   crates/
     fresh-gui-protocol/
-    fresh-gui-backend/
+    fresh-gui/
     fresh-gui-client/
     fresh-gui-app/            # CLI + Vite/TS UI (`ui/`, builds to `ui/dist`)
     fresh-gui-desktop/        # Tauri 2 host (Windows MVP)

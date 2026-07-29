@@ -2,7 +2,7 @@
 
 Tauri 2 host window loading the xterm.js + file-tree UI from `crates/fresh-gui-app/ui`.
 
-The WebView connects directly to the remote `fresh-gui-backend` WebSocket (`/ws`).
+The WebView connects directly to the remote `fresh-gui` WebSocket (`/ws`).
 
 ## Dev
 

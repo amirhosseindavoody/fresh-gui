@@ -90,7 +90,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
     };
     let mut hello = Hello::backend(
-        format!("fresh-gui-backend/{}", env!("CARGO_PKG_VERSION")),
+        format!("fresh-gui/{}", env!("CARGO_PKG_VERSION")),
         caps,
     );
     hello.config_path = Some(state.config_path.display().to_string());

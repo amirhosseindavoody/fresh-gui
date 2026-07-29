@@ -26,7 +26,7 @@ fn wait_health(addr: SocketAddr) {
 }
 
 fn spawn_backend(addr: SocketAddr, root: &std::path::Path) -> Child {
-    let bin = env!("CARGO_BIN_EXE_fresh-gui-backend");
+    let bin = env!("CARGO_BIN_EXE_fresh-gui");
     Command::new(bin)
         .arg("--listen")
         .arg(addr.to_string())

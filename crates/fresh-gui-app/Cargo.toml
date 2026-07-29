@@ -10,7 +10,7 @@ description = "Host ADE shell for fresh-gui (CLI + Tauri UI)"
 readme = "README.md"
 
 [[bin]]
-name = "fresh-gui"
+name = "fresh-gui-app"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,4 +1,4 @@
-//! fresh-gui-backend — remote ADE daemon (PTY + FS + optional Fresh editor).
+//! fresh-gui — remote ADE daemon (PTY + FS + optional Fresh editor).
 
 mod config;
 mod editor_worker;
@@ -28,7 +28,7 @@ use crate::session::SessionStore;
 const LISTEN_PORT_FALLBACK_SPAN: u16 = 64;
 
 #[derive(Debug, Parser)]
-#[command(name = "fresh-gui-backend", version, about = "Remote daemon for fresh-gui")]
+#[command(name = "fresh-gui", version, about = "Remote daemon for fresh-gui")]
 struct Args {
     /// Listen address (default loopback). Prefer SSH tunnels over non-loopback binds.
     /// If the port is busy, the next free ports on the same host are tried
@@ -153,7 +153,7 @@ async fn main() -> Result<()> {
         editor = state.editor.is_some(),
         default_shell = %default_shell,
         config = %state.config_path.display(),
-        "starting fresh-gui-backend"
+        "starting fresh-gui"
     );
     // Plain lines so the launch URL is obvious in `pixi run serve` output.
     // The token is printed here once (operator terminal only) — never via tracing.
@@ -443,7 +443,7 @@ fn resolve_ui_dir(explicit: Option<&std::path::Path>) -> Option<PathBuf> {
 fn ui_dir_candidates() -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
-    // Pixi / conda package layout: $PREFIX/bin/fresh-gui-backend → ../share/fresh-gui/ui
+    // Pixi / conda package layout: $PREFIX/bin/fresh-gui → ../share/fresh-gui/ui
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             candidates.push(parent.join("../share/fresh-gui/ui"));

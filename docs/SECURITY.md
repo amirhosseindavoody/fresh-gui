@@ -2,12 +2,12 @@
 
 Status: **implemented** (see also [DESIGN.md §8](./DESIGN.md#8-security-baseline)).
 
-This document is the security design for how operators reach `fresh-gui-backend`
+This document is the security design for how operators reach `fresh-gui`
 on shared hosts. User-facing install steps: [README.md](../README.md).
 
 ## 1. Problem
 
-`fresh-gui-backend` typically runs on a **shared multi-user Linux server** (a compute
+`fresh-gui` typically runs on a **shared multi-user Linux server** (a compute
 node, dev box, etc.), not a personal single-user machine. It exposes a real PTY
 (interactive shell) and file system access under the operator's own Unix
 permissions to whoever can complete the ADE WebSocket handshake.
