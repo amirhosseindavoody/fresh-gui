@@ -85,6 +85,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             terminal_font_size: cfg.ui.terminal_font_size,
             editor_font_size: cfg.ui.editor_font_size,
             webgl: cfg.ui.webgl,
+            show_dotfiles: cfg.ui.show_dotfiles,
+            show_git_dirs: cfg.ui.show_git_dirs,
         }
     };
     let mut hello = Hello::backend(

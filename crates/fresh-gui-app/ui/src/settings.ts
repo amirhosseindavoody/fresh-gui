@@ -15,6 +15,10 @@ export type UiSettings = {
   terminalFontSize: number;
   editorFontSize: number;
   webgl: boolean;
+  /** Show names starting with `.` (except `.git`, controlled by `showGitDirs`). */
+  showDotfiles: boolean;
+  /** Show `.git` directories. Independent of `showDotfiles`; default off. */
+  showGitDirs: boolean;
 };
 
 export type HelloUi = {
@@ -22,6 +26,8 @@ export type HelloUi = {
   terminalFontSize?: number;
   editorFontSize?: number;
   webgl?: boolean;
+  showDotfiles?: boolean;
+  showGitDirs?: boolean;
 };
 
 const DEFAULTS: UiSettings = {
@@ -29,6 +35,8 @@ const DEFAULTS: UiSettings = {
   terminalFontSize: 14,
   editorFontSize: 14,
   webgl: true,
+  showDotfiles: false,
+  showGitDirs: false,
 };
 
 export function defaultUiSettings(): UiSettings {
@@ -37,6 +45,17 @@ export function defaultUiSettings(): UiSettings {
 
 function clamp(n: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, n));
+}
+
+function readBool(
+  partial: Partial<UiSettings> | HelloUi | null | undefined,
+  key: "webgl" | "showDotfiles" | "showGitDirs",
+  fallback: boolean,
+): boolean {
+  if (!partial || !(key in partial)) return fallback;
+  const value = (partial as Record<string, unknown>)[key];
+  if (value == null) return fallback;
+  return value !== false;
 }
 
 export function normalizeUiSettings(partial: Partial<UiSettings> | HelloUi | null | undefined): UiSettings {
@@ -52,15 +71,13 @@ export function normalizeUiSettings(partial: Partial<UiSettings> | HelloUi | nul
     partial && "editorFontSize" in partial && partial.editorFontSize != null
       ? Number(partial.editorFontSize)
       : DEFAULTS.editorFontSize;
-  const webgl =
-    partial && "webgl" in partial && partial.webgl != null
-      ? partial.webgl !== false
-      : DEFAULTS.webgl;
   return {
     theme: parseThemePreference(themeRaw),
     terminalFontSize: clamp(Number.isFinite(term) ? term : DEFAULTS.terminalFontSize, 10, 28),
     editorFontSize: clamp(Number.isFinite(ed) ? ed : DEFAULTS.editorFontSize, 10, 28),
-    webgl,
+    webgl: readBool(partial, "webgl", DEFAULTS.webgl),
+    showDotfiles: readBool(partial, "showDotfiles", DEFAULTS.showDotfiles),
+    showGitDirs: readBool(partial, "showGitDirs", DEFAULTS.showGitDirs),
   };
 }
 

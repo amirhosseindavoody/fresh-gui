@@ -612,6 +612,10 @@ function applyUiSettings(next: UiSettings): void {
   saveSettings(next);
   const resolved = resolveTheme(next.theme);
   restyleOpenPanes(resolved, resolved !== prevResolved);
+  tree.setVisibility({
+    showDotfiles: next.showDotfiles,
+    showGitDirs: next.showGitDirs,
+  });
   requestAnimationFrame(fitActiveLeaves);
 }
 
@@ -1174,6 +1178,10 @@ const tree = new VirtualTree(treeEl, fsList, {
   noteInteraction: () => noteTreeInteraction(),
   onRootChange: (rootPath) => updateExplorerTitle(rootPath),
   onContextMenu: (entry, x, y) => openPathContextMenu(entry.path, x, y),
+});
+tree.setVisibility({
+  showDotfiles: uiSettings.showDotfiles,
+  showGitDirs: uiSettings.showGitDirs,
 });
 setTreeEmptyHint(true);
 

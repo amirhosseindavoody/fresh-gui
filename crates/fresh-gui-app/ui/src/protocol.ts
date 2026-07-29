@@ -58,6 +58,8 @@ export type HelloUiMsg = {
   terminalFontSize?: number;
   editorFontSize?: number;
   webgl?: boolean;
+  showDotfiles?: boolean;
+  showGitDirs?: boolean;
 };
 
 export type ServerMessage =

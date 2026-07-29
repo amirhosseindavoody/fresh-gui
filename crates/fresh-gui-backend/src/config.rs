@@ -27,7 +27,10 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"{
     "theme": "system",
     "terminalFontSize": 14,
     "editorFontSize": 14,
-    "webgl": true
+    "webgl": true,
+    // Explorer: hide .* by default; .git stays hidden unless showGitDirs is true
+    "showDotfiles": false,
+    "showGitDirs": false
   },
   // Default PTY shell when the client does not pass `shell`.
   // Empty args keep interactive / OSC 7 setup for known shells.
@@ -70,6 +73,12 @@ pub struct UiConfig {
     pub editor_font_size: u32,
     #[serde(default = "default_true")]
     pub webgl: bool,
+    /// Show names starting with `.` in the explorer (except `.git`, see [`Self::show_git_dirs`]).
+    #[serde(default, rename = "showDotfiles")]
+    pub show_dotfiles: bool,
+    /// Show `.git` directories in the explorer. Independent of [`Self::show_dotfiles`]; default off.
+    #[serde(default, rename = "showGitDirs")]
+    pub show_git_dirs: bool,
 }
 
 impl Default for UiConfig {
@@ -79,6 +88,8 @@ impl Default for UiConfig {
             terminal_font_size: default_font_size(),
             editor_font_size: default_font_size(),
             webgl: true,
+            show_dotfiles: false,
+            show_git_dirs: false,
         }
     }
 }
@@ -390,6 +401,20 @@ mod tests {
         let cfg = Config::parse(DEFAULT_CONFIG_TEMPLATE).unwrap();
         assert_eq!(cfg.ui.theme, "system");
         assert_eq!(cfg.resolve_shell().0, "zsh");
+        assert!(!cfg.ui.show_dotfiles);
+        assert!(!cfg.ui.show_git_dirs);
+    }
+
+    #[test]
+    fn parses_explorer_visibility_flags() {
+        let cfg = Config::parse(
+            r#"{
+              "ui": { "showDotfiles": true, "showGitDirs": true }
+            }"#,
+        )
+        .unwrap();
+        assert!(cfg.ui.show_dotfiles);
+        assert!(cfg.ui.show_git_dirs);
     }
 
     fn tempfile_dir() -> PathBuf {

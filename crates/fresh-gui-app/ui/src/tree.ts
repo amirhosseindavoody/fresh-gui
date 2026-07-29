@@ -6,6 +6,13 @@ import { fileIcon } from "./icons";
 
 export type TreeListFn = (path: string) => Promise<{ path: string; entries: FsEntry[] }>;
 
+export type TreeVisibility = {
+  /** Show names starting with `.` (except `.git`). */
+  showDotfiles: boolean;
+  /** Show `.git` directories. Independent of `showDotfiles`. */
+  showGitDirs: boolean;
+};
+
 export type TreeCallbacks = {
   onSelect?: (entry: FsEntry | null) => void;
   onOpenFile?: (entry: FsEntry, preview: boolean) => void;
@@ -28,6 +35,13 @@ type Row = {
 
 const ROW_HEIGHT = 24;
 
+/** Whether an FS entry should appear in the explorer for the given visibility prefs. */
+export function isTreeEntryVisible(entry: FsEntry, vis: TreeVisibility): boolean {
+  if (entry.name === ".git") return vis.showGitDirs;
+  if (entry.name.startsWith(".")) return vis.showDotfiles;
+  return true;
+}
+
 function normalizePath(p: string): string {
   const s = p.replace(/\\/g, "/").replace(/\/+$/, "");
   return s || "/";
@@ -40,6 +54,7 @@ export class VirtualTree {
   private listFn: TreeListFn;
   private callbacks: TreeCallbacks;
   private childrenCache = new Map<string, FsEntry[]>();
+  private visibility: TreeVisibility = { showDotfiles: false, showGitDirs: false };
   /** Path passed to `fs_list` for the view root (`""` = backend sandbox root). */
   private listRoot = "";
   private rootPath = "";
@@ -90,6 +105,16 @@ export class VirtualTree {
 
   getWorkspaceRoot(): string {
     return this.workspaceRoot;
+  }
+
+  /** Update explorer visibility prefs and refresh rows from the cached listings. */
+  setVisibility(vis: TreeVisibility): void {
+    this.visibility = {
+      showDotfiles: !!vis.showDotfiles,
+      showGitDirs: !!vis.showGitDirs,
+    };
+    this.rebuildRows();
+    this.schedulePaint();
   }
 
   /** Map absolute cwd → fs_list path ("" at workspace root). */
@@ -269,6 +294,7 @@ export class VirtualTree {
     const walk = (parentKey: string, depth: number) => {
       const entries = this.childrenCache.get(parentKey) || [];
       for (const entry of entries) {
+        if (!isTreeEntryVisible(entry, this.visibility)) continue;
         const isDir = entry.kind === "dir";
         const expanded = isDir && this.expanded.has(entry.path);
         rows.push({
