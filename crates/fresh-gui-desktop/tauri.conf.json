@@ -12,7 +12,8 @@
       {
         "title": "fresh-gui",
         "width": 1100,
-        "height": 720
+        "height": 720,
+        "resizable": true
       }
     ],
     "security": {
@@ -21,13 +22,32 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis", "msi"],
+    "publisher": "Amirhossein Davoody",
+    "shortDescription": "Terminal-first ADE GUI for remote Fresh backends",
+    "longDescription": "Host GUI that connects to a remote fresh-gui-backend over WebSocket for PTY and file browsing.",
+    "copyright": "Copyright (c) 2026 Amirhossein Davoody",
+    "category": "DeveloperTool",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "digestAlgorithm": "sha256",
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": false
+      },
+      "wix": {
+        "language": "en-US"
+      }
+    }
   }
 }

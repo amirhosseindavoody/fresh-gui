@@ -1,0 +1,65 @@
+name: Windows Tauri
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/fresh-gui-desktop/**"
+      - "crates/fresh-gui-app/ui/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/windows-tauri.yml"
+  pull_request:
+    paths:
+      - "crates/fresh-gui-desktop/**"
+      - "crates/fresh-gui-app/ui/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/windows-tauri.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-bundle:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: crates/fresh-gui-desktop
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: crates/fresh-gui-desktop/package-lock.json
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install npm deps (Tauri CLI)
+        run: npm ci
+
+      - name: Build Windows installers (NSIS + MSI)
+        run: npm run build:windows
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: fresh-gui-windows
+          # Workspace Cargo target dir is the repo root `target/`, not under the crate.
+          path: |
+            target/release/bundle/nsis/*.exe
+            target/release/bundle/msi/*.msi
+          if-no-files-found: error

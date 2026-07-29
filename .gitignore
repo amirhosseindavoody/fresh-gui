@@ -19,3 +19,5 @@ dist/
 # Tauri
 crates/fresh-gui-desktop/gen/
 crates/fresh-gui-desktop/target/
+node_modules/
+crates/fresh-gui-desktop/node_modules/

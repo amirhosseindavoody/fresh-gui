@@ -17,11 +17,13 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::fs::FsRoot;
 use crate::pty::PtySession;
 
 pub struct AppState {
     pub token: Option<String>,
     pub require_auth: bool,
+    pub fs_root: FsRoot,
 }
 
 pub async fn serve(addr: SocketAddr, state: Arc<AppState>) -> Result<()> {
@@ -262,6 +264,52 @@ async fn handle_client_msg(
             .await
             .ok();
             Ok(())
+        }
+        Message::FsList { request_id, path } => {
+            require_auth(*authed)?;
+            match state.fs_root.list(&path).await {
+                Ok((resolved, entries)) => {
+                    send_msg(
+                        sink,
+                        &Message::FsListed {
+                            request_id,
+                            path: resolved,
+                            entries,
+                        },
+                    )
+                    .await
+                    .map_err(|_| Message::Error {
+                        code: "send_failed".into(),
+                        message: "failed to send FsListed".into(),
+                    })?;
+                    Ok(())
+                }
+                Err(err) => Err(Message::Error {
+                    code: "fs_list_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                }),
+            }
+        }
+        Message::FsStat { request_id, path } => {
+            require_auth(*authed)?;
+            match state.fs_root.stat(&path).await {
+                Ok(entry) => {
+                    send_msg(
+                        sink,
+                        &Message::FsStatResult { request_id, entry },
+                    )
+                    .await
+                    .map_err(|_| Message::Error {
+                        code: "send_failed".into(),
+                        message: "failed to send FsStatResult".into(),
+                    })?;
+                    Ok(())
+                }
+                Err(err) => Err(Message::Error {
+                    code: "fs_stat_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                }),
+            }
         }
         other => {
             warn!(?other, "unexpected client message");

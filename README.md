@@ -1,10 +1,10 @@
 # fresh-gui
 
-Terminal-first ADE **GUI on the local host**, powered by a **remote backend** (Fresh crates later; Phase 1 is a PTY daemon).
+Terminal-first ADE **GUI on the local host**, powered by a **remote backend** (Fresh crates later).
 
 Inspired by [Terax](https://github.com/crynta/terax-ai). Repo logistics follow [pixi-mise](https://github.com/amirhosseindavoody/pixi-mise).
 
-**Status:** Phase 1 (remote PTY loop). See **[docs/DESIGN.md](./docs/DESIGN.md)**.
+**Status:** Phase 1 + 1b (PTY + read-only file tree); Windows Tauri NSIS/MSI packaging wired. See **[docs/DESIGN.md](./docs/DESIGN.md)** and **[docs/WINDOWS.md](./docs/WINDOWS.md)**.
 
 ## Split
 
@@ -18,27 +18,36 @@ Inspired by [Terax](https://github.com/crynta/terax-ai). Repo logistics follow [
 
 Fresh is vendored as a **git submodule** at `vendor/fresh`, pinned by commit (DESIGN §10 D3). After clone: `git submodule update --init --recursive`.
 
-## Quick start (Phase 1)
+## Quick start
 
 ```bash
 pixi install
 
 # terminal 1 — remote daemon (loopback; add --token for non-loopback)
 pixi run backend
-# pixi run backend -- --listen 0.0.0.0:7420 --token secret
+# pixi run backend -- --listen 0.0.0.0:7420 --token secret --root /path/to/project
 
 # terminal 2 — CLI smoke
 pixi run app -- smoke --backend ws://127.0.0.1:7420/ws
 
-# terminal 2 — serve xterm.js UI (browser / until Tauri deps exist)
+# terminal 2 — serve UI (PTY + file tree)
 pixi run ui
 # open http://127.0.0.1:1420/ → Connect to ws://127.0.0.1:7420/ws
-
-# Tauri window (needs OS WebView / webkit prerequisites)
-pixi run desktop
 ```
 
-Auth: on loopback, token is optional unless `--token` / `FRESH_GUI_TOKEN` is set. Non-loopback binds **require** a token.
+Auth: on loopback, token is optional unless `--token` / `FRESH_GUI_TOKEN` is set. Non-loopback binds **require** a token. FS listing is sandboxed to `--root` (default: cwd).
+
+## Windows installers
+
+On a Windows machine (or via CI):
+
+```powershell
+cd crates\fresh-gui-desktop
+npm ci
+npm run build:windows
+```
+
+See [docs/WINDOWS.md](./docs/WINDOWS.md). CI workflow: `.github/workflows/windows-tauri.yml`.
 
 ## Development
 
@@ -48,13 +57,13 @@ pixi run test
 pixi run build
 ```
 
-`fresh-gui-desktop` is excluded from default check/test (Linux CI without webkit). Build it explicitly with `pixi run desktop` / `cargo check -p fresh-gui-desktop`.
+`fresh-gui-desktop` is excluded from default check/test on Linux (no webkit).
 
-## Protocol (Phase 1)
+## Protocol
 
 JSON text frames over WebSocket `ws://host:port/ws`:
 
-`hello` → optional `auth` → `pty_open` / `pty_data` (base64) / `pty_resize` / `pty_close`
+`hello` → optional `auth` → `pty_*` and/or `fs_list` / `fs_stat`
 
 ## Versioning
 

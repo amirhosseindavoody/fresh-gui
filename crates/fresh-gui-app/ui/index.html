@@ -74,10 +74,55 @@
         border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
       }
       button:disabled { opacity: 0.5; cursor: not-allowed; }
-      #status { font-size: 0.8rem; color: var(--muted); margin-left: auto; }
+      #status { font-size: 0.8rem; color: var(--muted); margin-left: auto; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #main {
+        display: grid;
+        grid-template-columns: minmax(200px, 280px) 1fr;
+        min-height: 0;
+        height: 100%;
+      }
+      #tree-panel {
+        border-right: 1px solid var(--border);
+        background: color-mix(in srgb, var(--panel) 70%, transparent);
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+      }
+      #tree-panel h2 {
+        margin: 0;
+        padding: 0.65rem 0.75rem;
+        font-size: 0.75rem;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: var(--muted);
+        border-bottom: 1px solid var(--border);
+      }
+      #tree {
+        overflow: auto;
+        padding: 0.4rem 0.35rem 0.75rem;
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 12px;
+        flex: 1;
+      }
+      .tree-item {
+        display: flex;
+        align-items: center;
+        gap: 0.35rem;
+        padding: 0.2rem 0.35rem;
+        border-radius: 4px;
+        cursor: pointer;
+        user-select: none;
+      }
+      .tree-item:hover { background: #21262d; }
+      .tree-item.selected { background: color-mix(in srgb, var(--accent) 22%, #21262d); }
+      .tree-item .twist { width: 1rem; color: var(--muted); flex-shrink: 0; }
+      .tree-item .kind { color: var(--muted); }
+      .tree-children { margin-left: 0.85rem; border-left: 1px solid var(--border); }
       #term-wrap {
         padding: 0.75rem;
         min-height: 0;
+        min-width: 0;
       }
       #terminal {
         height: 100%;
@@ -85,6 +130,10 @@
         border-radius: 8px;
         overflow: hidden;
         background: #010409;
+      }
+      @media (max-width: 720px) {
+        #main { grid-template-columns: 1fr; grid-template-rows: 40% 1fr; }
+        #tree-panel { border-right: none; border-bottom: 1px solid var(--border); }
       }
     </style>
   </head>
@@ -103,8 +152,14 @@
       <button id="disconnect" type="button" disabled>Disconnect</button>
       <div id="status">disconnected</div>
     </header>
-    <div id="term-wrap">
-      <div id="terminal"></div>
+    <div id="main">
+      <aside id="tree-panel">
+        <h2>Files</h2>
+        <div id="tree"><div class="tree-empty" style="padding:0.75rem;color:var(--muted)">Connect to load remote tree</div></div>
+      </aside>
+      <div id="term-wrap">
+        <div id="terminal"></div>
+      </div>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>

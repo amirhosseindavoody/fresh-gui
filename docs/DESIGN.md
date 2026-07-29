@@ -124,12 +124,19 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 - Host: Tauri 2 crate (`fresh-gui-desktop`) loads xterm.js UI; Linux/WSL can use `fresh-gui serve-ui` as a stand-in when webkit isn’t installed.
 - Host CLI: `fresh-gui ping|smoke|attach` via `fresh-gui-client`.
 - Integration test: `pty_smoke_echo`.
-- Remaining / follow-ups: Windows desktop packaging proof, reconnect UX polish, measured latency on real SSH forwards.
+- Remaining / follow-ups: reconnect UX polish, measured latency on real SSH forwards.
 
-### Phase 1b — Read-only file tree (immediately after Phase 1)
+### Phase 1b — Read-only file tree ✅
 
-- Protocol `fs` capability: list directory, open path as context (read-only tree in the GUI).
-- Ships right after the PTY loop works—before multi-tab polish if needed.
+- Protocol `fs` capability: `fs_list` / `fs_stat` (read-only); paths sandboxed under `--root` / `FRESH_GUI_FS_ROOT`.
+- Host UI: sidebar tree (expand dirs, select path as context in status).
+- Tests: `fs::tests::list_and_block_escape`, `fs_list_root` e2e.
+
+### Phase 1 / packaging — Windows Tauri installers ✅ (unsigned MVP)
+
+- Brought forward from Phase 4 for MVP host distribution.
+- NSIS + MSI via `crates/fresh-gui-desktop` (`npm run build:windows`); CI: `.github/workflows/windows-tauri.yml`.
+- Docs: `docs/WINDOWS.md`. Code signing + auto-update remain Phase 4.
 
 ### Phase 2 — Multi-tab / splits + session detach
 
@@ -142,7 +149,8 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 
 ### Phase 4 — Polish / packaging
 
-- Windows installer, Linux backend package, auto-update story, hardening.
+- Code signing, Linux backend package, auto-update story, hardening.
+- (Unsigned Windows NSIS/MSI already available from Phase 1 packaging.)
 
 ## 7. Development Environment
 

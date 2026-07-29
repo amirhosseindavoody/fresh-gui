@@ -153,6 +153,38 @@ impl Client {
         .await
     }
 
+    pub async fn list_dir(
+        &mut self,
+        path: impl Into<String>,
+    ) -> Result<(String, Vec<fresh_gui_protocol::FsEntry>)> {
+        let request_id = format!("fs-{}", uuid_simple());
+        send_msg(
+            &mut self.sink,
+            &Message::FsList {
+                request_id: request_id.clone(),
+                path: path.into(),
+            },
+        )
+        .await?;
+        loop {
+            match self.recv().await? {
+                Message::FsListed {
+                    request_id: rid,
+                    path,
+                    entries,
+                } if rid == request_id => return Ok((path, entries)),
+                Message::Error { code, message } => {
+                    bail!("fs list failed: {code}: {message}")
+                }
+                Message::PtyData { .. }
+                | Message::PtyClosed { .. }
+                | Message::Pong { .. }
+                | Message::Ping { .. } => continue,
+                other => bail!("unexpected while listing dir: {other:?}"),
+            }
+        }
+    }
+
     pub async fn recv(&mut self) -> Result<Message> {
         recv_msg(&mut self.stream).await
     }
@@ -161,6 +193,15 @@ impl Client {
     pub fn decode_pty_data(data_b64: &str) -> Result<Vec<u8>> {
         Ok(base64::engine::general_purpose::STANDARD.decode(data_b64)?)
     }
+}
+
+fn uuid_simple() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{t:x}")
 }
 
 async fn send_msg(
