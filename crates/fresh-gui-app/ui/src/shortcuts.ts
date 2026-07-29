@@ -13,6 +13,7 @@ export type ShortcutId =
   | "editor.save"
   | "editor.markdownPreview"
   | "commandPalette.open"
+  | "gotoFile.open"
   | "search.focus"
   | "settings.open";
 
@@ -38,16 +39,20 @@ export const MOD_PROP: "meta" | "ctrl" = isMac ? "meta" : "ctrl";
 
 export const SHORTCUTS: Shortcut[] = [
   {
+    id: "gotoFile.open",
+    label: "Go to File",
+    defaultBindings: [{ [MOD_PROP]: true, key: "p" }],
+  },
+  {
     id: "commandPalette.open",
     label: "Open command palette",
-    defaultBindings: [{ [MOD_PROP]: true, key: "p" }],
+    defaultBindings: [{ [MOD_PROP]: true, shift: true, key: "p" }],
   },
   {
     id: "tab.new",
     label: "New terminal tab",
     defaultBindings: [{ [MOD_PROP]: true, key: "t" }],
-  },
-  {
+  },  {
     id: "tab.close",
     label: "Close tab or pane",
     defaultBindings: [{ [MOD_PROP]: true, key: "w" }],
@@ -142,12 +147,13 @@ export function installShortcuts(handlers: ShortcutHandlers): () => void {
       target &&
       (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)
     ) {
-      // Still allow save / palette / sidebar from inputs in the strip.
+      // Still allow save / palette / goto / sidebar from inputs in the strip.
       const id = matchShortcut(e);
       if (
         id !== "editor.save" &&
         id !== "editor.markdownPreview" &&
         id !== "commandPalette.open" &&
+        id !== "gotoFile.open" &&
         id !== "sidebar.toggle" &&
         id !== "search.focus" &&
         id !== "settings.open"

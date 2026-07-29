@@ -253,11 +253,34 @@ pub enum Message {
         paths: Vec<String>,
     },
     /// Client → backend: open a path in the Fresh editor (capability `editor`).
+    ///
+    /// `path` may include a Fresh-style `:line` / `:line:col` suffix. Optional
+    /// `cwd` resolves relative paths (terminal OSC 7 cwd), matching Fresh
+    /// terminal-link resolution order.
     EditorOpen {
         request_id: String,
         path: String,
         #[serde(default)]
         preview: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        column: Option<u32>,
+    },
+    /// Client → backend: Ctrl+click open — detect a path in `line_text` at
+    /// `column` via Fresh `path_link::detect_link_at`, then open it.
+    EditorOpenLink {
+        request_id: String,
+        /// Full line of terminal / editor text containing the path.
+        line_text: String,
+        /// 0-based character offset of the click within `line_text`.
+        column: u32,
+        #[serde(default)]
+        preview: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
     },
     /// Backend → client: file opened; full text follows in [`Message::BufferSnapshot`].
     EditorOpened {
@@ -266,6 +289,12 @@ pub enum Message {
         path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         language: Option<String>,
+        /// 1-based line to reveal in the host editor (from path suffix or link).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line: Option<u32>,
+        /// 1-based column to reveal in the host editor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        column: Option<u32>,
     },
     /// Backend → client: full buffer text.
     BufferSnapshot {
@@ -454,6 +483,43 @@ mod tests {
         assert_eq!(
             Message::from_json(&changed.to_json().unwrap()).unwrap(),
             changed
+        );
+    }
+
+    #[test]
+    fn editor_open_link_roundtrips() {
+        let open = Message::EditorOpen {
+            request_id: "e1".into(),
+            path: "src/main.rs:10:2".into(),
+            preview: true,
+            cwd: Some("/tmp/proj".into()),
+            line: None,
+            column: None,
+        };
+        assert_eq!(Message::from_json(&open.to_json().unwrap()).unwrap(), open);
+
+        let link = Message::EditorOpenLink {
+            request_id: "e2".into(),
+            line_text: "error: src/lib.rs:1:1: boom".into(),
+            column: 7,
+            preview: true,
+            cwd: Some("/tmp/proj".into()),
+        };
+        let json = link.to_json().unwrap();
+        assert!(json.contains("\"editor_open_link\""));
+        assert_eq!(Message::from_json(&json).unwrap(), link);
+
+        let opened = Message::EditorOpened {
+            request_id: "e2".into(),
+            buffer_id: "1".into(),
+            path: "/tmp/proj/src/lib.rs".into(),
+            language: Some("rust".into()),
+            line: Some(1),
+            column: Some(1),
+        };
+        assert_eq!(
+            Message::from_json(&opened.to_json().unwrap()).unwrap(),
+            opened
         );
     }
 }

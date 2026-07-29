@@ -244,7 +244,8 @@ Connection errors and auth failures use inline strip status; never modal loops.
 ### Phase UI-2 — Pane tree + keyboard ✅
 
 - Recursive splits (max 4 leaves/tab, `src/panes.ts`); replaced the old global two-pane mode — each terminal tab now owns its own `PaneNode` tree and a `leaves: Map<ptyId, TermBundle>`.
-- Shortcut registry (`src/shortcuts.ts`) wired via `installShortcuts`; command palette (`src/palette.ts`, `Mod+P`) lists all shortcuts and runs them by id.
+- Shortcut registry (`src/shortcuts.ts`) wired via `installShortcuts`; **Go to File** (`Mod+P`) pastes/types a path (`path[:line[:col]]`); **command palette** (`Mod+Shift+P`, `src/palette.ts`) lists shortcuts and runs them by id.
+- Terminal / editor **Ctrl/Cmd+click** on a path opens the file (Fresh `path_link` detection on the backend; host hover uses a mirrored detector). Relative paths resolve against the terminal OSC 7 cwd.
 - Tree keyboard navigation (arrow keys, Enter) via the virtualized tree.
 - Explorer: **virtualized rows** (`src/tree.ts` `VirtualTree`) — lazy one-level `fs_list` + windowed row rendering, so expanded views stay responsive with large trees.
 - Richer layout blob (`version: 2`) in `layout_set` / localStorage, including each terminal tab's `paneTree` and `activeLeafId`.

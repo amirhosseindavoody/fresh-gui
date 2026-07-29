@@ -284,10 +284,13 @@ impl Client {
                 request_id: request_id.clone(),
                 path: path.into(),
                 preview,
+                cwd: None,
+                line: None,
+                column: None,
             },
         )
         .await?;
-        let mut opened: Option<(String, String, Option<String>)> = None;
+        let mut opened: Option<(String, String, Option<String>, Option<u32>, Option<u32>)> = None;
         loop {
             match self.recv().await? {
                 Message::EditorOpened {
@@ -295,8 +298,10 @@ impl Client {
                     buffer_id,
                     path,
                     language,
+                    line,
+                    column,
                 } if rid == request_id => {
-                    opened = Some((buffer_id, path, language));
+                    opened = Some((buffer_id, path, language, line, column));
                 }
                 Message::BufferSnapshot {
                     buffer_id,
@@ -306,9 +311,9 @@ impl Client {
                 } => {
                     if opened
                         .as_ref()
-                        .is_some_and(|(oid, _, _)| oid == &buffer_id)
+                        .is_some_and(|(oid, _, _, _, _)| oid == &buffer_id)
                     {
-                        let (_, opath, lang) = opened.take().expect("opened set");
+                        let (_, opath, lang, _line, _column) = opened.take().expect("opened set");
                         let path = if snap_path.is_empty() {
                             opath
                         } else {
