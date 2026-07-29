@@ -159,7 +159,7 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 
 - Protocol `0.4.0`: `buffer_edit` / `buffer_changed` / `buffer_save` / `buffer_saved` with revision CAS.
 - Host UI: CodeMirror 6 pane (Phase UI-1); Ctrl/Cmd+S save; dirty indicator.
-- Host UI stack: Vite + TypeScript under `crates/fresh-gui-app/ui` (Bun via Pixi for install/scripts; xterm/CodeMirror from registry; no CDN).
+- Host UI stack: Vite + React 19 + Tailwind + shadcn under `crates/fresh-gui-app/ui` (Bun via Pixi for install/scripts; xterm/CodeMirror from registry; no CDN). ADE protocol/controller remains typed TypeScript modules attached to the React shell.
 - Test: `editor_edit_save_reopen`.
 
 #### Phase 3c — fs_watch + thin scene ✅
