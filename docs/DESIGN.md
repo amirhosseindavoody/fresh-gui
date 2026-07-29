@@ -209,6 +209,8 @@ CalVer compatible with Cargo: `YYYY.MMDD.N` (e.g. `2026.728.1`). `scripts/update
 
 ## 8. Security (baseline)
 
+Full design: **[SECURITY.md](./SECURITY.md)** (always-on token + SSH tunnel).
+
 - **Always-on bearer token**, including on the default loopback bind. Shared multi-user hosts can reach `127.0.0.1`; an unauthenticated loopback ADE (PTY + FS) is not safe. Token is taken from `--token` / `FRESH_GUI_TOKEN`, or auto-generated per process start and printed once in the startup banner (never in `tracing` logs or on disk). Prefer the env var over the CLI flag so the secret does not appear in `ps`.
 - No unauthenticated listen on `0.0.0.0`. Non-loopback binds still require a token and emit a warning; the documented remote path is **SSH tunnel → loopback**.
 - Prefer SSH port-forward (printed on startup) over raw public TCP / TLS for MVP.

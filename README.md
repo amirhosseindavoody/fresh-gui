@@ -130,7 +130,7 @@ Useful tasks: `pixi run check`, `test`, `build`, `ui` (Vite hot reload on `:1420
 | `fresh-gui-desktop` | Windows Tauri host |
 | `fresh-gui-protocol` / `fresh-gui-client` | Shared wire format + client library |
 
-Deeper design notes: [docs/DESIGN.md](./docs/DESIGN.md), [docs/UI.md](./docs/UI.md). Backend flags and packaging: [crates/fresh-gui-backend/README.md](./crates/fresh-gui-backend/README.md).
+Deeper design notes: [docs/DESIGN.md](./docs/DESIGN.md), [docs/SECURITY.md](./docs/SECURITY.md), [docs/UI.md](./docs/UI.md). Backend flags and packaging: [crates/fresh-gui-backend/README.md](./crates/fresh-gui-backend/README.md).
 
 ## Releases
 
