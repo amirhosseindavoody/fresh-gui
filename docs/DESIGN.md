@@ -168,10 +168,17 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 - Optional `scene` capability: ADE `scene_get` / `scene_snapshot` listing open buffers (not Fresh `--web` cell scene).
 - Still deferred: full Fresh web-ui scene envelopes, merging Fresh session detach with ADE sessions.
 
+### Phase UI — Host chrome polish (see [UI.md](./UI.md))
+
+- **Not started.** Functional surfaces from Phases 1–3 exist; visual IA is still a connect-bar prototype.
+- Target: Terax-inspired three-zone shell, unified terminal/editor tabs, pane trees, tokenized theme, CM6 + xterm WebGL.
+- Phased as UI-1 → UI-3 in [UI.md](./UI.md). Do not conflate with packaging polish below.
+
 ### Phase 4 — Polish / packaging
 
 - Code signing, Linux backend package, auto-update story, hardening.
 - (Unsigned Windows NSIS + MSI already available from Phase 1 packaging.)
+- Host **visual** polish is Phase UI / [UI.md](./UI.md), not this section.
 
 ## 7. Development Environment
 

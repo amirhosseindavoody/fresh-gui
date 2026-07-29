@@ -4,7 +4,7 @@ Terminal-first ADE **GUI on the local host**, powered by a **remote backend** (F
 
 Inspired by [Terax](https://github.com/crynta/terax-ai). Repo logistics follow [pixi-mise](https://github.com/amirhosseindavoody/pixi-mise).
 
-**Status:** Phase 3 (Fresh editor edit/save, CodeMirror, fs_watch, thin scene) on Phase 2 sessions/tabs; Windows Tauri NSIS/MSI packaging wired. See **[docs/DESIGN.md](./docs/DESIGN.md)** and **[docs/WINDOWS.md](./docs/WINDOWS.md)**.
+**Status:** Phase 3 (Fresh editor edit/save, CodeMirror, fs_watch, thin scene) on Phase 2 sessions/tabs; Windows Tauri NSIS/MSI packaging wired. Host UI polish target: **[docs/UI.md](./docs/UI.md)**. See also **[docs/DESIGN.md](./docs/DESIGN.md)** and **[docs/WINDOWS.md](./docs/WINDOWS.md)**.
 
 ## Split
 
