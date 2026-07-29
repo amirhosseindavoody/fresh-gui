@@ -106,7 +106,8 @@ type PaneNode =
 **Behaviors (Terax-aligned)**
 
 - **Preview editor tabs:** single-click / first open may be preview; double-click or edit pins. Next preview replaces the unpinned tab.
-- **Inherited cwd:** new terminal tabs/splits prefer active leaf cwd (OSC 7) or editor file’s parent.
+- **Inherited cwd:** new terminal tabs/splits prefer active leaf cwd (OSC 7) or last terminal cwd (not the editor file’s parent — Terax-aligned).
+- **Explorer root:** follows the active terminal leaf cwd when it lies under the backend FS sandbox (`VirtualTree.setViewRoot`).
 - **Max leaves per terminal tab:** 4 (renderer cost + clarity).
 - **Layout persistence:** serialize tab list + `paneTree` + sidebar width into existing `layout_set` / localStorage (extend today’s JSON blob).
 - **Close pane vs close tab:** last leaf closes the tab; closing a tab closes remote PTYs / buffers for that tab.
@@ -240,6 +241,7 @@ Connection errors and auth failures use inline strip status + optional toast; ne
 ### Phase UI-3 — Depth ✅
 
 - OSC 7 cwd → tab titles + inherited cwd for new tabs/splits (backend bash/zsh hooks in `pty.rs`; client `TermBundle.cwd` + `pty_open.cwd`).
+- Explorer re-roots to the active terminal leaf cwd (Terax `explorerRoot`); `fs_authorize` expands the FS sandbox when cwd leaves `--root` (e.g. `~/csv-utils`). Editor tabs keep the last terminal cwd.
 - Header find bar for terminal buffer (`@xterm/addon-search`, `Mod+F`); editor uses CodeMirror search panel.
 - Activity bar with Explorer (toggles sidebar) + Settings entry; explorer remains the only sidebar view until SCM exists.
 - Lightweight file-type badges in the virtualized tree (`src/icons.ts`) — no heavy icon pack.

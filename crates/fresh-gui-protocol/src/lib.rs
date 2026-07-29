@@ -175,6 +175,16 @@ pub enum Message {
         path: String,
         entries: Vec<FsEntry>,
     },
+    /// Client → backend: authorize a directory for FS list/open (terminal cwd sync outside `--root`).
+    FsAuthorize {
+        request_id: String,
+        path: String,
+    },
+    /// Backend → client after a successful authorize.
+    FsAuthorized {
+        request_id: String,
+        path: String,
+    },
     /// Client → backend: stat a path (read-only).
     FsStat {
         request_id: String,

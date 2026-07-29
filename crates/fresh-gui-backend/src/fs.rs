@@ -1,6 +1,7 @@
-//! Read-only filesystem listing under a sandboxed root.
+//! Read-only filesystem listing under a sandboxed root (+ Terax-style authorized cwds).
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use fresh_gui_protocol::{FsEntry, FsKind};
@@ -9,6 +10,8 @@ use tokio::fs;
 #[derive(Debug, Clone)]
 pub struct FsRoot {
     root: PathBuf,
+    /// Extra directories the host may list/open after `fs_authorize` (terminal cwd sync).
+    authorized: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 impl FsRoot {
@@ -19,7 +22,10 @@ impl FsRoot {
         if !root.is_dir() {
             bail!("FS root is not a directory: {}", root.display());
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            authorized: Arc::new(Mutex::new(Vec::new())),
+        })
     }
 
     pub fn root_display(&self) -> String {
@@ -30,8 +36,45 @@ impl FsRoot {
         &self.root
     }
 
-    /// Resolve a client path to an absolute path inside the root.
-    /// Empty, `.`, or `/` → root. Absolute paths must still stay under root.
+    fn is_allowed(&self, canon: &Path) -> bool {
+        if canon.starts_with(&self.root) {
+            return true;
+        }
+        let guard = self.authorized.lock().expect("fs authorized lock");
+        guard.iter().any(|p| canon.starts_with(p))
+    }
+
+    /// Terax-style: allow listing/opening under `path` (absolute directory) for this process.
+    /// Safe relative to PTY access — the shell can already read these paths.
+    pub async fn authorize(&self, path: &str) -> Result<PathBuf> {
+        if path.is_empty() || path == "." || path == "/" {
+            return Ok(self.root.clone());
+        }
+        let candidate = Path::new(path);
+        if !candidate.is_absolute() {
+            bail!("fs_authorize requires an absolute path, got {path}");
+        }
+        let canon = fs::canonicalize(candidate)
+            .await
+            .with_context(|| format!("canonicalize {}", candidate.display()))?;
+        let meta = fs::metadata(&canon).await?;
+        if !meta.is_dir() {
+            bail!("not a directory: {}", canon.display());
+        }
+        if self.is_allowed(&canon) {
+            return Ok(canon);
+        }
+        {
+            let mut guard = self.authorized.lock().expect("fs authorized lock");
+            if !guard.iter().any(|p| p == &canon) {
+                guard.push(canon.clone());
+            }
+        }
+        Ok(canon)
+    }
+
+    /// Resolve a client path to an absolute path inside the root or an authorized cwd.
+    /// Empty, `.`, or `/` → primary root. Absolute paths may be under root or authorized dirs.
     pub async fn resolve(&self, path: &str) -> Result<PathBuf> {
         let candidate = if path.is_empty() || path == "." || path == "/" {
             self.root.clone()
@@ -48,7 +91,7 @@ impl FsRoot {
             .await
             .with_context(|| format!("canonicalize {}", candidate.display()))?;
 
-        if !canon.starts_with(&self.root) {
+        if !self.is_allowed(&canon) {
             bail!("path escapes FS root: {}", canon.display());
         }
         Ok(canon)
@@ -142,12 +185,30 @@ mod tests {
 
         let root = FsRoot::new(tmp.clone()).unwrap();
         let (path, entries) = root.list("").await.unwrap();
-        assert!(path.contains(tmp.file_name().unwrap().to_str().unwrap()) || path == tmp.display().to_string() || entries.len() >= 2);
+        assert!(
+            path.contains(tmp.file_name().unwrap().to_str().unwrap())
+                || path == tmp.display().to_string()
+                || entries.len() >= 2
+        );
         assert!(entries.iter().any(|e| e.name == "a.txt"));
         assert!(entries.iter().any(|e| e.name == "sub" && e.kind == FsKind::Dir));
 
         let escape = root.resolve("../").await;
         assert!(escape.is_err());
+    }
+
+    #[tokio::test]
+    async fn authorize_outside_root_allows_list() {
+        let a = tempfile_dir();
+        let b = tempfile_dir();
+        stdfs::write(b.join("out.txt"), b"x").unwrap();
+
+        let root = FsRoot::new(a).unwrap();
+        assert!(root.list(&b.display().to_string()).await.is_err());
+        let auth = root.authorize(&b.display().to_string()).await.unwrap();
+        assert_eq!(auth, b.canonicalize().unwrap());
+        let (_path, entries) = root.list(&b.display().to_string()).await.unwrap();
+        assert!(entries.iter().any(|e| e.name == "out.txt"));
     }
 
     fn tempfile_dir() -> PathBuf {

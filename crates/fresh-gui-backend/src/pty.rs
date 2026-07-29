@@ -127,14 +127,28 @@ fn ensure_bash_rcfile() -> Option<PathBuf> {
     let dir = shell_init_dir();
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join("bashrc");
+    // Terax-style: ST terminator, urlencoded path, fire once at load, then PROMPT_COMMAND.
     let body = r#"# fresh-gui OSC 7 cwd reporting
 [[ -f /etc/bash.bashrc ]] && . /etc/bash.bashrc
 [[ -f ~/.bashrc ]] && . ~/.bashrc
-fresh_gui_osc7() { printf '\033]7;file://localhost%s\007' "$PWD"; }
-case ";${PROMPT_COMMAND:-};" in
-  *fresh_gui_osc7*) ;;
-  *) PROMPT_COMMAND="fresh_gui_osc7${PROMPT_COMMAND:+; ${PROMPT_COMMAND}}" ;;
+_fresh_gui_urlencode() {
+  local LC_ALL=C s="$1" i c
+  for (( i=0; i<${#s}; i++ )); do
+    c="${s:i:1}"
+    case "$c" in
+      [a-zA-Z0-9/._~-]) printf '%s' "$c" ;;
+      *) printf '%%%02X' "'$c" ;;
+    esac
+  done
+}
+fresh_gui_osc7() {
+  printf '\033]7;file://%s%s\033\\' "${HOSTNAME:-localhost}" "$(_fresh_gui_urlencode "$PWD")"
+}
+case ":${PROMPT_COMMAND:-}:" in
+  *:fresh_gui_osc7:*) ;;
+  *) PROMPT_COMMAND="fresh_gui_osc7${PROMPT_COMMAND:+;${PROMPT_COMMAND}}" ;;
 esac
+fresh_gui_osc7
 "#;
     std::fs::write(&path, body).ok()?;
     Some(path)
@@ -146,12 +160,28 @@ fn ensure_zsh_zdotdir() -> Option<PathBuf> {
     let path = dir.join(".zshrc");
     let body = r#"# fresh-gui OSC 7 cwd reporting
 [[ -f ${ZDOTDIR_USER:-$HOME}/.zshrc ]] && . ${ZDOTDIR_USER:-$HOME}/.zshrc
-fresh_gui_osc7() { printf '\033]7;file://localhost%s\007' "$PWD"; }
+_fresh_gui_urlencode() {
+  local LC_ALL=C s="$1" i c
+  for (( i=1; i<=${#s}; i++ )); do
+    c="$s[i]"
+    case "$c" in
+      [a-zA-Z0-9/._~-]) printf '%s' "$c" ;;
+      *) printf '%%%02X' "'$c" ;;
+    esac
+  done
+}
+fresh_gui_osc7() {
+  printf '\033]7;file://%s%s\033\\' "${HOST:-${HOSTNAME:-localhost}}" "$(_fresh_gui_urlencode "$PWD")"
+}
+autoload -Uz add-zsh-hook 2>/dev/null
 if typeset -f add-zsh-hook >/dev/null 2>&1; then
   add-zsh-hook precmd fresh_gui_osc7
-elif [[ -z "${precmd_functions[(r)fresh_gui_osc7]}" ]]; then
-  precmd_functions+=(fresh_gui_osc7)
+  add-zsh-hook chpwd fresh_gui_osc7
+else
+  precmd_functions=(${precmd_functions:#fresh_gui_osc7} fresh_gui_osc7)
+  chpwd_functions=(${chpwd_functions:#fresh_gui_osc7} fresh_gui_osc7)
 fi
+fresh_gui_osc7
 "#;
     std::fs::write(&path, body).ok()?;
     Some(dir)
@@ -174,7 +204,6 @@ fn configure_shell_cmd(cmd: &mut CommandBuilder, shell: &str) {
                 if let Ok(home) = std::env::var("HOME") {
                     cmd.env("ZDOTDIR_USER", home);
                 }
-                // Preserve user ZDOTDIR if set, else home is implied via ZDOTDIR_USER.
                 cmd.env("ZDOTDIR", zdot);
                 cmd.arg("-i");
             } else {
@@ -182,12 +211,7 @@ fn configure_shell_cmd(cmd: &mut CommandBuilder, shell: &str) {
             }
         }
         _ => {
-            // Best-effort interactive login for unknown shells.
-            if shell_basename(shell) == "fish" {
-                cmd.arg("-l");
-            } else {
-                cmd.arg("-l");
-            }
+            cmd.arg("-l");
         }
     }
 }

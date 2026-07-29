@@ -16,6 +16,7 @@ import {
   disposeTerminal,
   type TermBundle,
 } from "./terminal";
+import { feedOsc7Chunk } from "./osc7";
 import {
   MAX_LEAVES_PER_TAB,
   type PaneNode,
@@ -148,6 +149,7 @@ let stripForceExpanded = false;
 let connected = false;
 
 const pendingFs = new Map<string, Pending<{ path: string; entries: FsEntry[] }>>();
+const pendingFsAuth = new Map<string, Pending<{ path: string }>>();
 const pendingEditor = new Map<string, PendingEditor>();
 const pendingEdit = new Map<string, Pending<number>>();
 const pendingSave = new Map<string, Pending<{ path: string; rev: number }>>();
@@ -322,6 +324,21 @@ function fsList(path: string): Promise<{ path: string; entries: FsEntry[] }> {
   });
 }
 
+/** Terax-style: allow explorer/editor FS under a terminal cwd (may be outside `--root`). */
+function fsAuthorize(path: string): Promise<{ path: string }> {
+  const request_id = nextRequestId();
+  return new Promise((resolve, reject) => {
+    pendingFsAuth.set(request_id, { resolve, reject });
+    send({ type: "fs_authorize", request_id, path });
+    setTimeout(() => {
+      if (pendingFsAuth.has(request_id)) {
+        pendingFsAuth.delete(request_id);
+        reject(new Error("fs_authorize timeout"));
+      }
+    }, 8000);
+  });
+}
+
 function editorOpen(path: string, preview = false): Promise<OpenedInfo & { rev: number; text: string }> {
   const request_id = nextRequestId();
   return new Promise((resolve, reject) => {
@@ -389,6 +406,7 @@ function rejectPendingError(msg: Extract<ServerMessage, { type: "error" }>): voi
   };
   if (
     tryReject(pendingFs) ||
+    tryReject(pendingFsAuth) ||
     tryReject(pendingEditor) ||
     tryReject(pendingEdit) ||
     tryReject(pendingSave)
@@ -433,48 +451,100 @@ function titleFromCwd(cwd: string | undefined, fallback: string): string {
   return base || fallback;
 }
 
-function parentDir(path: string): string {
-  const normalized = path.replace(/\\/g, "/");
-  const idx = normalized.lastIndexOf("/");
-  if (idx <= 0) return normalized.startsWith("/") ? "/" : ".";
-  return normalized.slice(0, idx) || "/";
-}
+/** Last known terminal leaf cwd (Terax: explorer + new shells follow this, not editor folder). */
+let lastTerminalCwd: string | null = null;
+let explorerSyncGen = 0;
 
-/** Prefer active terminal leaf cwd (OSC 7), else editor file parent. */
+/** Prefer active terminal leaf cwd (OSC 7), else last terminal cwd — not the editor file’s parent. */
 function resolveSpawnCwd(): string | undefined {
   const active = tabs[activeTabIndex];
   if (active?.kind === "terminal") {
     const leaf = active.leaves.get(active.activeLeafId);
     if (leaf?.cwd) return leaf.cwd;
   }
-  if (active?.kind === "editor") return parentDir(active.path);
+  if (lastTerminalCwd) return lastTerminalCwd;
   for (const t of tabs) {
     if (t.kind !== "terminal") continue;
     const leaf = t.leaves.get(t.activeLeafId);
     if (leaf?.cwd) return leaf.cwd;
   }
-  for (const t of tabs) {
-    if (t.kind === "editor") return parentDir(t.path);
-  }
   return undefined;
+}
+
+function updateExplorerTitle(rootPath: string): void {
+  const title = document.getElementById("sidebar-title");
+  if (!title) return;
+  if (!rootPath) {
+    title.textContent = "Explorer";
+    title.removeAttribute("title");
+    return;
+  }
+  title.textContent = basename(rootPath) || "Explorer";
+  title.title = rootPath;
+}
+
+/** Re-root explorer immediately (authorize outside `--root` first, like Terax). */
+function syncExplorerToCwd(cwd: string): void {
+  lastTerminalCwd = cwd;
+  try {
+    updateExplorerTitle(cwd);
+    setTreeEmptyHint(false);
+  } catch {
+    /* ignore chrome update errors */
+  }
+  explorerSyncGen += 1;
+  const gen = explorerSyncGen;
+  void (async () => {
+    try {
+      await fsAuthorize(cwd);
+      if (gen !== explorerSyncGen) return;
+      const ok = await tree.setViewRoot(cwd);
+      if (gen !== explorerSyncGen) return;
+      if (!ok) {
+        setStatusLeft(`explorer stuck at ${tree.getRootPath() || "?"} · want ${cwd}`);
+        return;
+      }
+      updateExplorerTitle(tree.getRootPath() || cwd);
+    } catch (err) {
+      if (gen !== explorerSyncGen) return;
+      setStatusLeft(
+        `explorer: cannot open ${cwd} (${err instanceof Error ? err.message : String(err)})`,
+      );
+    }
+  })();
+}
+
+/** Sync explorer to the active terminal leaf cwd (Terax `explorerRoot`). */
+function syncExplorerToActiveContext(): void {
+  const active = tabs[activeTabIndex];
+  if (active?.kind === "terminal") {
+    const cwd = active.leaves.get(active.activeLeafId)?.cwd;
+    if (cwd) syncExplorerToCwd(cwd);
+  } else if (lastTerminalCwd) {
+    syncExplorerToCwd(lastTerminalCwd);
+  }
 }
 
 function applyLeafCwd(tab: TerminalTab, ptyId: string, cwd: string): void {
   const bundle = tab.leaves.get(ptyId);
   if (!bundle) return;
+  if (bundle.cwd === cwd) return;
   bundle.cwd = cwd;
-  if (tab.leaves.size === 1 || tab.activeLeafId === ptyId) {
+
+  const follow = tab.activeLeafId === ptyId || tab.leaves.size === 1;
+  if (follow) {
     tab.title = titleFromCwd(cwd, tab.title);
     renderTabs();
+    lastTerminalCwd = cwd;
+    if (tabs[activeTabIndex] === tab) setStatusLeft(cwd);
+    syncExplorerToCwd(cwd);
   }
+
   panesEl.querySelectorAll<HTMLElement>(".pane-leaf").forEach((el) => {
     if (el.dataset.leafId !== ptyId) return;
     const label = el.querySelector(".pane-label");
     if (label) label.textContent = titleFromCwd(cwd, tab.title);
   });
-  if (tabs[activeTabIndex] === tab && tab.activeLeafId === ptyId) {
-    setStatusLeft(cwd);
-  }
 }
 
 function syncSearchTarget(): void {
@@ -800,6 +870,7 @@ function renderTabs(): void {
       activeTabIndex = i;
       renderAll();
       persistLayout();
+      syncExplorerToActiveContext();
       focusActiveTab();
     });
     tabsEl.appendChild(el);
@@ -882,6 +953,8 @@ function focusLeaf(tab: TerminalTab, leafId: string): void {
     tab.activeLeafId = leafId;
     updatePaneActiveClasses(tab);
     persistLayout();
+    const cwd = bundle?.cwd;
+    if (cwd && tabs[activeTabIndex] === tab) syncExplorerToCwd(cwd);
   }
   bundle?.term.focus();
 }
@@ -898,6 +971,7 @@ function selectTabRelative(delta: 1 | -1): void {
   activeTabIndex = (activeTabIndex + delta + tabs.length) % tabs.length;
   renderAll();
   persistLayout();
+  syncExplorerToActiveContext();
   focusActiveTab();
 }
 
@@ -956,12 +1030,14 @@ const tree = new VirtualTree(treeEl, fsList, {
   },
   onStatus: (text) => setStatusLeft(text),
   noteInteraction: () => noteTreeInteraction(),
+  onRootChange: (rootPath) => updateExplorerTitle(rootPath),
 });
 setTreeEmptyHint(true);
 
 function clearTree(): void {
   tree.clear();
   pendingFs.clear();
+  pendingFsAuth.clear();
   treeLoaded = false;
   treeLoading = false;
   treeNeedsRefresh = false;
@@ -1270,7 +1346,13 @@ function onMessage(raw: string): void {
     }
     case "pty_data": {
       const owner = findLeafOwner(msg.id);
-      if (owner) owner.bundle.term.write(b64decode(msg.data));
+      if (owner) {
+        const bytes = b64decode(msg.data);
+        const text = new TextDecoder().decode(bytes);
+        const cwd = feedOsc7Chunk(owner.bundle.oscCarry, text);
+        if (cwd) applyLeafCwd(owner.tab, msg.id, cwd);
+        owner.bundle.term.write(bytes);
+      }
       break;
     }
     case "pty_closed": {
@@ -1283,6 +1365,14 @@ function onMessage(raw: string): void {
       if (pending) {
         pendingFs.delete(msg.request_id);
         pending.resolve(msg);
+      }
+      break;
+    }
+    case "fs_authorized": {
+      const pending = pendingFsAuth.get(msg.request_id);
+      if (pending) {
+        pendingFsAuth.delete(msg.request_id);
+        pending.resolve({ path: msg.path });
       }
       break;
     }
@@ -1384,6 +1474,8 @@ function disconnect(): void {
   pendingSave.clear();
   clearTabs();
   clearTree();
+  lastTerminalCwd = null;
+  explorerSyncGen += 1;
   setTreeEmptyHint(true);
   connectBtn.disabled = false;
   disconnectBtn.disabled = true;

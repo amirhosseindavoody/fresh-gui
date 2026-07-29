@@ -1,7 +1,7 @@
 /** Lazy, virtualized file tree with keyboard navigation (UI-2). */
 
 import type { FsEntry } from "./protocol";
-import { escapeHtml } from "./dom";
+import { basename, escapeHtml } from "./dom";
 import { fileIcon } from "./icons";
 
 export type TreeListFn = (path: string) => Promise<{ path: string; entries: FsEntry[] }>;
@@ -11,6 +11,8 @@ export type TreeCallbacks = {
   onOpenFile?: (entry: FsEntry, preview: boolean) => void;
   onStatus?: (text: string) => void;
   noteInteraction?: () => void;
+  /** Fired after the displayed root path changes (cwd sync / reload). */
+  onRootChange?: (rootPath: string) => void;
 };
 
 type Row = {
@@ -24,6 +26,11 @@ type Row = {
 
 const ROW_HEIGHT = 24;
 
+function normalizePath(p: string): string {
+  const s = p.replace(/\\/g, "/").replace(/\/+$/, "");
+  return s || "/";
+}
+
 export class VirtualTree {
   private host: HTMLElement;
   private viewport: HTMLElement;
@@ -31,12 +38,19 @@ export class VirtualTree {
   private listFn: TreeListFn;
   private callbacks: TreeCallbacks;
   private childrenCache = new Map<string, FsEntry[]>();
+  /** Path passed to `fs_list` for the view root (`""` = backend sandbox root). */
+  private listRoot = "";
   private rootPath = "";
   private expanded = new Set<string>();
   private selected: string | null = null;
   private rows: Row[] = [];
   private scrollTop = 0;
   private raf = 0;
+  private loadGen = 0;
+  private viewRootToken = 0;
+  private viewRootInFlight: string | null = null;
+  /** Absolute sandbox root from the first `fs_list("")`. */
+  private workspaceRoot = "";
 
   constructor(host: HTMLElement, listFn: TreeListFn, callbacks: TreeCallbacks = {}) {
     this.host = host;
@@ -68,12 +82,112 @@ export class VirtualTree {
     return this.selected;
   }
 
+  getRootPath(): string {
+    return this.rootPath;
+  }
+
+  getWorkspaceRoot(): string {
+    return this.workspaceRoot;
+  }
+
+  /** Map absolute cwd → fs_list path ("" at workspace root). */
+  pathForFsList(absOrRel: string): string {
+    const n = normalizePath(absOrRel);
+    if (!this.workspaceRoot) return absOrRel;
+    const root = normalizePath(this.workspaceRoot);
+    if (n === root) return "";
+    if (n.startsWith(root + "/")) return n.slice(root.length + 1);
+    return absOrRel;
+  }
+
+  /**
+   * Terax-style re-root. Isolated from `loadRoot` / fs_watch via viewRootInFlight.
+   */
+  async setViewRoot(path: string): Promise<boolean> {
+    const listPath = this.workspaceRoot ? this.pathForFsList(path) : path;
+    const token = ++this.viewRootToken;
+    this.viewRootInFlight = listPath;
+
+    if (this.rootPath && this.workspaceRoot) {
+      const wantAbs =
+        listPath === ""
+          ? normalizePath(this.workspaceRoot)
+          : normalizePath(
+              listPath.startsWith("/")
+                ? listPath
+                : `${normalizePath(this.workspaceRoot)}/${listPath}`,
+            );
+      if (normalizePath(this.rootPath) === wantAbs) {
+        this.selected = this.rootPath;
+        this.scrollIntoView(this.rootPath);
+        this.schedulePaint();
+        if (this.viewRootToken === token) this.viewRootInFlight = null;
+        return true;
+      }
+    }
+
+    const prevListRoot = this.listRoot;
+    const prevRoot = this.rootPath;
+    const prevExpanded = new Set(this.expanded);
+    const prevCache = new Map(this.childrenCache);
+    const prevRows = this.rows;
+    const prevSelected = this.selected;
+
+    this.listRoot = listPath;
+    this.expanded.clear();
+    this.childrenCache.clear();
+    this.selected = null;
+
+    try {
+      const listed = await this.listFn(listPath);
+      if (token !== this.viewRootToken) return false;
+      if (!this.workspaceRoot) this.workspaceRoot = listPath === "" ? listed.path : this.workspaceRoot;
+      // If we re-rooted before the first workspace load, remember sandbox from listed if under path.
+      if (!this.workspaceRoot && listed.path) {
+        // Best-effort: keep listed.path's ancestor unknown; workspace set on next loadRoot("").
+      }
+      this.rootPath = listed.path;
+      this.childrenCache.set("", listed.entries);
+      this.rebuildRows();
+      this.selected = this.rootPath || null;
+      this.viewport.scrollTop = 0;
+      this.scrollTop = 0;
+      this.schedulePaint();
+      this.callbacks.onRootChange?.(this.rootPath);
+      return true;
+    } catch (err) {
+      if (token !== this.viewRootToken) return false;
+      this.listRoot = prevListRoot;
+      this.rootPath = prevRoot;
+      this.expanded = prevExpanded;
+      this.childrenCache = prevCache;
+      this.rows = prevRows;
+      this.selected = prevSelected;
+      this.schedulePaint();
+      this.callbacks.onRootChange?.(this.rootPath);
+      this.callbacks.onStatus?.(
+        `explorer cwd failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    } finally {
+      if (token === this.viewRootToken) this.viewRootInFlight = null;
+    }
+  }
+
   async loadRoot(opts: { silent?: boolean; keepExpanded?: Set<string> } = {}): Promise<void> {
+    if (this.viewRootInFlight !== null) return;
+
     if (!opts.silent) {
       this.host.classList.add("loading");
     }
+    const gen = ++this.loadGen;
+    const listPath = this.listRoot;
     try {
-      const listed = await this.listFn("");
+      const listed = await this.listFn(listPath);
+      if (gen !== this.loadGen || this.listRoot !== listPath || this.viewRootInFlight !== null) {
+        return;
+      }
+      if (listPath === "") this.workspaceRoot = listed.path;
       this.rootPath = listed.path;
       this.childrenCache.set("", listed.entries);
       if (opts.keepExpanded) {
@@ -82,23 +196,47 @@ export class VirtualTree {
         );
       }
       await this.ensureExpandedLoaded();
+      if (gen !== this.loadGen || this.listRoot !== listPath || this.viewRootInFlight !== null) {
+        return;
+      }
       this.rebuildRows();
       this.schedulePaint();
+      this.callbacks.onRootChange?.(this.rootPath);
       if (!opts.silent) {
         this.callbacks.onStatus?.(`tree ${this.rootPath}`);
       }
     } finally {
-      this.host.classList.remove("loading");
+      if (gen === this.loadGen) {
+        this.host.classList.remove("loading");
+      }
     }
   }
 
   clear(): void {
+    this.listRoot = "";
+    this.rootPath = "";
+    this.workspaceRoot = "";
+    this.viewRootInFlight = null;
+    this.viewRootToken += 1;
+    this.loadGen += 1;
     this.childrenCache.clear();
     this.expanded.clear();
     this.selected = null;
     this.rows = [];
     this.spacer.style.height = "0px";
     this.viewport.querySelectorAll(".vtree-row").forEach((el) => el.remove());
+    this.callbacks.onRootChange?.("");
+  }
+
+  private scrollIntoView(path: string): void {
+    const idx = this.rows.findIndex((r) => r.path === path);
+    if (idx < 0) return;
+    const top = idx * ROW_HEIGHT;
+    if (top < this.viewport.scrollTop) this.viewport.scrollTop = top;
+    if (top + ROW_HEIGHT > this.viewport.scrollTop + this.viewport.clientHeight) {
+      this.viewport.scrollTop = top + ROW_HEIGHT - this.viewport.clientHeight;
+    }
+    this.scrollTop = this.viewport.scrollTop;
   }
 
   private async ensureExpandedLoaded(): Promise<void> {
@@ -117,9 +255,10 @@ export class VirtualTree {
 
   private rebuildRows(): void {
     const rows: Row[] = [];
+    const rootLabel = this.rootPath ? basename(this.rootPath) || this.rootPath : "/";
     rows.push({
       path: this.rootPath || "",
-      name: this.rootPath || "/",
+      name: rootLabel,
       kind: "dir",
       depth: 0,
       expanded: true,
@@ -207,7 +346,7 @@ export class VirtualTree {
     return { name: row.name, path: row.path, kind: row.kind };
   }
 
-  private async activateRow(row: Row, fromKeyboard: boolean): Promise<void> {
+  private async activateRow(row: Row, _fromKeyboard: boolean): Promise<void> {
     this.callbacks.noteInteraction?.();
     this.selected = row.path;
     this.callbacks.onSelect?.(this.entryForRow(row));
@@ -226,12 +365,7 @@ export class VirtualTree {
 
     if (row.kind === "dir") {
       if (this.expanded.has(row.path)) {
-        if (!fromKeyboard) {
-          this.expanded.delete(row.path);
-        } else {
-          // keyboard Enter/ArrowRight expands; ArrowLeft collapses elsewhere
-          this.expanded.delete(row.path);
-        }
+        this.expanded.delete(row.path);
       } else {
         if (!this.childrenCache.has(row.path)) {
           try {
@@ -264,11 +398,7 @@ export class VirtualTree {
     const row = this.rows[i];
     this.selected = row.path;
     this.callbacks.onSelect?.(this.entryForRow(row));
-    const top = i * ROW_HEIGHT;
-    if (top < this.viewport.scrollTop) this.viewport.scrollTop = top;
-    if (top + ROW_HEIGHT > this.viewport.scrollTop + this.viewport.clientHeight) {
-      this.viewport.scrollTop = top + ROW_HEIGHT - this.viewport.clientHeight;
-    }
+    this.scrollIntoView(row.path);
     this.schedulePaint();
   }
 
@@ -295,7 +425,6 @@ export class VirtualTree {
         this.rebuildRows();
         this.schedulePaint();
       } else if (row && row.depth > 0) {
-        // jump to parent
         for (let i = this.selectedIndex() - 1; i >= 0; i--) {
           if (this.rows[i].depth < row.depth) {
             this.focusIndex(i);

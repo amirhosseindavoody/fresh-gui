@@ -7,13 +7,14 @@ mod pty;
 mod server;
 mod session;
 
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::editor_worker::EditorHandle;
 use crate::fs::FsRoot;
@@ -21,12 +22,21 @@ use crate::fs_watch::FsWatchStore;
 use crate::server::AppState;
 use crate::session::SessionStore;
 
+/// How many ports above the preferred one to try when the preferred bind is busy.
+const LISTEN_PORT_FALLBACK_SPAN: u16 = 64;
+
 #[derive(Debug, Parser)]
 #[command(name = "fresh-gui-backend", version, about = "Remote daemon for fresh-gui")]
 struct Args {
     /// Listen address. Non-loopback binds require `--token`.
+    /// If the port is busy, the next free ports on the same host are tried
+    /// (unless `--strict-listen`).
     #[arg(long, default_value = "127.0.0.1:7420", env = "FRESH_GUI_LISTEN")]
     listen: SocketAddr,
+
+    /// Fail if `--listen` is already in use (do not scan for a free port).
+    #[arg(long, env = "FRESH_GUI_STRICT_LISTEN")]
+    strict_listen: bool,
 
     /// Shared auth token (also `FRESH_GUI_TOKEN`). Required for non-loopback binds.
     /// On loopback, if set, clients must present the same token.
@@ -79,9 +89,7 @@ async fn main() -> Result<()> {
     let require_auth = !loopback || token.is_some();
 
     // Bind before spawning Fresh so a busy port fails cleanly (no editor teardown panic).
-    let listener = tokio::net::TcpListener::bind(args.listen)
-        .await
-        .with_context(|| format!("bind {}", args.listen))?;
+    let (listener, bound) = bind_listen(args.listen, args.strict_listen).await?;
 
     let editor = if args.no_editor {
         info!("Fresh editor disabled (--no-editor)");
@@ -99,23 +107,80 @@ async fn main() -> Result<()> {
         watches: FsWatchStore::new(),
     });
 
-    info!(
-        listen = %args.listen,
-        auth_required = state.require_auth,
-        fs_root = %state.fs_root.root_display(),
-        editor = state.editor.is_some(),
-        "starting fresh-gui-backend"
-    );
-
     let ui_dir = if args.no_ui {
         None
     } else {
         resolve_ui_dir(args.ui_dir.as_deref())
     };
 
+    let http_url = format!("http://{bound}/");
+    let ws_url = format!("ws://{bound}/ws");
+    info!(
+        listen = %bound,
+        preferred = %args.listen,
+        auth_required = state.require_auth,
+        fs_root = %state.fs_root.root_display(),
+        editor = state.editor.is_some(),
+        "starting fresh-gui-backend"
+    );
+    // Plain lines so the launch URL is obvious in `pixi run serve` output.
+    println!();
+    println!("  fresh-gui ready");
+    println!("  UI:  {http_url}");
+    println!("  WS:  {ws_url}");
+    println!();
+
     server::serve_listener(listener, state, ui_dir)
         .await
         .context("server exited with error")
+}
+
+/// Bind `preferred`, or the next free ports on the same IP when busy.
+async fn bind_listen(
+    preferred: SocketAddr,
+    strict: bool,
+) -> Result<(tokio::net::TcpListener, SocketAddr)> {
+    match tokio::net::TcpListener::bind(preferred).await {
+        Ok(listener) => {
+            let bound = listener.local_addr().context("local_addr after bind")?;
+            return Ok((listener, bound));
+        }
+        Err(err) if err.kind() == ErrorKind::AddrInUse && !strict => {
+            warn!(
+                %preferred,
+                "listen address in use — scanning for a free port"
+            );
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("bind {preferred}"));
+        }
+    }
+
+    let start = preferred.port();
+    // Wrap around the u16 space carefully; stop after LISTEN_PORT_FALLBACK_SPAN tries.
+    for offset in 1..=LISTEN_PORT_FALLBACK_SPAN {
+        let port = start.wrapping_add(offset);
+        if port == 0 {
+            continue;
+        }
+        let candidate = SocketAddr::new(preferred.ip(), port);
+        match tokio::net::TcpListener::bind(candidate).await {
+            Ok(listener) => {
+                let bound = listener.local_addr().context("local_addr after fallback bind")?;
+                warn!(%preferred, %bound, "bound fallback listen address");
+                return Ok((listener, bound));
+            }
+            Err(err) if err.kind() == ErrorKind::AddrInUse => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("bind {candidate}"));
+            }
+        }
+    }
+
+    bail!(
+        "no free port near {preferred} (tried {LISTEN_PORT_FALLBACK_SPAN} ports); \
+         stop the other process or pass --listen HOST:PORT"
+    );
 }
 
 /// Pick a directory that contains `index.html` for the embedded web UI.

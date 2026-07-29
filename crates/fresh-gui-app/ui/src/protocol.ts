@@ -34,6 +34,7 @@ export type ClientMessage =
   | { type: "pty_resize"; id: string; cols: number; rows: number }
   | { type: "pty_close"; id: string }
   | { type: "fs_list"; request_id: string; path: string }
+  | { type: "fs_authorize"; request_id: string; path: string }
   | { type: "fs_watch"; request_id: string; path: string; recursive: boolean }
   | { type: "fs_unwatch"; watch_id: string }
   | { type: "editor_open"; request_id: string; path: string; preview: boolean }
@@ -78,6 +79,7 @@ export type ServerMessage =
       path: string;
       entries: FsEntry[];
     }
+  | { type: "fs_authorized"; request_id: string; path: string }
   | {
       type: "editor_opened";
       request_id: string;

@@ -24,9 +24,10 @@ Fresh is vendored as a **git submodule** at `vendor/fresh`, pinned by commit (DE
 pixi install
 pixi run ui-install   # once (Bun via Pixi)
 
-# one process: build UI + backend (HTTP UI + WebSocket on :7420)
+# one process: build UI + backend (HTTP UI + WebSocket; prefers :7420, else next free port)
 pixi run serve
-# open http://127.0.0.1:7420/ → Connect (WS defaults to same host /ws)
+# terminal prints: UI: http://127.0.0.1:PORT/  and  WS: ws://127.0.0.1:PORT/ws
+# open that UI URL → Connect (WS defaults to same host /ws)
 
 # optional CLI smoke against that backend
 pixi run app -- smoke --backend ws://127.0.0.1:7420/ws

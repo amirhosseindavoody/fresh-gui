@@ -50,6 +50,8 @@ pub async fn serve_listener(
     };
 
     info!(%addr, "listening (http UI + ws path /ws)");
+    // Keep a second clear line in case the startup banner scrolled off.
+    eprintln!("listening on http://{addr}/  (ws://{addr}/ws)");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -399,6 +401,30 @@ async fn handle_client_msg(
                 }
                 Err(err) => Err(Message::Error {
                     code: "fs_list_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                }),
+            }
+        }
+        Message::FsAuthorize { request_id, path } => {
+            require_auth(*authed)?;
+            match state.fs_root.authorize(&path).await {
+                Ok(resolved) => {
+                    send_msg(
+                        sink,
+                        &Message::FsAuthorized {
+                            request_id,
+                            path: resolved.display().to_string(),
+                        },
+                    )
+                    .await
+                    .map_err(|_| Message::Error {
+                        code: "send_failed".into(),
+                        message: "failed to send FsAuthorized".into(),
+                    })?;
+                    Ok(())
+                }
+                Err(err) => Err(Message::Error {
+                    code: "fs_authorize_failed".into(),
                     message: format!("{request_id}: {err:#}"),
                 }),
             }

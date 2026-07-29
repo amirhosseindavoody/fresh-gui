@@ -3,6 +3,9 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { SearchAddon } from "@xterm/addon-search";
 import type { UiSettings } from "./settings";
+import { parseOsc7 } from "./osc7";
+
+export { parseOsc7 };
 
 export interface TermBundle {
   term: Terminal;
@@ -11,23 +14,8 @@ export interface TermBundle {
   search: SearchAddon;
   el: HTMLElement;
   cwd?: string;
-}
-
-export function parseOsc7(data: string): string | null {
-  // file://hostname/path or file:///path or raw path
-  let s = data.trim();
-  if (s.startsWith("file://")) {
-    s = s.slice("file://".length);
-    // strip host
-    const slash = s.indexOf("/");
-    if (slash >= 0) s = s.slice(slash);
-  }
-  try {
-    s = decodeURIComponent(s);
-  } catch {
-    /* keep raw */
-  }
-  return s || null;
+  /** Incomplete OSC tail across PTY frames. */
+  oscCarry: { buf: string };
 }
 
 export function createTerminal(
@@ -68,7 +56,7 @@ export function createTerminal(
   el.className = "xterm-host";
   term.open(el);
 
-  // OSC 7 → cwd
+  // OSC 7 → cwd (xterm parser; also scanned from raw PTY bytes in main.ts)
   try {
     term.parser.registerOscHandler(7, (data) => {
       const cwd = parseOsc7(data);
@@ -97,7 +85,7 @@ export function createTerminal(
     }
   }
 
-  return { term, fit, webgl, search, el };
+  return { term, fit, webgl, search, el, oscCarry: { buf: "" } };
 }
 
 export function disposeTerminal(bundle: TermBundle): void {
