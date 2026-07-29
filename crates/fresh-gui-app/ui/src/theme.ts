@@ -120,16 +120,21 @@ export function xtermThemeFromCss(): {
   foreground: string;
   cursor: string;
   selectionBackground: string;
+  selectionInactiveBackground: string;
+  selectionForeground: string;
 } {
   const s = getComputedStyle(document.documentElement);
   const read = (name: string, fallback: string) => {
     const v = s.getPropertyValue(name).trim();
     return v || fallback;
   };
+  const selection = read("--term-selection", "#2da44ea6");
   return {
     background: read("--term-bg", read("--bg", "#0c0f14")),
     foreground: read("--term-fg", read("--text", "#e8edf4")),
     cursor: read("--term-cursor", read("--accent", "#3fb950")),
-    selectionBackground: read("--term-selection", "color-mix(in srgb, var(--accent) 33%, transparent)"),
+    selectionBackground: selection,
+    selectionInactiveBackground: selection,
+    selectionForeground: read("--term-selection-fg", read("--term-fg", "#1f2328")),
   };
 }
