@@ -1,6 +1,6 @@
 # fresh-gui-app
 
-Host CLI (`fresh-gui`) and the Vite + TypeScript UI under `ui/`.
+Host CLI (`fresh-gui-app`) and the Vite + TypeScript UI under `ui/`.
 
 ```bash
 pixi run app -- ping

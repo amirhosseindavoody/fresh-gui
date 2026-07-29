@@ -256,7 +256,7 @@ main() {
   # Keep Cargo.lock in sync so `cargo build --locked` works (e.g. git source builds).
   if ! cargo update \
     -p fresh-gui-protocol \
-    -p fresh-gui-backend \
+    -p fresh-gui \
     -p fresh-gui-client \
     -p fresh-gui-app \
     -p fresh-gui-desktop \
@@ -265,7 +265,7 @@ main() {
     local lock="$ROOT/Cargo.lock"
     if [[ -f "$lock" ]]; then
       awk -v ver="$new_version" '
-        /^name = "(fresh-gui-protocol|fresh-gui-backend|fresh-gui-client|fresh-gui-app|fresh-gui-desktop)"$/ {
+        /^name = "(fresh-gui-protocol|fresh-gui|fresh-gui-client|fresh-gui-app|fresh-gui-desktop)"$/ {
           print
           in_pkg = 1
           next

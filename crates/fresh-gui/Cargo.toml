@@ -1,5 +1,5 @@
 [package]
-name = "fresh-gui-backend"
+name = "fresh-gui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,7 +10,7 @@ description = "Linux remote daemon for fresh-gui (PTY + Fresh editor ADE protoco
 readme = "README.md"
 
 [[bin]]
-name = "fresh-gui-backend"
+name = "fresh-gui"
 path = "src/main.rs"
 
 [dependencies]

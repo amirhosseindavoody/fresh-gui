@@ -1,7 +1,7 @@
-//! fresh-gui — host ADE shell (Phase 1).
+//! fresh-gui-app — host ADE shell (Phase 1).
 //!
 //! CLI: connect to a backend and run a PTY smoke test, or open the UI when built
-//! with the `tauri` feature / `fresh-gui` desktop entry.
+//! with the `tauri` feature / `fresh-gui-desktop` entry.
 
 use anyhow::{Context, Result};
 use axum::Router;
@@ -14,7 +14,7 @@ use tower_http::services::ServeDir;
 use tracing::info;
 
 #[derive(Debug, Parser)]
-#[command(name = "fresh-gui", version, about = "Terminal-first ADE GUI (host)")]
+#[command(name = "fresh-gui-app", version, about = "Terminal-first ADE GUI (host)")]
 struct Args {
     #[command(subcommand)]
     cmd: Option<Cmd>,

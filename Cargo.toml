@@ -2,14 +2,14 @@
 resolver = "2"
 members = [
     "crates/fresh-gui-protocol",
-    "crates/fresh-gui-backend",
+    "crates/fresh-gui",
     "crates/fresh-gui-client",
     "crates/fresh-gui-app",
     "crates/fresh-gui-desktop",
 ]
 default-members = [
     "crates/fresh-gui-protocol",
-    "crates/fresh-gui-backend",
+    "crates/fresh-gui",
     "crates/fresh-gui-client",
     "crates/fresh-gui-app",
 ]

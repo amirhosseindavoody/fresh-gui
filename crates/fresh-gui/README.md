@@ -1,4 +1,4 @@
-# fresh-gui-backend
+# fresh-gui
 
 Linux remote daemon: WebSocket ADE API + detachable sessions + PTY + filesystem + optional Fresh editor + embedded host UI.
 
@@ -21,10 +21,10 @@ Open the printed **Local access** URL (includes `?token=`) in a browser — not 
 pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git
 # or a release .conda / --tag from GitHub Releases
 # or from a checkout: pixi global install --path .
-fresh-gui-backend
+fresh-gui
 ```
 
-The package ships `bin/fresh-gui-backend` and UI assets under `share/fresh-gui/ui`.
+The package ships `bin/fresh-gui` and UI assets under `share/fresh-gui/ui`.
 
 ## Endpoints
 

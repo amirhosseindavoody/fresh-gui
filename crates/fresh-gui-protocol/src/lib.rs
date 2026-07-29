@@ -22,7 +22,7 @@ pub const CAP_SCENE: &str = "scene";
 pub struct Hello {
     pub protocol_version: String,
     pub role: PeerRole,
-    /// Free-form implementation id, e.g. `fresh-gui-backend/2026.728.1`.
+    /// Free-form implementation id, e.g. `fresh-gui/2026.728.1`.
     pub implementation: String,
     pub capabilities: Vec<String>,
     /// Absolute path to the backend `config.json` (settings file). Backend only.
@@ -396,7 +396,7 @@ mod tests {
 
     #[test]
     fn hello_includes_editor_and_scene() {
-        let hello = Hello::backend("fresh-gui-backend/test", Hello::default_backend_caps());
+        let hello = Hello::backend("fresh-gui/test", Hello::default_backend_caps());
         let json = Message::Hello(hello).to_json().unwrap();
         assert!(json.contains("\"editor\""));
         assert!(json.contains("\"scene\""));
