@@ -1,0 +1,179 @@
+# Bump CalVer, build the linux-64 fresh-gui-backend pixi package, and publish
+# a GitHub Release with the .conda artifact.
+#
+# Triggers on every push to main (merge) and on manual dispatch.
+# Commits/tags pushed with GITHUB_TOKEN do not re-trigger this workflow.
+
+name: Release backend
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Bump CalVer (YYYY.MMDD.N) before building
+        type: boolean
+        default: true
+      version:
+        description: Optional explicit version (YYYY.MMDD.N). Empty = auto bump.
+        type: string
+        required: false
+        default: ""
+
+concurrency:
+  group: release-backend-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Bump · package · release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    # Avoid publishing releases from forks.
+    if: github.repository == 'amirhosseindavoody/fresh-gui'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@v0.9.4
+        with:
+          cache: true
+          pixi-version: v0.74.0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version
+        id: bump
+        env:
+          DO_BUMP: ${{ github.event_name == 'push' && 'true' || inputs.bump }}
+          SET_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+        run: |
+          set -euo pipefail
+          read_version() {
+            awk '
+              /^\[workspace\.package\]$/ { in_sec = 1; next }
+              /^\[/ { in_sec = 0 }
+              in_sec && /^version =/ {
+                line = $0
+                sub(/^version = "/, "", line)
+                sub(/"$/, "", line)
+                print line
+                exit
+              }
+            ' Cargo.toml
+          }
+
+          BEFORE="$(read_version)"
+          echo "version_before=${BEFORE}" >> "$GITHUB_OUTPUT"
+
+          if [[ "${DO_BUMP}" == "true" ]]; then
+            if [[ -n "${SET_VERSION}" ]]; then
+              ./scripts/update-version.sh --set "${SET_VERSION}"
+            else
+              ./scripts/update-version.sh
+            fi
+          else
+            echo "Skipping version bump (workflow_dispatch bump=false)"
+          fi
+
+          VERSION="$(read_version)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Version: ${BEFORE} -> ${VERSION}"
+
+      - name: Build pixi package
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          mkdir -p dist
+          pixi run package
+          ls -lah dist
+          test -n "$(find dist -maxdepth 1 -name 'fresh-gui-backend-*.conda' -print -quit)"
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum fresh-gui-backend-*.conda | tee SHA256SUMS
+
+      - name: Commit version bump and push tag
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+          TAG: ${{ steps.bump.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if ! git diff --quiet; then
+            git add -u
+            git commit -m "chore: release ${VERSION}"
+          else
+            echo "No version-file changes to commit"
+          fi
+
+          if git rev-parse "${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists locally"
+          else
+            git tag -a "${TAG}" -m "fresh-gui-backend ${VERSION}"
+          fi
+
+          # GITHUB_TOKEN pushes do not re-run workflows.
+          git push origin HEAD:main
+          git push origin "${TAG}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.bump.outputs.version }}
+          TAG: ${{ steps.bump.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          NOTES="$(mktemp)"
+          {
+            echo "## fresh-gui-backend \`${VERSION}\`"
+            echo
+            echo "Linux remote daemon (browser UI + WebSocket PTYs), packaged for **linux-64**."
+            echo
+            echo "### Install from this release"
+            echo
+            echo '```bash'
+            echo "# download the .conda asset, then:"
+            echo "pixi global install ./fresh-gui-backend-${VERSION}-*.conda"
+            echo "fresh-gui-backend --help"
+            echo '```'
+            echo
+            echo "Or install from git at this tag:"
+            echo
+            echo '```bash'
+            echo "pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git --tag ${TAG}"
+            echo '```'
+            echo
+            echo "Default settings file: \`~/.config/fresh-gui/config.json\` (theme, fonts, shell)."
+          } >"${NOTES}"
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists — uploading assets"
+            gh release upload "${TAG}" dist/fresh-gui-backend-*.conda dist/SHA256SUMS --clobber
+          else
+            gh release create "${TAG}" \
+              dist/fresh-gui-backend-*.conda \
+              dist/SHA256SUMS \
+              --title "fresh-gui-backend ${VERSION}" \
+              --notes-file "${NOTES}" \
+              --verify-tag
+          fi
