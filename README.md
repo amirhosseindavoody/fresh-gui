@@ -41,15 +41,22 @@ Auth: on loopback, token is optional unless `--token` / `FRESH_GUI_TOKEN` is set
 
 ### Installable Linux binary (Pixi package)
 
-Same role as `pixi run serve`, without needing the full Rust/UI toolchain on the machine:
+Same role as `pixi run serve`. **Install on a linux-64 machine** (the remote daemon). Windows/macOS hosts are not supported for this package — use the Windows GUI client later, or a browser against this server.
 
 ```bash
+# Private repo: ensure git can clone GitHub first, e.g.:
+#   gh auth login && gh auth setup-git
+# or use SSH:
+#   pixi global install --git git@github.com:amirhosseindavoody/fresh-gui.git
+
 pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git
 # exposes `fresh-gui-backend` (UI under share/fresh-gui/ui)
 
 fresh-gui-backend
-# → UI: http://127.0.0.1:7420/   WS: ws://127.0.0.1:7420/ws
+# → open the UI URL printed in the terminal (not the ws:// line)
 ```
+
+Works on older enterprise glibc (2.28+) — the package build uses Rollup’s WASM backend so it does not need host `GLIBC_2.32`.
 
 From a local checkout (optional): `pixi global install --path .` or `pixi run package` (writes `./dist`).
 

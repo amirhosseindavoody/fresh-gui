@@ -53,6 +53,9 @@ ensure_vendor_fresh
 echo "Building host UI…"
 (
   cd crates/fresh-gui-app/ui
+  # package.json overrides rollup → @rollup/wasm-node so Vite does not load the
+  # native @rollup/rollup-linux-* addon (needs GLIBC_2.32+; many enterprise
+  # linux-64 hosts still ship 2.28–2.31 — see issue #3).
   bun install --frozen-lockfile
   bun run build
   test -f dist/index.html
@@ -60,7 +63,8 @@ echo "Building host UI…"
 
 echo "Installing fresh-gui-backend…"
 export CARGO_PROFILE_RELEASE_STRIP="${CARGO_PROFILE_RELEASE_STRIP:-symbols}"
-export CARGO_PROFILE_RELEASE_LTO="${CARGO_PROFILE_RELEASE_LTO:-fat}"
+# Prefer thin LTO: fat LTO can OOM on smaller cloud/VPS machines during install.
+export CARGO_PROFILE_RELEASE_LTO="${CARGO_PROFILE_RELEASE_LTO:-thin}"
 cargo auditable install \
   --locked \
   --force \
