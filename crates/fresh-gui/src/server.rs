@@ -640,26 +640,29 @@ async fn handle_client_msg(
                 code: "fs_watch_failed".into(),
                 message: format!("{request_id}: {err:#}"),
             })?;
-            let (watch_id, display) = state
-                .watches
-                .watch(&state.fs_root, resolved, recursive, out_tx.clone())
-                .map_err(|err| Message::Error {
-                    code: "fs_watch_failed".into(),
-                    message: format!("{request_id}: {err:#}"),
-                })?;
-            send_msg(
-                sink,
-                &Message::FsWatchStarted {
-                    request_id,
-                    watch_id,
-                    path: display,
-                },
-            )
-            .await
-            .map_err(|_| Message::Error {
-                code: "send_failed".into(),
-                message: "failed to send FsWatchStarted".into(),
-            })?;
+            // Install watches off the WebSocket task. A recursive root walk can
+            // take seconds on large trees; awaiting it here would stall PTY
+            // output on the same connection (felt as slow shell init / lag).
+            let watches = state.watches.clone();
+            let fs_root = state.fs_root.clone();
+            let out = out_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                match watches.watch(&fs_root, resolved, recursive, out.clone()) {
+                    Ok((watch_id, display)) => {
+                        let _ = out.send(Message::FsWatchStarted {
+                            request_id,
+                            watch_id,
+                            path: display,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = out.send(Message::Error {
+                            code: "fs_watch_failed".into(),
+                            message: format!("{request_id}: {err:#}"),
+                        });
+                    }
+                }
+            });
             Ok(())
         }
         Message::FsUnwatch { watch_id } => {

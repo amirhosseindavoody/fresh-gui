@@ -88,7 +88,7 @@ Before the first successful connect, the strip is expanded (URL / token / Connec
 | **Default keybindings** | Match **Terax** pane/tab shortcuts (see §6). Remappable later via settings. |
 | **File tree icons** | Lightweight inline SVG icons + typed color tones (`src/icons.ts`); VS Code–style indent guides and chevrons in the virtualized tree. No full Material icon pack. |
 | **UI framework** | **Stay on Vite + TypeScript modules.** Do not adopt Preact/React for large trees or pane polish. Revisit only if hand-rolled pane trees become unmaintainable. |
-| **Large trees (~10k files)** | Host concern: keep lazy one-level `fs_list`; add **row virtualization** + watch discipline when polishing the explorer. Not a Fresh-editor problem; not a reason to add React. |
+| **Large trees (~10k files)** | Host concern: keep lazy one-level `fs_list`; **row virtualization** + watch discipline. Backend `fs_watch` skips `.git` / `target` / `node_modules` / … when installing recursive watches (and runs install off the WS task) so PTY I/O is not stalled. Not a Fresh-editor problem; not a reason to add React. |
 | **Editor authority UX** | **Quiet day-to-day:** normal file-tab chrome (path, dirty `•`, save). Surface remote/Fresh authority only on **connection state**, **save errors**, and **conflicts** — not permanent “remote buffer” badging. |
 
 ## 4. Tab and pane model
@@ -215,7 +215,7 @@ Connection errors and auth failures use inline strip status; never modal loops.
 - Inactive terminal tabs remain mounted and continue receiving `pty_data`.
 - Fit/resize only the visible leaves; debounce resize storms.
 - Tree refresh stays silent (no “Loading…” flash); preserve expand/selection (already started).
-- Large directories: expand stays **lazy** (one `fs_list` per opened dir). When a visible folder can expose thousands of rows, **virtualize** the tree viewport (mount only visible rows). Debounced/`WATCH_IGNORE`-style watch filtering stays required so `fs_changed` does not rebuild the world.
+- Large directories: expand stays **lazy** (one `fs_list` per opened dir). When a visible folder can expose thousands of rows, **virtualize** the tree viewport (mount only visible rows). Backend recursive `fs_watch` skips ignored trees before registering inotify watches; the host still applies Debounced/`WATCH_IGNORE`-style filtering so residual `fs_changed` events do not rebuild the world.
 - Save conflicts: when backend grows mtime/CAS errors, show overwrite UI — never silent last-writer-wins (Terax editor lesson). Day-to-day editor chrome stays local-feeling; remote authority appears in the connection strip / status and on save or conflict failures only.
 
 ## 8. Stack decision
