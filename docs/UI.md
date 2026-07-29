@@ -125,7 +125,7 @@ type PaneNode =
 
 ### 5.1 Direction
 
-- **Dense ADE**, not dashboard. Dark-first default; light theme via settings (`data-theme`).
+- **Dense ADE**, not dashboard. Theme defaults to **system** (`prefers-color-scheme`); override to light or dark in settings (`data-theme` is always the resolved value).
 - **One accent** for focus/active (connection healthy, active tab, primary button). Avoid purple-glow / multi-shadow AI aesthetics.
 - **Typography:** keep expressive mono for terminal + paths (`IBM Plex Mono` or similar); UI chrome uses a paired sans. No Inter/Roboto/Arial defaults as the brand face.
 - **Surfaces:** subtle elevation via border + slight fill shifts, not card grids. Resizable gutters like Terax (`react-resizable-panels` or CSS equivalent).
@@ -246,7 +246,7 @@ Connection errors and auth failures use inline strip status + optional toast; ne
 - Activity bar with Explorer (toggles sidebar) + Settings entry; explorer remains the only sidebar view until SCM exists.
 - Lightweight file-type badges in the virtualized tree (`src/icons.ts`) — no heavy icon pack.
 - Skipped `fs_list` pagination for now — row virtualization covers large trees; revisit only if a single directory listing becomes a protocol bottleneck.
-- Light theme tokens (`data-theme`) + settings modal (theme, terminal/editor font size, WebGL preference) via `Mod+,` / activity bar.
+- Theme preference (`system` / `light` / `dark`) + CSS tokens (`data-theme` resolved) + settings modal (theme, terminal/editor font size, WebGL preference) via `Mod+,` / activity bar. Terminal pane chrome and xterm palettes follow the same tokens.
 
 ### Out of UI phases (stay in DESIGN Phase 4+)
 
