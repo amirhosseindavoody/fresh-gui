@@ -1,19 +1,19 @@
 # fresh-gui-app
 
-Host CLI (`fresh-gui`) and the **Vite + TypeScript** UI under `ui/` (xterm.js WebGL, CodeMirror 6, unified tabs/splits, session reattach).
+Host CLI (`fresh-gui`) and the Vite + TypeScript UI under `ui/`.
 
 ```bash
 pixi run app -- ping
 pixi run app -- smoke
 pixi run app -- attach
-pixi run ui-install  # Bun deps (Bun comes from Pixi)
-pixi run ui          # Vite dev server on :1420
-pixi run ui-build    # emit ui/dist
+pixi run ui-install  # once
+pixi run ui          # Vite on :1420
+pixi run ui-build
 pixi run ui-serve    # serve ui/dist on :1420
 ```
 
-UI: leave Session empty to create; Disconnect leaves the backend session alive for reconnect. Double-click a file to edit in CodeMirror; Ctrl/Cmd+S saves via Fresh (`editor`). Tree auto-refreshes on `fs_watch`.
+**UI basics:** leave Session empty to create; Disconnect keeps the backend session. Open files from the tree (editor tabs). `Mod+S` saves. Settings / `Mod+,` opens `config.json` on the backend. Right-click tabs or tree rows to copy paths. Theme follows the OS by default.
 
-Tauri window: see `fresh-gui-desktop` (builds `ui/dist` via `beforeBuildCommand`).
+Tauri window: `fresh-gui-desktop` (builds `ui/dist` via `beforeBuildCommand`).
 
-See [docs/DESIGN.md](../../docs/DESIGN.md).
+Product overview: [README.md](../../README.md). Design: [docs/DESIGN.md](../../docs/DESIGN.md), [docs/UI.md](../../docs/UI.md).

@@ -1,43 +1,57 @@
 # fresh-gui-backend
 
-Remote (Linux MVP) daemon: WebSocket ADE protocol + sessions + PTY + FS + optional Fresh editor + optional embedded web UI.
+Linux remote daemon: WebSocket ADE API + detachable sessions + PTY + filesystem + optional Fresh editor + embedded host UI.
+
+## Run
 
 ```bash
-pixi run ui-install   # once
-pixi run serve        # ui-build + backend (http://127.0.0.1:7420/ + ws://…/ws)
+pixi run ui-install   # once (dev)
+pixi run serve        # build UI + start (http://127.0.0.1:7420/ + ws://…/ws)
 
-pixi run backend      # same binary; rebuild UI separately with `pixi run ui-build` if needed
 pixi run backend -- --listen 127.0.0.1:7420 --token secret --root /path/to/project
 pixi run backend -- --no-editor   # omit editor capability
 pixi run backend -- --no-ui       # WebSocket + /healthz only
 ```
 
-### Pixi package (installable binary)
+Open the printed **UI** URL in a browser (not the `ws://` line).
 
-Builds the same binary + ships UI under `$PREFIX/share/fresh-gui/ui` (recipe in `recipe/`):
+## Install
 
 ```bash
 pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git
+# or a release .conda / --tag from GitHub Releases
 # or from a checkout: pixi global install --path .
-# or: pixi run package   # writes .conda under ./dist
 fresh-gui-backend
 ```
 
-- `GET /` — built host UI from `share/fresh-gui/ui` (package) or `crates/fresh-gui-app/ui/dist` (dev)
-- `GET /healthz`
-- `WS /ws` — JSON frames (`hello`, `auth`, `session_*`, `layout_set`, `pty_*`, `fs_*`, `editor_*`, `buffer_*`, `scene_*`, …)
-- Sessions own PTYs; disconnect detaches the subscriber but keeps shells running for reattach + scrollback replay
-- In-process Fresh `Editor` (capability `editor`) for open / edit / save with revision CAS
-- `fs_watch` via notify; thin ADE `scene` lists open buffers (not Fresh `--web`)
-- `--root` / `FRESH_GUI_FS_ROOT` — sandbox for `fs` and editor open (default: current directory)
-- `--ui-dir` / `FRESH_GUI_UI_DIR` — override UI assets directory
-- `--no-ui` / `FRESH_GUI_NO_UI` — disable static UI
-- `--public-host` / `FRESH_GUI_PUBLIC_HOST` — hostname in startup UI/WS URLs; when unset, uses an assigned FQDN (`hostname -f` / `HOSTNAME` / `FRESH_GUI_DOMAIN`) if one looks like a real domain
-- `--config` / `FRESH_GUI_CONFIG` — JSON config path (default: `$XDG_CONFIG_HOME/fresh-gui/config.json` or `~/.config/fresh-gui/config.json`)
+The package ships `bin/fresh-gui-backend` and UI assets under `share/fresh-gui/ui`.
 
-### Config (`config.json`)
+## Endpoints
 
-Shared settings file (JSONC). Path: `$XDG_CONFIG_HOME/fresh-gui/config.json` or `~/.config/fresh-gui/config.json` (override with `--config` / `FRESH_GUI_CONFIG`). Missing file → built-in defaults until Settings creates it.
+| Route | Role |
+|-------|------|
+| `GET /` | Host UI (`share/fresh-gui/ui` or `ui/dist` in dev) |
+| `GET /healthz` | Liveness |
+| `WS /ws` | ADE JSON frames |
+
+Sessions own PTYs; disconnect detaches the subscriber but keeps shells running for reattach + scrollback. Fresh `Editor` (capability `editor`) handles open / edit / save with revision CAS. `fs_watch` refreshes the tree; thin ADE `scene` lists open buffers.
+
+## Flags
+
+| Flag / env | Meaning |
+|------------|---------|
+| `--listen` / `FRESH_GUI_LISTEN` | Bind address (default `127.0.0.1:7420`; scans next ports unless `--strict-listen`) |
+| `--token` / `FRESH_GUI_TOKEN` | Auth token (required for non-loopback) |
+| `--root` / `FRESH_GUI_FS_ROOT` | FS + editor sandbox (default: cwd) |
+| `--ui-dir` / `FRESH_GUI_UI_DIR` | Override UI assets directory |
+| `--no-ui` / `FRESH_GUI_NO_UI` | API only |
+| `--no-editor` / `FRESH_GUI_NO_EDITOR` | Omit Fresh editor |
+| `--public-host` / `FRESH_GUI_PUBLIC_HOST` | Hostname in startup UI/WS URLs (else FQDN / bind address) |
+| `--config` / `FRESH_GUI_CONFIG` | Path to `config.json` |
+
+## Config
+
+Default path: `$XDG_CONFIG_HOME/fresh-gui/config.json` or `~/.config/fresh-gui/config.json`.
 
 ```jsonc
 {
@@ -55,6 +69,6 @@ Shared settings file (JSONC). Path: `$XDG_CONFIG_HOME/fresh-gui/config.json` or 
 }
 ```
 
-Empty `args` keep the backend’s interactive / OSC 7 setup; non-empty `args` are passed through as-is. In the host UI, the Settings button / `Mod+,` opens this file in the editor (save with `Mod+S`).
+Missing file → built-in defaults (`zsh`, system theme). First **Settings** / `Mod+,` open creates the documented template. Empty shell `args` keep interactive / OSC 7 setup; non-empty args are passed through. JSONC (`//` / `/* */`) is accepted.
 
 See [docs/DESIGN.md](../../docs/DESIGN.md).

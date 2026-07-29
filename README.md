@@ -1,80 +1,90 @@
 # fresh-gui
 
-Terminal-first ADE **GUI on the local host**, powered by a **remote backend** (Fresh crates later).
+A **terminal-first IDE shell** for a remote Linux machine. Run the backend on your server; open shells, edit files, and browse the tree from a browser (or the Windows host app).
 
-Inspired by [Terax](https://github.com/crynta/terax-ai). Repo logistics follow [pixi-mise](https://github.com/amirhosseindavoody/pixi-mise).
+Inspired by [Terax](https://github.com/crynta/terax-ai). The remote editor core is [Fresh](https://github.com/sinelaw/fresh).
 
-**Status:** Phase 3 (Fresh editor edit/save, fs_watch, thin scene) + **UI-1–UI-3** host chrome (pane trees, shortcuts, palette, virtualized tree, OSC 7 cwd, find, activity bar, light theme/settings); Windows Tauri NSIS/MSI packaging wired. Host UI: **[docs/UI.md](./docs/UI.md)**. See also **[docs/DESIGN.md](./docs/DESIGN.md)** and **[docs/WINDOWS.md](./docs/WINDOWS.md)**.
+## Install the backend (Linux)
 
-## Split
-
-| Piece | MVP platform | Crate / binary |
-|-------|--------------|----------------|
-| Host GUI | Windows (Tauri 2 + Vite/TS UI) | `fresh-gui-desktop` |
-| Host UI assets / CLI | all | `fresh-gui-app` → `fresh-gui` |
-| Remote backend | Linux | `fresh-gui-backend` |
-| Shared protocol | all | `fresh-gui-protocol` |
-| Host client lib | all | `fresh-gui-client` |
-
-Fresh is vendored as a **git submodule** at `vendor/fresh`, pinned by commit (DESIGN §10 D3). After clone: `git submodule update --init --recursive`.
-
-## Quick start
+On the machine that holds your project:
 
 ```bash
-pixi install
-pixi run ui-install   # once (Bun via Pixi)
-
-# one process: build UI + backend (HTTP UI + WebSocket; prefers :7420, else next free port)
-pixi run serve
-# terminal prints: UI: http://127.0.0.1:PORT/  and  WS: ws://127.0.0.1:PORT/ws
-# open that UI URL → Connect (WS defaults to same host /ws)
-
-# optional CLI smoke against that backend
-pixi run app -- smoke --backend ws://127.0.0.1:7420/ws
-
-# UI hot-reload during development (two processes):
-#   pixi run backend
-#   pixi run ui          # Vite on :1420 → Connect to ws://127.0.0.1:7420/ws
-```
-
-Auth: on loopback, token is optional unless `--token` / `FRESH_GUI_TOKEN` is set. Non-loopback binds **require** a token. FS listing and editor open are sandboxed to `--root` (default: cwd). Sessions keep PTYs alive across GUI disconnect. Pass `--no-editor` to run without Fresh. Pass `--no-ui` for API-only. Startup UI/WS URLs prefer an assigned host domain (`--public-host` / `FRESH_GUI_PUBLIC_HOST`, or auto-detected FQDN) over a bare loopback address. Settings (theme, fonts, default shell, …) live in `~/.config/fresh-gui/config.json` — open via the Settings button / `Mod+,` (see [crates/fresh-gui-backend/README.md](./crates/fresh-gui-backend/README.md)).
-
-### Installable Linux binary (Pixi package)
-
-Same role as `pixi run serve`. **Install on a linux-64 machine** (the remote daemon). Windows/macOS hosts are not supported for this package — use the Windows GUI client later, or a browser against this server.
-
-```bash
-# Private repo: ensure git can clone GitHub first, e.g.:
-#   gh auth login && gh auth setup-git
-# or use SSH:
-#   pixi global install --git git@github.com:amirhosseindavoody/fresh-gui.git
-
 pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git
-# exposes `fresh-gui-backend` (UI under share/fresh-gui/ui)
+# or a release tag / .conda from https://github.com/amirhosseindavoody/fresh-gui/releases
 
+cd /path/to/your/project
 fresh-gui-backend
-# → open the UI URL printed in the terminal (not the ws:// line)
 ```
 
-Works on older enterprise glibc (2.28+) — the package build uses Rollup’s WASM backend so it does not need host `GLIBC_2.32`.
+The process prints something like:
 
-From a local checkout (optional): `pixi global install --path .` or `pixi run package` (writes `./dist`).
+```text
+  UI:  http://127.0.0.1:7420/
+  WS:  ws://127.0.0.1:7420/ws
+```
 
-### Remote Linux + browser (SSH)
+Open the **UI** URL in a browser and click **Connect**. (The `ws://` line is for the client — you do not browse it.)
+
+Works on older enterprise glibc (2.28+).
+
+### From your laptop over SSH
 
 ```bash
 # on the server
-pixi run serve -- --listen 127.0.0.1:7420 --token secret --root "$PWD"
-# or, after packaging: fresh-gui-backend --listen 127.0.0.1:7420 --token secret --root "$PWD"
+fresh-gui-backend --listen 127.0.0.1:7420 --token secret --root "$PWD"
 
 # on your laptop
 ssh -L 7420:127.0.0.1:7420 user@server
-# browser → http://127.0.0.1:7420/
+# browser → http://127.0.0.1:7420/  (paste the same token if you set one)
 ```
 
-## Windows installers (NSIS + MSI)
+Non-loopback binds require `--token` / `FRESH_GUI_TOKEN`. On loopback, a token is optional unless you set one.
 
-On a Windows machine (or via CI):
+## Using the UI
+
+After connect you get terminals, an explorer, and editor tabs in one shell:
+
+| Do this | How |
+|---------|-----|
+| New terminal | `Mod+T` or **+** |
+| Split terminal | `Mod+D` / `Mod+Shift+D` |
+| Open a file | Click or double-click in the tree |
+| Save | `Mod+S` |
+| Find | `Mod+F` |
+| Command palette | `Mod+P` |
+| Settings | Activity bar gear or `Mod+,` (opens `config.json`) |
+| Copy a path | Right-click a tab or tree row |
+
+`Mod` is `Ctrl` on Linux/Windows and `Cmd` on macOS. Disconnect leaves remote sessions and PTYs running so you can reconnect.
+
+Sessions keep shells alive across GUI disconnect. File listing and editor open are sandboxed to `--root` (default: current directory).
+
+## Settings
+
+All prefs live in one JSONC file on the **backend** host:
+
+`~/.config/fresh-gui/config.json`  
+(or `$XDG_CONFIG_HOME/fresh-gui/config.json`, or `--config` / `FRESH_GUI_CONFIG`)
+
+```jsonc
+{
+  "ui": {
+    "theme": "system", // system | light | dark
+    "terminalFontSize": 14,
+    "editorFontSize": 14,
+    "webgl": true
+  },
+  "terminal": {
+    "shell": { "command": "zsh", "args": [] }
+  }
+}
+```
+
+Open it from the UI (**Settings** / `Mod+,`), edit, save with `Mod+S`. Theme follows the OS by default; terminal chrome tracks the same theme. Empty shell `args` keep interactive / OSC 7 setup for known shells.
+
+## Windows host app
+
+A Tauri desktop wrapper can load the same UI. Build installers on Windows (or via CI):
 
 ```powershell
 cd crates\fresh-gui-desktop
@@ -82,37 +92,35 @@ npm ci
 npm run build:windows
 ```
 
-Produces NSIS + MSI under `target/release/bundle/`. Installer version is a WiX-safe mapping of CalVer (e.g. `2026.728.1` → `26.7.28001` — [docs/WINDOWS.md](./docs/WINDOWS.md)).
+Details: [docs/WINDOWS.md](./docs/WINDOWS.md).
 
-## Development
-
-```bash
-pixi run check
-pixi run test
-pixi run build
-```
-
-`fresh-gui-desktop` is excluded from default check/test on Linux (no webkit).
-
-## Protocol
-
-JSON text frames over WebSocket `ws://host:port/ws`:
-
-`hello` → optional `auth` → `session_*` / `layout_set` → `pty_*` / `fs_*` / `editor_*` / `buffer_*` / `scene_*` (protocol `0.4.0`)
-
-## Versioning
-
-CalVer `YYYY.MMDD.N` (e.g. `2026.728.1`):
+## Develop from source
 
 ```bash
-pixi run update-version
-# or: ./scripts/update-version.sh --set 2026.729.1
+git clone https://github.com/amirhosseindavoody/fresh-gui.git
+cd fresh-gui
+git submodule update --init --recursive
+pixi install
+pixi run ui-install   # once
+
+pixi run serve        # build UI + start backend (prints UI / WS URLs)
 ```
 
-On every push to `main`, [.github/workflows/release-backend.yml](./.github/workflows/release-backend.yml) bumps the version, builds the linux-64 `fresh-gui-backend` pixi package (`pixi run package`), tags `vYYYY.MMDD.N`, and publishes a [GitHub Release](https://github.com/amirhosseindavoody/fresh-gui/releases) with the `.conda` artifact + checksums. You can also run the workflow manually (`workflow_dispatch`) and optionally skip the bump or set an explicit version.
+Useful tasks: `pixi run check`, `test`, `build`, `ui` (Vite hot reload on `:1420`), `package` (write `.conda` under `./dist`).
 
-If `main` is protected, allow GitHub Actions to push version-bump commits (or bypass for `github-actions[bot]`).
+| Piece | Role |
+|-------|------|
+| `fresh-gui-backend` | Linux daemon (PTY, FS, Fresh editor, embedded UI) |
+| `fresh-gui-app` / `ui/` | Browser UI + small CLI |
+| `fresh-gui-desktop` | Windows Tauri host |
+| `fresh-gui-protocol` / `fresh-gui-client` | Shared wire format + client library |
+
+Deeper design notes: [docs/DESIGN.md](./docs/DESIGN.md), [docs/UI.md](./docs/UI.md). Backend flags and packaging: [crates/fresh-gui-backend/README.md](./crates/fresh-gui-backend/README.md).
+
+## Releases
+
+CalVer `YYYY.MMDD.N`. Pushes to `main` bump the version, build the linux-64 package, and publish a [GitHub Release](https://github.com/amirhosseindavoody/fresh-gui/releases) (see `.github/workflows/release-backend.yml`). Manual bump: `pixi run update-version`.
 
 ## License
 
-[GPL-2.0](./LICENSE) (same as Fresh). See DESIGN.md §9 / D5.
+[GPL-2.0](./LICENSE) (same as Fresh).
