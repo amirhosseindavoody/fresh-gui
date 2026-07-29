@@ -53,6 +53,13 @@ export type ClientMessage =
       base_rev: number;
     };
 
+export type HelloUiMsg = {
+  theme?: string;
+  terminalFontSize?: number;
+  editorFontSize?: number;
+  webgl?: boolean;
+};
+
 export type ServerMessage =
   | {
       type: "hello";
@@ -60,6 +67,8 @@ export type ServerMessage =
       role: string;
       implementation: string;
       capabilities: string[];
+      config_path?: string;
+      ui?: HelloUiMsg;
     }
   | { type: "auth_ok" }
   | { type: "auth_error"; message: string }

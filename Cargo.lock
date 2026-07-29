@@ -1472,6 +1472,8 @@ dependencies = [
  "futures-util",
  "notify 7.0.0",
  "portable-pty",
+ "serde",
+ "serde_json",
  "tokio",
  "tower-http",
  "tracing",

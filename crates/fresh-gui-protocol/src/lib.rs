@@ -18,13 +18,44 @@ pub const CAP_EDITOR: &str = "editor";
 pub const CAP_SCENE: &str = "scene";
 
 /// First message after WebSocket connect. Client sends; backend replies with its own.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Hello {
     pub protocol_version: String,
     pub role: PeerRole,
     /// Free-form implementation id, e.g. `fresh-gui-backend/2026.728.1`.
     pub implementation: String,
     pub capabilities: Vec<String>,
+    /// Absolute path to the backend `config.json` (settings file). Backend only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
+    /// Host UI prefs snapshot from that config (theme / fonts / webgl). Backend only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<HelloUi>,
+}
+
+/// UI section mirrored from `config.json` → `Hello.ui`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HelloUi {
+    #[serde(default = "hello_ui_theme")]
+    pub theme: String,
+    #[serde(default = "hello_ui_font", rename = "terminalFontSize")]
+    pub terminal_font_size: u32,
+    #[serde(default = "hello_ui_font", rename = "editorFontSize")]
+    pub editor_font_size: u32,
+    #[serde(default = "hello_ui_webgl")]
+    pub webgl: bool,
+}
+
+fn hello_ui_theme() -> String {
+    "system".to_owned()
+}
+
+fn hello_ui_font() -> u32 {
+    14
+}
+
+fn hello_ui_webgl() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -306,6 +337,8 @@ impl Hello {
             role: PeerRole::Backend,
             implementation: implementation.into(),
             capabilities,
+            config_path: None,
+            ui: None,
         }
     }
 
@@ -315,6 +348,8 @@ impl Hello {
             role: PeerRole::Client,
             implementation: implementation.into(),
             capabilities,
+            config_path: None,
+            ui: None,
         }
     }
 

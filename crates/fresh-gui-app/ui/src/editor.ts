@@ -29,6 +29,9 @@ function langForPath(path: string): Extension | null {
   }
   if (lower.endsWith(".py")) return python();
   if (lower.endsWith(".md") || lower.endsWith(".markdown")) return markdown();
+  if (lower.endsWith(".json") || lower.endsWith(".jsonc")) {
+    return javascript({ typescript: false });
+  }
   return null;
 }
 

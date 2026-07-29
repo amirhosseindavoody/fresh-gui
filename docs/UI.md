@@ -246,7 +246,7 @@ Connection errors and auth failures use inline strip status + optional toast; ne
 - Activity bar with Explorer (toggles sidebar) + Settings entry; explorer remains the only sidebar view until SCM exists.
 - Lightweight file-type badges in the virtualized tree (`src/icons.ts`) — no heavy icon pack.
 - Skipped `fs_list` pagination for now — row virtualization covers large trees; revisit only if a single directory listing becomes a protocol bottleneck.
-- Theme preference (`system` / `light` / `dark`) + CSS tokens (`data-theme` resolved) + settings modal (theme, terminal/editor font size, WebGL preference) via `Mod+,` / activity bar. Terminal pane chrome and xterm palettes follow the same tokens.
+- Theme preference (`system` / `light` / `dark`) + CSS tokens (`data-theme` resolved). Settings live in backend `config.json` (`ui` + `terminal.shell`); the activity-bar / `Mod+,` entry opens that file in the editor (no modal).
 
 ### Out of UI phases (stay in DESIGN Phase 4+)
 
