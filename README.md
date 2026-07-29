@@ -39,11 +39,29 @@ pixi run app -- smoke --backend ws://127.0.0.1:7420/ws
 
 Auth: on loopback, token is optional unless `--token` / `FRESH_GUI_TOKEN` is set. Non-loopback binds **require** a token. FS listing and editor open are sandboxed to `--root` (default: cwd). Sessions keep PTYs alive across GUI disconnect. Pass `--no-editor` to run without Fresh. Pass `--no-ui` for API-only.
 
+### Installable Linux binary (Pixi package)
+
+Same role as `pixi run serve`, without needing the full Rust/UI toolchain on the machine:
+
+```bash
+git clone --recurse-submodules https://github.com/amirhosseindavoody/fresh-gui.git
+cd fresh-gui
+pixi global install --path .
+# exposes `fresh-gui-backend` (and ships UI under share/fresh-gui/ui)
+
+fresh-gui-backend
+# → UI: http://127.0.0.1:7420/   WS: ws://127.0.0.1:7420/ws
+
+# or build the conda package into ./dist
+pixi run package
+```
+
 ### Remote Linux + browser (SSH)
 
 ```bash
 # on the server
 pixi run serve -- --listen 127.0.0.1:7420 --token secret --root "$PWD"
+# or, after packaging: fresh-gui-backend --listen 127.0.0.1:7420 --token secret --root "$PWD"
 
 # on your laptop
 ssh -L 7420:127.0.0.1:7420 user@server

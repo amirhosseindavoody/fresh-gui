@@ -12,7 +12,17 @@ pixi run backend -- --no-editor   # omit editor capability
 pixi run backend -- --no-ui       # WebSocket + /healthz only
 ```
 
-- `GET /` — built host UI from `crates/fresh-gui-app/ui/dist` (when present)
+### Pixi package (installable binary)
+
+Builds the same binary + ships UI under `$PREFIX/share/fresh-gui/ui` (recipe in `recipe/`):
+
+```bash
+pixi global install --path .   # from a clone with submodules
+# or: pixi run package         # writes .conda under ./dist
+fresh-gui-backend
+```
+
+- `GET /` — built host UI from `share/fresh-gui/ui` (package) or `crates/fresh-gui-app/ui/dist` (dev)
 - `GET /healthz`
 - `WS /ws` — JSON frames (`hello`, `auth`, `session_*`, `layout_set`, `pty_*`, `fs_*`, `editor_*`, `buffer_*`, `scene_*`, …)
 - Sessions own PTYs; disconnect detaches the subscriber but keeps shells running for reattach + scrollback replay

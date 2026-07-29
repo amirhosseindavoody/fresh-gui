@@ -178,6 +178,10 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 ### Phase 4 — Polish / packaging
 
 - Code signing, Linux backend package, auto-update story, hardening.
+- **Linux backend Pixi package (scaffold):** `[package]` + `recipe/` builds installable
+  `fresh-gui-backend` with UI under `share/fresh-gui/ui` (`pixi global install --path .`
+  / `pixi run package`) — same role as `pixi run serve` for browser shells before the
+  native GUI client.
 - (Unsigned Windows NSIS + MSI already available from Phase 1 packaging.)
 - Host **visual** polish is Phase UI / [UI.md](./UI.md), not this section.
 
@@ -187,9 +191,11 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 
 - Channels: conda-forge.
 - Platforms: at least `linux-64` for backend/dev on WSL; `win-64` added when GUI builds are routine.
-- Tasks: `check`, `test`, `build`, `clippy`, `fmt`, `ui` / `ui-install` / `ui-build` / `ui-serve`, `update-version`.
+- Tasks: `check`, `test`, `build`, `clippy`, `fmt`, `ui` / `ui-install` / `ui-build` / `ui-serve`, `package`, `update-version`.
 - Rust toolchain via Pixi `rust` dependency (same idea as pixi-mise).
 - **Bun** via Pixi (`bun` conda-forge package) for the Vite/TS UI install and scripts — faster than npm; lockfile is `crates/fresh-gui-app/ui/bun.lock`.
+- **Package build:** `preview = ["pixi-build"]` + `pixi-build-rattler-build` + `recipe/recipe.yaml`
+  (mirrors pixi-mise). Requires Fresh submodule present for path builds.
 
 ### Fresh dependency
 
