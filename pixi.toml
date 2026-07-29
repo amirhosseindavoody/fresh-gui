@@ -32,6 +32,13 @@ fmt-check = "cargo fmt --all -- --check"
 backend = "cargo run -p fresh-gui --"
 # Build UI then run backend (serves ui/dist + /ws on one port).
 serve = { depends-on = ["ui-build"], cmd = "cargo run -p fresh-gui --" }
+# Same as `serve`, but Cargo `--release` into `target/release/` so you can
+# exercise release-like performance locally. Incremental: small Rust changes
+# rebuild only what changed — no full `pixi build` / package from scratch.
+# (Packaged installs still use thin LTO + strip via `recipe/build.sh`.)
+serve-release = { depends-on = ["ui-build"], cmd = "cargo run --release -p fresh-gui --" }
+build-release = "cargo build --release -p fresh-gui"
+backend-release = "cargo run --release -p fresh-gui --"
 app = "cargo run -p fresh-gui-app --"
 ui = { cwd = "crates/fresh-gui-app/ui", cmd = "bun run dev" }
 ui-install = { cwd = "crates/fresh-gui-app/ui", cmd = "bun install" }

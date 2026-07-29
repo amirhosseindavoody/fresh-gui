@@ -7,8 +7,10 @@ Linux remote daemon: WebSocket ADE API + detachable sessions + PTY + filesystem 
 ```bash
 pixi run ui-install   # once (dev)
 pixi run serve        # build UI + start (http://127.0.0.1:7420/ + ws://…/ws)
+pixi run serve-release  # same with Cargo --release (incremental local release testing)
 
 pixi run backend -- --listen 127.0.0.1:7420 --root /path/to/project
+pixi run backend-release -- --listen 127.0.0.1:7420   # release binary, no UI rebuild
 pixi run backend -- --no-editor   # omit editor capability
 pixi run backend -- --no-ui       # WebSocket + /healthz only
 ```

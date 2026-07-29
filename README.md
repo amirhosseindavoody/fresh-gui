@@ -119,9 +119,10 @@ pixi install
 pixi run ui-install   # once
 
 pixi run serve        # build UI + start backend (prints UI / WS URLs)
+pixi run serve-release  # same, but Cargo --release (incremental; closer to packaged binary)
 ```
 
-Useful tasks: `pixi run check`, `test`, `build`, `ui` (Vite hot reload on `:1420`), `package` (write `.conda` under `./dist`).
+Useful tasks: `pixi run check`, `test`, `build`, `build-release`, `ui` (Vite hot reload on `:1420`), `package` (write `.conda` under `./dist`).
 
 | Piece | Role |
 |-------|------|
