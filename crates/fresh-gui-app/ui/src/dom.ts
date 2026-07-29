@@ -44,3 +44,19 @@ export function basename(path: string): string {
   const parts = path.split(/[/\\]/).filter(Boolean);
   return parts[parts.length - 1] || path || "untitled";
 }
+
+/** Normalize separators and strip trailing slashes (keep `/` as root). */
+export function normalizePath(path: string): string {
+  const s = String(path || "").replace(/\\/g, "/").replace(/\/+$/, "");
+  return s || "/";
+}
+
+/** Path of `abs` relative to `root`, or `abs` when outside root. */
+export function relativePath(abs: string, root: string): string {
+  const a = normalizePath(abs);
+  const r = normalizePath(root);
+  if (!root || r === "/" || r === ".") return a.replace(/^\//, "") || a;
+  if (a === r) return ".";
+  if (a.startsWith(r + "/")) return a.slice(r.length + 1);
+  return a;
+}

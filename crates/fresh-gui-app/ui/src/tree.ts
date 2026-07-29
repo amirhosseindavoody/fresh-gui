@@ -13,6 +13,8 @@ export type TreeCallbacks = {
   noteInteraction?: () => void;
   /** Fired after the displayed root path changes (cwd sync / reload). */
   onRootChange?: (rootPath: string) => void;
+  /** Right-click on a tree row (file or directory). */
+  onContextMenu?: (entry: FsEntry, clientX: number, clientY: number) => void;
 };
 
 type Row = {
@@ -326,6 +328,14 @@ export class VirtualTree {
               false,
             );
           }
+        });
+        el.addEventListener("contextmenu", (ev) => {
+          ev.preventDefault();
+          this.callbacks.noteInteraction?.();
+          this.selected = row.path;
+          this.callbacks.onSelect?.(this.entryForRow(row));
+          this.callbacks.onContextMenu?.(this.entryForRow(row), ev.clientX, ev.clientY);
+          this.schedulePaint();
         });
         this.viewport.appendChild(el);
       }

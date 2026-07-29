@@ -8,7 +8,7 @@ import {
   type PtyInfo,
   type ServerMessage,
 } from "./protocol";
-import { $, $button, $input, b64decode, b64encode, basename } from "./dom";
+import { $, $button, $input, b64decode, b64encode, basename, relativePath } from "./dom";
 import { applyEditorFontSize, applyEditorTheme, createEditorView, openEditorSearch } from "./editor";
 import {
   applyTerminalFontSize,
@@ -41,6 +41,11 @@ import {
   type UiSettings,
 } from "./settings";
 import { closeFindBar, openFindBar, setSearchTarget } from "./search";
+import {
+  copyToClipboard,
+  openContextMenu,
+  type ContextMenuItem,
+} from "./context-menu";
 
 const SESSION_KEY = "fresh-gui.sessionId";
 const LAYOUT_KEY = "fresh-gui.layout";
@@ -672,6 +677,9 @@ function updateSaveButton(): void {
 function updateStacks(): void {
   const hasTabs = tabs.length > 0;
   emptyStack.hidden = connected && hasTabs;
+  emptyStack.textContent = connected
+    ? "Open a terminal or file to get started"
+    : "Connect to a backend to open a session";
   const active = tabs[activeTabIndex];
   terminalStack.hidden = !connected || active?.kind !== "terminal";
   editorStack.hidden = !connected || active?.kind !== "editor";
@@ -857,6 +865,44 @@ function tabLabel(tab: Tab): string {
   return basename(tab.path);
 }
 
+/** Workspace / explorer root used for relative paths. */
+function pathAnchorRoot(): string {
+  return tree.getWorkspaceRoot() || tree.getRootPath() || "";
+}
+
+async function copyPathFeedback(label: string, value: string): Promise<void> {
+  const ok = await copyToClipboard(value);
+  setStatusLeft(ok ? `copied ${label}: ${value}` : `copy failed: ${value}`);
+}
+
+function pathContextItems(absPath: string): ContextMenuItem[] {
+  const abs = absPath;
+  const rel = relativePath(abs, pathAnchorRoot());
+  const name = basename(abs);
+  return [
+    {
+      kind: "item",
+      label: "Copy Absolute Path",
+      run: () => copyPathFeedback("absolute path", abs),
+    },
+    {
+      kind: "item",
+      label: "Copy Relative Path",
+      run: () => copyPathFeedback("relative path", rel),
+    },
+    {
+      kind: "item",
+      label: "Copy File Name",
+      run: () => copyPathFeedback("name", name),
+    },
+  ];
+}
+
+function openPathContextMenu(absPath: string, clientX: number, clientY: number): void {
+  if (!absPath) return;
+  openContextMenu(clientX, clientY, pathContextItems(absPath));
+}
+
 function renderTabs(): void {
   const pill = tabPill;
   tabsEl.innerHTML = "";
@@ -875,6 +921,10 @@ function renderTabs(): void {
     const label = document.createElement("span");
     label.className = "tab-label";
     label.textContent = tabLabel(tab);
+    if (tab.kind === "editor") label.title = tab.path;
+    else if (tab.leaves.get(tab.activeLeafId)?.cwd) {
+      label.title = tab.leaves.get(tab.activeLeafId)!.cwd!;
+    }
     el.appendChild(label);
     const x = document.createElement("button");
     x.className = "x";
@@ -892,6 +942,32 @@ function renderTabs(): void {
       persistLayout();
       syncExplorerToActiveContext();
       focusActiveTab();
+    });
+    el.addEventListener("contextmenu", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      activeTabIndex = i;
+      renderAll();
+      persistLayout();
+      syncExplorerToActiveContext();
+
+      const items: ContextMenuItem[] = [];
+      if (tab.kind === "editor") {
+        items.push(...pathContextItems(tab.path));
+        items.push({ kind: "separator" });
+      } else {
+        const cwd = tab.leaves.get(tab.activeLeafId)?.cwd;
+        if (cwd) {
+          items.push(...pathContextItems(cwd));
+          items.push({ kind: "separator" });
+        }
+      }
+      items.push({
+        kind: "item",
+        label: "Close",
+        run: () => closeTabAt(i),
+      });
+      openContextMenu(ev.clientX, ev.clientY, items);
     });
     tabsEl.appendChild(el);
   });
@@ -1051,6 +1127,7 @@ const tree = new VirtualTree(treeEl, fsList, {
   onStatus: (text) => setStatusLeft(text),
   noteInteraction: () => noteTreeInteraction(),
   onRootChange: (rootPath) => updateExplorerTitle(rootPath),
+  onContextMenu: (entry, x, y) => openPathContextMenu(entry.path, x, y),
 });
 setTreeEmptyHint(true);
 
