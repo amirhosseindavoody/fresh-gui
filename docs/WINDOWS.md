@@ -18,14 +18,16 @@ WiX `ProductVersion` requires major/minor ≤ **255** and build ≤ **65535**, s
 
 Example: `2026.728.1` → **`26.7.28001`**.
 
-`scripts/update-version.sh` updates Cargo/pixi CalVer and rewrites this mapped version into `crates/fresh-gui-desktop/tauri.conf.json` and `package.json`.
+`scripts/update-version.sh` updates Cargo/pixi CalVer and rewrites this mapped version into `crates/fresh-gui-desktop/tauri.conf.json` / `package.json`, and the UI `crates/fresh-gui-app/ui/package.json`. Tauri builds the Vite UI (`ui/dist`) via `beforeBuildCommand` (Bun).
 
 ## Local build (on Windows)
 
-Prerequisites: [Tauri Windows prerequisites](https://v2.tauri.app/start/prerequisites/#windows) (WebView2, VS Build Tools, Rust).
+Prerequisites: [Tauri Windows prerequisites](https://v2.tauri.app/start/prerequisites/#windows) (WebView2, VS Build Tools, Rust), plus [Bun](https://bun.sh) on `PATH` for the UI build.
 
 ```powershell
-cd crates\fresh-gui-desktop
+cd crates\fresh-gui-app\ui
+bun install --frozen-lockfile
+cd ..\..\fresh-gui-desktop
 npm ci
 npm run build:windows
 ```

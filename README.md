@@ -10,7 +10,7 @@ Inspired by [Terax](https://github.com/crynta/terax-ai). Repo logistics follow [
 
 | Piece | MVP platform | Crate / binary |
 |-------|--------------|----------------|
-| Host GUI | Windows (Tauri 2 + xterm.js) | `fresh-gui-desktop` |
+| Host GUI | Windows (Tauri 2 + Vite/TS UI) | `fresh-gui-desktop` |
 | Host UI assets / CLI | all | `fresh-gui-app` → `fresh-gui` |
 | Remote backend | Linux | `fresh-gui-backend` |
 | Shared protocol | all | `fresh-gui-protocol` |
@@ -30,10 +30,12 @@ pixi run backend
 # terminal 2 — CLI smoke
 pixi run app -- smoke --backend ws://127.0.0.1:7420/ws
 
-# terminal 2 — serve UI (PTY + file tree + tabs/splits + editor)
+# terminal 2 — Vite UI (PTY + file tree + tabs/splits + editor)
+pixi run ui-install   # once (Bun via Pixi)
 pixi run ui
 # open http://127.0.0.1:1420/ → Connect to ws://127.0.0.1:7420/ws
 # leave Session empty to create; double-click a file to open in the editor pane
+# production-like: pixi run ui-build && pixi run ui-serve
 ```
 
 Auth: on loopback, token is optional unless `--token` / `FRESH_GUI_TOKEN` is set. Non-loopback binds **require** a token. FS listing and editor open are sandboxed to `--root` (default: cwd). Sessions keep PTYs alive across GUI disconnect. Pass `--no-editor` to run without Fresh.

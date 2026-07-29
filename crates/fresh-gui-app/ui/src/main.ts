@@ -1,49 +1,99 @@
 /* Phase 3b/3c host UI: sessions, tabs/splits, tree+watch, CodeMirror edit/save, thin scene. */
+import { Terminal } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import CodeMirror from "codemirror";
+import type { Editor } from "codemirror";
+import "@xterm/xterm/css/xterm.css";
+import "codemirror/lib/codemirror.css";
+import "codemirror/theme/material-darker.css";
+import "codemirror/mode/rust/rust.js";
+import "codemirror/mode/javascript/javascript.js";
+import "codemirror/mode/python/python.js";
+import "codemirror/mode/markdown/markdown.js";
+import "./styles.css";
+import {
+  PROTOCOL_VERSION,
+  type ClientMessage,
+  type FsEntry,
+  type ServerMessage,
+} from "./protocol";
 
-const PROTOCOL_VERSION = "0.4.0";
 const SESSION_KEY = "fresh-gui.sessionId";
 const LAYOUT_KEY = "fresh-gui.layout";
 
-const $ = (id) => document.getElementById(id);
+function $(id: string): HTMLElement {
+  const el = document.getElementById(id);
+  if (!el) throw new Error(`missing #${id}`);
+  return el;
+}
+function $input(id: string): HTMLInputElement {
+  const el = $(id);
+  if (!(el instanceof HTMLInputElement)) throw new Error(`#${id} is not an input`);
+  return el;
+}
+function $button(id: string): HTMLButtonElement {
+  const el = $(id);
+  if (!(el instanceof HTMLButtonElement)) throw new Error(`#${id} is not a button`);
+  return el;
+}
+
 const statusEl = $("status");
-const connectBtn = $("connect");
-const disconnectBtn = $("disconnect");
+const connectBtn = $button("connect");
+const disconnectBtn = $button("disconnect");
 const treeEl = $("tree");
 const tabsEl = $("tabs");
 const panesEl = $("panes");
 const editorPanel = $("editor-panel");
 const editorHost = $("editor-host");
 const editorPathEl = $("editor-path");
-const editorSaveBtn = $("editor-save");
+const editorSaveBtn = $button("editor-save");
 
-let ws = null;
-let authed = false;
-let sessionId = null;
+interface Pending<T> {
+  resolve: (value: T) => void;
+  reject: (err: Error) => void;
+}
+
+interface OpenedInfo {
+  buffer_id: string;
+  path: string;
+  language?: string;
+}
+
+interface PendingEditor extends Pending<OpenedInfo & { rev: number; text: string }> {
+  _opened?: OpenedInfo;
+}
+
+interface Tab {
+  id: string;
+  title: string;
+  term: Terminal;
+  fit: FitAddon;
+  el: HTMLElement;
+}
+
+type SplitMode = "horizontal" | "vertical";
+
+let ws: WebSocket | null = null;
+let sessionId: string | null = null;
 let reqSeq = 0;
 let hasEditor = false;
-/** @type {Map<string, {resolve: Function, reject: Function}>} */
-const pendingFs = new Map();
-/** @type {Map<string, {resolve: Function, reject: Function}>} */
-const pendingEditor = new Map();
-/** @type {Map<string, {resolve: Function, reject: Function}>} */
-const pendingEdit = new Map();
-/** @type {Map<string, {resolve: Function, reject: Function}>} */
-const pendingSave = new Map();
-let selectedPath = null;
-let openBufferId = null;
+const pendingFs = new Map<string, Pending<{ path: string; entries: FsEntry[] }>>();
+const pendingEditor = new Map<string, PendingEditor>();
+const pendingEdit = new Map<string, Pending<number>>();
+const pendingSave = new Map<string, Pending<{ path: string; rev: number }>>();
+let selectedPath: string | null = null;
+let openBufferId: string | null = null;
 let openBufferRev = 0;
-let openBufferPath = null;
+let openBufferPath: string | null = null;
 let editorDirty = false;
 let suppressCmChange = false;
-/** @type {any} */
-let cm = null;
-let watchId = null;
-let treeRefreshTimer = null;
+let cm: Editor | null = null;
+let watchId: string | null = null;
+let treeRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let treeLoading = false;
 let treeLoaded = false;
 let treeNeedsRefresh = false;
-/** @type {Set<string>} */
-const expandedPaths = new Set();
+const expandedPaths = new Set<string>();
 /** Suppress auto-refresh briefly after the user clicks the tree. */
 let treeQuietUntil = 0;
 
@@ -58,22 +108,20 @@ const WATCH_IGNORE_DIRS = new Set([
   "dist",
 ]);
 
-/** @type {{ id: string, title: string, term: any, fit: any, el: HTMLElement }[]} */
-let tabs = [];
+let tabs: Tab[] = [];
 let activeTab = 0;
-/** null | 'horizontal' | 'vertical' */
-let splitMode = null;
+let splitMode: SplitMode | null = null;
 /** second pane tab index when split */
 let splitTab = 1;
 /** Apply this split once a newly opened PTY arrives (when splitting with <2 tabs). */
-let pendingSplit = null;
+let pendingSplit: SplitMode | null = null;
 
-function setStatus(text) {
+function setStatus(text: string): void {
   statusEl.textContent = text;
   statusEl.title = text;
 }
 
-function b64encode(str) {
+function b64encode(str: string): string {
   const bytes = new TextEncoder().encode(str);
   let s = "";
   bytes.forEach((b) => {
@@ -82,23 +130,23 @@ function b64encode(str) {
   return btoa(s);
 }
 
-function b64decode(b64) {
+function b64decode(b64: string): Uint8Array {
   const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return bytes;
 }
 
-function send(msg) {
+function send(msg: ClientMessage): void {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }
 
-function nextRequestId() {
+function nextRequestId(): string {
   reqSeq += 1;
   return `ui-${reqSeq}`;
 }
 
-function fsList(path) {
+function fsList(path: string): Promise<{ path: string; entries: FsEntry[] }> {
   const request_id = nextRequestId();
   return new Promise((resolve, reject) => {
     pendingFs.set(request_id, { resolve, reject });
@@ -112,7 +160,7 @@ function fsList(path) {
   });
 }
 
-function editorOpen(path, preview = false) {
+function editorOpen(path: string, preview = false): Promise<OpenedInfo & { rev: number; text: string }> {
   const request_id = nextRequestId();
   return new Promise((resolve, reject) => {
     pendingEditor.set(request_id, { resolve, reject });
@@ -126,7 +174,7 @@ function editorOpen(path, preview = false) {
   });
 }
 
-function bufferEdit(bufferId, baseRev, text) {
+function bufferEdit(bufferId: string, baseRev: number, text: string): Promise<number> {
   const request_id = nextRequestId();
   return new Promise((resolve, reject) => {
     pendingEdit.set(request_id, { resolve, reject });
@@ -146,7 +194,7 @@ function bufferEdit(bufferId, baseRev, text) {
   });
 }
 
-function bufferSave(bufferId, baseRev) {
+function bufferSave(bufferId: string, baseRev: number): Promise<{ path: string; rev: number }> {
   const request_id = nextRequestId();
   return new Promise((resolve, reject) => {
     pendingSave.set(request_id, { resolve, reject });
@@ -165,7 +213,7 @@ function bufferSave(bufferId, baseRev) {
   });
 }
 
-function modeForPath(path) {
+function modeForPath(path: string | null | undefined): string | null {
   const lower = (path || "").toLowerCase();
   if (lower.endsWith(".rs")) return "rust";
   if (lower.endsWith(".js") || lower.endsWith(".ts") || lower.endsWith(".mjs")) return "javascript";
@@ -174,7 +222,7 @@ function modeForPath(path) {
   return null;
 }
 
-function ensureCodeMirror() {
+function ensureCodeMirror(): Editor {
   if (cm) return cm;
   cm = CodeMirror(editorHost, {
     value: "",
@@ -191,14 +239,14 @@ function ensureCodeMirror() {
   return cm;
 }
 
-function updateEditorChrome() {
+function updateEditorChrome(): void {
   const name = openBufferPath || "untitled";
   editorPathEl.textContent = editorDirty ? `${name} •` : name;
   editorPathEl.classList.toggle("dirty", editorDirty);
   editorSaveBtn.disabled = !openBufferId || !editorDirty;
 }
 
-function showEditor(path, text, bufferId, rev) {
+function showEditor(path: string, text: string, bufferId: string, rev: number): void {
   openBufferId = bufferId;
   openBufferRev = rev || 0;
   openBufferPath = path || "untitled";
@@ -215,12 +263,14 @@ function showEditor(path, text, bufferId, rev) {
     for (const tab of tabs) {
       try {
         tab.fit.fit();
-      } catch (_) {}
+      } catch {
+        /* ignore */
+      }
     }
   });
 }
 
-function hideEditor() {
+function hideEditor(): void {
   if (openBufferId) send({ type: "editor_close", buffer_id: openBufferId });
   openBufferId = null;
   openBufferRev = 0;
@@ -238,12 +288,14 @@ function hideEditor() {
     for (const tab of tabs) {
       try {
         tab.fit.fit();
-      } catch (_) {}
+      } catch {
+        /* ignore */
+      }
     }
   });
 }
 
-async function saveOpenBuffer() {
+async function saveOpenBuffer(): Promise<void> {
   if (!openBufferId || !cm || !editorDirty) return;
   const text = cm.getValue();
   setStatus(`saving ${openBufferPath}…`);
@@ -256,20 +308,20 @@ async function saveOpenBuffer() {
     updateEditorChrome();
     setStatus(`saved ${saved.path}`);
   } catch (err) {
-    setStatus(`save error: ${err}`);
+    setStatus(`save error: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
-function pathIsNoisy(path) {
+function pathIsNoisy(path: string): boolean {
   const parts = String(path).split(/[/\\]/).filter(Boolean);
   return parts.some((p) => WATCH_IGNORE_DIRS.has(p));
 }
 
-function noteTreeInteraction() {
+function noteTreeInteraction(): void {
   treeQuietUntil = Date.now() + 2000;
 }
 
-function scheduleTreeRefresh() {
+function scheduleTreeRefresh(): void {
   if (Date.now() < treeQuietUntil) {
     // Retry after the quiet window so we don't drop real updates forever.
     if (treeRefreshTimer) clearTimeout(treeRefreshTimer);
@@ -290,12 +342,12 @@ function scheduleTreeRefresh() {
   }, 800);
 }
 
-function startFsWatch() {
+function startFsWatch(): void {
   const request_id = nextRequestId();
   send({ type: "fs_watch", request_id, path: "", recursive: true });
 }
 
-function escapeHtml(s) {
+function escapeHtml(s: string): string {
   return String(s)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
@@ -303,7 +355,7 @@ function escapeHtml(s) {
     .replaceAll('"', "&quot;");
 }
 
-function persistLayout() {
+function persistLayout(): void {
   const layout = {
     split: splitMode,
     activeTab,
@@ -315,7 +367,7 @@ function persistLayout() {
   if (sessionId) send({ type: "layout_set", layout: json });
 }
 
-function makeTerm() {
+function makeTerm(): { term: Terminal; fit: FitAddon } {
   const term = new Terminal({
     cursorBlink: true,
     fontFamily: '"IBM Plex Mono", ui-monospace, monospace',
@@ -326,16 +378,16 @@ function makeTerm() {
       cursor: "#3fb950",
     },
   });
-  const fit = new FitAddon.FitAddon();
+  const fit = new FitAddon();
   term.loadAddon(fit);
   return { term, fit };
 }
 
-function openPtyForDims(cols, rows) {
+function openPtyForDims(cols: number, rows: number): void {
   send({ type: "pty_open", cols, rows });
 }
 
-function createTab(ptyId, title, opts = {}) {
+function createTab(ptyId: string, title?: string, opts: { silentActivate?: boolean } = {}): Tab {
   const { term, fit } = makeTerm();
   const host = document.createElement("div");
   host.className = "xterm-host";
@@ -364,13 +416,15 @@ function createTab(ptyId, title, opts = {}) {
   return tab;
 }
 
-function closeTab(index) {
+function closeTab(index: number): void {
   const tab = tabs[index];
   if (!tab) return;
   send({ type: "pty_close", id: tab.id });
   try {
     tab.term.dispose();
-  } catch (_) {}
+  } catch {
+        /* ignore */
+      }
   tabs.splice(index, 1);
   if (activeTab >= tabs.length) activeTab = Math.max(0, tabs.length - 1);
   if (splitTab >= tabs.length) splitTab = Math.max(0, tabs.length - 1);
@@ -380,7 +434,7 @@ function closeTab(index) {
   persistLayout();
 }
 
-function renderTabs() {
+function renderTabs(): void {
   tabsEl.innerHTML = "";
   tabs.forEach((tab, i) => {
     const el = document.createElement("div");
@@ -409,7 +463,7 @@ function renderTabs() {
   });
 }
 
-function renderPanes() {
+function renderPanes(): void {
   panesEl.innerHTML = "";
   panesEl.className =
     splitMode === "horizontal"
@@ -433,16 +487,20 @@ function renderPanes() {
     requestAnimationFrame(() => {
       try {
         tab.fit.fit();
-      } catch (_) {}
+      } catch {
+        /* ignore */
+      }
     });
   }
 }
 
-function clearTerminals() {
+function clearTerminals(): void {
   for (const tab of tabs) {
     try {
       tab.term.dispose();
-    } catch (_) {}
+    } catch {
+        /* ignore */
+      }
   }
   tabs = [];
   activeTab = 0;
@@ -453,7 +511,7 @@ function clearTerminals() {
   panesEl.className = "no-split";
 }
 
-function clearTree() {
+function clearTree(): void {
   treeEl.innerHTML = "";
   pendingFs.clear();
   selectedPath = null;
@@ -467,7 +525,7 @@ function clearTree() {
   }
 }
 
-async function loadRoot(opts = {}) {
+async function loadRoot(opts: { silent?: boolean } = {}): Promise<void> {
   const silent = !!opts.silent && treeLoaded;
   if (treeLoading) {
     treeNeedsRefresh = true;
@@ -513,14 +571,18 @@ async function loadRoot(opts = {}) {
 }
 
 /** Re-expand directories that were open before a silent tree rebuild. */
-async function restoreExpanded(container, paths) {
-  const rows = [...container.querySelectorAll(":scope > .tree-item")];
+async function restoreExpanded(container: HTMLElement, paths: Set<string>): Promise<void> {
+  const rows = [...container.querySelectorAll(":scope > .tree-item")].filter(
+    (el): el is HTMLElement => el instanceof HTMLElement,
+  );
   for (const row of rows) {
     const childBox = row.nextElementSibling;
-    if (!childBox || !childBox.classList.contains("tree-children")) continue;
+    if (!(childBox instanceof HTMLElement) || !childBox.classList.contains("tree-children")) {
+      continue;
+    }
     const path = row.dataset.path;
     if (!path || !paths.has(path)) continue;
-    const twist = row.querySelector(".twist");
+    const twist = row.querySelector(".twist") as HTMLElement | null;
     try {
       if (!childBox.dataset.loaded) {
         if (twist) twist.textContent = "…";
@@ -533,20 +595,20 @@ async function restoreExpanded(container, paths) {
       if (twist) twist.textContent = "▾";
       expandedPaths.add(path);
       await restoreExpanded(childBox, paths);
-    } catch (_) {
+    } catch {
       if (twist) twist.textContent = "▸";
       expandedPaths.delete(path);
     }
   }
 }
 
-function kindIcon(kind) {
+function kindIcon(kind: string): string {
   if (kind === "dir") return "▸";
   if (kind === "symlink") return "↗";
   return "·";
 }
 
-function renderEntries(container, entries) {
+function renderEntries(container: HTMLElement, entries: FsEntry[]): void {
   for (const entry of entries) {
     const row = document.createElement("div");
     row.className = "tree-item";
@@ -568,7 +630,9 @@ function renderEntries(container, entries) {
     row.addEventListener("click", async (ev) => {
       ev.stopPropagation();
       noteTreeInteraction();
-      document.querySelectorAll(".tree-item.selected").forEach((el) => el.classList.remove("selected"));
+      document.querySelectorAll(".tree-item.selected").forEach((el) => {
+        el.classList.remove("selected");
+      });
       row.classList.add("selected");
       selectedPath = entry.path;
       setStatus(`${entry.kind}: ${entry.path}`);
@@ -586,7 +650,7 @@ function renderEntries(container, entries) {
           } catch (err) {
             twist.textContent = "▸";
             expandedPaths.delete(entry.path);
-            setStatus(`fs error: ${err}`);
+            setStatus(`fs error: ${err instanceof Error ? err.message : String(err)}`);
           }
         } else if (childBox.hidden) {
           childBox.hidden = false;
@@ -613,7 +677,7 @@ function renderEntries(container, entries) {
           showEditor(opened.path, opened.text, opened.buffer_id, opened.rev);
           setStatus(`opened ${opened.path}`);
         } catch (err) {
-          setStatus(`editor error: ${err}`);
+          setStatus(`editor error: ${err instanceof Error ? err.message : String(err)}`);
         }
       });
     }
@@ -621,18 +685,18 @@ function renderEntries(container, entries) {
   }
 }
 
-function afterSessionReady() {
-  $("new-tab").disabled = false;
-  $("split-h").disabled = false;
-  $("split-v").disabled = false;
-  $("split-off").disabled = false;
+function afterSessionReady(): void {
+  $button("new-tab").disabled = false;
+  $button("split-h").disabled = false;
+  $button("split-v").disabled = false;
+  $button("split-off").disabled = false;
   loadRoot().then(() => startFsWatch()).catch(() => startFsWatch());
 }
 
-function onMessage(raw) {
-  let msg;
+function onMessage(raw: string): void {
+  let msg: ServerMessage;
   try {
-    msg = JSON.parse(raw);
+    msg = JSON.parse(raw) as ServerMessage;
   } catch {
     setStatus("bad json from backend");
     return;
@@ -649,10 +713,9 @@ function onMessage(raw) {
         capabilities: ["ping", "pty", "fs", "session", "editor", "scene"],
       });
       {
-        const token = $("token").value;
+        const token = $input("token").value;
         if (token) send({ type: "auth", token });
         else {
-          authed = true;
           beginSession();
         }
       }
@@ -661,7 +724,6 @@ function onMessage(raw) {
       );
       break;
     case "auth_ok":
-      authed = true;
       beginSession();
       setStatus("authenticated");
       break;
@@ -670,7 +732,7 @@ function onMessage(raw) {
       break;
     case "session_created":
       sessionId = msg.session_id;
-      $("session").value = sessionId;
+      $input("session").value = sessionId;
       localStorage.setItem(SESSION_KEY, sessionId);
       afterSessionReady();
       openPtyForDims(80, 24);
@@ -678,16 +740,22 @@ function onMessage(raw) {
       break;
     case "session_attached":
       sessionId = msg.session_id;
-      $("session").value = sessionId;
+      $input("session").value = sessionId;
       localStorage.setItem(SESSION_KEY, sessionId);
       clearTerminals();
-      if (msg.layout) {
+      if (typeof msg.layout === "string" && msg.layout) {
         try {
-          const layout = JSON.parse(msg.layout);
+          const layout = JSON.parse(msg.layout) as {
+            split?: SplitMode | null;
+            activeTab?: number;
+            splitTab?: number;
+          };
           splitMode = layout.split || null;
           activeTab = layout.activeTab || 0;
           splitTab = layout.splitTab ?? 1;
-        } catch (_) {}
+        } catch {
+          /* ignore bad layout */
+        }
       }
       for (const p of msg.ptys || []) {
         createTab(p.id, `sh ${tabs.length + 1}`, { silentActivate: true });
@@ -717,7 +785,9 @@ function onMessage(raw) {
           try {
             tab.fit.fit();
             tab.term.focus();
-          } catch (_) {}
+          } catch {
+        /* ignore */
+      }
         });
       }
       break;
@@ -731,7 +801,9 @@ function onMessage(raw) {
       if (idx >= 0) {
         try {
           tabs[idx].term.dispose();
-        } catch (_) {}
+        } catch {
+        /* ignore */
+      }
         tabs.splice(idx, 1);
         if (activeTab >= tabs.length) activeTab = Math.max(0, tabs.length - 1);
         renderTabs();
@@ -825,7 +897,7 @@ function onMessage(raw) {
       }
       if (msg.code === "session_attach_failed") {
         localStorage.removeItem(SESSION_KEY);
-        $("session").value = "";
+        $input("session").value = "";
         setStatus(`${msg.code}: ${msg.message}; creating new session…`);
         const layout = localStorage.getItem(LAYOUT_KEY);
         send({ type: "session_create", layout: layout || undefined });
@@ -838,10 +910,10 @@ function onMessage(raw) {
   }
 }
 
-function beginSession() {
-  const wanted = $("session").value.trim() || localStorage.getItem(SESSION_KEY) || "";
+function beginSession(): void {
+  const wanted = $input("session").value.trim() || localStorage.getItem(SESSION_KEY) || "";
   if (wanted) {
-    $("session").value = wanted;
+    $input("session").value = wanted;
     send({ type: "session_attach", session_id: wanted });
   } else {
     const layout = localStorage.getItem(LAYOUT_KEY);
@@ -849,17 +921,18 @@ function beginSession() {
   }
 }
 
-function disconnect() {
+function disconnect(): void {
   if (watchId) send({ type: "fs_unwatch", watch_id: watchId });
   watchId = null;
   if (openBufferId) send({ type: "editor_close", buffer_id: openBufferId });
   if (ws) {
     try {
       ws.close();
-    } catch (_) {}
+    } catch {
+        /* ignore */
+      }
   }
   ws = null;
-  authed = false;
   sessionId = null;
   hasEditor = false;
   pendingEditor.clear();
@@ -873,16 +946,16 @@ function disconnect() {
     '<div class="tree-empty" style="padding:0.75rem;color:var(--muted)">Connect to load remote tree</div>';
   connectBtn.disabled = false;
   disconnectBtn.disabled = true;
-  $("new-tab").disabled = true;
-  $("split-h").disabled = true;
-  $("split-v").disabled = true;
-  $("split-off").disabled = true;
+  $button("new-tab").disabled = true;
+  $button("split-h").disabled = true;
+  $button("split-v").disabled = true;
+  $button("split-off").disabled = true;
   setStatus("disconnected (session kept on backend if created)");
 }
 
-function connect() {
+function connect(): void {
   disconnect();
-  const url = $("url").value.trim();
+  const url = $input("url").value.trim();
   setStatus(`connecting ${url}…`);
   ws = new WebSocket(url);
   ws.addEventListener("open", () => {
@@ -890,11 +963,13 @@ function connect() {
     disconnectBtn.disabled = false;
     setStatus("socket open, waiting for hello…");
   });
-  ws.addEventListener("message", (ev) => onMessage(ev.data));
+  ws.addEventListener("message", (ev) => {
+    if (typeof ev.data === "string") onMessage(ev.data);
+  });
   ws.addEventListener("close", () => {
     connectBtn.disabled = false;
     disconnectBtn.disabled = true;
-    $("new-tab").disabled = true;
+    $button("new-tab").disabled = true;
     setStatus("disconnected (session kept on backend if created)");
   });
   ws.addEventListener("error", () => setStatus("websocket error"));
@@ -902,7 +977,7 @@ function connect() {
 
 connectBtn.addEventListener("click", connect);
 disconnectBtn.addEventListener("click", disconnect);
-$("editor-close").addEventListener("click", hideEditor);
+$button("editor-close").addEventListener("click", hideEditor);
 editorSaveBtn.addEventListener("click", () => {
   saveOpenBuffer();
 });
@@ -915,12 +990,12 @@ window.addEventListener("keydown", (ev) => {
   }
 });
 
-$("new-tab").addEventListener("click", () => {
+$button("new-tab").addEventListener("click", () => {
   const dims = tabs[activeTab]?.fit.proposeDimensions?.() || { cols: 80, rows: 24 };
   openPtyForDims(dims.cols || 80, dims.rows || 24);
 });
 
-function requestSplit(mode) {
+function requestSplit(mode: SplitMode): void {
   if (tabs.length < 1) {
     setStatus("open a shell first");
     return;
@@ -941,10 +1016,10 @@ function requestSplit(mode) {
   setStatus(`split ${mode}`);
 }
 
-$("split-h").addEventListener("click", () => requestSplit("horizontal"));
-$("split-v").addEventListener("click", () => requestSplit("vertical"));
+$button("split-h").addEventListener("click", () => requestSplit("horizontal"));
+$button("split-v").addEventListener("click", () => requestSplit("vertical"));
 
-$("split-off").addEventListener("click", () => {
+$button("split-off").addEventListener("click", () => {
   splitMode = null;
   pendingSplit = null;
   renderPanes();
@@ -956,9 +1031,11 @@ window.addEventListener("resize", () => {
   for (const tab of tabs) {
     try {
       tab.fit.fit();
-    } catch (_) {}
+    } catch {
+        /* ignore */
+      }
   }
 });
 
 const savedSession = localStorage.getItem(SESSION_KEY);
-if (savedSession) $("session").value = savedSession;
+if (savedSession) $input("session").value = savedSession;

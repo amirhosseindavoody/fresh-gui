@@ -41,11 +41,11 @@ enum Cmd {
         #[arg(long, default_value_t = 24)]
         rows: u16,
     },
-    /// Serve the xterm.js UI over HTTP (dev stand-in before / alongside Tauri).
+    /// Serve the built Vite UI over HTTP (dev stand-in before / alongside Tauri).
     ServeUi {
         #[arg(long, default_value = "127.0.0.1:1420")]
         listen: SocketAddr,
-        /// Directory with index.html (defaults to crate ui/ next to this source tree).
+        /// Directory with index.html (defaults to `ui/dist` from a Vite build).
         #[arg(long)]
         dir: Option<PathBuf>,
     },
@@ -163,15 +163,19 @@ async fn cmd_attach(args: &SharedArgs, cols: u16, rows: u16) -> Result<()> {
 }
 
 async fn cmd_serve_ui(listen: SocketAddr, dir: Option<PathBuf>) -> Result<()> {
-    let dir = dir.unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui"));
+    let dir = dir.unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("ui")
+            .join("dist")
+    });
     anyhow::ensure!(
         dir.join("index.html").is_file(),
-        "missing {}",
+        "missing {} — run `pixi run ui-install && pixi run ui-build` (or `pixi run ui` for Vite dev)",
         dir.join("index.html").display()
     );
 
     let app = Router::new().fallback_service(ServeDir::new(&dir));
-    info!(%listen, dir = %dir.display(), "serving xterm UI — open http://{listen}/");
+    info!(%listen, dir = %dir.display(), "serving UI — open http://{listen}/");
     let listener = tokio::net::TcpListener::bind(listen).await?;
     axum::serve(listener, app).await?;
     Ok(())

@@ -33,7 +33,12 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Setup Node
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.11"
+
+      - name: Setup Node (Tauri CLI)
         uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -47,6 +52,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
+
+      - name: Install UI deps
+        working-directory: crates/fresh-gui-app/ui
+        run: bun install --frozen-lockfile
 
       - name: Install npm deps (Tauri CLI)
         run: npm ci

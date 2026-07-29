@@ -4,7 +4,10 @@
   "version": "26.7.28001",
   "identifier": "com.amirhosseindavoody.fresh-gui",
   "build": {
-    "frontendDist": "../fresh-gui-app/ui"
+    "frontendDist": "../fresh-gui-app/ui/dist",
+    "beforeBuildCommand": "bun run --cwd ../fresh-gui-app/ui build",
+    "beforeDevCommand": "bun run --cwd ../fresh-gui-app/ui dev",
+    "devUrl": "http://127.0.0.1:1420"
   },
   "app": {
     "withGlobalTauri": true,

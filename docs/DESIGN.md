@@ -81,7 +81,7 @@ Logistics template: `pixi.toml` + Cargo workspace under `crates/`, `docs/DESIGN.
 | `fresh-gui-protocol` | no | all | Versioned messages, capability negotiation, errors |
 | `fresh-gui-backend` | yes (`fresh-gui-backend`) | linux | Daemon: bind transport, host Fresh session(s), serve protocol |
 | `fresh-gui-client` | no | all (host) | Dial, auth, reconnect, typed RPC / streams |
-| `fresh-gui-app` | yes (`fresh-gui`) | all | CLI (`ping`/`smoke`/`attach`/`serve-ui`) + `ui/` xterm assets |
+| `fresh-gui-app` | yes (`fresh-gui`) | all | CLI (`ping`/`smoke`/`attach`/`serve-ui`) + Vite/TS UI (`ui/`) |
 | `fresh-gui-desktop` | yes (`fresh-gui-desktop`) | windows | Tauri 2 window loading `fresh-gui-app/ui` |
 
 Dev machines (e.g. WSL) may build backend + protocol + client locally; the Windows GUI is cross-built or built on Windows CI / a Windows host.
@@ -121,7 +121,7 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 ### Phase 1 — Remote PTY loop (D4) ✅ (core)
 
 - Backend exposes authenticated PTY create/read/write/resize over WebSocket (`/ws`).
-- Host: Tauri 2 crate (`fresh-gui-desktop`) loads xterm.js UI; Linux/WSL can use `fresh-gui serve-ui` as a stand-in when webkit isn’t installed.
+- Host: Tauri 2 crate (`fresh-gui-desktop`) loads the Vite-built UI (`ui/dist`); Linux/WSL can use `pixi run ui` (Vite) or `fresh-gui serve-ui` (static `ui/dist`) when webkit isn’t installed.
 - Host CLI: `fresh-gui ping|smoke|attach` via `fresh-gui-client`.
 - Integration test: `pty_smoke_echo`.
 - Remaining / follow-ups: reconnect UX polish, measured latency on real SSH forwards.
@@ -159,6 +159,7 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 
 - Protocol `0.4.0`: `buffer_edit` / `buffer_changed` / `buffer_save` / `buffer_saved` with revision CAS.
 - Host UI: CodeMirror 5 pane; Ctrl/Cmd+S save; dirty indicator.
+- Host UI stack: Vite + TypeScript under `crates/fresh-gui-app/ui` (Bun via Pixi for install/scripts; xterm/CodeMirror from registry; no CDN).
 - Test: `editor_edit_save_reopen`.
 
 #### Phase 3c — fs_watch + thin scene ✅
@@ -178,8 +179,9 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 
 - Channels: conda-forge.
 - Platforms: at least `linux-64` for backend/dev on WSL; `win-64` added when GUI builds are routine.
-- Tasks: `check`, `test`, `build`, `clippy`, `fmt`, `update-version`.
+- Tasks: `check`, `test`, `build`, `clippy`, `fmt`, `ui` / `ui-install` / `ui-build` / `ui-serve`, `update-version`.
 - Rust toolchain via Pixi `rust` dependency (same idea as pixi-mise).
+- **Bun** via Pixi (`bun` conda-forge package) for the Vite/TS UI install and scripts — faster than npm; lockfile is `crates/fresh-gui-app/ui/bun.lock`.
 
 ### Fresh dependency
 
@@ -288,7 +290,7 @@ fresh-gui/
     fresh-gui-protocol/
     fresh-gui-backend/
     fresh-gui-client/
-    fresh-gui-app/            # CLI + xterm.js UI assets (`ui/`)
+    fresh-gui-app/            # CLI + Vite/TS UI (`ui/`, builds to `ui/dist`)
     fresh-gui-desktop/        # Tauri 2 host (Windows MVP)
   scripts/
     update-version.sh
