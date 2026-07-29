@@ -101,7 +101,7 @@ export const SHORTCUTS: Shortcut[] = [
   },
   {
     id: "settings.open",
-    label: "Open settings",
+    label: "Open settings file",
     defaultBindings: [{ [MOD_PROP]: true, key: "," }],
   },
 ];
