@@ -59,6 +59,11 @@ struct Args {
     /// Do not serve the web UI (WebSocket + health only).
     #[arg(long, env = "FRESH_GUI_NO_UI")]
     no_ui: bool,
+
+    /// Hostname (or host:port) shown in startup UI/WS URLs.
+    /// When unset, uses an assigned FQDN/domain if one is available; otherwise the bind address.
+    #[arg(long, env = "FRESH_GUI_PUBLIC_HOST")]
+    public_host: Option<String>,
 }
 
 #[tokio::main]
@@ -113,11 +118,11 @@ async fn main() -> Result<()> {
         resolve_ui_dir(args.ui_dir.as_deref())
     };
 
-    let http_url = format!("http://{bound}/");
-    let ws_url = format!("ws://{bound}/ws");
+    let (http_url, ws_url) = public_urls(bound, args.public_host.as_deref());
     info!(
         listen = %bound,
         preferred = %args.listen,
+        public_ui = %http_url,
         auth_required = state.require_auth,
         fs_root = %state.fs_root.root_display(),
         editor = state.editor.is_some(),
@@ -128,9 +133,16 @@ async fn main() -> Result<()> {
     println!("  fresh-gui ready");
     println!("  UI:  {http_url}");
     println!("  WS:  {ws_url}");
+    if bound.ip().is_loopback()
+        && !http_url.contains("127.0.0.1")
+        && !http_url.contains("[::1]")
+        && !http_url.contains("localhost")
+    {
+        println!("  bind: {bound} (loopback — reach the domain via proxy/tunnel if needed)");
+    }
     println!();
 
-    server::serve_listener(listener, state, ui_dir)
+    server::serve_listener(listener, state, ui_dir, &http_url, &ws_url)
         .await
         .context("server exited with error")
 }
@@ -181,6 +193,120 @@ async fn bind_listen(
         "no free port near {preferred} (tried {LISTEN_PORT_FALLBACK_SPAN} ports); \
          stop the other process or pass --listen HOST:PORT"
     );
+}
+
+/// Build UI/WS URLs for the startup banner, preferring an assigned host domain.
+fn public_urls(bound: SocketAddr, explicit_host: Option<&str>) -> (String, String) {
+    let host_port = display_host_port(bound, explicit_host);
+    (
+        format!("http://{host_port}/"),
+        format!("ws://{host_port}/ws"),
+    )
+}
+
+fn display_host_port(bound: SocketAddr, explicit_host: Option<&str>) -> String {
+    if let Some(host) = explicit_host.map(str::trim).filter(|s| !s.is_empty()) {
+        return if host_has_port(host) {
+            host.to_string()
+        } else {
+            format_host_port(host, bound.port())
+        };
+    }
+
+    if let Some(domain) = assigned_host_domain() {
+        return format_host_port(&domain, bound.port());
+    }
+
+    // Unspecified bind (0.0.0.0 / ::) is not a useful URL host.
+    if bound.ip().is_unspecified() {
+        return format_host_port("127.0.0.1", bound.port());
+    }
+
+    bound.to_string()
+}
+
+fn host_has_port(host: &str) -> bool {
+    if let Some(rest) = host.strip_prefix('[') {
+        // [ipv6]:port
+        return rest
+            .rsplit_once("]:")
+            .map(|(_, port)| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or(false);
+    }
+    // hostname:port or ipv4:port — reject multi-colon (bare IPv6).
+    if host.chars().filter(|c| *c == ':').count() != 1 {
+        return false;
+    }
+    host.rsplit_once(':')
+        .map(|(_, port)| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or(false)
+}
+
+fn format_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        // Bare IPv6 literal.
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Return a machine domain/FQDN when one looks assigned (not localhost).
+fn assigned_host_domain() -> Option<String> {
+    let candidates = [
+        std::env::var("FRESH_GUI_DOMAIN").ok(),
+        std::env::var("HOSTNAME").ok(),
+        hostname_command(&["-f"]),
+        hostname_command(&[]),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        if is_assigned_domain(&candidate) {
+            return Some(candidate.trim().to_string());
+        }
+    }
+    None
+}
+
+fn hostname_command(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("hostname")
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+fn is_assigned_domain(name: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty()
+        || name.eq_ignore_ascii_case("localhost")
+        || name.eq_ignore_ascii_case("(none)")
+        || name.eq_ignore_ascii_case("localhost.localdomain")
+    {
+        return false;
+    }
+    // Require a dotted name so short DHCP labels (e.g. "ubuntu") do not replace loopback.
+    let Some((label, rest)) = name.split_once('.') else {
+        return false;
+    };
+    if label.is_empty() || rest.is_empty() {
+        return false;
+    }
+    if name.ends_with(".localhost") || name.ends_with(".localdomain") {
+        return false;
+    }
+    // Reject pure IPs — those are already covered by the bind address.
+    if name.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    true
 }
 
 /// Pick a directory that contains `index.html` for the embedded web UI.
@@ -245,7 +371,11 @@ fn ui_dir_candidates() -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::ui_dir_candidates;
+    use super::{
+        display_host_port, format_host_port, host_has_port, is_assigned_domain, public_urls,
+        ui_dir_candidates,
+    };
+    use std::net::SocketAddr;
 
     #[test]
     fn ui_dir_candidates_include_packaged_share_layout() {
@@ -256,5 +386,46 @@ mod tests {
                 .any(|p| p.to_string_lossy().contains("share/fresh-gui/ui")),
             "expected a share/fresh-gui/ui candidate, got {candidates:?}"
         );
+    }
+
+    #[test]
+    fn assigned_domain_requires_dotted_non_local_name() {
+        assert!(is_assigned_domain("gui.example.com"));
+        assert!(is_assigned_domain("ip-10-0-0-1.ec2.internal"));
+        assert!(!is_assigned_domain("localhost"));
+        assert!(!is_assigned_domain("ubuntu"));
+        assert!(!is_assigned_domain("foo.localhost"));
+        assert!(!is_assigned_domain("127.0.0.1"));
+        assert!(!is_assigned_domain(""));
+    }
+
+    #[test]
+    fn host_has_port_detects_host_port_forms() {
+        assert!(host_has_port("example.com:8443"));
+        assert!(host_has_port("127.0.0.1:7420"));
+        assert!(host_has_port("[::1]:7420"));
+        assert!(!host_has_port("example.com"));
+        assert!(!host_has_port("::1"));
+    }
+
+    #[test]
+    fn explicit_public_host_wins_in_urls() {
+        let bound: SocketAddr = "127.0.0.1:7420".parse().unwrap();
+        let (http, ws) = public_urls(bound, Some("gui.example.com"));
+        assert_eq!(http, "http://gui.example.com:7420/");
+        assert_eq!(ws, "ws://gui.example.com:7420/ws");
+
+        let (http, ws) = public_urls(bound, Some("gui.example.com:9000"));
+        assert_eq!(http, "http://gui.example.com:9000/");
+        assert_eq!(ws, "ws://gui.example.com:9000/ws");
+    }
+
+    #[test]
+    fn display_host_port_formats_ipv6() {
+        assert_eq!(format_host_port("::1", 7420), "[::1]:7420");
+        let bound: SocketAddr = "[::1]:7420".parse().unwrap();
+        // Without an assigned domain / explicit host, keep the bound address.
+        let shown = display_host_port(bound, None);
+        assert!(shown.contains("7420"), "{shown}");
     }
 }
