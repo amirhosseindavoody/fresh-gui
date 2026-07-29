@@ -1506,6 +1506,7 @@ function disconnect(): void {
   connected = false;
   sessionId = null;
   hasEditor = false;
+  configPath = null;
   stripForceExpanded = false;
   pendingEditor.clear();
   pendingEdit.clear();
