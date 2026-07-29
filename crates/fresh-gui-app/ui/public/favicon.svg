@@ -1,7 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="fresh-gui">
-  <!-- Terminal chevron on Primer-dark canvas; accent matches default --accent. -->
-  <rect width="32" height="32" rx="7" fill="#0d1117"/>
-  <rect x="1.5" y="1.5" width="29" height="29" rx="6" fill="none" stroke="#21262d" stroke-width="1"/>
-  <path d="M8 10.5 L14 16 L8 21.5" fill="none" stroke="#3fb950" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M16 21.5 H24.5" fill="none" stroke="#e6edf3" stroke-width="2.6" stroke-linecap="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <rect width="32" height="32" rx="6" fill="#161b22"/>
+  <rect x="1" y="1" width="30" height="30" rx="5" fill="none" stroke="#30363d" stroke-width="1"/>
+  <path d="M8 10.5 L14 16 L8 21.5" fill="none" stroke="#3fb950" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M16 21.5 H24.5" fill="none" stroke="#f0f6fc" stroke-width="2.8" stroke-linecap="round"/>
 </svg>
