@@ -1,0 +1,62 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/prefix-dev/recipe-format/main/schema.json
+#
+# Install: `pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git`
+# Local packaging also works via path source. The build script fetches Fresh from
+# `vendor/fresh.rev` when the git submodule is not checked out (typical for --git).
+context:
+  version: 2026.728.1
+
+package:
+  name: fresh-gui-backend
+  version: ${{ version }}
+
+source:
+  path: ..
+  use_gitignore: true
+
+build:
+  number: 0
+  # Linux-only for MVP (matches workspace platforms + DESIGN remote backend).
+  skip: win or osx
+  script: build.sh
+
+requirements:
+  build:
+    - ${{ stdlib('c') }}
+    - ${{ compiler('c') }}
+    - ${{ compiler('rust') }}
+    - cargo-auditable
+    - cargo-bundle-licenses
+    - bun
+    - git
+  run:
+    # Shells spawned by the daemon use the system shell/PTY; no extra run deps.
+
+tests:
+  - script:
+      - fresh-gui-backend --help
+      - fresh-gui-backend --version
+      - test -f "${PREFIX}/share/fresh-gui/ui/index.html"
+  - package_contents:
+      bin:
+        - fresh-gui-backend
+      files:
+        exists:
+          - share/fresh-gui/ui/index.html
+
+about:
+  homepage: https://github.com/amirhosseindavoody/fresh-gui
+  repository: https://github.com/amirhosseindavoody/fresh-gui
+  summary: Linux remote daemon for fresh-gui (browser UI + PTY shells over WebSocket)
+  description: |
+    Installable Linux binary equivalent to `pixi run serve`: serves the host web UI
+    and WebSocket ADE API so you can open shells from a browser (or any host that
+    can reach the URL) before using the native GUI client.
+  license: GPL-2.0-only
+  license_file:
+    - LICENSE
+    - THIRDPARTY.yml
+
+extra:
+  recipe-maintainers:
+    - amirhosseindavoody

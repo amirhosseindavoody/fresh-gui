@@ -4,7 +4,22 @@ channels = ["conda-forge"]
 description = "Terminal-first ADE GUI (host) with remote Fresh backend"
 name = "fresh-gui"
 platforms = ["linux-64"]
+preview = ["pixi-build"]
 version = "2026.728.1"
+
+# Packaged Linux binary (`fresh-gui-backend` + share/fresh-gui/ui) — same role as
+# `pixi run serve`. Install with:
+#   pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git
+[package]
+name = "fresh-gui-backend"
+version = "2026.728.1"
+description = "Linux remote daemon for fresh-gui (browser UI + PTY shells)"
+authors = ["Amirhossein Davoody <amirhossein.davoody@gmail.com>"]
+license = "GPL-2.0"
+repository = "https://github.com/amirhosseindavoody/fresh-gui"
+
+[package.build]
+backend = { name = "pixi-build-rattler-build", version = "0.*" }
 
 [tasks]
 check = "cargo check --workspace --exclude fresh-gui-desktop"
@@ -22,6 +37,7 @@ ui-build = { cwd = "crates/fresh-gui-app/ui", cmd = "bun run build" }
 ui-install = { cwd = "crates/fresh-gui-app/ui", cmd = "bun install" }
 ui-serve = "cargo run -p fresh-gui-app -- serve-ui"
 desktop = "cargo run -p fresh-gui-desktop --"
+package = "pixi build -o dist"
 update-version = "scripts/update-version.sh"
 
 [dependencies]

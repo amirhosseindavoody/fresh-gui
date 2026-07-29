@@ -198,22 +198,7 @@ fn resolve_ui_dir(explicit: Option<&std::path::Path>) -> Option<PathBuf> {
         return None;
     }
 
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    candidates.push(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fresh-gui-app/ui/dist"),
-    );
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("crates/fresh-gui-app/ui/dist"));
-        candidates.push(cwd.join("ui/dist"));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("ui"));
-            candidates.push(parent.join("../ui/dist"));
-        }
-    }
-
-    for dir in candidates {
+    for dir in ui_dir_candidates() {
         let Ok(dir) = dir.canonicalize() else {
             continue;
         };
@@ -224,7 +209,52 @@ fn resolve_ui_dir(explicit: Option<&std::path::Path>) -> Option<PathBuf> {
     }
 
     tracing::warn!(
-        "no web UI found (expected crates/fresh-gui-app/ui/dist) — API only; run `pixi run ui-build`"
+        "no web UI found (expected share/fresh-gui/ui or crates/fresh-gui-app/ui/dist) — API only; \
+         install the pixi package or run `pixi run ui-build`"
     );
     None
+}
+
+/// Search order for packaged installs, then workspace / dev layouts.
+fn ui_dir_candidates() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // Pixi / conda package layout: $PREFIX/bin/fresh-gui-backend → ../share/fresh-gui/ui
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("../share/fresh-gui/ui"));
+            candidates.push(parent.join("ui"));
+            candidates.push(parent.join("../ui/dist"));
+        }
+    }
+    if let Ok(prefix) = std::env::var("CONDA_PREFIX") {
+        candidates.push(PathBuf::from(prefix).join("share/fresh-gui/ui"));
+    }
+
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fresh-gui-app/ui/dist"),
+    );
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("crates/fresh-gui-app/ui/dist"));
+        candidates.push(cwd.join("ui/dist"));
+        candidates.push(cwd.join("share/fresh-gui/ui"));
+    }
+
+    candidates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ui_dir_candidates;
+
+    #[test]
+    fn ui_dir_candidates_include_packaged_share_layout() {
+        let candidates = ui_dir_candidates();
+        assert!(
+            candidates
+                .iter()
+                .any(|p| p.to_string_lossy().contains("share/fresh-gui/ui")),
+            "expected a share/fresh-gui/ui candidate, got {candidates:?}"
+        );
+    }
 }

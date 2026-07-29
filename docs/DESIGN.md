@@ -178,6 +178,12 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 ### Phase 4 — Polish / packaging
 
 - Code signing, Linux backend package, auto-update story, hardening.
+- **Linux backend Pixi package (scaffold):** `[package]` + `recipe/` builds installable
+  `fresh-gui-backend` with UI under `share/fresh-gui/ui`
+  (`pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git`
+  / `pixi run package`) — same role as `pixi run serve` for browser shells before the
+  native GUI client. Recipe fetches the pinned Fresh tree via `vendor/fresh.rev` when
+  git submodules are not initialized (typical for `--git` installs).
 - (Unsigned Windows NSIS + MSI already available from Phase 1 packaging.)
 - Host **visual** polish is Phase UI / [UI.md](./UI.md), not this section.
 
@@ -187,9 +193,11 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 
 - Channels: conda-forge.
 - Platforms: at least `linux-64` for backend/dev on WSL; `win-64` added when GUI builds are routine.
-- Tasks: `check`, `test`, `build`, `clippy`, `fmt`, `ui` / `ui-install` / `ui-build` / `ui-serve`, `update-version`.
+- Tasks: `check`, `test`, `build`, `clippy`, `fmt`, `ui` / `ui-install` / `ui-build` / `ui-serve`, `package`, `update-version`.
 - Rust toolchain via Pixi `rust` dependency (same idea as pixi-mise).
 - **Bun** via Pixi (`bun` conda-forge package) for the Vite/TS UI install and scripts — faster than npm; lockfile is `crates/fresh-gui-app/ui/bun.lock`.
+- **Package build:** `preview = ["pixi-build"]` + `pixi-build-rattler-build` + `recipe/recipe.yaml`
+  (mirrors pixi-mise). Requires Fresh submodule present for path builds.
 
 ### Fresh dependency
 
@@ -245,9 +253,9 @@ CalVer compatible with Cargo: `YYYY.MMDD.N` (e.g. `2026.728.1`). `scripts/update
 | **C. Submodule + pin by git rev** ✓ | Explicit pin, portable clone, editable tree | Extra `submodule update` step |
 | D. crates.io only | Clean | APIs may not ship for this use |
 
-**Current pin (Phase 0):** `f5f2c4639f7d5ed3d6b3ef3d2343365ced426401` (`Merge upstream/master into master` on the integration fork).
+**Current pin (Phase 0):** `f5f2c4639f7d5ed3d6b3ef3d2343365ced426401` (`Merge upstream/master into master` on the integration fork). Also recorded in `vendor/fresh.rev` for package builds that cannot rely on submodule checkout.
 
-**Remote:** prefer the fork used for integration work (`https://github.com/amirhosseindavoody/fresh.git`); bump the pin with `git -C vendor/fresh fetch && git -C vendor/fresh checkout --detach <rev>` then stage `vendor/fresh` in this repo. Upstream tracking: `https://github.com/sinelaw/fresh.git`.
+**Remote:** prefer the fork used for integration work (`https://github.com/amirhosseindavoody/fresh.git`); bump the pin with `git -C vendor/fresh fetch && git -C vendor/fresh checkout --detach <rev>` then stage `vendor/fresh` **and** update `vendor/fresh.rev` to the same SHA. Upstream tracking: `https://github.com/sinelaw/fresh.git`.
 
 **Clone:**
 
