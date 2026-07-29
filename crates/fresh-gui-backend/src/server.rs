@@ -34,6 +34,8 @@ pub async fn serve_listener(
     listener: tokio::net::TcpListener,
     state: Arc<AppState>,
     ui_dir: Option<std::path::PathBuf>,
+    http_url: &str,
+    ws_url: &str,
 ) -> Result<()> {
     let addr = listener.local_addr()?;
     let api = Router::new()
@@ -49,9 +51,9 @@ pub async fn serve_listener(
         api
     };
 
-    info!(%addr, "listening (http UI + ws path /ws)");
+    info!(%addr, %http_url, %ws_url, "listening (http UI + ws path /ws)");
     // Keep a second clear line in case the startup banner scrolled off.
-    eprintln!("listening on http://{addr}/  (ws://{addr}/ws)");
+    eprintln!("listening on {http_url}  ({ws_url})");
     axum::serve(listener, app).await?;
     Ok(())
 }
