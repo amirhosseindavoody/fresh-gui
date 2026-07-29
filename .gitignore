@@ -12,7 +12,9 @@ crates/fresh-gui-backend/data/
 # Editors / OS
 .idea/
 .vscode/
-.cursor/
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/**
 *.swp
 .DS_Store
 

@@ -1,0 +1,34 @@
+---
+description: Prefer Fresh editor capabilities over custom fresh-gui reimplementations
+alwaysApply: true
+---
+
+# Leverage fresh-editor before inventing
+
+For every new feature or behavior change in **fresh-gui**, treat [Fresh](https://github.com/sinelaw/fresh) (`vendor/fresh`, especially `fresh-editor`) as the source of truth. Prefer reusing, exposing, or bridging existing Fresh capabilities over building a parallel solution in the host UI or backend glue.
+
+## Required approach
+
+1. **Search Fresh first** — Before designing a custom implementation, inspect `vendor/fresh` (config, actions, buffers, PTY, FS/explorer, LSP, search, keybindings, plugins, etc.) and how `crates/fresh-gui-backend` already embeds it (`editor_worker`, protocol messages).
+2. **Reuse or thin-wrap** — Prefer:
+   - Calling into Fresh APIs / types already linked by the backend
+   - Extending the host↔backend protocol to surface a Fresh capability
+   - Aligning config keys / semantics with Fresh where that is intentional
+3. **Only then invent** — Implement something fresh-gui-specific when Fresh truly lacks the capability, cannot expose it remotely, or the work is purely host chrome (layout, windowing, browser/Tauri UX that Fresh does not own).
+4. **Say why** — When a custom path is necessary, briefly note in the PR/commit what Fresh was checked and why it was insufficient (missing API, TUI-only, wrong layer, etc.).
+
+## Do not
+
+- Reimplement buffer editing, language intelligence, PTY semantics, or other editor-core logic in the TypeScript UI or ad-hoc backend code when Fresh already owns it
+- Fork Fresh behavior in the GUI “for convenience” without checking whether Fresh already has a setting, action, or service for it
+- Duplicate Fresh config models under different names when mirroring Fresh is the goal (see existing `terminal.shell` alignment)
+
+## Where to look
+
+- `vendor/fresh/crates/fresh-editor/` — editor core, config, actions, services
+- `vendor/fresh/crates/fresh-core/` and sibling crates — shared primitives
+- `crates/fresh-gui-backend/src/editor_worker.rs` — in-process Fresh embedding
+- `crates/fresh-gui-protocol/` — existing host↔remote surface area
+- `docs/DESIGN.md` — “Fresh as backend of truth” architecture
+
+Host UI (`crates/fresh-gui-app/ui`) should remain a client of the protocol and Fresh-backed services, not a second editor engine.
