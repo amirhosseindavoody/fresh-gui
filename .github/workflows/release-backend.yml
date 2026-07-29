@@ -36,8 +36,12 @@ jobs:
     name: Bump · package · release
     runs-on: ubuntu-22.04
     timeout-minutes: 180
-    # Avoid publishing releases from forks.
-    if: github.repository == 'amirhosseindavoody/fresh-gui'
+    # Avoid publishing releases from forks. Skip bot release commits if they
+    # ever re-trigger (e.g. PAT instead of GITHUB_TOKEN).
+    if: >-
+      github.repository == 'amirhosseindavoody/fresh-gui' &&
+      (github.event_name != 'push' ||
+       !startsWith(github.event.head_commit.message, 'chore: release'))
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -125,15 +129,26 @@ jobs:
             echo "No version-file changes to commit"
           fi
 
-          if git rev-parse "${TAG}" >/dev/null 2>&1; then
-            echo "Tag ${TAG} already exists locally"
-          else
-            git tag -a "${TAG}" -m "fresh-gui-backend ${VERSION}"
-          fi
+          # Main may move while the long package build runs (other merges).
+          # Rebase + retry so we do not fail after a successful build.
+          for attempt in 1 2 3 4 5; do
+            if git push origin HEAD:main; then
+              break
+            fi
+            if [[ "${attempt}" -eq 5 ]]; then
+              echo "Failed to push version bump to main after retries" >&2
+              exit 1
+            fi
+            echo "Push to main rejected (attempt ${attempt}); rebasing onto origin/main…"
+            git fetch origin main
+            git rebase origin/main
+          done
 
-          # GITHUB_TOKEN pushes do not re-run workflows.
-          git push origin HEAD:main
-          git push origin "${TAG}"
+          # Tag the commit that landed on main (after any rebase).
+          git tag -f -a "${TAG}" -m "fresh-gui-backend ${VERSION}"
+          if ! git push origin "${TAG}"; then
+            echo "Tag ${TAG} may already exist on origin; continuing"
+          fi
 
       - name: Create GitHub Release
         env:

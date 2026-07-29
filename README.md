@@ -119,7 +119,7 @@ Deeper design notes: [docs/DESIGN.md](./docs/DESIGN.md), [docs/UI.md](./docs/UI.
 
 ## Releases
 
-CalVer `YYYY.MMDD.N`. Pushes to `main` bump the version, build the linux-64 package, and publish a [GitHub Release](https://github.com/amirhosseindavoody/fresh-gui/releases) (see `.github/workflows/release-backend.yml`). Manual bump: `pixi run update-version`.
+CalVer `YYYY.MMDD.N`. Pushes to `main` bump the version, build the linux-64 package, and publish a [GitHub Release](https://github.com/amirhosseindavoody/fresh-gui/releases) (see `.github/workflows/release-backend.yml`). The version-bump commit rebases if `main` moved during the build. Manual bump: `pixi run update-version`.
 
 ## License
 
