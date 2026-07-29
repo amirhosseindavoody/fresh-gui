@@ -9,6 +9,7 @@
 # Editors / OS
 .idea/
 .vscode/
+.cursor/
 *.swp
 .DS_Store
 

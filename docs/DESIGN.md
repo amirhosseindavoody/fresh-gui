@@ -111,10 +111,11 @@ Wire framing (JSON over WebSocket vs length-prefixed MessagePack/CBOR, etc.) can
 
 ## 6. MVP Scope (phased)
 
-### Phase 0 — Scaffold (this commit)
+### Phase 0 — Scaffold ✅
 
 - `docs/DESIGN.md`, Pixi + Cargo workspace, crate stubs, README.
 - No Fresh linkage yet; protocol types are placeholders.
+- Decisions D1–D5 resolved; `vendor/fresh` submodule pinned.
 
 ### Phase 1 — Remote PTY loop (D4)
 
