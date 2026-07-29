@@ -2,7 +2,7 @@
 
 import type { FsEntry } from "./protocol";
 import { basename, escapeHtml } from "./dom";
-import { fileIcon } from "./icons";
+import { fileIcon, iconSvg } from "./icons";
 
 export type TreeListFn = (path: string) => Promise<{ path: string; entries: FsEntry[] }>;
 
@@ -33,7 +33,10 @@ type Row = {
   hasChildren: boolean;
 };
 
-const ROW_HEIGHT = 24;
+/** Keep in sync with `--tree-row-height` / indent tokens in `tokens.css`. */
+const ROW_HEIGHT = 22;
+const TREE_INDENT = 12;
+const TREE_BASE = 8;
 
 /** Whether an FS entry should appear in the explorer for the given visibility prefs. */
 export function isTreeEntryVisible(entry: FsEntry, vis: TreeVisibility): boolean {
@@ -341,41 +344,71 @@ export class VirtualTree {
         el = document.createElement("div");
         el.className = "vtree-row";
         el.dataset.path = row.path;
+        el.setAttribute("role", "treeitem");
         el.addEventListener("click", (ev) => {
           ev.preventDefault();
-          void this.activateRow(row, false);
+          const current = this.rows.find((r) => r.path === el!.dataset.path);
+          if (current) void this.activateRow(current, false);
         });
         el.addEventListener("dblclick", (ev) => {
           ev.preventDefault();
-          if (row.kind === "file") {
-            this.callbacks.noteInteraction?.();
-            this.callbacks.onOpenFile?.(
-              { name: row.name, path: row.path, kind: row.kind },
-              false,
-            );
-          }
+          const current = this.rows.find((r) => r.path === el!.dataset.path);
+          if (!current || current.kind !== "file") return;
+          this.callbacks.noteInteraction?.();
+          this.callbacks.onOpenFile?.(
+            { name: current.name, path: current.path, kind: current.kind },
+            false,
+          );
         });
         el.addEventListener("contextmenu", (ev) => {
           ev.preventDefault();
+          const current = this.rows.find((r) => r.path === el!.dataset.path);
+          if (!current) return;
           this.callbacks.noteInteraction?.();
-          this.selected = row.path;
-          this.callbacks.onSelect?.(this.entryForRow(row));
-          this.callbacks.onContextMenu?.(this.entryForRow(row), ev.clientX, ev.clientY);
+          this.selected = current.path;
+          this.callbacks.onSelect?.(this.entryForRow(current));
+          this.callbacks.onContextMenu?.(this.entryForRow(current), ev.clientX, ev.clientY);
           this.schedulePaint();
         });
         this.viewport.appendChild(el);
       }
       el.style.top = `${i * ROW_HEIGHT}px`;
-      el.style.paddingLeft = `${0.4 + row.depth * 0.85}rem`;
       el.classList.toggle("selected", this.selected === row.path);
-      const twist = row.kind === "dir" ? (row.expanded ? "▾" : "▸") : "";
-      const kind = fileIcon(row.name, row.kind);
-      el.innerHTML = `<span class="twist">${twist}</span><span class="kind">${escapeHtml(kind)}</span><span class="name">${escapeHtml(row.name)}</span>`;
+      el.classList.toggle("is-dir", row.kind === "dir");
+      el.classList.toggle("expanded", row.kind === "dir" && row.expanded);
+      el.dataset.depth = String(row.depth);
+      el.dataset.kind = row.kind;
+      if (row.kind === "dir") {
+        el.setAttribute("aria-expanded", row.expanded ? "true" : "false");
+      } else {
+        el.removeAttribute("aria-expanded");
+      }
+      el.innerHTML = this.rowHtml(row);
     }
 
     for (const [path, el] of existing) {
       if (!keep.has(path)) el.remove();
     }
+  }
+
+  private rowHtml(row: Row): string {
+    const indentWidth = Math.max(0, row.depth) * TREE_INDENT;
+    const guides: string[] = [];
+    for (let d = 0; d < row.depth; d++) {
+      const left = TREE_BASE + d * TREE_INDENT + TREE_INDENT / 2;
+      guides.push(`<span class="vtree-guide" style="left:${left}px"></span>`);
+    }
+    const icon = fileIcon(row.name, row.kind, row.expanded);
+    const twist =
+      row.kind === "dir"
+        ? `<span class="vtree-twist" aria-hidden="true"></span>`
+        : `<span class="vtree-twist is-leaf" aria-hidden="true"></span>`;
+    return (
+      `<span class="vtree-indent" style="width:${TREE_BASE + indentWidth}px">${guides.join("")}</span>` +
+      twist +
+      `<span class="vtree-icon ${escapeHtml(icon.tone ?? "")}" aria-hidden="true">${iconSvg(icon)}</span>` +
+      `<span class="vtree-name">${escapeHtml(row.name)}</span>`
+    );
   }
 
   private entryForRow(row: Row): FsEntry {

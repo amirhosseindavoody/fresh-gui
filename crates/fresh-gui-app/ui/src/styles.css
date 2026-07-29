@@ -180,10 +180,10 @@ input#session {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 0.25rem;
+  gap: 0.15rem;
   padding: 0.35rem 0;
   border-right: 1px solid var(--border);
-  background: var(--panel);
+  background: color-mix(in srgb, var(--panel) 88%, #000);
   z-index: 2;
 }
 
@@ -234,16 +234,17 @@ input#session {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0.45rem 0.65rem;
+  padding: 0 0.55rem 0 1.15rem;
   border-bottom: 1px solid var(--border);
   height: var(--tab-height);
+  background: color-mix(in srgb, var(--bg-elevated) 92%, var(--bg));
 }
 
 .sidebar-head h2 {
   margin: 0;
-  font-size: 0.72rem;
+  font-size: 0.68rem;
   font-weight: 600;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--muted);
 }
@@ -260,10 +261,10 @@ input#session {
 
 .tree {
   flex: 1;
-  overflow: auto;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  padding: 0.35rem 0;
+  overflow: hidden;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  padding: 0.2rem 0 0.35rem;
   user-select: none;
 }
 
@@ -722,7 +723,7 @@ input#session {
   color: color-mix(in srgb, var(--muted) 80%, var(--accent));
 }
 
-/* Virtual tree */
+/* Virtual tree — VS Code–like indent guides + icons */
 .vtree {
   flex: 1;
   min-height: 0;
@@ -738,8 +739,9 @@ input#session {
   position: absolute;
   inset: 0;
   overflow: auto;
-  font-family: var(--font-mono);
-  font-size: 12px;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: var(--tree-row-height);
 }
 
 .vtree-spacer {
@@ -752,36 +754,171 @@ input#session {
   position: absolute;
   left: 0;
   right: 0;
-  height: 24px;
+  height: var(--tree-row-height);
   display: flex;
   align-items: center;
-  gap: 0.35rem;
+  gap: 0;
   padding-right: 0.5rem;
   cursor: pointer;
   white-space: nowrap;
   box-sizing: border-box;
+  color: var(--text);
 }
 
 .vtree-row:hover {
-  background: color-mix(in srgb, var(--panel-2) 80%, transparent);
+  background: var(--list-hover);
 }
 
 .vtree-row.selected {
-  background: var(--accent-dim);
+  background: var(--list-active);
 }
 
-.vtree-row .twist,
-.vtree-row .kind {
-  width: 1.1rem;
-  color: var(--muted);
-  text-align: center;
+.vtree-row.selected:hover {
+  background: var(--list-active);
+}
+
+.vtree-indent {
+  position: relative;
   flex-shrink: 0;
-  font-size: 10px;
-  letter-spacing: -0.02em;
+  align-self: stretch;
+  height: 100%;
 }
 
-.vtree-row .kind:empty {
-  width: 0.35rem;
+.vtree-guide {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  margin-left: -0.5px;
+  background: var(--tree-guide);
+  pointer-events: none;
+}
+
+.vtree-twist {
+  position: relative;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+}
+
+.vtree-twist.is-leaf::before {
+  content: none;
+}
+
+.vtree-twist:not(.is-leaf)::before {
+  content: "";
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-width: 4px 0 4px 6px;
+  border-color: transparent transparent transparent currentColor;
+  transform: translateX(1px);
+  transition: transform 0.12s ease;
+}
+
+.vtree-row.expanded > .vtree-twist:not(.is-leaf)::before {
+  transform: translateX(1px) rotate(90deg);
+}
+
+.vtree-icon {
+  width: 16px;
+  height: 16px;
+  margin: 0 4px 0 2px;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  color: var(--icon-file);
+}
+
+.vtree-icon-svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+
+.vtree-icon.icon-folder {
+  color: var(--icon-folder);
+}
+.vtree-icon.icon-file {
+  color: var(--icon-file);
+}
+.vtree-icon.icon-symlink {
+  color: var(--icon-symlink);
+}
+.vtree-icon.icon-rs {
+  color: var(--icon-rs);
+}
+.vtree-icon.icon-ts {
+  color: var(--icon-ts);
+}
+.vtree-icon.icon-js {
+  color: var(--icon-js);
+}
+.vtree-icon.icon-py {
+  color: var(--icon-py);
+}
+.vtree-icon.icon-md {
+  color: var(--icon-md);
+}
+.vtree-icon.icon-json {
+  color: var(--icon-json);
+}
+.vtree-icon.icon-toml {
+  color: var(--icon-toml);
+}
+.vtree-icon.icon-yaml {
+  color: var(--icon-yaml);
+}
+.vtree-icon.icon-css {
+  color: var(--icon-css);
+}
+.vtree-icon.icon-html {
+  color: var(--icon-html);
+}
+.vtree-icon.icon-svg {
+  color: var(--icon-svg);
+}
+.vtree-icon.icon-shell {
+  color: var(--icon-shell);
+}
+.vtree-icon.icon-go {
+  color: var(--icon-go);
+}
+.vtree-icon.icon-c,
+.vtree-icon.icon-cpp {
+  color: var(--icon-c);
+}
+.vtree-icon.icon-java {
+  color: var(--icon-java);
+}
+.vtree-icon.icon-rb {
+  color: var(--icon-rb);
+}
+.vtree-icon.icon-php {
+  color: var(--icon-php);
+}
+.vtree-icon.icon-sql {
+  color: var(--icon-sql);
+}
+.vtree-icon.icon-lock {
+  color: var(--icon-lock);
+}
+.vtree-icon.icon-text {
+  color: var(--icon-text);
+}
+.vtree-icon.icon-docker {
+  color: var(--icon-docker);
+}
+
+.vtree-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
 }
 
 .vtree.loading::after {

@@ -31,6 +31,37 @@
   /* Opaque enough for canvas selection (xterm does not soft-blend well). */
   --term-selection: #3fb95080;
   --term-selection-fg: #ffffff;
+  /* Explorer tree (VS Code–like density) */
+  --tree-row-height: 22px;
+  --tree-indent: 12px;
+  --tree-guide: color-mix(in srgb, var(--border) 90%, transparent);
+  --list-hover: color-mix(in srgb, var(--text) 7%, transparent);
+  --list-active: var(--accent-dim);
+  --icon-folder: #c9a227;
+  --icon-file: #8b949e;
+  --icon-rs: #dea584;
+  --icon-ts: #519aba;
+  --icon-js: #cbcb41;
+  --icon-py: #519aba;
+  --icon-md: #519aba;
+  --icon-json: #cbcb41;
+  --icon-toml: #9b859d;
+  --icon-yaml: #cb171e;
+  --icon-css: #519aba;
+  --icon-html: #e37933;
+  --icon-svg: #c5c5c5;
+  --icon-shell: #89d185;
+  --icon-go: #00add8;
+  --icon-c: #519aba;
+  --icon-cpp: #519aba;
+  --icon-java: #b07219;
+  --icon-rb: #cc342d;
+  --icon-php: #4f5d95;
+  --icon-sql: #dad8d8;
+  --icon-lock: #a1a1a1;
+  --icon-text: #8b949e;
+  --icon-docker: #2496ed;
+  --icon-symlink: #8b949e;
 }
 
 :root[data-theme="light"] {
@@ -54,4 +85,31 @@
   /* Stronger than accent@33% — that was nearly invisible on #f6f8fa. */
   --term-selection: #2da44ea6;
   --term-selection-fg: #0a1628;
+  --tree-guide: color-mix(in srgb, var(--border) 80%, transparent);
+  --list-hover: color-mix(in srgb, var(--text) 6%, transparent);
+  --icon-folder: #d4a72c;
+  --icon-file: #656d76;
+  --icon-rs: #a3540c;
+  --icon-ts: #3178c6;
+  --icon-js: #b08900;
+  --icon-py: #3572a5;
+  --icon-md: #0550ae;
+  --icon-json: #a16207;
+  --icon-toml: #6e7781;
+  --icon-yaml: #cf222e;
+  --icon-css: #6639b7;
+  --icon-html: #cf4620;
+  --icon-svg: #656d76;
+  --icon-shell: #1a7f37;
+  --icon-go: #007d9c;
+  --icon-c: #0550ae;
+  --icon-cpp: #0550ae;
+  --icon-java: #b07219;
+  --icon-rb: #cf222e;
+  --icon-php: #4f5d95;
+  --icon-sql: #656d76;
+  --icon-lock: #8b949e;
+  --icon-text: #656d76;
+  --icon-docker: #1d63ed;
+  --icon-symlink: #656d76;
 }

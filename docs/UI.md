@@ -86,7 +86,7 @@ Before the first successful connect, the strip is expanded (URL / token / Connec
 |-------|----------|
 | **Connect UX** | Always-on strip (compact when connected; expand inline to edit). No modal-only connect flow. |
 | **Default keybindings** | Match **Terax** pane/tab shortcuts (see §6). Remappable later via settings. |
-| **File tree icons** | UI-1 text-only; **UI-3:** lightweight extension badges (`src/icons.ts`), not a full icon pack. |
+| **File tree icons** | Lightweight inline SVG icons + typed color tones (`src/icons.ts`); VS Code–style indent guides and chevrons in the virtualized tree. No full Material icon pack. |
 | **UI framework** | **Stay on Vite + TypeScript modules.** Do not adopt Preact/React for large trees or pane polish. Revisit only if hand-rolled pane trees become unmaintainable. |
 | **Large trees (~10k files)** | Host concern: keep lazy one-level `fs_list`; add **row virtualization** + watch discipline when polishing the explorer. Not a Fresh-editor problem; not a reason to add React. |
 | **Editor authority UX** | **Quiet day-to-day:** normal file-tab chrome (path, dirty `•`, save). Surface remote/Fresh authority only on **connection state**, **save errors**, and **conflicts** — not permanent “remote buffer” badging. |
@@ -131,7 +131,7 @@ type PaneNode =
 - **One accent** for focus/active (connection healthy, active tab, primary button). Avoid purple-glow / multi-shadow AI aesthetics.
 - **Typography:** keep expressive mono for terminal + paths (`IBM Plex Mono` or similar); UI chrome uses a paired sans. No Inter/Roboto/Arial defaults as the brand face.
 - **Surfaces:** subtle elevation via border + slight fill shifts, not card grids. Resizable gutters like Terax (`react-resizable-panels` or CSS equivalent).
-- **Icons:** Lightweight extension badges in the explorer (UI-3). Full SVG icon packs remain optional later.
+- **Icons:** Lightweight SVG folder/file icons with extension color tones in the explorer; indent guides + chevrons (VS Code–like). Full Material icon packs remain optional later.
 
 ### 5.2 Tokens (illustrative)
 
@@ -245,7 +245,7 @@ Connection errors and auth failures use inline strip status; never modal loops.
 
 - Recursive splits (max 4 leaves/tab, `src/panes.ts`); replaced the old global two-pane mode — each terminal tab now owns its own `PaneNode` tree and a `leaves: Map<ptyId, TermBundle>`.
 - Shortcut registry (`src/shortcuts.ts`) wired via `installShortcuts`; command palette (`src/palette.ts`, `Mod+P`) lists all shortcuts and runs them by id.
-- Tree keyboard navigation (arrow keys, Enter) via the virtualized tree (still text-only glyphs).
+- Tree keyboard navigation (arrow keys, Enter) via the virtualized tree.
 - Explorer: **virtualized rows** (`src/tree.ts` `VirtualTree`) — lazy one-level `fs_list` + windowed row rendering, so expanded views stay responsive with large trees.
 - Richer layout blob (`version: 2`) in `layout_set` / localStorage, including each terminal tab's `paneTree` and `activeLeafId`.
 - Simplifications: pane-tree restore across `session_attach` only recreates the exact multi-pane layout when the reattached ptys match a persisted tab's leaf ids 1:1; otherwise it falls back to one terminal tab per pty. Editor tabs are not restored across reattach (server-side buffers aren't rehydrated by path yet).
@@ -256,7 +256,7 @@ Connection errors and auth failures use inline strip status; never modal loops.
 - Explorer re-roots to the active terminal leaf cwd (Terax `explorerRoot`); `fs_authorize` expands the FS sandbox when cwd leaves `--root` (e.g. `~/csv-utils`). Editor tabs keep the last terminal cwd.
 - Header find bar for terminal buffer (`@xterm/addon-search`, `Mod+F`); editor uses CodeMirror search panel.
 - Activity bar with Explorer (toggles sidebar) + Settings entry; explorer remains the only sidebar view until SCM exists.
-- Lightweight file-type badges in the virtualized tree (`src/icons.ts`) — no heavy icon pack.
+- Lightweight SVG file/folder icons + indent guides in the virtualized tree (`src/icons.ts`, `src/tree.ts`) — no heavy icon pack.
 - Skipped `fs_list` pagination for now — row virtualization covers large trees; revisit only if a single directory listing becomes a protocol bottleneck.
 - Theme preference (`system` / `light` / `dark`) + CSS tokens (`data-theme` resolved). Settings live in backend `config.json` (`ui` + `terminal.shell`); the activity-bar / `Mod+,` entry opens that file in the editor (no modal).
 - Path context menus on tabs and the file tree (copy absolute / relative / name).
