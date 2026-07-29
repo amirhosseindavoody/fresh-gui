@@ -1,24 +1,23 @@
 /** Phase UI-3 host shell: OSC 7 cwd, find bar, activity bar, icons, light theme + settings. */
 import type { EditorView } from "@codemirror/view";
-import "./styles.css";
 import {
   PROTOCOL_VERSION,
   type ClientMessage,
   type FsEntry,
   type PtyInfo,
   type ServerMessage,
-} from "./protocol";
-import { $, $button, $input, b64decode, b64encode, basename, relativePath } from "./dom";
-import { applyEditorFontSize, applyEditorTheme, createEditorView, openEditorSearch, revealEditorLocation } from "./editor";
-import { isMarkdownPath, updateMarkdownPreview } from "./markdown-preview";
+} from "../protocol";
+import { $, $button, $input, b64decode, b64encode, basename, relativePath } from "../dom";
+import { applyEditorFontSize, applyEditorTheme, createEditorView, openEditorSearch, revealEditorLocation } from "../editor";
+import { isMarkdownPath, updateMarkdownPreview } from "../markdown-preview";
 import {
   applyTerminalFontSize,
   applyTerminalTheme,
   createTerminal,
   disposeTerminal,
   type TermBundle,
-} from "./terminal";
-import { feedOsc7Chunk } from "./osc7";
+} from "../terminal";
+import { feedOsc7Chunk } from "../osc7";
 import {
   MAX_LEAVES_PER_TAB,
   type PaneNode,
@@ -29,30 +28,30 @@ import {
   nextLeafId,
   removeLeaf,
   splitLeaf,
-} from "./panes";
-import { installShortcuts, type ShortcutHandlers, type ShortcutId } from "./shortcuts";
+} from "../panes";
+import { installShortcuts, type ShortcutHandlers, type ShortcutId } from "../shortcuts";
 import {
   defaultPaletteCommands,
   openGotoFile,
   openPalette,
   setGotoFileHandler,
   setPaletteCommands,
-} from "./palette";
-import { VirtualTree } from "./tree";
-import { applyTheme, getResolvedTheme, initTheme, onResolvedThemeChange, resolveTheme } from "./theme";
+} from "../palette";
+import { VirtualTree } from "../tree";
+import { applyTheme, getResolvedTheme, initTheme, onResolvedThemeChange, resolveTheme } from "../theme";
 import {
   loadSettings,
   normalizeUiSettings,
   saveSettings,
   uiSettingsFromConfigText,
   type UiSettings,
-} from "./settings";
-import { closeFindBar, openFindBar, setSearchTarget } from "./search";
+} from "../settings";
+import { closeFindBar, openFindBar, setSearchTarget } from "../search";
 import {
   copyToClipboard,
   openContextMenu,
   type ContextMenuItem,
-} from "./context-menu";
+} from "../context-menu";
 
 const SESSION_KEY = "fresh-gui.sessionId";
 const LAYOUT_KEY = "fresh-gui.layout";
@@ -126,47 +125,41 @@ interface LayoutBlob {
 /** Deferred intent consumed by the next `pty_opened` reply (requests are FIFO on one socket). */
 type PtyIntent = { kind: "newTab" } | { kind: "split"; tabId: string; leafId: string; direction: SplitDir };
 
-const connectionStrip = $("connection-strip");
-const stripToggle = $button("strip-toggle");
-const stripCompact = $("strip-compact");
-const stripHost = $("strip-host");
-const stripSession = $("strip-session");
-const stripState = $("strip-state");
-const connectBtn = $button("connect");
-const disconnectBtn = $button("disconnect");
-const workspaceEl = $("workspace");
-const sidebarToggle = $button("sidebar-toggle");
-const sidebarResizer = $("sidebar-resizer");
-const treeEl = $("tree");
-const tabsEl = $("tabs");
-const tabPill = $("tab-pill");
-const panesEl = $("panes");
-const emptyStack = $("empty-stack");
-const terminalStack = $("terminal-stack");
-const editorStack = $("editor-stack");
-const statusLeft = $("status-left");
-const statusRight = $("status-right");
-const editorSaveBtn = $button("editor-save");
-const editorMdPreviewBtn = $button("editor-md-preview");
-const newTabBtn = $button("new-tab");
-const splitHBtn = $button("split-h");
-const splitVBtn = $button("split-v");
-const splitOffBtn = $button("split-off");
-const findBtn = $button("find-btn");
-const activityExplorer = $button("activity-explorer");
-const activitySettings = $button("activity-settings");
+let connectionStrip: HTMLElement;
+let stripToggle: HTMLButtonElement;
+let stripCompact: HTMLElement;
+let stripHost: HTMLElement;
+let stripSession: HTMLElement;
+let stripState: HTMLElement;
+let connectBtn: HTMLButtonElement;
+let disconnectBtn: HTMLButtonElement;
+let workspaceEl: HTMLElement;
+let sidebarToggle: HTMLButtonElement;
+let sidebarResizer: HTMLElement;
+let treeEl: HTMLElement;
+let tabsEl: HTMLElement;
+let tabPill: HTMLElement;
+let panesEl: HTMLElement;
+let emptyStack: HTMLElement;
+let terminalStack: HTMLElement;
+let editorStack: HTMLElement;
+let statusLeft: HTMLElement;
+let statusRight: HTMLElement;
+let editorSaveBtn: HTMLButtonElement;
+let editorMdPreviewBtn: HTMLButtonElement;
+let newTabBtn: HTMLButtonElement;
+let splitHBtn: HTMLButtonElement;
+let splitVBtn: HTMLButtonElement;
+let splitOffBtn: HTMLButtonElement;
+let findBtn: HTMLButtonElement;
+let activityExplorer: HTMLButtonElement;
+let activitySettings: HTMLButtonElement;
 
-initTheme();
 let uiSettings: UiSettings = loadSettings();
-applyTheme(uiSettings.theme);
 /** Absolute path to backend `config.json` (from Hello). */
 let configPath: string | null = null;
 
-const terminalPark = document.createElement("div");
-terminalPark.className = "terminal-park";
-terminalPark.style.cssText =
-  "position:absolute;visibility:hidden;pointer-events:none;width:0;height:0;overflow:hidden";
-terminalStack.appendChild(terminalPark);
+let terminalPark: HTMLDivElement;
 
 let ws: WebSocket | null = null;
 let sessionId: string | null = null;
@@ -1233,19 +1226,7 @@ function setTreeEmptyHint(show: boolean, text = "Connect to load remote tree"): 
 }
 
 // Selection state lives inside VirtualTree (tree.getSelectedPath()); no duplicate module state needed.
-const tree = new VirtualTree(treeEl, fsList, {
-  onOpenFile: (entry, preview) => {
-    void openEditorTab(entry.path, { preview });
-  },
-  onStatus: (text) => setStatusLeft(text),
-  noteInteraction: () => noteTreeInteraction(),
-  onRootChange: (rootPath) => updateExplorerTitle(rootPath),
-  onContextMenu: (entry, x, y) => openPathContextMenu(entry.path, x, y),
-});
-tree.setVisibility({
-  showDotfiles: uiSettings.showDotfiles,
-  showGitDirs: uiSettings.showGitDirs,
-});
+let tree: VirtualTree;
 setTreeEmptyHint(true);
 
 function clearTree(): void {
@@ -1889,6 +1870,68 @@ function setupSidebarResizer(): void {
   });
 }
 
+
+let bootstrapped = false;
+
+/** Bind the React-rendered shell and start the ADE controller (once). */
+export function bootstrapAde(): void {
+  if (bootstrapped) return;
+  bootstrapped = true;
+
+  connectionStrip = $("connection-strip");
+  stripToggle = $button("strip-toggle");
+  stripCompact = $("strip-compact");
+  stripHost = $("strip-host");
+  stripSession = $("strip-session");
+  stripState = $("strip-state");
+  connectBtn = $button("connect");
+  disconnectBtn = $button("disconnect");
+  workspaceEl = $("workspace");
+  sidebarToggle = $button("sidebar-toggle");
+  sidebarResizer = $("sidebar-resizer");
+  treeEl = $("tree");
+  tabsEl = $("tabs");
+  tabPill = $("tab-pill");
+  panesEl = $("panes");
+  emptyStack = $("empty-stack");
+  terminalStack = $("terminal-stack");
+  editorStack = $("editor-stack");
+  statusLeft = $("status-left");
+  statusRight = $("status-right");
+  editorSaveBtn = $button("editor-save");
+  editorMdPreviewBtn = $button("editor-md-preview");
+  newTabBtn = $button("new-tab");
+  splitHBtn = $button("split-h");
+  splitVBtn = $button("split-v");
+  splitOffBtn = $button("split-off");
+  findBtn = $button("find-btn");
+  activityExplorer = $button("activity-explorer");
+  activitySettings = $button("activity-settings");
+
+  initTheme();
+  uiSettings = loadSettings();
+  applyTheme(uiSettings.theme);
+
+  terminalPark = document.createElement("div");
+  terminalPark.className = "terminal-park";
+  terminalPark.style.cssText =
+    "position:absolute;visibility:hidden;pointer-events:none;width:0;height:0;overflow:hidden";
+  terminalStack.appendChild(terminalPark);
+
+  tree = new VirtualTree(treeEl, fsList, {
+    onOpenFile: (entry, preview) => {
+      void openEditorTab(entry.path, { preview });
+    },
+    onStatus: (text) => setStatusLeft(text),
+    noteInteraction: () => noteTreeInteraction(),
+    onRootChange: (rootPath) => updateExplorerTitle(rootPath),
+    onContextMenu: (entry, x, y) => openPathContextMenu(entry.path, x, y),
+  });
+  tree.setVisibility({
+    showDotfiles: uiSettings.showDotfiles,
+    showGitDirs: uiSettings.showGitDirs,
+  });
+
 connectBtn.addEventListener("click", connect);
 disconnectBtn.addEventListener("click", disconnect);
 stripToggle.addEventListener("click", () => {
@@ -2017,4 +2060,6 @@ renderAll();
 
 if (shouldAutoConnect) {
   connect();
+}
+
 }

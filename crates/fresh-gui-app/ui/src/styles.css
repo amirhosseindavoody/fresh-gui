@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "tw-animate-css";
 @import "@fontsource/ibm-plex-sans/400.css";
 @import "@fontsource/ibm-plex-sans/500.css";
 @import "@fontsource/ibm-plex-sans/600.css";
@@ -7,10 +8,16 @@
 @import "./tokens.css";
 @import "@xterm/xterm/css/xterm.css";
 
+/* Match shadcn `dark:` variants to our data-theme attribute (not .dark class). */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
 /*
  * Map design tokens → Tailwind theme so utilities stay in sync with
- * data-theme (e.g. bg-bg, text-muted, border-border, font-mono).
+ * data-theme (e.g. bg-bg, text-muted-foreground, border-border, font-mono).
  * Complex ADE regions below remain hand-rolled CSS for density control.
+ *
+ * Note: CSS var `--muted` stays a *text* color for ADE chrome. Tailwind
+ * `bg-muted` / `text-muted-foreground` follow shadcn (surface + muted text).
  */
 @theme {
   --color-bg: var(--bg);
@@ -20,14 +27,31 @@
   --color-border: var(--border);
   --color-border-strong: var(--border-strong);
   --color-text: var(--text);
-  --color-muted: var(--muted);
-  --color-accent: var(--accent);
   --color-accent-dim: var(--accent-dim);
   --color-danger: var(--danger);
   --color-warning: var(--warning);
   --color-success: var(--success);
   --color-list-hover: var(--list-hover);
   --color-list-active: var(--list-active);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--panel-2);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--list-hover);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
   --font-sans: var(--font-ui);
   --font-mono: var(--font-mono);
   --radius-sm: var(--radius-sm);
@@ -50,13 +74,20 @@ body {
 }
 
 body {
-  display: grid;
-  grid-template-rows: auto 1fr var(--statusbar-height);
   min-height: 100%;
   overflow: hidden;
 }
 
-button {
+#root {
+  display: grid;
+  grid-template-rows: auto 1fr var(--statusbar-height);
+  height: 100%;
+  min-height: 100%;
+  overflow: hidden;
+}
+
+/* Legacy chrome buttons (tabs, tree) that are still plain <button>s. */
+button:not([data-slot="button"]) {
   padding: 0.4rem 0.65rem;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -67,18 +98,18 @@ button {
   cursor: pointer;
 }
 
-button.primary {
+button:not([data-slot="button"]).primary {
   background: var(--accent-dim);
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
 }
 
-button:disabled {
+button:not([data-slot="button"]):disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }
 
-button:focus-visible,
-input:focus-visible {
+button:not([data-slot="button"]):focus-visible,
+input:not([data-slot="input"]):focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
@@ -91,7 +122,7 @@ label {
   color: var(--muted);
 }
 
-input {
+input:not([data-slot="input"]) {
   min-width: 11rem;
   padding: 0.4rem 0.55rem;
   border: 1px solid var(--border);
@@ -103,6 +134,18 @@ input {
 }
 
 input#session {
+  min-width: 16rem;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+#strip-fields [data-slot="input"] {
+  min-width: 11rem;
+  height: 2rem;
+  font-size: 0.85rem;
+}
+
+#strip-fields #session[data-slot="input"] {
   min-width: 16rem;
   font-family: var(--font-mono);
   font-size: 12px;

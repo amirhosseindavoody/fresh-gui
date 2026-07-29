@@ -12,11 +12,11 @@ This doc keeps the IA, visual language, and interaction map for ongoing polish. 
 - **Editor and explorer are peers**, not afterthoughts: same tab chrome, shared focus model, shared shortcuts.
 - **Remote-aware chrome.** Connection, session, and capability state are first-class (unlike Terax’s local monolith).
 - **Dense, calm, premium.** Terax-level polish bar: intentional motion, clear hierarchy, no decorative clutter.
-- **Stay light.** Prefer small CSS + typed modules over a second product stack until the shell IA is proven.
+- **Stay dense.** React + shadcn own chrome; editor-core and PTY stay Fresh / xterm / CodeMirror.
 
 ## 2. Borrow from Terax vs diverge
 
-Inspired by Terax’s public UI / [TERAX.md](https://github.com/crynta/terax-ai/blob/main/TERAX.md) module layout. We borrow **structure and feel**, not feature parity or React-by-default.
+Inspired by Terax’s public UI / [TERAX.md](https://github.com/crynta/terax-ai/blob/main/TERAX.md) module layout. We borrow **structure, feel, and the React 19 + Tailwind + shadcn chrome stack**, not feature parity or Terax’s local monolith.
 
 | Terax idea | Borrow? | fresh-gui note |
 |------------|---------|----------------|
@@ -36,8 +36,8 @@ Inspired by Terax’s public UI / [TERAX.md](https://github.com/crynta/terax-ai/
 | Web preview / markdown tabs | **Later** | Optional tab kinds after editor tabs land |
 | Spaces / multi-project switcher | **Later** | Map to ADE sessions when useful |
 | Custom window controls | **Windows only** | Follow Tauri; don’t invent chrome early |
-| Tailwind CSS utilities (no React) | **Yes** | Spacing/typography helpers; still Vite + TS modules |
-| shadcn + React 19 | **No** | Stay Vite + TS; large trees → virtualization, not React |
+| React 19 + Tailwind + shadcn | **Yes** | Host chrome in `src/app` + `src/components/ui`; ADE controller still imperative (`src/ade/bootstrap.ts`) |
+| Large trees via React reconciliation | **No** | Explorer stays `VirtualTree` (windowed rows), not a React list of 10k nodes |
 
 ## 3. Information architecture
 
@@ -88,8 +88,8 @@ Before the first successful connect, the strip is expanded (URL / token / Connec
 | **Connect UX** | Always-on strip (compact when connected; expand inline to edit). No modal-only connect flow. |
 | **Default keybindings** | Match **Terax** pane/tab shortcuts (see §6). Remappable later via settings. |
 | **File tree icons** | Lightweight inline SVG icons + typed color tones (`src/icons.ts`); VS Code–style indent guides and chevrons in the virtualized tree. No full Material icon pack. |
-| **UI framework** | **Stay on Vite + TypeScript modules.** Do not adopt Preact/React for large trees or pane polish. Revisit only if hand-rolled pane trees become unmaintainable. |
-| **Large trees (~10k files)** | Host concern: keep lazy one-level `fs_list`; **row virtualization** + watch discipline. Backend `fs_watch` skips `.git` / `target` / `node_modules` / … when installing recursive watches (and runs install off the WS task) so PTY I/O is not stalled. Not a Fresh-editor problem; not a reason to add React. |
+| **UI framework** | **React 19 + Tailwind v4 + shadcn/ui** for shell chrome (strip, activity, tabs actions, status). Imperative ADE controller (`bootstrapAde`) still owns protocol, xterm, CodeMirror, and the virtualized tree — attached to stable DOM ids from the React shell. |
+| **Large trees (~10k files)** | Host concern: keep lazy one-level `fs_list`; **row virtualization** (`VirtualTree`) + watch discipline. Backend `fs_watch` skips `.git` / `target` / `node_modules` / … when installing recursive watches (and runs install off the WS task) so PTY I/O is not stalled. Do not replace the explorer with a naive React row list. |
 | **Editor authority UX** | **Quiet day-to-day:** normal file-tab chrome (path, dirty `•`, save). Surface remote/Fresh authority only on **connection state**, **save errors**, and **conflicts** — not permanent “remote buffer” badging. |
 
 ## 4. Tab and pane model
@@ -136,7 +136,7 @@ type PaneNode =
 
 ### 5.2 Tokens
 
-Primer-inspired dark/light surfaces live in `src/tokens.css`. The same variables drive chrome, xterm (`xtermThemeFromCss`), and CodeMirror (CSS `var(--syn-*)` / `--editor-*`). Tailwind `@theme` in `styles.css` exposes them as utilities (`bg-bg`, `text-muted`, …) without React/shadcn.
+Primer-inspired dark/light surfaces live in `src/tokens.css`. The same variables drive chrome, xterm (`xtermThemeFromCss`), and CodeMirror (CSS `var(--syn-*)` / `--editor-*`). shadcn semantic tokens (`--background`, `--primary`, …) bridge onto Primer. Tailwind `@theme` in `styles.css` exposes both ADE utilities (`bg-bg`, …) and shadcn utilities (`bg-primary`, `text-muted-foreground`, …). IBM Plex remains the UI font.
 
 ```css
 :root[data-theme="dark"] {
@@ -209,9 +209,9 @@ Connection errors and auth failures use inline strip status; never modal loops.
 
 | Option | Status |
 |--------|--------|
-| **A. Vite + TypeScript modules** (current) | **Chosen.** UI-1 through UI-3 default. Large-tree perf = virtualization + watch discipline in the explorer, not a framework switch. Tailwind utilities OK for chrome polish. |
-| **B. Preact/React later** | Deferred escape hatch only if recursive pane trees become unmaintainable by hand — **not** for 10k-file trees. |
-| **C. Full Terax clone (React 19 + Tailwind + shadcn)** | Rejected: high cost, product/AI divergence. Tailwind-without-React is allowed; shadcn/React is not. |
+| **A. Vite + TypeScript modules only** | Superseded for chrome. Still used for ADE modules (`terminal.ts`, `editor.ts`, `tree.ts`, `palette.ts`, …). |
+| **B. Preact/React for panes only** | Not needed; pane trees remain hand-rolled DOM under the terminal stack. |
+| **C. React 19 + Tailwind + shadcn** (current) | **Chosen** for host chrome (Terax-aligned look). Hybrid: React mounts the shell; `bootstrapAde()` binds once. Explorer virtualization stays non-React. Revert path: drop back to static `index.html` + modules if perf is unacceptable. |
 
 ## 9. Implementation phases
 
@@ -246,7 +246,7 @@ Connection errors and auth failures use inline strip status; never modal loops.
 - Activity bar with Explorer (toggles sidebar) + Settings entry; explorer remains the only sidebar view until SCM exists.
 - Lightweight SVG file/folder icons + indent guides in the virtualized tree (`src/icons.ts`, `src/tree.ts`) — no heavy icon pack.
 - Skipped `fs_list` pagination for now — row virtualization covers large trees; revisit only if a single directory listing becomes a protocol bottleneck.
-- Theme preference (`system` / `light` / `dark`) + Primer-inspired CSS tokens (`data-theme` resolved); xterm + CodeMirror read the same vars. Tailwind v4 utilities for chrome polish (no React). IBM Plex via `@fontsource`. Settings live in backend `config.json`.
+- Theme preference (`system` / `light` / `dark`) + Primer-inspired CSS tokens (`data-theme` resolved); xterm + CodeMirror read the same vars. React 19 + Tailwind v4 + shadcn for chrome; IBM Plex via `@fontsource`. Settings live in backend `config.json`.
 - Path context menus on tabs and the file tree (copy absolute / relative / name).
 - Terminal mouse selection + `Mod+C` / `Mod+V` clipboard (Fresh policy: copy when selected, else interrupt).
 
