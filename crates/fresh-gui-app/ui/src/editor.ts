@@ -30,17 +30,19 @@ const highlightCompartment = new Compartment();
  * Editor chrome + syntax highlight from CSS tokens (`tokens.css`).
  * Colors use `var(--*)` so `data-theme` swaps update without rebundling themes.
  */
-function tokenEditorTheme(fontSize: number): Extension {
+function tokenEditorTheme(fontSize: number, fontWeight = 400): Extension {
   return EditorView.theme({
     "&": {
       height: "100%",
       fontSize: `${fontSize}px`,
+      fontWeight: String(fontWeight),
       backgroundColor: "var(--editor-bg)",
       color: "var(--editor-fg)",
     },
     ".cm-scroller": {
       overflow: "auto",
       fontFamily: "var(--font-mono)",
+      fontWeight: "var(--font-mono-weight)",
       backgroundColor: "var(--editor-bg)",
     },
     ".cm-content": { caretColor: "var(--editor-cursor)" },
@@ -49,6 +51,7 @@ function tokenEditorTheme(fontSize: number): Extension {
       backgroundColor: "var(--editor-gutter-bg)",
       color: "var(--editor-gutter-fg)",
       borderRight: "1px solid var(--border)",
+      fontWeight: "var(--font-mono-weight)",
     },
     ".cm-activeLine": { backgroundColor: "var(--editor-active-line)" },
     ".cm-activeLineGutter": { backgroundColor: "var(--editor-active-line)" },
@@ -222,11 +225,13 @@ export function createEditorView(
   onDocChange: () => void,
   opts: {
     fontSize?: number;
+    fontWeight?: number;
     theme?: ResolvedTheme;
     onPathLink?: EditorPathLinkHandler;
   } = {},
 ): EditorView {
   const fontSize = opts.fontSize ?? 14;
+  const fontWeight = opts.fontWeight ?? 400;
   const lang = langForPath(path);
   const extensions: Extension[] = [
     lineNumbers(),
@@ -235,7 +240,7 @@ export function createEditorView(
     search(),
     keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap, indentWithTab]),
     syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-    fontSizeCompartment.of(tokenEditorTheme(fontSize)),
+    fontSizeCompartment.of(tokenEditorTheme(fontSize, fontWeight)),
     themeCompartment.of([]),
     highlightCompartment.of(tokenHighlightStyle()),
     EditorView.updateListener.of((update) => {
@@ -259,9 +264,13 @@ export function openEditorSearch(view: EditorView): void {
   openSearchPanel(view);
 }
 
-export function applyEditorFontSize(view: EditorView, fontSize: number): void {
+export function applyEditorFontSize(
+  view: EditorView,
+  fontSize: number,
+  fontWeight = 400,
+): void {
   view.dispatch({
-    effects: fontSizeCompartment.reconfigure(tokenEditorTheme(fontSize)),
+    effects: fontSizeCompartment.reconfigure(tokenEditorTheme(fontSize, fontWeight)),
   });
 }
 

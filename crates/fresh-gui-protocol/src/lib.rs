@@ -38,10 +38,20 @@ pub struct Hello {
 pub struct HelloUi {
     #[serde(default = "hello_ui_theme")]
     pub theme: String,
+    #[serde(default = "hello_ui_palette")]
+    pub palette: String,
     #[serde(default = "hello_ui_font", rename = "terminalFontSize")]
     pub terminal_font_size: u32,
     #[serde(default = "hello_ui_font", rename = "editorFontSize")]
     pub editor_font_size: u32,
+    #[serde(default = "hello_ui_font_weight", rename = "fontWeight")]
+    pub font_weight: u32,
+    #[serde(default = "hello_ui_font_weight", rename = "monoFontWeight")]
+    pub mono_font_weight: u32,
+    #[serde(default, rename = "fontFamily")]
+    pub font_family: String,
+    #[serde(default, rename = "monoFontFamily")]
+    pub mono_font_family: String,
     #[serde(default = "hello_ui_webgl")]
     pub webgl: bool,
     #[serde(default, rename = "showDotfiles")]
@@ -54,8 +64,16 @@ fn hello_ui_theme() -> String {
     "system".to_owned()
 }
 
+fn hello_ui_palette() -> String {
+    "primer".to_owned()
+}
+
 fn hello_ui_font() -> u32 {
     14
+}
+
+fn hello_ui_font_weight() -> u32 {
+    400
 }
 
 fn hello_ui_webgl() -> bool {

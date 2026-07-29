@@ -71,6 +71,7 @@ body {
     var(--bg);
   color: var(--text);
   font-family: var(--font-ui);
+  font-weight: var(--font-ui-weight);
 }
 
 body {
@@ -84,6 +85,12 @@ body {
   height: 100%;
   min-height: 100%;
   overflow: hidden;
+}
+
+.brand,
+.sidebar-head h2,
+.statusbar {
+  font-weight: var(--font-ui-weight);
 }
 
 /* Legacy chrome buttons (tabs, tree) that are still plain <button>s. */

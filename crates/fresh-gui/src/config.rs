@@ -2,6 +2,8 @@
 //!
 //! Mirrors Fresh editor’s user-facing shape for the terminal shell
 //! (`terminal.shell.{command,args}`) and stores host chrome under `ui.*`.
+//! Color packs under `ui.palette` reuse Fresh theme names where applicable
+//! (`nord`, `dracula`, …) mapped onto host CSS tokens.
 //!
 //! Default path (Linux): `$XDG_CONFIG_HOME/fresh-gui/config.json`
 //! (falls back to `~/.config/fresh-gui/config.json`).
@@ -23,10 +25,20 @@ pub const DEFAULT_SHELL_COMMAND: &str = "zsh";
 pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"{
   // Host UI chrome — applied on connect and when this file is saved.
   "ui": {
-    // system | light | dark
+    // system | light | dark  (used when palette is "primer")
     "theme": "system",
+    // Color pack: primer | nord | dracula | solarized-dark | high-contrast |
+    // nostalgia | dark | light  (Fresh theme names where applicable)
+    "palette": "primer",
     "terminalFontSize": 14,
     "editorFontSize": 14,
+    // UI chrome weight (100–900, steps of 100)
+    "fontWeight": 400,
+    // Terminal + editor monospace weight
+    "monoFontWeight": 400,
+    // Optional CSS font-family overrides (empty = IBM Plex)
+    "fontFamily": "",
+    "monoFontFamily": "",
     "webgl": true,
     // Explorer: hide .* by default; .git stays hidden unless showGitDirs is true
     "showDotfiles": false,
@@ -42,6 +54,17 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"{
   }
 }
 "#;
+
+const KNOWN_PALETTES: &[&str] = &[
+    "primer",
+    "nord",
+    "dracula",
+    "solarized-dark",
+    "high-contrast",
+    "nostalgia",
+    "dark",
+    "light",
+];
 
 /// Top-level config file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -67,10 +90,25 @@ pub struct UiConfig {
     /// `system` | `light` | `dark`
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Color pack id (`primer` or a Fresh theme name).
+    #[serde(default = "default_palette")]
+    pub palette: String,
     #[serde(default = "default_font_size", rename = "terminalFontSize")]
     pub terminal_font_size: u32,
     #[serde(default = "default_font_size", rename = "editorFontSize")]
     pub editor_font_size: u32,
+    /// UI chrome font weight (100–900).
+    #[serde(default = "default_font_weight", rename = "fontWeight")]
+    pub font_weight: u32,
+    /// Terminal + editor monospace weight (100–900).
+    #[serde(default = "default_font_weight", rename = "monoFontWeight")]
+    pub mono_font_weight: u32,
+    /// Optional UI `font-family` CSS value; empty → IBM Plex Sans.
+    #[serde(default, rename = "fontFamily")]
+    pub font_family: String,
+    /// Optional mono `font-family` CSS value; empty → IBM Plex Mono.
+    #[serde(default, rename = "monoFontFamily")]
+    pub mono_font_family: String,
     #[serde(default = "default_true")]
     pub webgl: bool,
     /// Show names starting with `.` in the explorer (except `.git`, see [`Self::show_git_dirs`]).
@@ -85,8 +123,13 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             theme: default_theme(),
+            palette: default_palette(),
             terminal_font_size: default_font_size(),
             editor_font_size: default_font_size(),
+            font_weight: default_font_weight(),
+            mono_font_weight: default_font_weight(),
+            font_family: String::new(),
+            mono_font_family: String::new(),
             webgl: true,
             show_dotfiles: false,
             show_git_dirs: false,
@@ -98,12 +141,25 @@ fn default_theme() -> String {
     "system".to_owned()
 }
 
+fn default_palette() -> String {
+    "primer".to_owned()
+}
+
 fn default_font_size() -> u32 {
     14
 }
 
+fn default_font_weight() -> u32 {
+    400
+}
+
 fn default_true() -> bool {
     true
+}
+
+fn normalize_font_weight(weight: u32) -> u32 {
+    let clamped = weight.clamp(100, 900);
+    ((clamped + 50) / 100) * 100
 }
 
 /// Terminal / PTY settings (Fresh-compatible nesting).
@@ -176,6 +232,7 @@ impl Config {
                     path = %path.display(),
                     shell = %cfg.resolve_shell().0,
                     theme = %cfg.ui.theme,
+                    palette = %cfg.ui.palette,
                     "loaded config"
                 );
                 cfg
@@ -222,8 +279,24 @@ impl Config {
                 "system".to_owned()
             }
         };
+
+        let palette = self.ui.palette.trim().to_ascii_lowercase();
+        self.ui.palette = if KNOWN_PALETTES.contains(&palette.as_str()) {
+            palette
+        } else if palette.is_empty() {
+            warn!("ui.palette is empty — falling back to primer");
+            "primer".to_owned()
+        } else {
+            warn!("ui.palette `{palette}` is unknown — falling back to primer");
+            "primer".to_owned()
+        };
+
         self.ui.terminal_font_size = self.ui.terminal_font_size.clamp(10, 28);
         self.ui.editor_font_size = self.ui.editor_font_size.clamp(10, 28);
+        self.ui.font_weight = normalize_font_weight(self.ui.font_weight);
+        self.ui.mono_font_weight = normalize_font_weight(self.ui.mono_font_weight);
+        self.ui.font_family = self.ui.font_family.trim().to_owned();
+        self.ui.mono_font_family = self.ui.mono_font_family.trim().to_owned();
 
         if let Some(shell) = &mut self.terminal.shell {
             shell.command = shell.command.trim().to_owned();
@@ -342,6 +415,8 @@ mod tests {
         assert_eq!(cmd, "zsh");
         assert!(args.is_empty());
         assert_eq!(cfg.ui.theme, "system");
+        assert_eq!(cfg.ui.palette, "primer");
+        assert_eq!(cfg.ui.font_weight, 400);
     }
 
     #[test]
@@ -349,6 +424,7 @@ mod tests {
         let cfg = Config::load_from_path(Path::new("/no/such/fresh-gui-config.json")).unwrap();
         assert_eq!(cfg.resolve_shell().0, "zsh");
         assert_eq!(cfg.ui.theme, "system");
+        assert_eq!(cfg.ui.palette, "primer");
     }
 
     #[test]
@@ -394,12 +470,16 @@ mod tests {
         let cfg = Config::load_from_path(&path).unwrap();
         assert_eq!(cfg.resolve_shell().0, "zsh");
         assert_eq!(cfg.ui.theme, "system");
+        assert_eq!(cfg.ui.palette, "primer");
     }
 
     #[test]
     fn default_template_parses() {
         let cfg = Config::parse(DEFAULT_CONFIG_TEMPLATE).unwrap();
         assert_eq!(cfg.ui.theme, "system");
+        assert_eq!(cfg.ui.palette, "primer");
+        assert_eq!(cfg.ui.font_weight, 400);
+        assert_eq!(cfg.ui.mono_font_weight, 400);
         assert_eq!(cfg.resolve_shell().0, "zsh");
         assert!(!cfg.ui.show_dotfiles);
         assert!(!cfg.ui.show_git_dirs);
@@ -415,6 +495,33 @@ mod tests {
         .unwrap();
         assert!(cfg.ui.show_dotfiles);
         assert!(cfg.ui.show_git_dirs);
+    }
+
+    #[test]
+    fn parses_palette_and_typography() {
+        let cfg = Config::parse(
+            r#"{
+              "ui": {
+                "palette": "Nord",
+                "fontWeight": 550,
+                "monoFontWeight": 700,
+                "fontFamily": "IBM Plex Sans",
+                "monoFontFamily": "IBM Plex Mono"
+              }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.ui.palette, "nord");
+        assert_eq!(cfg.ui.font_weight, 600);
+        assert_eq!(cfg.ui.mono_font_weight, 700);
+        assert_eq!(cfg.ui.font_family, "IBM Plex Sans");
+        assert_eq!(cfg.ui.mono_font_family, "IBM Plex Mono");
+    }
+
+    #[test]
+    fn unknown_palette_falls_back_to_primer() {
+        let cfg = Config::parse(r#"{"ui":{"palette":"octarine"}}"#).unwrap();
+        assert_eq!(cfg.ui.palette, "primer");
     }
 
     fn tempfile_dir() -> PathBuf {

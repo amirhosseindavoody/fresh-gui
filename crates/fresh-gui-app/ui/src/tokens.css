@@ -31,6 +31,9 @@
   --radius-md: 8px;
   --font-ui: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --font-ui-weight: 400;
+  --font-mono-weight: 400;
+  --font-mono-weight-bold: 600;
   --tab-height: 36px;
   --statusbar-height: 28px;
   --strip-height: auto;

@@ -38,8 +38,10 @@ import {
   setPaletteCommands,
 } from "../palette";
 import { VirtualTree } from "../tree";
-import { applyTheme, getResolvedTheme, initTheme, onResolvedThemeChange, resolveTheme } from "../theme";
+import { applyPalette, paletteLabel } from "../palettes";
+import { getResolvedTheme, initTheme, onResolvedThemeChange, resolveTheme } from "../theme";
 import {
+  applyUiChrome,
   loadSettings,
   normalizeUiSettings,
   saveSettings,
@@ -659,11 +661,19 @@ function focusFind(): void {
 }
 
 function applyUiSettings(next: UiSettings): void {
-  const prevResolved = resolveTheme(uiSettings.theme);
+  const prev = uiSettings;
   uiSettings = next;
   saveSettings(next);
-  const resolved = resolveTheme(next.theme);
-  restyleOpenPanes(resolved, resolved !== prevResolved);
+  const chromeChanged =
+    prev.theme !== next.theme ||
+    prev.palette !== next.palette ||
+    prev.terminalFontSize !== next.terminalFontSize ||
+    prev.editorFontSize !== next.editorFontSize ||
+    prev.fontWeight !== next.fontWeight ||
+    prev.monoFontWeight !== next.monoFontWeight ||
+    prev.fontFamily !== next.fontFamily ||
+    prev.monoFontFamily !== next.monoFontFamily;
+  restyleOpenPanes(getResolvedTheme(), chromeChanged);
   tree.setVisibility({
     showDotfiles: next.showDotfiles,
     showGitDirs: next.showGitDirs,
@@ -697,7 +707,7 @@ async function openSettingsFile(): Promise<void> {
   setStatusLeft(`settings: ${configPath} (save with Mod+S)`);
 }
 
-/** Restyle open terminals/editors to match the resolved chrome theme. */
+/** Restyle open terminals/editors to match the resolved chrome theme / palette. */
 function restyleOpenPanes(resolved: ReturnType<typeof resolveTheme>, themeChanged: boolean): void {
   for (const tab of tabs) {
     if (tab.kind === "terminal") {
@@ -706,7 +716,7 @@ function restyleOpenPanes(resolved: ReturnType<typeof resolveTheme>, themeChange
         if (themeChanged) applyTerminalTheme(bundle);
       }
     } else {
-      applyEditorFontSize(tab.view, uiSettings.editorFontSize);
+      applyEditorFontSize(tab.view, uiSettings.editorFontSize, uiSettings.monoFontWeight);
       if (themeChanged) {
         applyEditorTheme(tab.view, resolved);
         if (tab.mdView === "preview" && tab.mdPreviewEl) {
@@ -1367,6 +1377,7 @@ async function presentOpenedBuffer(
     },
     {
       fontSize: uiSettings.editorFontSize,
+      fontWeight: uiSettings.monoFontWeight,
       theme: getResolvedTheme(),
       onPathLink: (info) => {
         void openEditorTab(info.path, {
@@ -1465,7 +1476,9 @@ async function saveActiveEditor(): Promise<void> {
     if (isConfigPath(saved.path) || isConfigPath(active.path)) {
       try {
         applyUiSettings(uiSettingsFromConfigText(text));
-        setStatusLeft(`saved settings · theme ${uiSettings.theme}`);
+        setStatusLeft(
+          `saved settings · ${paletteLabel(uiSettings.palette)} · theme ${uiSettings.theme}`,
+        );
       } catch (err) {
         setStatusLeft(
           `saved ${saved.path}, but ui parse failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -1910,7 +1923,7 @@ export function bootstrapAde(): void {
 
   initTheme();
   uiSettings = loadSettings();
-  applyTheme(uiSettings.theme);
+  applyUiChrome(uiSettings);
 
   terminalPark = document.createElement("div");
   terminalPark.className = "terminal-park";
@@ -1997,8 +2010,15 @@ setGotoFileHandler((path) => {
     cwd: lastTerminalCwd || undefined,
   });
 });
-// OS theme flips while preference is "system" → restyle open panes.
+// OS theme flips while preference is "system" → restyle open panes (primer only).
 onResolvedThemeChange((resolved) => {
+  if (uiSettings.palette !== "primer") {
+    // Named Fresh packs pin appearance; re-assert after applyTheme notifications.
+    applyPalette(uiSettings.palette);
+    restyleOpenPanes(getResolvedTheme(), true);
+    requestAnimationFrame(fitActiveLeaves);
+    return;
+  }
   if (uiSettings.theme !== "system") return;
   restyleOpenPanes(resolved, true);
   requestAnimationFrame(fitActiveLeaves);

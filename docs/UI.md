@@ -2,7 +2,7 @@
 
 Product UI for the **local host** ADE shell. Architecture and protocol: [DESIGN.md](./DESIGN.md). Overview for users: [README.md](../README.md).
 
-**Status:** UI-1–UI-3 are in use in `crates/fresh-gui-app/ui` — connection strip, status bar, unified terminal/editor tabs, CodeMirror 6, xterm WebGL, pane trees, shortcuts + palette, virtualized tree, OSC 7 cwd, find, activity bar, system/light/dark theme via `config.json`, path context menus.
+**Status:** UI-1–UI-3 are in use in `crates/fresh-gui-app/ui` — connection strip, status bar, unified terminal/editor tabs, CodeMirror 6, xterm WebGL, pane trees, shortcuts + palette, virtualized tree, OSC 7 cwd, find, activity bar, system/light/dark theme + named color palettes + typography via `config.json`, path context menus.
 
 This doc keeps the IA, visual language, and interaction map for ongoing polish. It is not a backlog of unfinished MVP chrome.
 
@@ -136,12 +136,16 @@ type PaneNode =
 
 ### 5.2 Tokens
 
-Primer-inspired dark/light surfaces live in `src/tokens.css`. The same variables drive chrome, xterm (`xtermThemeFromCss`), and CodeMirror (CSS `var(--syn-*)` / `--editor-*`). shadcn semantic tokens (`--background`, `--primary`, …) bridge onto Primer. Tailwind `@theme` in `styles.css` exposes both ADE utilities (`bg-bg`, …) and shadcn utilities (`bg-primary`, `text-muted-foreground`, …). IBM Plex remains the UI font.
+Primer-inspired dark/light surfaces live in `src/tokens.css` (palette `primer`). Named packs in `src/palettes.ts` reuse Fresh editor theme colors (`vendor/fresh/.../themes/*.json`) mapped onto the same CSS variables for chrome, xterm (`xtermThemeFromCss`), and CodeMirror. shadcn semantic tokens (`--background`, `--primary`, …) bridge onto Primer. Tailwind `@theme` in `styles.css` exposes both ADE utilities (`bg-bg`, …) and shadcn utilities (`bg-primary`, `text-muted-foreground`, …). IBM Plex remains the default UI font (overridable via `fontFamily` / `monoFontFamily`).
 
-```css
-:root[data-theme="dark"] {
-  --bg: …; --panel: …; --text: …; --accent: …;
-  --term-bg: …; --editor-bg: …; --syn-keyword: …;
+```jsonc
+"ui": {
+  "theme": "system",       // system | light | dark (primer adaptive mode)
+  "palette": "primer",     // primer | nord | dracula | solarized-dark | …
+  "fontWeight": 400,       // UI chrome 100–900
+  "monoFontWeight": 400,   // terminal + editor
+  "fontFamily": "",        // empty → IBM Plex Sans
+  "monoFontFamily": ""     // empty → IBM Plex Mono
 }
 ```
 
@@ -176,7 +180,7 @@ Defaults follow [Terax `shortcuts.ts`](https://github.com/crynta/terax-ai/blob/m
 
 **Windows note:** `Ctrl+D` is also shell EOF. Prefer Terax behavior: shortcut wins when the host handles it for split; users who need raw EOF can remap. Do not silently switch to VS Code `\` bindings.
 
-Tree: expand/collapse, open file (preview), pin on edit, keyboard nav. Dirty editors show `•` in the tab label. Theme preference defaults to **system**; light/dark override and fonts live in `config.json` (not a settings modal).
+Tree: expand/collapse, open file (preview), pin on edit, keyboard nav. Dirty editors show `•` in the tab label. Theme mode, color palette, and fonts live in `config.json` (not a settings modal).
 
 Connection errors and auth failures use inline strip status; never modal loops.
 
@@ -246,7 +250,7 @@ Connection errors and auth failures use inline strip status; never modal loops.
 - Activity bar with Explorer (toggles sidebar) + Settings entry; explorer remains the only sidebar view until SCM exists.
 - Lightweight SVG file/folder icons + indent guides in the virtualized tree (`src/icons.ts`, `src/tree.ts`) — no heavy icon pack.
 - Skipped `fs_list` pagination for now — row virtualization covers large trees; revisit only if a single directory listing becomes a protocol bottleneck.
-- Theme preference (`system` / `light` / `dark`) + Primer-inspired CSS tokens (`data-theme` resolved); xterm + CodeMirror read the same vars. React 19 + Tailwind v4 + shadcn for chrome; IBM Plex via `@fontsource`. Settings live in backend `config.json`.
+- Theme preference (`system` / `light` / `dark`) + color **palette** (`primer` or Fresh theme names: `nord`, `dracula`, …) via `config.json`; typography (`fontWeight`, `monoFontWeight`, optional font families). Primer-inspired CSS tokens (`data-theme` resolved); named palettes map Fresh theme colors onto the same vars for chrome / xterm / CodeMirror. React 19 + Tailwind v4 + shadcn for chrome; IBM Plex via `@fontsource` (overridable). Settings live in backend `config.json`.
 - Path context menus on tabs and the file tree (copy absolute / relative / name).
 - Terminal mouse selection + `Mod+C` / `Mod+V` clipboard (Fresh policy: copy when selected, else interrupt).
 

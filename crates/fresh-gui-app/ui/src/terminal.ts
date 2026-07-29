@@ -5,7 +5,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { SearchAddon } from "@xterm/addon-search";
 import type { UiSettings } from "./settings";
 import { parseOsc7 } from "./osc7";
-import { monoFontFromCss, xtermThemeFromCss } from "./theme";
+import { monoFontFromCss, monoFontWeightBoldFromCss, monoFontWeightFromCss, xtermThemeFromCss } from "./theme";
 import { copyToClipboard } from "./context-menu";
 import { detectLinksInLine } from "./path-link";
 
@@ -46,6 +46,8 @@ export type CreateTerminalOpts = {
 export function applyTerminalTheme(bundle: TermBundle): void {
   bundle.term.options.theme = xtermThemeFromCss();
   bundle.term.options.fontFamily = monoFontFromCss();
+  bundle.term.options.fontWeight = monoFontWeightFromCss();
+  bundle.term.options.fontWeightBold = monoFontWeightBoldFromCss();
 }
 
 function isModKey(ev: KeyboardEvent): boolean {
@@ -155,6 +157,11 @@ export function createTerminal(opts: CreateTerminalOpts = {}): TermBundle {
     cursorBlink: true,
     fontFamily: monoFontFromCss(),
     fontSize,
+    fontWeight: settings?.monoFontWeight ?? monoFontWeightFromCss(),
+    fontWeightBold:
+      settings != null
+        ? Math.min(900, settings.monoFontWeight + 200)
+        : monoFontWeightBoldFromCss(),
     theme: xtermThemeFromCss(),
     // Word select on double-click / right-click (Fresh scrollback double-click).
     rightClickSelectsWord: true,
@@ -220,6 +227,9 @@ export function disposeTerminal(bundle: TermBundle): void {
 
 export function applyTerminalFontSize(bundle: TermBundle, size: number): void {
   bundle.term.options.fontSize = size;
+  bundle.term.options.fontFamily = monoFontFromCss();
+  bundle.term.options.fontWeight = monoFontWeightFromCss();
+  bundle.term.options.fontWeightBold = monoFontWeightBoldFromCss();
   try {
     bundle.fit.fit();
   } catch {
