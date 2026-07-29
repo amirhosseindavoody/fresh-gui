@@ -718,6 +718,12 @@ function makeTerminal(): TermBundle {
       const owner = findLeafOwner(id);
       if (owner) applyLeafCwd(owner.tab, id, cwd);
     },
+    onCopied: (text) => {
+      const preview = text.length > 48 ? `${text.slice(0, 48)}…` : text;
+      const oneLine = preview.replace(/\s+/g, " ");
+      setStatusLeft(`copied (${text.length} chars): ${oneLine}`);
+    },
+    onPasteFailed: (message) => setStatusLeft(message),
   });
   return bundle;
 }

@@ -51,6 +51,8 @@ After connect you get terminals, an explorer, and editor tabs in one shell:
 | Open a file | Click or double-click in the tree |
 | Save | `Mod+S` |
 | Find | `Mod+F` |
+| Copy selected terminal text | Select with the mouse, then `Mod+C` (no selection → interrupt) |
+| Paste into terminal | `Mod+V` |
 | Command palette | `Mod+P` |
 | Settings | Activity bar gear or `Mod+,` (opens `config.json`) |
 | Copy a path | Right-click a tab or tree row |

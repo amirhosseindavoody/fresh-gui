@@ -177,11 +177,15 @@ Defaults follow [Terax `shortcuts.ts`](https://github.com/crynta/terax-ai/blob/m
 | Save buffer | `Mod+S` | Editor tabs; also saves settings `config.json` |
 | Toggle sidebar | `Mod+B` (and `Mod+Shift+B`) | |
 | Find | `Mod+F` | Terminal buffer or editor search |
+| Copy (terminal) | `Mod+C` | Copies when text is selected (mouse drag); otherwise sends interrupt |
+| Paste (terminal) | `Mod+V` | System clipboard → PTY (bracketed paste when supported) |
 | Command palette | `Mod+P` | |
 | Open settings | `Mod+,` | Opens backend `config.json` in an editor tab |
 | Connect / disconnect | — | Primary in strip; disconnect keeps remote session |
 
 **Context menus:** right-click a tab or file-tree row to copy absolute path, relative path (vs workspace root), or file name; tabs also offer Close.
+
+**Terminal mouse:** drag to select (xterm). If a TUI enables DEC mouse reporting, hold **Shift** while dragging to select instead. Copy clears the selection so the next `Mod+C` is SIGINT (Fresh / VS Code policy).
 
 **Windows note:** `Ctrl+D` is also shell EOF. Prefer Terax behavior: shortcut wins when the host handles it for split; users who need raw EOF can remap. Do not silently switch to VS Code `\` bindings.
 
@@ -256,6 +260,7 @@ Connection errors and auth failures use inline strip status; never modal loops.
 - Skipped `fs_list` pagination for now — row virtualization covers large trees; revisit only if a single directory listing becomes a protocol bottleneck.
 - Theme preference (`system` / `light` / `dark`) + CSS tokens (`data-theme` resolved). Settings live in backend `config.json` (`ui` + `terminal.shell`); the activity-bar / `Mod+,` entry opens that file in the editor (no modal).
 - Path context menus on tabs and the file tree (copy absolute / relative / name).
+- Terminal mouse selection + `Mod+C` / `Mod+V` clipboard (Fresh policy: copy when selected, else interrupt).
 
 ### Out of UI phases (stay in DESIGN Phase 4+)
 
