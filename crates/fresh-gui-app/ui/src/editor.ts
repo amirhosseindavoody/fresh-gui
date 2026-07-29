@@ -1,13 +1,16 @@
-import { EditorState } from "@codemirror/state";
+import { EditorState, Compartment } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers, highlightActiveLine } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { syntaxHighlighting, defaultHighlightStyle } from "@codemirror/language";
 import { oneDark } from "@codemirror/theme-one-dark";
+import { search, openSearchPanel, searchKeymap } from "@codemirror/search";
 import { rust } from "@codemirror/lang-rust";
 import { javascript } from "@codemirror/lang-javascript";
 import { python } from "@codemirror/lang-python";
 import { markdown } from "@codemirror/lang-markdown";
 import type { Extension } from "@codemirror/state";
+
+const fontSizeCompartment = new Compartment();
 
 function langForPath(path: string): Extension | null {
   const lower = path.toLowerCase();
@@ -32,23 +35,27 @@ export function createEditorView(
   text: string,
   path: string,
   onDocChange: () => void,
+  opts: { fontSize?: number; theme?: "dark" | "light" } = {},
 ): EditorView {
+  const fontSize = opts.fontSize ?? 14;
+  const theme = opts.theme ?? "dark";
   const lang = langForPath(path);
   const extensions: Extension[] = [
     lineNumbers(),
     highlightActiveLine(),
     history(),
-    keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
+    search(),
+    keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap, indentWithTab]),
     syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-    oneDark,
+    fontSizeCompartment.of(EditorView.theme({
+      "&": { height: "100%", fontSize: `${fontSize}px` },
+      ".cm-scroller": { overflow: "auto", fontFamily: "var(--font-mono)" },
+    })),
     EditorView.updateListener.of((update) => {
       if (update.docChanged) onDocChange();
     }),
-    EditorView.theme({
-      "&": { height: "100%" },
-      ".cm-scroller": { overflow: "auto" },
-    }),
   ];
+  if (theme === "dark") extensions.push(oneDark);
   if (lang) extensions.push(lang);
 
   return new EditorView({
@@ -57,5 +64,20 @@ export function createEditorView(
       doc: text,
       extensions,
     }),
+  });
+}
+
+export function openEditorSearch(view: EditorView): void {
+  openSearchPanel(view);
+}
+
+export function applyEditorFontSize(view: EditorView, fontSize: number): void {
+  view.dispatch({
+    effects: fontSizeCompartment.reconfigure(
+      EditorView.theme({
+        "&": { height: "100%", fontSize: `${fontSize}px` },
+        ".cm-scroller": { overflow: "auto", fontFamily: "var(--font-mono)" },
+      }),
+    ),
   });
 }

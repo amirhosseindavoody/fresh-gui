@@ -46,9 +46,29 @@
     </header>
 
     <div id="workspace" class="workspace">
+      <nav id="activity-bar" class="activity-bar" aria-label="Activity">
+        <button
+          id="activity-explorer"
+          class="activity-btn active"
+          type="button"
+          title="Explorer (Mod+B)"
+          aria-pressed="true"
+        >
+          <span class="activity-glyph" aria-hidden="true">▤</span>
+        </button>
+        <div class="activity-spacer"></div>
+        <button
+          id="activity-settings"
+          class="activity-btn"
+          type="button"
+          title="Settings (Mod+,)"
+        >
+          <span class="activity-glyph" aria-hidden="true">∗</span>
+        </button>
+      </nav>
       <aside id="sidebar" class="sidebar">
         <div class="sidebar-head">
-          <h2>Files</h2>
+          <h2>Explorer</h2>
           <button id="sidebar-toggle" type="button" title="Toggle sidebar (Mod+B)">‹</button>
         </div>
         <div id="tree" class="tree"></div>
@@ -76,6 +96,7 @@
               ═
             </button>
             <button id="split-off" type="button" disabled title="Keep only active pane">▢</button>
+            <button id="find-btn" type="button" title="Find (Mod+F)">Find</button>
             <button
               id="editor-save"
               type="button"

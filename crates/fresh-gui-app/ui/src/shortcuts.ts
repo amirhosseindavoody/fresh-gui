@@ -11,7 +11,9 @@ export type ShortcutId =
   | "pane.focusPrev"
   | "sidebar.toggle"
   | "editor.save"
-  | "commandPalette.open";
+  | "commandPalette.open"
+  | "search.focus"
+  | "settings.open";
 
 export type KeyBinding = {
   key: string;
@@ -92,6 +94,16 @@ export const SHORTCUTS: Shortcut[] = [
     label: "Save buffer",
     defaultBindings: [{ [MOD_PROP]: true, key: "s" }],
   },
+  {
+    id: "search.focus",
+    label: "Find in active pane",
+    defaultBindings: [{ [MOD_PROP]: true, key: "f" }],
+  },
+  {
+    id: "settings.open",
+    label: "Open settings",
+    defaultBindings: [{ [MOD_PROP]: true, key: "," }],
+  },
 ];
 
 export function matchBinding(e: KeyboardEvent, binding: KeyBinding): boolean {
@@ -126,7 +138,13 @@ export function installShortcuts(handlers: ShortcutHandlers): () => void {
     ) {
       // Still allow save / palette / sidebar from inputs in the strip.
       const id = matchShortcut(e);
-      if (id !== "editor.save" && id !== "commandPalette.open" && id !== "sidebar.toggle") {
+      if (
+        id !== "editor.save" &&
+        id !== "commandPalette.open" &&
+        id !== "sidebar.toggle" &&
+        id !== "search.focus" &&
+        id !== "settings.open"
+      ) {
         return;
       }
     }

@@ -1,4 +1,4 @@
-/** Phase UI-2 host shell: per-tab pane trees, shortcut registry, command palette, virtualized tree. */
+/** Phase UI-3 host shell: OSC 7 cwd, find bar, activity bar, icons, light theme + settings. */
 import type { EditorView } from "@codemirror/view";
 import "./styles.css";
 import {
@@ -9,8 +9,13 @@ import {
   type ServerMessage,
 } from "./protocol";
 import { $, $button, $input, b64decode, b64encode, basename } from "./dom";
-import { createEditorView } from "./editor";
-import { createTerminal, disposeTerminal, type TermBundle } from "./terminal";
+import { applyEditorFontSize, createEditorView, openEditorSearch } from "./editor";
+import {
+  applyTerminalFontSize,
+  createTerminal,
+  disposeTerminal,
+  type TermBundle,
+} from "./terminal";
 import {
   MAX_LEAVES_PER_TAB,
   type PaneNode,
@@ -25,6 +30,14 @@ import {
 import { installShortcuts, type ShortcutHandlers, type ShortcutId } from "./shortcuts";
 import { defaultPaletteCommands, openPalette, setPaletteCommands } from "./palette";
 import { VirtualTree } from "./tree";
+import { applyTheme, initTheme } from "./theme";
+import {
+  loadSettings,
+  openSettings,
+  setSettingsChangeHandler,
+  type UiSettings,
+} from "./settings";
+import { closeFindBar, openFindBar, setSearchTarget } from "./search";
 
 const SESSION_KEY = "fresh-gui.sessionId";
 const LAYOUT_KEY = "fresh-gui.layout";
@@ -111,6 +124,13 @@ const newTabBtn = $button("new-tab");
 const splitHBtn = $button("split-h");
 const splitVBtn = $button("split-v");
 const splitOffBtn = $button("split-off");
+const findBtn = $button("find-btn");
+const activityExplorer = $button("activity-explorer");
+const activitySettings = $button("activity-settings");
+
+initTheme();
+let uiSettings: UiSettings = loadSettings();
+applyTheme(uiSettings.theme);
 
 const terminalPark = document.createElement("div");
 terminalPark.className = "terminal-park";
@@ -222,6 +242,8 @@ function setSidebarCollapsed(collapsed: boolean): void {
   workspaceEl.classList.toggle("sidebar-collapsed", collapsed);
   localStorage.setItem(SIDEBAR_COLLAPSED_KEY, collapsed ? "1" : "0");
   sidebarToggle.textContent = collapsed ? "›" : "‹";
+  activityExplorer.classList.toggle("active", !collapsed);
+  activityExplorer.setAttribute("aria-pressed", collapsed ? "false" : "true");
 }
 
 function toggleSidebar(): void {
@@ -400,9 +422,138 @@ function proposedDims(tab: TerminalTab | null): { cols: number; rows: number } {
   return { cols: dims?.cols || 80, rows: dims?.rows || 24 };
 }
 
-function requestNewPty(cols: number, rows: number, intent: PtyIntent): void {
+function requestNewPty(cols: number, rows: number, intent: PtyIntent, cwd?: string): void {
   pendingPtyIntents.push(intent);
-  send({ type: "pty_open", cols, rows });
+  send({ type: "pty_open", cols, rows, ...(cwd ? { cwd } : {}) });
+}
+
+function titleFromCwd(cwd: string | undefined, fallback: string): string {
+  if (!cwd) return fallback;
+  const base = basename(cwd.replace(/[/\\]+$/, "") || cwd);
+  return base || fallback;
+}
+
+function parentDir(path: string): string {
+  const normalized = path.replace(/\\/g, "/");
+  const idx = normalized.lastIndexOf("/");
+  if (idx <= 0) return normalized.startsWith("/") ? "/" : ".";
+  return normalized.slice(0, idx) || "/";
+}
+
+/** Prefer active terminal leaf cwd (OSC 7), else editor file parent. */
+function resolveSpawnCwd(): string | undefined {
+  const active = tabs[activeTabIndex];
+  if (active?.kind === "terminal") {
+    const leaf = active.leaves.get(active.activeLeafId);
+    if (leaf?.cwd) return leaf.cwd;
+  }
+  if (active?.kind === "editor") return parentDir(active.path);
+  for (const t of tabs) {
+    if (t.kind !== "terminal") continue;
+    const leaf = t.leaves.get(t.activeLeafId);
+    if (leaf?.cwd) return leaf.cwd;
+  }
+  for (const t of tabs) {
+    if (t.kind === "editor") return parentDir(t.path);
+  }
+  return undefined;
+}
+
+function applyLeafCwd(tab: TerminalTab, ptyId: string, cwd: string): void {
+  const bundle = tab.leaves.get(ptyId);
+  if (!bundle) return;
+  bundle.cwd = cwd;
+  if (tab.leaves.size === 1 || tab.activeLeafId === ptyId) {
+    tab.title = titleFromCwd(cwd, tab.title);
+    renderTabs();
+  }
+  panesEl.querySelectorAll<HTMLElement>(".pane-leaf").forEach((el) => {
+    if (el.dataset.leafId !== ptyId) return;
+    const label = el.querySelector(".pane-label");
+    if (label) label.textContent = titleFromCwd(cwd, tab.title);
+  });
+  if (tabs[activeTabIndex] === tab && tab.activeLeafId === ptyId) {
+    setStatusLeft(cwd);
+  }
+}
+
+function syncSearchTarget(): void {
+  const active = tabs[activeTabIndex];
+  if (active?.kind === "terminal") {
+    const bundle = active.leaves.get(active.activeLeafId);
+    if (!bundle) {
+      setSearchTarget(null);
+      return;
+    }
+    const opts = {
+      caseSensitive: false,
+      incremental: false,
+      regex: false,
+      wholeWord: false,
+      decorations: {
+        matchBackground: "#3fb95055",
+        activeMatchBackground: "#3fb95088",
+        matchOverviewRuler: "#3fb950",
+        activeMatchColorOverviewRuler: "#3fb950",
+      },
+    };
+    setSearchTarget({
+      kind: "terminal",
+      findNext: (q, backwards) => {
+        if (!q) return false;
+        return backwards
+          ? !!bundle.search.findPrevious(q, opts)
+          : !!bundle.search.findNext(q, opts);
+      },
+      clear: () => bundle.search.clearDecorations(),
+    });
+  } else if (active?.kind === "editor") {
+    setSearchTarget({
+      kind: "editor",
+      open: () => openEditorSearch(active.view),
+    });
+  } else {
+    setSearchTarget(null);
+  }
+}
+
+function focusFind(): void {
+  syncSearchTarget();
+  openFindBar();
+}
+
+function applyUiSettings(next: UiSettings): void {
+  const themeChanged = next.theme !== uiSettings.theme;
+  uiSettings = next;
+  for (const tab of tabs) {
+    if (tab.kind === "terminal") {
+      for (const bundle of tab.leaves.values()) {
+        applyTerminalFontSize(bundle, next.terminalFontSize);
+        if (themeChanged) {
+          const dark = next.theme !== "light";
+          bundle.term.options.theme = dark
+            ? {
+                background: "#010409",
+                foreground: "#e6edf3",
+                cursor: "#3fb950",
+                selectionBackground: "#3fb95055",
+              }
+            : {
+                background: "#f6f8fa",
+                foreground: "#1f2328",
+                cursor: "#1a7f37",
+                selectionBackground: "#1a7f3755",
+              };
+        }
+      }
+    } else {
+      applyEditorFontSize(tab.view, next.editorFontSize);
+    }
+  }
+  requestAnimationFrame(fitActiveLeaves);
+  if (themeChanged) {
+    setStatusLeft(`theme: ${next.theme} (new terminals/editors pick up full chrome)`);
+  }
 }
 
 function measurePill(): void {
@@ -458,6 +609,19 @@ function wireTerminalLeaf(ptyId: string, bundle: TermBundle): void {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     send({ type: "pty_resize", id: ptyId, cols, rows });
   });
+}
+
+function makeTerminal(): TermBundle {
+  const bundle = createTerminal({
+    settings: uiSettings,
+    onCwd: (cwd) => {
+      const id = bundle.el.dataset.ptyId;
+      if (!id) return;
+      const owner = findLeafOwner(id);
+      if (owner) applyLeafCwd(owner.tab, id, cwd);
+    },
+  });
+  return bundle;
 }
 
 function fitBundle(bundle: TermBundle): void {
@@ -652,7 +816,7 @@ function buildLeafEl(node: Extract<PaneNode, { type: "leaf" }>, tab: TerminalTab
   if (bundle) {
     const label = document.createElement("div");
     label.className = "pane-label";
-    label.textContent = tab.title;
+    label.textContent = titleFromCwd(bundle.cwd, tab.title);
     leafEl.appendChild(label);
     leafEl.appendChild(bundle.el);
   }
@@ -758,6 +922,7 @@ function renderAll(): void {
   updateStacks();
   updateSaveButton();
   updateStatusRight();
+  syncSearchTarget();
 }
 
 function clearTabs(): void {
@@ -903,7 +1068,7 @@ async function openEditorTab(path: string, preview: boolean): Promise<void> {
       renderTabs();
       updateSaveButton();
       updateStatusRight();
-    });
+    }, { fontSize: uiSettings.editorFontSize, theme: uiSettings.theme });
 
     tabRef = {
       kind: "editor",
@@ -969,7 +1134,7 @@ function restoreTerminalTabsFromBlob(blob: LayoutBlob, ptyList: PtyInfo[]): bool
       if (!sameSet) continue;
       const leaves = new Map<string, TermBundle>();
       for (const id of leafIds) {
-        const bundle = createTerminal();
+        const bundle = makeTerminal();
         wireTerminalLeaf(id, bundle);
         leaves.set(id, bundle);
       }
@@ -1007,7 +1172,7 @@ function onMessage(raw: string): void {
         type: "hello",
         protocol_version: PROTOCOL_VERSION,
         role: "client",
-        implementation: "fresh-gui-ui/0.4",
+        implementation: "fresh-gui-ui/0.5",
         capabilities: ["ping", "pty", "fs", "session", "editor", "scene"],
       });
       {
@@ -1056,7 +1221,7 @@ function onMessage(raw: string): void {
       const restored = restoreTerminalTabsFromBlob(blob, ptyList);
       if (!restored) {
         for (const p of ptyList) {
-          const bundle = createTerminal();
+          const bundle = makeTerminal();
           createTerminalTab(p.id, bundle, { silentActivate: true });
         }
       }
@@ -1075,7 +1240,7 @@ function onMessage(raw: string): void {
     }
     case "pty_opened": {
       const intent = pendingPtyIntents.shift() ?? { kind: "newTab" as const };
-      const bundle = createTerminal();
+      const bundle = makeTerminal();
       let handled = false;
       if (intent.kind === "split") {
         const tab = tabs.find((t): t is TerminalTab => t.kind === "terminal" && t.id === intent.tabId);
@@ -1258,7 +1423,7 @@ function connect(): void {
 function openNewTerminalTab(): void {
   if (!connected) return;
   const dims = proposedDims(activeTerminalTab());
-  requestNewPty(dims.cols, dims.rows, { kind: "newTab" });
+  requestNewPty(dims.cols, dims.rows, { kind: "newTab" }, resolveSpawnCwd());
 }
 
 function requestSplit(mode: SplitMode): void {
@@ -1280,7 +1445,7 @@ function requestSplit(mode: SplitMode): void {
     tabId: tab.id,
     leafId: tab.activeLeafId,
     direction,
-  });
+  }, resolveSpawnCwd());
 }
 
 function setupSidebarResizer(): void {
@@ -1330,6 +1495,12 @@ splitHBtn.addEventListener("click", () => requestSplit("horizontal"));
 splitVBtn.addEventListener("click", () => requestSplit("vertical"));
 splitOffBtn.addEventListener("click", collapseToActiveLeaf);
 sidebarToggle.addEventListener("click", toggleSidebar);
+findBtn.addEventListener("click", () => focusFind());
+activityExplorer.addEventListener("click", () => {
+  toggleSidebar();
+  if (!isSidebarCollapsed()) treeEl.focus();
+});
+activitySettings.addEventListener("click", () => openSettings());
 
 tabsEl.addEventListener("scroll", () => requestAnimationFrame(measurePill));
 
@@ -1347,6 +1518,8 @@ const shortcutHandlers: ShortcutHandlers = {
   "editor.save": () => {
     void saveActiveEditor();
   },
+  "search.focus": () => focusFind(),
+  "settings.open": () => openSettings(),
 };
 
 function runShortcutId(id: ShortcutId): void {
@@ -1355,10 +1528,17 @@ function runShortcutId(id: ShortcutId): void {
 
 installShortcuts(shortcutHandlers);
 setPaletteCommands(defaultPaletteCommands(runShortcutId));
+setSettingsChangeHandler(applyUiSettings);
 
 window.addEventListener("resize", () => {
   fitActiveLeaves();
   requestAnimationFrame(measurePill);
+});
+
+window.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape" && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+    closeFindBar();
+  }
 });
 
 loadSidebarPrefs();

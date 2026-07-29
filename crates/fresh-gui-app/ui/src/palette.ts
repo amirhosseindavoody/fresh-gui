@@ -27,7 +27,7 @@ function ensureDom(): void {
     <div class="palette-panel" role="dialog" aria-label="Command palette">
       <input class="palette-input" type="text" placeholder="Type a command…" spellcheck="false" />
       <div class="palette-list" role="listbox"></div>
-      <div class="palette-hint">UI-2 stub · Esc to close</div>
+      <div class="palette-hint">Esc to close</div>
     </div>
   `;
   document.body.appendChild(root);

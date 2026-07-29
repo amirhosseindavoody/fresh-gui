@@ -1,50 +1,103 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { SearchAddon } from "@xterm/addon-search";
+import type { UiSettings } from "./settings";
 
 export interface TermBundle {
   term: Terminal;
   fit: FitAddon;
   webgl: WebglAddon | null;
+  search: SearchAddon;
   el: HTMLElement;
+  cwd?: string;
 }
 
-export function createTerminal(): TermBundle {
+export function parseOsc7(data: string): string | null {
+  // file://hostname/path or file:///path or raw path
+  let s = data.trim();
+  if (s.startsWith("file://")) {
+    s = s.slice("file://".length);
+    // strip host
+    const slash = s.indexOf("/");
+    if (slash >= 0) s = s.slice(slash);
+  }
+  try {
+    s = decodeURIComponent(s);
+  } catch {
+    /* keep raw */
+  }
+  return s || null;
+}
+
+export function createTerminal(
+  opts: {
+    settings?: UiSettings;
+    onCwd?: (cwd: string) => void;
+  } = {},
+): TermBundle {
+  const settings = opts.settings;
+  const fontSize = settings?.terminalFontSize ?? 14;
+  const preferWebgl = settings?.webgl !== false;
+
+  const dark = (settings?.theme ?? "dark") !== "light";
   const term = new Terminal({
     cursorBlink: true,
     fontFamily: '"IBM Plex Mono", ui-monospace, monospace',
-    fontSize: 14,
-    theme: {
-      background: "#010409",
-      foreground: "#e6edf3",
-      cursor: "#3fb950",
-      selectionBackground: "#3fb95055",
-    },
+    fontSize,
+    theme: dark
+      ? {
+          background: "#010409",
+          foreground: "#e6edf3",
+          cursor: "#3fb950",
+          selectionBackground: "#3fb95055",
+        }
+      : {
+          background: "#f6f8fa",
+          foreground: "#1f2328",
+          cursor: "#1a7f37",
+          selectionBackground: "#1a7f3755",
+        },
   });
   const fit = new FitAddon();
   term.loadAddon(fit);
+  const search = new SearchAddon();
+  term.loadAddon(search);
 
   const el = document.createElement("div");
   el.className = "xterm-host";
   term.open(el);
 
-  let webgl: WebglAddon | null = null;
+  // OSC 7 → cwd
   try {
-    webgl = new WebglAddon();
-    webgl.onContextLoss(() => {
-      try {
-        webgl?.dispose();
-      } catch {
-        /* ignore */
-      }
-      webgl = null;
+    term.parser.registerOscHandler(7, (data) => {
+      const cwd = parseOsc7(data);
+      if (cwd) opts.onCwd?.(cwd);
+      return true;
     });
-    term.loadAddon(webgl);
   } catch {
-    webgl = null;
+    /* older xterm */
   }
 
-  return { term, fit, webgl, el };
+  let webgl: WebglAddon | null = null;
+  if (preferWebgl) {
+    try {
+      webgl = new WebglAddon();
+      webgl.onContextLoss(() => {
+        try {
+          webgl?.dispose();
+        } catch {
+          /* ignore */
+        }
+        webgl = null;
+      });
+      term.loadAddon(webgl);
+    } catch {
+      webgl = null;
+    }
+  }
+
+  return { term, fit, webgl, search, el };
 }
 
 export function disposeTerminal(bundle: TermBundle): void {
@@ -55,6 +108,15 @@ export function disposeTerminal(bundle: TermBundle): void {
   }
   try {
     bundle.term.dispose();
+  } catch {
+    /* ignore */
+  }
+}
+
+export function applyTerminalFontSize(bundle: TermBundle, size: number): void {
+  bundle.term.options.fontSize = size;
+  try {
+    bundle.fit.fit();
   } catch {
     /* ignore */
   }

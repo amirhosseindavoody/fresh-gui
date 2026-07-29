@@ -172,7 +172,7 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 
 - **UI-1 ✅** — Terax-inspired chrome: always-on connection strip, status bar, unified terminal/editor tabs, tokenized theme, CodeMirror 6, xterm WebGL, tab pill, collapsible sidebar, dirty/preview affordances.
 - **UI-2 ✅** — per-tab recursive pane trees (max 4 leaves), shortcut registry + command palette, virtualized explorer, richer `layout_set` blob (see [UI.md](./UI.md)).
-- **UI-3** — OSC 7 cwd, search, activity bar, icon pack, light theme, settings window (see [UI.md](./UI.md)).
+- **UI-3 ✅** — OSC 7 cwd, search, activity bar, lightweight file badges, light theme, settings modal (see [UI.md](./UI.md)).
 - Do not conflate with packaging polish below.
 
 ### Phase 4 — Polish / packaging

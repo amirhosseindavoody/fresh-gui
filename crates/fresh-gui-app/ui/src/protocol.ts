@@ -29,7 +29,7 @@ export type ClientMessage =
   | { type: "session_create"; layout?: string }
   | { type: "session_attach"; session_id: string }
   | { type: "layout_set"; layout: string }
-  | { type: "pty_open"; cols: number; rows: number }
+  | { type: "pty_open"; cols: number; rows: number; cwd?: string; shell?: string }
   | { type: "pty_data"; id: string; data: string }
   | { type: "pty_resize"; id: string; cols: number; rows: number }
   | { type: "pty_close"; id: string }

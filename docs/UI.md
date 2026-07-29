@@ -2,7 +2,7 @@
 
 Product UI for the **local host** ADE shell. Architecture and protocol live in [DESIGN.md](./DESIGN.md). This document defines **what the UI should become**, borrowing layout and interaction patterns from [Terax](https://github.com/crynta/terax-ai) while staying honest about our remote-backend split.
 
-**Status:** UI-1 and UI-2 shipped in `crates/fresh-gui-app/ui` (connection strip, status bar, unified terminal/editor tabs, CodeMirror 6, xterm WebGL, per-tab recursive pane trees, shortcut registry + command palette, virtualized file tree). UI-3 still ahead. Architecture/protocol: [DESIGN.md](./DESIGN.md).
+**Status:** UI-1 through UI-3 shipped in `crates/fresh-gui-app/ui` (connection strip, status bar, unified terminal/editor tabs, CodeMirror 6, xterm WebGL, per-tab recursive pane trees, shortcut registry + command palette, virtualized file tree, OSC 7 cwd, find bar, activity bar, light theme + settings). Architecture/protocol: [DESIGN.md](./DESIGN.md).
 
 ## 1. Goals
 
@@ -61,7 +61,7 @@ Inspired by Terax’s public UI / [TERAX.md](https://github.com/crynta/terax-ai/
 | Region | Role |
 |--------|------|
 | **Connection strip** | **Always on** (not a disconnect-only modal). Backend URL, auth, Connect/Disconnect stay in a top strip. After connect the strip stays visible but **compacts** to a quiet chip row (host + session id + status); expand inline to edit URL/token without leaving the workspace. |
-| **Activity / sidebar** | UI-1: file tree only. UI-3+: icons for Explorer (and later SCM). Collapsible; width persisted in layout blob. |
+| **Activity / sidebar** | Activity bar (Explorer + Settings). Sidebar hosts the file tree; collapsible; width persisted in layout blob. |
 | **Tab bar** | All document surfaces. New tab = new PTY by default. Double-click file opens/focuses an **editor tab** (not a permanent bottom pane). |
 | **Main stack** | One visible tab; inactive tabs hidden (`visibility` / `content-visibility`), not unmounted. |
 | **Right rail** | Reserved width 0. Do not build AI chrome here for MVP. |
@@ -84,7 +84,7 @@ Before the first successful connect, the strip is expanded (URL / token / Connec
 |-------|----------|
 | **Connect UX** | Always-on strip (compact when connected; expand inline to edit). No modal-only connect flow. |
 | **Default keybindings** | Match **Terax** pane/tab shortcuts (see §6). Remappable later via settings. |
-| **File tree icons** | **Text-only for UI-1** (twist / kind glyphs as today). Icon packs deferred to UI-3+. |
+| **File tree icons** | UI-1 text-only; **UI-3:** lightweight extension badges (`src/icons.ts`), not a full icon pack. |
 | **UI framework** | **Stay on Vite + TypeScript modules.** Do not adopt Preact/React for large trees or pane polish. Revisit only if hand-rolled pane trees become unmaintainable. |
 | **Large trees (~10k files)** | Host concern: keep lazy one-level `fs_list`; add **row virtualization** + watch discipline when polishing the explorer. Not a Fresh-editor problem; not a reason to add React. |
 | **Editor authority UX** | **Quiet day-to-day:** normal file-tab chrome (path, dirty `•`, save). Surface remote/Fresh authority only on **connection state**, **save errors**, and **conflicts** — not permanent “remote buffer” badging. |
@@ -106,7 +106,7 @@ type PaneNode =
 **Behaviors (Terax-aligned)**
 
 - **Preview editor tabs:** single-click / first open may be preview; double-click or edit pins. Next preview replaces the unpinned tab.
-- **Inherited cwd:** new terminal tabs/splits prefer active leaf cwd (OSC 7 later) or editor file’s parent; until OSC exists, use backend root / last known path.
+- **Inherited cwd:** new terminal tabs/splits prefer active leaf cwd (OSC 7) or editor file’s parent.
 - **Max leaves per terminal tab:** 4 (renderer cost + clarity).
 - **Layout persistence:** serialize tab list + `paneTree` + sidebar width into existing `layout_set` / localStorage (extend today’s JSON blob).
 - **Close pane vs close tab:** last leaf closes the tab; closing a tab closes remote PTYs / buffers for that tab.
@@ -124,11 +124,11 @@ type PaneNode =
 
 ### 5.1 Direction
 
-- **Dense ADE**, not dashboard. Dark-first for MVP (match terminal habits); light theme tokenized for later.
+- **Dense ADE**, not dashboard. Dark-first default; light theme via settings (`data-theme`).
 - **One accent** for focus/active (connection healthy, active tab, primary button). Avoid purple-glow / multi-shadow AI aesthetics.
 - **Typography:** keep expressive mono for terminal + paths (`IBM Plex Mono` or similar); UI chrome uses a paired sans. No Inter/Roboto/Arial defaults as the brand face.
 - **Surfaces:** subtle elevation via border + slight fill shifts, not card grids. Resizable gutters like Terax (`react-resizable-panels` or CSS equivalent).
-- **Icons:** UI-1 tree stays **text-only** (no file-type icon pack). Optional Catppuccin / Material-style icons are UI-3+. Prefer SVG sprites over emoji when icons land.
+- **Icons:** Lightweight extension badges in the explorer (UI-3). Full SVG icon packs remain optional later.
 
 ### 5.2 Tokens (illustrative)
 
@@ -237,14 +237,14 @@ Connection errors and auth failures use inline strip status + optional toast; ne
 - Richer layout blob (`version: 2`) in `layout_set` / localStorage, including each terminal tab's `paneTree` and `activeLeafId`.
 - Simplifications: pane-tree restore across `session_attach` only recreates the exact multi-pane layout when the reattached ptys match a persisted tab's leaf ids 1:1; otherwise it falls back to one terminal tab per pty. Editor tabs are not restored across reattach (server-side buffers aren't rehydrated by path yet).
 
-### Phase UI-3 — Depth (protocol-gated)
+### Phase UI-3 — Depth ✅
 
-- OSC 7 cwd → tab titles + inherited cwd (needs backend/shell integration).
-- Search (terminal buffer / editor) in header.
-- Optional activity bar entries (explorer only until SCM exists).
-- Optional file-type icon pack for the tree.
-- Optional `fs_list` pagination / truncated listing for monster single directories (protocol), if virtualization alone is not enough.
-- Light theme; settings window (Tauri) for font sizes, renderer, theme id.
+- OSC 7 cwd → tab titles + inherited cwd for new tabs/splits (backend bash/zsh hooks in `pty.rs`; client `TermBundle.cwd` + `pty_open.cwd`).
+- Header find bar for terminal buffer (`@xterm/addon-search`, `Mod+F`); editor uses CodeMirror search panel.
+- Activity bar with Explorer (toggles sidebar) + Settings entry; explorer remains the only sidebar view until SCM exists.
+- Lightweight file-type badges in the virtualized tree (`src/icons.ts`) — no heavy icon pack.
+- Skipped `fs_list` pagination for now — row virtualization covers large trees; revisit only if a single directory listing becomes a protocol bottleneck.
+- Light theme tokens (`data-theme`) + settings modal (theme, terminal/editor font size, WebGL preference) via `Mod+,` / activity bar.
 
 ### Out of UI phases (stay in DESIGN Phase 4+)
 

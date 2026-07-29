@@ -2,6 +2,7 @@
 
 import type { FsEntry } from "./protocol";
 import { escapeHtml } from "./dom";
+import { fileIcon } from "./icons";
 
 export type TreeListFn = (path: string) => Promise<{ path: string; entries: FsEntry[] }>;
 
@@ -193,8 +194,8 @@ export class VirtualTree {
       el.style.paddingLeft = `${0.4 + row.depth * 0.85}rem`;
       el.classList.toggle("selected", this.selected === row.path);
       const twist = row.kind === "dir" ? (row.expanded ? "▾" : "▸") : "";
-      const kind = row.kind === "dir" ? "▸" : row.kind === "symlink" ? "↗" : "·";
-      el.innerHTML = `<span class="twist">${twist}</span><span class="kind">${kind}</span><span class="name">${escapeHtml(row.name)}</span>`;
+      const kind = fileIcon(row.name, row.kind);
+      el.innerHTML = `<span class="twist">${twist}</span><span class="kind">${escapeHtml(kind)}</span><span class="name">${escapeHtml(row.name)}</span>`;
     }
 
     for (const [path, el] of existing) {
