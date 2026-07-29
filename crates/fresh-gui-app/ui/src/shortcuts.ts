@@ -11,6 +11,7 @@ export type ShortcutId =
   | "pane.focusPrev"
   | "sidebar.toggle"
   | "editor.save"
+  | "editor.markdownPreview"
   | "commandPalette.open"
   | "search.focus"
   | "settings.open";
@@ -95,6 +96,11 @@ export const SHORTCUTS: Shortcut[] = [
     defaultBindings: [{ [MOD_PROP]: true, key: "s" }],
   },
   {
+    id: "editor.markdownPreview",
+    label: "Toggle markdown preview",
+    defaultBindings: [{ [MOD_PROP]: true, shift: true, key: "v" }],
+  },
+  {
     id: "search.focus",
     label: "Find in active pane",
     defaultBindings: [{ [MOD_PROP]: true, key: "f" }],
@@ -140,6 +146,7 @@ export function installShortcuts(handlers: ShortcutHandlers): () => void {
       const id = matchShortcut(e);
       if (
         id !== "editor.save" &&
+        id !== "editor.markdownPreview" &&
         id !== "commandPalette.open" &&
         id !== "sidebar.toggle" &&
         id !== "search.focus" &&

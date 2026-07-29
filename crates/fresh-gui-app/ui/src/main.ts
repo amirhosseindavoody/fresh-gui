@@ -10,6 +10,7 @@ import {
 } from "./protocol";
 import { $, $button, $input, b64decode, b64encode, basename, relativePath } from "./dom";
 import { applyEditorFontSize, applyEditorTheme, createEditorView, openEditorSearch } from "./editor";
+import { isMarkdownPath, updateMarkdownPreview } from "./markdown-preview";
 import {
   applyTerminalFontSize,
   applyTerminalTheme,
@@ -85,8 +86,11 @@ interface EditorTab {
   rev: number;
   dirty: boolean;
   preview: boolean;
+  /** Rendered markdown view vs source (only used for markdown paths). */
+  mdView: "source" | "preview";
   view: EditorView;
   host: HTMLElement;
+  mdPreviewEl: HTMLElement | null;
   suppressChange: boolean;
 }
 
@@ -128,6 +132,7 @@ const editorStack = $("editor-stack");
 const statusLeft = $("status-left");
 const statusRight = $("status-right");
 const editorSaveBtn = $button("editor-save");
+const editorMdPreviewBtn = $button("editor-md-preview");
 const newTabBtn = $button("new-tab");
 const splitHBtn = $button("split-h");
 const splitVBtn = $button("split-v");
@@ -667,8 +672,18 @@ function measurePill(): void {
 function updateSaveButton(): void {
   const active = tabs[activeTabIndex];
   const editorActive = active?.kind === "editor";
+  const mdActive = editorActive && isMarkdownPath(active.path);
   editorSaveBtn.hidden = !editorActive;
   editorSaveBtn.disabled = !editorActive || !active.dirty;
+  editorMdPreviewBtn.hidden = !mdActive;
+  if (mdActive) {
+    const inPreview = active.mdView === "preview";
+    editorMdPreviewBtn.textContent = inPreview ? "Edit" : "Preview";
+    editorMdPreviewBtn.title = inPreview
+      ? "Show markdown source (Mod+Shift+V)"
+      : "Show rendered markdown (Mod+Shift+V)";
+    editorMdPreviewBtn.setAttribute("aria-pressed", inPreview ? "true" : "false");
+  }
   splitHBtn.hidden = editorActive;
   splitVBtn.hidden = editorActive;
   splitOffBtn.hidden = editorActive;
@@ -686,6 +701,7 @@ function updateStacks(): void {
   tabs.forEach((t, i) => {
     if (t.kind === "editor") {
       t.host.hidden = i !== activeTabIndex;
+      if (i === activeTabIndex) applyEditorMdView(t);
     }
   });
 }
@@ -1087,9 +1103,28 @@ function focusActiveTab(): void {
       fitBundle(bundle);
       bundle.term.focus();
     });
+  } else if (active.mdView === "preview" && active.mdPreviewEl) {
+    active.mdPreviewEl.focus();
   } else {
     active.view.focus();
   }
+}
+
+function applyEditorMdView(tab: EditorTab, opts: { refresh?: boolean } = {}): void {
+  const showPreview = tab.mdView === "preview" && !!tab.mdPreviewEl;
+  tab.host.classList.toggle("md-preview-active", showPreview);
+  if (showPreview && tab.mdPreviewEl && opts.refresh) {
+    updateMarkdownPreview(tab.mdPreviewEl, tab.view.state.doc.toString());
+  }
+}
+
+function toggleMarkdownPreview(): void {
+  const active = tabs[activeTabIndex];
+  if (active?.kind !== "editor" || !isMarkdownPath(active.path) || !active.mdPreviewEl) return;
+  active.mdView = active.mdView === "preview" ? "source" : "preview";
+  applyEditorMdView(active, { refresh: active.mdView === "preview" });
+  updateSaveButton();
+  focusActiveTab();
 }
 
 function renderAll(): void {
@@ -1249,6 +1284,16 @@ async function openEditorTab(path: string, preview: boolean): Promise<void> {
       updateStatusRight();
     }, { fontSize: uiSettings.editorFontSize, theme: getResolvedTheme() });
 
+    let mdPreviewEl: HTMLElement | null = null;
+    if (isMarkdownPath(opened.path)) {
+      mdPreviewEl = document.createElement("div");
+      mdPreviewEl.className = "md-preview";
+      mdPreviewEl.tabIndex = -1;
+      mdPreviewEl.setAttribute("role", "document");
+      mdPreviewEl.setAttribute("aria-label", "Markdown preview");
+      host.appendChild(mdPreviewEl);
+    }
+
     tabRef = {
       kind: "editor",
       id: `editor-${opened.buffer_id}`,
@@ -1257,8 +1302,10 @@ async function openEditorTab(path: string, preview: boolean): Promise<void> {
       rev: opened.rev,
       dirty: false,
       preview,
+      mdView: "source",
       view,
       host,
+      mdPreviewEl,
       suppressChange: false,
     };
 
@@ -1287,6 +1334,7 @@ async function saveActiveEditor(): Promise<void> {
     active.rev = saved.rev;
     active.dirty = false;
     active.preview = false;
+    if (active.mdView === "preview") applyEditorMdView(active, { refresh: true });
     renderAll();
     if (isConfigPath(saved.path) || isConfigPath(active.path)) {
       try {
@@ -1704,6 +1752,9 @@ stripCompact.addEventListener("click", expandStrip);
 editorSaveBtn.addEventListener("click", () => {
   void saveActiveEditor();
 });
+editorMdPreviewBtn.addEventListener("click", () => {
+  toggleMarkdownPreview();
+});
 newTabBtn.addEventListener("click", openNewTerminalTab);
 splitHBtn.addEventListener("click", () => requestSplit("horizontal"));
 splitVBtn.addEventListener("click", () => requestSplit("vertical"));
@@ -1733,6 +1784,9 @@ const shortcutHandlers: ShortcutHandlers = {
   "sidebar.toggle": () => toggleSidebar(),
   "editor.save": () => {
     void saveActiveEditor();
+  },
+  "editor.markdownPreview": () => {
+    toggleMarkdownPreview();
   },
   "search.focus": () => focusFind(),
   "settings.open": () => {
