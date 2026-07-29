@@ -99,8 +99,9 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let fs_root = FsRoot::new(root_path).context("init FS root")?;
 
-    let config = Arc::new(Config::load(args.config.as_deref()).context("load config")?);
+    let (config, config_path) = Config::load(args.config.as_deref()).context("load config")?;
     let (default_shell, _) = config.resolve_shell();
+    let config = Arc::new(std::sync::RwLock::new(config));
 
     let require_auth = !loopback || token.is_some();
 
@@ -122,6 +123,7 @@ async fn main() -> Result<()> {
         editor,
         watches: FsWatchStore::new(),
         config,
+        config_path,
     });
 
     let ui_dir = if args.no_ui {
@@ -139,6 +141,7 @@ async fn main() -> Result<()> {
         fs_root = %state.fs_root.root_display(),
         editor = state.editor.is_some(),
         default_shell = %default_shell,
+        config = %state.config_path.display(),
         "starting fresh-gui-backend"
     );
     // Plain lines so the launch URL is obvious in `pixi run serve` output.

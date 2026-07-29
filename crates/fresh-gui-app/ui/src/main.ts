@@ -35,8 +35,9 @@ import { VirtualTree } from "./tree";
 import { applyTheme, getResolvedTheme, initTheme, onResolvedThemeChange, resolveTheme } from "./theme";
 import {
   loadSettings,
-  openSettings,
-  setSettingsChangeHandler,
+  normalizeUiSettings,
+  saveSettings,
+  uiSettingsFromConfigText,
   type UiSettings,
 } from "./settings";
 import { closeFindBar, openFindBar, setSearchTarget } from "./search";
@@ -133,6 +134,8 @@ const activitySettings = $button("activity-settings");
 initTheme();
 let uiSettings: UiSettings = loadSettings();
 applyTheme(uiSettings.theme);
+/** Absolute path to backend `config.json` (from Hello). */
+let configPath: string | null = null;
 
 const terminalPark = document.createElement("div");
 terminalPark.className = "terminal-park";
@@ -596,16 +599,36 @@ function focusFind(): void {
 function applyUiSettings(next: UiSettings): void {
   const prevResolved = resolveTheme(uiSettings.theme);
   uiSettings = next;
-  applyTheme(next.theme);
+  saveSettings(next);
   const resolved = resolveTheme(next.theme);
-  const themeChanged = resolved !== prevResolved;
-  restyleOpenPanes(resolved, themeChanged);
+  restyleOpenPanes(resolved, resolved !== prevResolved);
   requestAnimationFrame(fitActiveLeaves);
-  if (themeChanged || next.theme !== "system") {
-    const label =
-      next.theme === "system" ? `system (${resolved})` : next.theme;
-    setStatusLeft(`theme: ${label}`);
+}
+
+function pathsEqual(a: string, b: string): boolean {
+  return a === b || a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
+}
+
+function isConfigPath(path: string): boolean {
+  return !!configPath && pathsEqual(path, configPath);
+}
+
+/** Open backend `config.json` as an editor tab (theme, fonts, shell, …). */
+async function openSettingsFile(): Promise<void> {
+  if (!connected) {
+    setStatusLeft("connect to a backend to edit settings");
+    return;
   }
+  if (!hasEditor) {
+    setStatusLeft("editor unavailable — cannot open settings");
+    return;
+  }
+  if (!configPath) {
+    setStatusLeft("backend did not advertise a config path");
+    return;
+  }
+  await openEditorTab(configPath, false);
+  setStatusLeft(`settings: ${configPath} (save with Mod+S)`);
 }
 
 /** Restyle open terminals/editors to match the resolved chrome theme. */
@@ -1158,6 +1181,9 @@ async function openEditorTab(path: string, preview: boolean): Promise<void> {
 
     tabs.push(tabRef);
     activeTabIndex = tabs.length - 1;
+    if (configPath && (pathsEqual(opened.path, configPath) || pathsEqual(path, configPath))) {
+      configPath = opened.path;
+    }
     renderAll();
     focusActiveTab();
     setStatusLeft(`opened ${opened.path}`);
@@ -1179,7 +1205,18 @@ async function saveActiveEditor(): Promise<void> {
     active.dirty = false;
     active.preview = false;
     renderAll();
-    setStatusLeft(`saved ${saved.path}`);
+    if (isConfigPath(saved.path) || isConfigPath(active.path)) {
+      try {
+        applyUiSettings(uiSettingsFromConfigText(text));
+        setStatusLeft(`saved settings · theme ${uiSettings.theme}`);
+      } catch (err) {
+        setStatusLeft(
+          `saved ${saved.path}, but ui parse failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    } else {
+      setStatusLeft(`saved ${saved.path}`);
+    }
   } catch (err) {
     setStatusLeft(`save error: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -1241,6 +1278,10 @@ function onMessage(raw: string): void {
   switch (msg.type) {
     case "hello":
       hasEditor = Array.isArray(msg.capabilities) && msg.capabilities.includes("editor");
+      configPath = typeof msg.config_path === "string" && msg.config_path ? msg.config_path : null;
+      if (msg.ui) {
+        applyUiSettings(normalizeUiSettings(msg.ui));
+      }
       send({
         type: "hello",
         protocol_version: PROTOCOL_VERSION,
@@ -1465,6 +1506,7 @@ function disconnect(): void {
   connected = false;
   sessionId = null;
   hasEditor = false;
+  configPath = null;
   stripForceExpanded = false;
   pendingEditor.clear();
   pendingEdit.clear();
@@ -1589,7 +1631,9 @@ activityExplorer.addEventListener("click", () => {
   toggleSidebar();
   if (!isSidebarCollapsed()) treeEl.focus();
 });
-activitySettings.addEventListener("click", () => openSettings());
+activitySettings.addEventListener("click", () => {
+  void openSettingsFile();
+});
 
 tabsEl.addEventListener("scroll", () => requestAnimationFrame(measurePill));
 
@@ -1608,7 +1652,9 @@ const shortcutHandlers: ShortcutHandlers = {
     void saveActiveEditor();
   },
   "search.focus": () => focusFind(),
-  "settings.open": () => openSettings(),
+  "settings.open": () => {
+    void openSettingsFile();
+  },
 };
 
 function runShortcutId(id: ShortcutId): void {
@@ -1617,7 +1663,6 @@ function runShortcutId(id: ShortcutId): void {
 
 installShortcuts(shortcutHandlers);
 setPaletteCommands(defaultPaletteCommands(runShortcutId));
-setSettingsChangeHandler(applyUiSettings);
 
 // OS theme flips while preference is "system" → restyle open panes.
 onResolvedThemeChange((resolved) => {

@@ -37,16 +37,24 @@ fresh-gui-backend
 
 ### Config (`config.json`)
 
-Same nesting as Fresh’s terminal shell setting. When the client omits `shell` on `pty_open`, the backend uses:
+Shared settings file (JSONC). Path: `$XDG_CONFIG_HOME/fresh-gui/config.json` or `~/.config/fresh-gui/config.json` (override with `--config` / `FRESH_GUI_CONFIG`). Missing file → built-in defaults until Settings creates it.
 
-```json
+```jsonc
 {
+  // Host UI — applied on connect and when this file is saved
+  "ui": {
+    "theme": "system", // system | light | dark
+    "terminalFontSize": 14,
+    "editorFontSize": 14,
+    "webgl": true
+  },
+  // Default PTY shell when the client omits `shell` on pty_open
   "terminal": {
     "shell": { "command": "zsh", "args": [] }
   }
 }
 ```
 
-`zsh` is the built-in default when the file is missing. Empty `args` keep the backend’s interactive / OSC 7 setup; non-empty `args` are passed through as-is. JSONC (`//` / `/* */`) is accepted.
+Empty `args` keep the backend’s interactive / OSC 7 setup; non-empty `args` are passed through as-is. In the host UI, the Settings button / `Mod+,` opens this file in the editor (save with `Mod+S`).
 
 See [docs/DESIGN.md](../../docs/DESIGN.md).

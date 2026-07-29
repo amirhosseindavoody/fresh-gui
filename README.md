@@ -37,7 +37,7 @@ pixi run app -- smoke --backend ws://127.0.0.1:7420/ws
 #   pixi run ui          # Vite on :1420 → Connect to ws://127.0.0.1:7420/ws
 ```
 
-Auth: on loopback, token is optional unless `--token` / `FRESH_GUI_TOKEN` is set. Non-loopback binds **require** a token. FS listing and editor open are sandboxed to `--root` (default: cwd). Sessions keep PTYs alive across GUI disconnect. Pass `--no-editor` to run without Fresh. Pass `--no-ui` for API-only. Startup UI/WS URLs prefer an assigned host domain (`--public-host` / `FRESH_GUI_PUBLIC_HOST`, or auto-detected FQDN) over a bare loopback address. Default PTY shell is `zsh` (override via `~/.config/fresh-gui/config.json` or `--config` / `FRESH_GUI_CONFIG` — see [crates/fresh-gui-backend/README.md](./crates/fresh-gui-backend/README.md)).
+Auth: on loopback, token is optional unless `--token` / `FRESH_GUI_TOKEN` is set. Non-loopback binds **require** a token. FS listing and editor open are sandboxed to `--root` (default: cwd). Sessions keep PTYs alive across GUI disconnect. Pass `--no-editor` to run without Fresh. Pass `--no-ui` for API-only. Startup UI/WS URLs prefer an assigned host domain (`--public-host` / `FRESH_GUI_PUBLIC_HOST`, or auto-detected FQDN) over a bare loopback address. Settings (theme, fonts, default shell, …) live in `~/.config/fresh-gui/config.json` — open via the Settings button / `Mod+,` (see [crates/fresh-gui-backend/README.md](./crates/fresh-gui-backend/README.md)).
 
 ### Installable Linux binary (Pixi package)
 

@@ -2,6 +2,7 @@
 
 #![allow(clippy::result_large_err)] // ADE `Message` is the shared error envelope.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -11,7 +12,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use base64::Engine;
-use fresh_gui_protocol::{Hello, Message, CAP_EDITOR, CAP_SCENE, PROTOCOL_VERSION};
+use fresh_gui_protocol::{Hello, HelloUi, Message, CAP_EDITOR, CAP_SCENE, PROTOCOL_VERSION};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -29,7 +30,10 @@ pub struct AppState {
     pub sessions: SessionStore,
     pub editor: Option<EditorHandle>,
     pub watches: FsWatchStore,
-    pub config: Arc<Config>,
+    /// Live config (reloaded when the settings file is saved).
+    pub config: Arc<std::sync::RwLock<Config>>,
+    /// Absolute path to `config.json`.
+    pub config_path: PathBuf,
 }
 
 pub async fn serve_listener(
@@ -74,10 +78,22 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     if state.editor.is_none() {
         caps.retain(|c| c != CAP_EDITOR && c != CAP_SCENE);
     }
-    let hello = Message::Hello(Hello::backend(
+    let ui = {
+        let cfg = state.config.read().expect("config lock");
+        HelloUi {
+            theme: cfg.ui.theme.clone(),
+            terminal_font_size: cfg.ui.terminal_font_size,
+            editor_font_size: cfg.ui.editor_font_size,
+            webgl: cfg.ui.webgl,
+        }
+    };
+    let mut hello = Hello::backend(
         format!("fresh-gui-backend/{}", env!("CARGO_PKG_VERSION")),
         caps,
-    ));
+    );
+    hello.config_path = Some(state.config_path.display().to_string());
+    hello.ui = Some(ui);
+    let hello = Message::Hello(hello);
     if send_msg(&mut sink, &hello).await.is_err() {
         return;
     }
@@ -315,9 +331,10 @@ async fn handle_client_msg(
                 }
             };
 
+            let cfg = state.config.read().expect("config lock").clone();
             let id = state
                 .sessions
-                .open_pty(&sid, cols, rows, cwd, shell, &state.config)
+                .open_pty(&sid, cols, rows, cwd, shell, &cfg)
                 .await
                 .map_err(|err| Message::Error {
                     code: "pty_open_failed".into(),
@@ -466,7 +483,7 @@ async fn handle_client_msg(
                     message: format!("{request_id}: editor capability not available"),
                 });
             };
-            let resolved = state.fs_root.resolve(&path).await.map_err(|err| Message::Error {
+            let resolved = resolve_editor_path(state, &path).await.map_err(|err| Message::Error {
                 code: "editor_open_failed".into(),
                 message: format!("{request_id}: {err:#}"),
             })?;
@@ -575,6 +592,26 @@ async fn handle_client_msg(
                     code: "buffer_save_failed".into(),
                     message: format!("{request_id}: {err:#}"),
                 })?;
+            if Config::path_matches(&state.config_path, &path) {
+                match Config::load_from_path(&state.config_path) {
+                    Ok(cfg) => {
+                        info!(
+                            path = %state.config_path.display(),
+                            shell = %cfg.resolve_shell().0,
+                            theme = %cfg.ui.theme,
+                            "reloaded config after save"
+                        );
+                        *state.config.write().expect("config lock") = cfg;
+                    }
+                    Err(err) => {
+                        warn!(
+                            path = %state.config_path.display(),
+                            %err,
+                            "config save on disk but reload failed"
+                        );
+                    }
+                }
+            }
             send_msg(
                 sink,
                 &Message::BufferSaved {
@@ -666,6 +703,22 @@ async fn handle_client_msg(
             Ok(())
         }
     }
+}
+
+/// Resolve an editor path: the settings `config.json` is always allowed (and
+/// created on first open); everything else stays inside the FS sandbox.
+async fn resolve_editor_path(state: &AppState, path: &str) -> anyhow::Result<std::path::PathBuf> {
+    if Config::path_matches(&state.config_path, path)
+        || path == state.config_path.display().to_string()
+        || std::path::Path::new(path) == state.config_path.as_path()
+    {
+        Config::ensure_file(&state.config_path)?;
+        return Ok(state
+            .config_path
+            .canonicalize()
+            .unwrap_or_else(|_| state.config_path.clone()));
+    }
+    state.fs_root.resolve(path).await
 }
 
 fn require_auth(authed: bool) -> Result<(), Message> {
