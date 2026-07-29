@@ -11,7 +11,7 @@ use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use fresh_gui_protocol::Message;
 use notify::event::{CreateKind, EventKind};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -130,12 +130,10 @@ impl FsWatchStore {
         *shared.lock().expect("watcher slot lock") = Some(watcher);
 
         let display = path.display().to_string();
-        self.inner.lock().expect("fs watch lock").insert(
-            watch_id.clone(),
-            WatchEntry {
-                _watcher: shared,
-            },
-        );
+        self.inner
+            .lock()
+            .expect("fs watch lock")
+            .insert(watch_id.clone(), WatchEntry { _watcher: shared });
 
         Ok((watch_id, display))
     }
@@ -171,8 +169,7 @@ fn maybe_watch_new_dirs(
         if !path.starts_with(root) || path_is_noisy(path) {
             continue;
         }
-        let is_dir =
-            matches!(event.kind, EventKind::Create(CreateKind::Folder)) || path.is_dir();
+        let is_dir = matches!(event.kind, EventKind::Create(CreateKind::Folder)) || path.is_dir();
         if !is_dir {
             continue;
         }
@@ -248,10 +245,8 @@ mod tests {
 
     #[test]
     fn collect_skips_ignored_trees() {
-        let tmp = std::env::temp_dir().join(format!(
-            "fresh-gui-watch-ignore-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("fresh-gui-watch-ignore-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(tmp.join("src")).unwrap();
         fs::create_dir_all(tmp.join("node_modules/left-pad")).unwrap();
@@ -276,10 +271,8 @@ mod tests {
 
     #[test]
     fn collect_non_recursive_is_just_root() {
-        let tmp = std::env::temp_dir().join(format!(
-            "fresh-gui-watch-nonrec-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("fresh-gui-watch-nonrec-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(tmp.join("a/b")).unwrap();
         let dirs = collect_watch_dirs(&tmp, false);
@@ -289,10 +282,8 @@ mod tests {
 
     #[test]
     fn collect_ignores_large_noise_quickly() {
-        let tmp = std::env::temp_dir().join(format!(
-            "fresh-gui-watch-bench-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("fresh-gui-watch-bench-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(tmp.join("src")).unwrap();
         // Simulate a fat dependency tree that recursive inotify would otherwise walk.
