@@ -6,6 +6,7 @@
 #   YYYY.MMDD.N   e.g. 2026.630.1  (2026-06-30, first release that day)
 #
 # MMDD is month*100+day (no leading zeros; unique per calendar day).
+# Jan–Sep yield 3 digits (e.g. 728); Oct–Dec yield 4 (e.g. 1231).
 # N starts at 1 on the first bump of a calendar day; further runs the same day increment N.
 #
 # Windows / WiX ProductVersion mapping (major,minor ≤ 255; build ≤ 65535):
@@ -44,11 +45,44 @@ read_workspace_version() {
   ' "$CARGO_TOML"
 }
 
+# Parse YYYY.MMDD.N into year/mmdd/n and validate the date encoding.
+# Sets: CALVER_YEAR CALVER_MMDD CALVER_N CALVER_MONTH CALVER_DAY
+parse_calver() {
+  local version="$1"
+  if [[ ! "$version" =~ ^([0-9]{4})\.([0-9]{3,4})\.([0-9]+)$ ]]; then
+    return 1
+  fi
+  local year="${BASH_REMATCH[1]}"
+  local mmdd="${BASH_REMATCH[2]}"
+  local n="${BASH_REMATCH[3]}"
+
+  # Reject leading zeros / padded forms (e.g. 0728, 072, 001).
+  if [[ "$mmdd" != "$((10#$mmdd))" ]]; then
+    return 1
+  fi
+  if (( 10#$n < 1 )); then
+    return 1
+  fi
+
+  local month=$((10#$mmdd / 100))
+  local day=$((10#$mmdd % 100))
+  if (( month < 1 || month > 12 || day < 1 || day > 31 )); then
+    return 1
+  fi
+
+  CALVER_YEAR="$year"
+  CALVER_MMDD="$mmdd"
+  CALVER_N="$n"
+  CALVER_MONTH="$month"
+  CALVER_DAY="$day"
+  return 0
+}
+
 # Convert legacy schemes to YYYY.MMDD.N when interpreting "same day".
 normalize_to_mmdd_version() {
   local version="$1"
-  # Already YYYY.MMDD.N
-  if [[ "$version" =~ ^([0-9]{4})\.([0-9]{3,4})\.([0-9]+)$ ]]; then
+  # Already YYYY.MMDD.N (strict: valid month/day, no leading zeros)
+  if parse_calver "$version"; then
     echo "$version"
     return
   fi
@@ -86,9 +120,9 @@ next_version() {
   local normalized n
 
   normalized="$(normalize_to_mmdd_version "$current")"
-  if [[ "$normalized" =~ ^([0-9]{4}\.[0-9]{3,4})\.([0-9]+)$ ]]; then
-    if [[ "${BASH_REMATCH[1]}" == "$prefix" ]]; then
-      n="${BASH_REMATCH[2]}"
+  if parse_calver "$normalized"; then
+    if [[ "${CALVER_YEAR}.${CALVER_MMDD}" == "$prefix" ]]; then
+      n="$CALVER_N"
       echo "${prefix}.$((n + 1))"
       return
     fi
@@ -140,20 +174,16 @@ update_recipe_version() {
 # Map CalVer YYYY.MMDD.N → WiX-safe major.minor.build
 calver_to_wix() {
   local version="$1"
-  if [[ ! "$version" =~ ^([0-9]{4})\.([0-9]{3,4})\.([0-9]+)$ ]]; then
-    echo "update-version: calver_to_wix expected YYYY.MMDD.N, got: $version" >&2
-    exit 1
+  if ! parse_calver "$version"; then
+    echo "update-version: calver_to_wix expected YYYY.MMDD.N (MMDD=month*100+day, no leading zeros; month 1-12, day 1-31), got: $version" >&2
+    return 1
   fi
-  local year="${BASH_REMATCH[1]}"
-  local mmdd="${BASH_REMATCH[2]}"
-  local n="${BASH_REMATCH[3]}"
-  local month=$((10#$mmdd / 100))
-  local day=$((10#$mmdd % 100))
-  local major=$((10#$year - 2000))
-  local patch=$((day * 1000 + 10#$n))
-  if (( major < 0 || major > 255 || month < 0 || month > 255 || patch < 0 || patch > 65535 )); then
+  local major=$((10#$CALVER_YEAR - 2000))
+  local month="$CALVER_MONTH"
+  local patch=$((CALVER_DAY * 1000 + 10#$CALVER_N))
+  if (( major < 0 || major > 255 || month < 1 || month > 12 || patch < 1 || patch > 65535 )); then
     echo "update-version: WiX mapping out of range for $version → ${major}.${month}.${patch}" >&2
-    exit 1
+    return 1
   fi
   echo "${major}.${month}.${patch}"
 }
@@ -197,6 +227,10 @@ main() {
 
   if [[ "${1:-}" == "--set" ]]; then
     new_version="${2:?usage: update-version.sh --set YYYY.MMDD.N}"
+    if ! parse_calver "$new_version"; then
+      echo "update-version: --set expects YYYY.MMDD.N (MMDD=month*100+day, no leading zeros; month 1-12, day 1-31), got: $new_version" >&2
+      exit 1
+    fi
   else
     new_version="$(next_version "$current" "$prefix")"
   fi

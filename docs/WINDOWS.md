@@ -6,6 +6,8 @@ The Windows MVP host is `fresh-gui-desktop` (Tauri 2). Installers are **NSIS** (
 
 Cargo / pixi keep CalVer `YYYY.MMDD.N` (e.g. `2026.728.1`).
 
+`MMDD` is `month*100+day` with **no leading zeros** (3 digits for Jan–Sep, 4 for Oct–Dec). The bump script rejects padded/malformed values (e.g. `2026.0728.1`, `2026.100.1`, `2026.132.1`).
+
 WiX `ProductVersion` requires major/minor ≤ **255** and build ≤ **65535**, so the Tauri bundle version in `tauri.conf.json` is a mapped form:
 
 | CalVer `YYYY.MMDD.N` | Bundle / MSI version |
