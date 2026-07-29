@@ -1,5 +1,38 @@
+@import "tailwindcss";
+@import "@fontsource/ibm-plex-sans/400.css";
+@import "@fontsource/ibm-plex-sans/500.css";
+@import "@fontsource/ibm-plex-sans/600.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
 @import "./tokens.css";
 @import "@xterm/xterm/css/xterm.css";
+
+/*
+ * Map design tokens → Tailwind theme so utilities stay in sync with
+ * data-theme (e.g. bg-bg, text-muted, border-border, font-mono).
+ * Complex ADE regions below remain hand-rolled CSS for density control.
+ */
+@theme {
+  --color-bg: var(--bg);
+  --color-bg-elevated: var(--bg-elevated);
+  --color-panel: var(--panel);
+  --color-panel-2: var(--panel-2);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-text: var(--text);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-dim: var(--accent-dim);
+  --color-danger: var(--danger);
+  --color-warning: var(--warning);
+  --color-success: var(--success);
+  --color-list-hover: var(--list-hover);
+  --color-list-active: var(--list-active);
+  --font-sans: var(--font-ui);
+  --font-mono: var(--font-mono);
+  --radius-sm: var(--radius-sm);
+  --radius-md: var(--radius-md);
+}
 
 * {
   box-sizing: border-box;
@@ -702,14 +735,27 @@ input#session {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 1rem;
+  gap: 0.75rem;
   padding: 0 0.75rem;
   border-top: 1px solid var(--border);
   background: var(--panel);
   font-size: 0.72rem;
   color: var(--muted);
-  font-family: var(--font-mono);
   overflow: hidden;
+}
+
+.statusbar #status-left {
+  color: var(--text);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.statusbar #status-right {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
 }
 
 #status-left,

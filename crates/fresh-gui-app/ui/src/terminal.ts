@@ -5,7 +5,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { SearchAddon } from "@xterm/addon-search";
 import type { UiSettings } from "./settings";
 import { parseOsc7 } from "./osc7";
-import { xtermThemeFromCss } from "./theme";
+import { monoFontFromCss, xtermThemeFromCss } from "./theme";
 import { copyToClipboard } from "./context-menu";
 import { detectLinksInLine } from "./path-link";
 
@@ -45,6 +45,7 @@ export type CreateTerminalOpts = {
 /** Apply the current CSS token palette to an open xterm instance. */
 export function applyTerminalTheme(bundle: TermBundle): void {
   bundle.term.options.theme = xtermThemeFromCss();
+  bundle.term.options.fontFamily = monoFontFromCss();
 }
 
 function isModKey(ev: KeyboardEvent): boolean {
@@ -152,7 +153,7 @@ export function createTerminal(opts: CreateTerminalOpts = {}): TermBundle {
 
   const term = new Terminal({
     cursorBlink: true,
-    fontFamily: '"IBM Plex Mono", ui-monospace, monospace',
+    fontFamily: monoFontFromCss(),
     fontSize,
     theme: xtermThemeFromCss(),
     // Word select on double-click / right-click (Fresh scrollback double-click).

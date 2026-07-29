@@ -1,22 +1,35 @@
+/**
+ * Design tokens for dense ADE chrome.
+ *
+ * Primer-inspired surfaces (GitHub dark/light canvas) + matching syntax tokens
+ * so xterm and CodeMirror share one palette via CSS variables.
+ * Tailwind `@theme` in styles.css maps these into utilities (`bg-bg`, `text-muted`, …).
+ */
+
 :root,
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #0c0f14;
-  --bg-elevated: #12161e;
+
+  /* Surfaces */
+  --bg: #010409;
+  --bg-elevated: #0d1117;
   --panel: #161b22;
-  --panel-2: #1c222c;
-  --border: #2a313c;
-  --border-strong: #3d4654;
-  --text: #e8edf4;
-  --muted: #8b949e;
+  --panel-2: #21262d;
+  --border: #30363d;
+  --border-strong: #484f58;
+  --text: #e6edf3;
+  --muted: #9198a1;
   --accent: #3fb950;
-  --accent-dim: color-mix(in srgb, var(--accent) 28%, var(--panel));
+  --accent-dim: color-mix(in srgb, var(--accent) 22%, var(--panel));
   --danger: #f85149;
   --warning: #d29922;
+  --success: #3fb950;
   --focus-ring: color-mix(in srgb, var(--accent) 55%, transparent);
+
+  /* Geometry / type */
   --radius-sm: 4px;
   --radius-md: 8px;
-  --font-ui: "IBM Plex Sans", "Segoe UI", sans-serif;
+  --font-ui: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, monospace;
   --tab-height: 36px;
   --statusbar-height: 28px;
@@ -24,21 +37,54 @@
   --sidebar-width: 260px;
   --activity-width: 44px;
   --resizer: 4px;
-  /* Terminal / pane surfaces — keep in sync with xtermThemeFromCss() */
+
+  /* Terminal (xtermThemeFromCss) */
   --term-bg: #010409;
   --term-fg: #e6edf3;
   --term-cursor: #3fb950;
-  /* Opaque enough for canvas selection (xterm does not soft-blend well). */
-  --term-selection: #3fb95080;
+  --term-selection: #3fb95066;
   --term-selection-fg: #ffffff;
-  /* Explorer tree (VS Code–like density) */
+
+  /* Editor chrome (CodeMirror) */
+  --editor-bg: #0d1117;
+  --editor-fg: #e6edf3;
+  --editor-gutter-bg: #0d1117;
+  --editor-gutter-fg: #656d76;
+  --editor-active-line: #161b2280;
+  --editor-selection: #3fb95044;
+  --editor-cursor: #3fb950;
+  --editor-matching-bracket: #3fb95055;
+
+  /* Syntax (Primer dark / github-dark style) */
+  --syn-keyword: #ff7b72;
+  --syn-control: #ff7b72;
+  --syn-string: #a5d6ff;
+  --syn-comment: #8b949e;
+  --syn-number: #79c0ff;
+  --syn-bool: #79c0ff;
+  --syn-function: #d2a8ff;
+  --syn-type: #ffa657;
+  --syn-variable: #e6edf3;
+  --syn-property: #79c0ff;
+  --syn-operator: #ff7b72;
+  --syn-punctuation: #e6edf3;
+  --syn-tag: #7ee787;
+  --syn-attribute: #79c0ff;
+  --syn-heading: #1f6feb;
+  --syn-link: #a5d6ff;
+  --syn-meta: #8b949e;
+  --syn-invalid: #f85149;
+
+  /* Explorer */
   --tree-row-height: 22px;
   --tree-indent: 12px;
   --tree-guide: color-mix(in srgb, var(--border) 90%, transparent);
   --list-hover: color-mix(in srgb, var(--text) 7%, transparent);
   --list-active: var(--accent-dim);
-  --icon-folder: #c9a227;
-  --icon-file: #8b949e;
+
+  /* File icon tones */
+  --icon-folder: #d4a72c;
+  --icon-file: #9198a1;
   --icon-rs: #dea584;
   --icon-ts: #519aba;
   --icon-js: #cbcb41;
@@ -59,34 +105,67 @@
   --icon-php: #4f5d95;
   --icon-sql: #dad8d8;
   --icon-lock: #a1a1a1;
-  --icon-text: #8b949e;
+  --icon-text: #9198a1;
   --icon-docker: #2496ed;
-  --icon-symlink: #8b949e;
+  --icon-symlink: #9198a1;
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg: #f4f6f8;
+
+  --bg: #f6f8fa;
   --bg-elevated: #ffffff;
-  --panel: #eef1f4;
-  --panel-2: #e4e9ef;
-  --border: #c9d1d9;
-  --border-strong: #8b949e;
+  --panel: #ffffff;
+  --panel-2: #f6f8fa;
+  --border: #d0d7de;
+  --border-strong: #8c959f;
   --text: #1f2328;
   --muted: #656d76;
   --accent: #1a7f37;
-  --accent-dim: color-mix(in srgb, var(--accent) 18%, var(--panel));
+  --accent-dim: color-mix(in srgb, var(--accent) 14%, var(--panel));
   --danger: #cf222e;
   --warning: #9a6700;
+  --success: #1a7f37;
   --focus-ring: color-mix(in srgb, var(--accent) 45%, transparent);
-  --term-bg: #f6f8fa;
+
+  --term-bg: #ffffff;
   --term-fg: #1f2328;
   --term-cursor: #1a7f37;
-  /* Stronger than accent@33% — that was nearly invisible on #f6f8fa. */
-  --term-selection: #2da44ea6;
+  --term-selection: #2da44e66;
   --term-selection-fg: #0a1628;
+
+  --editor-bg: #ffffff;
+  --editor-fg: #1f2328;
+  --editor-gutter-bg: #ffffff;
+  --editor-gutter-fg: #8c959f;
+  --editor-active-line: #eaeef280;
+  --editor-selection: #1a7f3728;
+  --editor-cursor: #1a7f37;
+  --editor-matching-bracket: #1a7f3733;
+
+  /* Syntax (Primer light / github-light style) */
+  --syn-keyword: #cf222e;
+  --syn-control: #cf222e;
+  --syn-string: #0a3069;
+  --syn-comment: #6e7781;
+  --syn-number: #0550ae;
+  --syn-bool: #0550ae;
+  --syn-function: #8250df;
+  --syn-type: #953800;
+  --syn-variable: #1f2328;
+  --syn-property: #0550ae;
+  --syn-operator: #cf222e;
+  --syn-punctuation: #1f2328;
+  --syn-tag: #116329;
+  --syn-attribute: #0550ae;
+  --syn-heading: #0550ae;
+  --syn-link: #0969da;
+  --syn-meta: #656d76;
+  --syn-invalid: #cf222e;
+
   --tree-guide: color-mix(in srgb, var(--border) 80%, transparent);
   --list-hover: color-mix(in srgb, var(--text) 6%, transparent);
+
   --icon-folder: #d4a72c;
   --icon-file: #656d76;
   --icon-rs: #a3540c;

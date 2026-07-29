@@ -130,11 +130,17 @@ export function xtermThemeFromCss(): {
   };
   const selection = read("--term-selection", "#2da44ea6");
   return {
-    background: read("--term-bg", read("--bg", "#0c0f14")),
-    foreground: read("--term-fg", read("--text", "#e8edf4")),
+    background: read("--term-bg", read("--bg", "#010409")),
+    foreground: read("--term-fg", read("--text", "#e6edf3")),
     cursor: read("--term-cursor", read("--accent", "#3fb950")),
     selectionBackground: selection,
     selectionInactiveBackground: selection,
     selectionForeground: read("--term-selection-fg", read("--term-fg", "#1f2328")),
   };
+}
+
+/** Prefer the loaded `--font-mono` token (IBM Plex Mono via @fontsource). */
+export function monoFontFromCss(): string {
+  const v = getComputedStyle(document.documentElement).getPropertyValue("--font-mono").trim();
+  return v || '"IBM Plex Mono", ui-monospace, monospace';
 }
