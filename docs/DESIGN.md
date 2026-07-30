@@ -143,7 +143,7 @@ Linux: Pixi `[package]` + `recipe/` installs `bin/fresh-gui` and UI under `share
 | **Vite dev** | `pixi run ui` on `:1420`, points at the backend WS |
 | **CLI** | `fresh-gui-app ping|smoke|attach` via `fresh-gui-client` |
 
-Host chrome is React 19 + Tailwind + shadcn (Button, Tabs, DropdownMenu, ContextMenu — same family Terax uses); ADE protocol, xterm, CodeMirror, and the virtualized tree stay imperative TypeScript modules attached once from the React shell. Full IA and shortcuts: [UI.md](./UI.md).
+Host chrome is React 19 + Tailwind + shadcn (Button, Tabs, DropdownMenu, ContextMenu — same family Terax uses); ADE protocol, xterm, CodeMirror, and the virtualized tree stay imperative TypeScript modules attached once from the React shell. Markdown tabs add an optional host WYSIWYG preview that serializes back into the CodeMirror buffer (Fresh Compose is not on the ADE path). Full IA and shortcuts: [UI.md](./UI.md).
 
 ## 8. Fresh coupling
 

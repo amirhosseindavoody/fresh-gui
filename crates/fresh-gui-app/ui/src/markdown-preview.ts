@@ -10,7 +10,7 @@ const defaultCode = renderer.code.bind(renderer);
 
 renderer.code = (token) => {
   if ((token.lang ?? "").trim().toLowerCase() === "mermaid") {
-    return `<pre class="mermaid">${escapeHtml(token.text)}</pre>\n`;
+    return `<pre class="mermaid" data-md-source="${escapeAttr(token.text)}" contenteditable="false">${escapeHtml(token.text)}</pre>\n`;
   }
   return defaultCode(token);
 };
@@ -35,6 +35,10 @@ function escapeHtml(s: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+function escapeAttr(s: string): string {
+  return escapeHtml(s).replace(/'/g, "&#39;");
 }
 
 function resolvePreviewTheme(): "dark" | "light" {
@@ -81,15 +85,19 @@ function injectMathHtml(html: string, math: MathSlot[]): string {
   return html.replace(/@@@@FRESH_MATH_(\d+)@@@@/g, (_m, i: string) => {
     const slot = math[Number(i)];
     if (!slot) return "";
+    const display = slot.display ? "1" : "0";
+    const cls = slot.display ? "md-math md-math-display" : "md-math";
     try {
-      return katex.renderToString(slot.tex, {
+      const rendered = katex.renderToString(slot.tex, {
         displayMode: slot.display,
         throwOnError: false,
         output: "html",
         strict: "ignore",
       });
+      // Stamp TeX so WYSIWYG can round-trip without parsing KaTeX HTML.
+      return `<span class="${cls}" data-md-math="${escapeAttr(slot.tex)}" data-md-display="${display}" contenteditable="false">${rendered}</span>`;
     } catch {
-      return `<code class="md-math-error">${escapeHtml(slot.tex)}</code>`;
+      return `<code class="md-math-error" data-md-math="${escapeAttr(slot.tex)}">${escapeHtml(slot.tex)}</code>`;
     }
   });
 }
@@ -100,7 +108,7 @@ export function renderMarkdownHtml(source: string): string {
   const raw = marked.parse(text, { async: false }) as string;
   const safe = DOMPurify.sanitize(raw, {
     USE_PROFILES: { html: true },
-    ADD_ATTR: ["target", "rel", "class"],
+    ADD_ATTR: ["target", "rel", "class", "contenteditable", "data-md-math", "data-md-display", "data-md-source"],
   });
   return injectMathHtml(safe, math);
 }
@@ -126,6 +134,13 @@ async function ensureMermaid(): Promise<typeof import("mermaid").default> {
 async function renderMermaidBlocks(root: HTMLElement): Promise<void> {
   const nodes = [...root.querySelectorAll<HTMLElement>("pre.mermaid")];
   if (nodes.length === 0) return;
+  for (const node of nodes) {
+    // Preserve fence body for WYSIWYG → markdown serialization after SVG replace.
+    if (!node.dataset.mdSource) {
+      node.dataset.mdSource = node.textContent ?? "";
+    }
+    node.contentEditable = "false";
+  }
   try {
     const api = await ensureMermaid();
     // Mermaid mutates nodes in place; ignore individual diagram failures.

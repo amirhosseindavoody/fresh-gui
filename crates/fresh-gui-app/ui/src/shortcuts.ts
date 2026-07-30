@@ -103,7 +103,7 @@ export const SHORTCUTS: Shortcut[] = [
   },
   {
     id: "editor.markdownPreview",
-    label: "Toggle markdown preview",
+    label: "Toggle markdown WYSIWYG",
     defaultBindings: [{ [MOD_PROP]: true, shift: true, key: "v" }],
   },
   {

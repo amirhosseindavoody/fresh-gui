@@ -145,7 +145,7 @@ Line/column from path or link are returned on `editor_opened` for the **host** t
 | Wire protocol | ADE JSON over `/ws` — not Fresh `--web` scene |
 | PTY | Host `portable-pty` + OSC 7 hooks (`pty.rs`); Fresh’s `TerminalManager` unused |
 | Explorer FS | Sandboxed `fs.rs` / `fs_watch.rs` (list, create, copy, move, watch). Fresh `StdFileSystem` is only used inside the editor for buffer I/O |
-| Host editing UX | CodeMirror 6 (syntax highlight, minimap, search) |
+| Host editing UX | CodeMirror 6 (syntax highlight, minimap, search); markdown tabs also get a host WYSIWYG preview (`markdown-wysiwyg.ts`) because Fresh Compose/Page View is a plugin and plugins are not enabled on the ADE path |
 | Host terminal UX | xterm.js WebGL |
 | Host chrome | React + Tailwind + shadcn |
 | Plugins / LSP / tree-sitter in the ADE path | Features off; not exposed over the protocol |
@@ -159,6 +159,7 @@ The React shell does not import Fresh. Imperative ADE code in `crates/fresh-gui-
 |--------|------|
 | `ade/bootstrap.ts` | `editor_open` / `editor_open_link`, buffer edit/save CAS, tab presentation |
 | `editor.ts` | CodeMirror view; applies snapshot text; reveals line/col from open |
+| `markdown-preview.ts` / `markdown-wysiwyg.ts` | Host markdown render + editable preview; syncs markdown into CodeMirror for ADE save (Fresh Compose plugin is not on the ADE path — see §6) |
 | `path-link.ts` | Host-side hover detector mirrored for UX; open still goes through backend Fresh `detect_link_at` |
 | `palettes.ts` | Fresh theme colors → CSS tokens |
 | `terminal.ts` / `osc7.ts` | PTY I/O and cwd (feeds open/link `cwd`) |
