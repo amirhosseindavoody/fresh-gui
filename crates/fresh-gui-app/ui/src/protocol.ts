@@ -101,6 +101,8 @@ export type HelloUiMsg = {
   showDotfiles?: boolean;
   showGitDirs?: boolean;
   editorMinimap?: boolean;
+  /** Soft-wrap long lines (Fresh `editor.line_wrap`). Default on. */
+  editorLineWrap?: boolean;
 };
 
 export type ServerMessage =

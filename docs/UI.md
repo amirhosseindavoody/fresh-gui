@@ -130,7 +130,8 @@ Primer-inspired dark/light surfaces live in `src/tokens.css` (palette `primer`).
   "monoFontWeight": 400,   // terminal + editor
   "fontFamily": "",        // empty → IBM Plex Sans
   "monoFontFamily": "",    // empty → IBM Plex Mono
-  "editorMinimap": false   // document map; off = chunk never loaded
+  "editorMinimap": false,  // document map; off = chunk never loaded
+  "editorLineWrap": true   // soft-wrap (Fresh editor.line_wrap); Alt+Z toggles
 }
 ```
 
@@ -153,6 +154,8 @@ Defaults follow [Terax `shortcuts.ts`](https://github.com/crynta/terax-ai/blob/m
 | Focus next / prev pane | `Mod+]` / `Mod+[` | |
 | Swap pane | `Mod+Alt+Arrow` | |
 | Save buffer | `Mod+S` | Editor tabs; also saves settings `config.json` |
+| Toggle markdown preview | `Mod+Shift+V` | Markdown editor tabs |
+| Toggle editor line wrap | `Alt+Z` | Soft wrap (Fresh `line_wrap`); also command palette |
 | Toggle sidebar | `Mod+B` (and `Mod+Shift+B`) | |
 | Find | `Mod+F` | Terminal buffer or editor search |
 | Copy (terminal) | `Mod+C` | Copies when text is selected; otherwise interrupt |

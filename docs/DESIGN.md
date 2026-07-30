@@ -129,7 +129,7 @@ When enabled, Fresh `Editor` runs in-process on a dedicated `!Send` thread (`Edi
 
 ### Config
 
-Backend `config.json` (JSONC) holds UI prefs (theme, palette, fonts, explorer visibility, minimap) and default shell. Snapshot is sent in `Hello.ui`. Settings / `Mod+,` opens the file in an editor tab; saving reloads live prefs. Missing keys are filled without overriding existing values.
+Backend `config.json` (JSONC) holds UI prefs (theme, palette, fonts, explorer visibility, minimap, editor line wrap) and default shell. Snapshot is sent in `Hello.ui`. Settings / `Mod+,` opens the file in an editor tab; saving reloads live prefs. Missing keys are filled without overriding existing values.
 
 ### Packaging
 

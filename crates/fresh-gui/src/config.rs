@@ -44,7 +44,9 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"{
     "showDotfiles": false,
     "showGitDirs": false,
     // VS Code–style editor document map (minimap). Off = not loaded (no UI cost).
-    "editorMinimap": false
+    "editorMinimap": false,
+    // Soft-wrap long lines (Fresh editor.line_wrap). Default on.
+    "editorLineWrap": true
   },
   // Default PTY shell when the client does not pass `shell`.
   // Empty args keep interactive / OSC 7 setup for known shells.
@@ -122,6 +124,9 @@ pub struct UiConfig {
     /// VS Code–style editor document map (minimap). Default off.
     #[serde(default, rename = "editorMinimap")]
     pub editor_minimap: bool,
+    /// Soft-wrap long lines in the host editor (Fresh `editor.line_wrap`). Default on.
+    #[serde(default = "default_true", rename = "editorLineWrap")]
+    pub editor_line_wrap: bool,
 }
 
 impl Default for UiConfig {
@@ -139,6 +144,7 @@ impl Default for UiConfig {
             show_dotfiles: false,
             show_git_dirs: false,
             editor_minimap: false,
+            editor_line_wrap: true,
         }
     }
 }
@@ -720,12 +726,19 @@ mod tests {
         assert!(!cfg.ui.show_dotfiles);
         assert!(!cfg.ui.show_git_dirs);
         assert!(!cfg.ui.editor_minimap);
+        assert!(cfg.ui.editor_line_wrap);
     }
 
     #[test]
     fn parses_editor_minimap_flag() {
         let cfg = Config::parse(r#"{"ui":{"editorMinimap":true}}"#).unwrap();
         assert!(cfg.ui.editor_minimap);
+    }
+
+    #[test]
+    fn parses_editor_line_wrap_flag() {
+        let cfg = Config::parse(r#"{"ui":{"editorLineWrap":false}}"#).unwrap();
+        assert!(!cfg.ui.editor_line_wrap);
     }
 
     #[test]

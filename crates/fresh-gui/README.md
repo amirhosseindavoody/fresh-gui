@@ -86,7 +86,8 @@ Default path: `$XDG_CONFIG_HOME/fresh-gui/config.json` or `~/.config/fresh-gui/c
     "webgl": true,
     "showDotfiles": false, // show .* names in the explorer
     "showGitDirs": false, // show .git folders (separate from showDotfiles)
-    "editorMinimap": false // VS Code–style document map; off = not loaded
+    "editorMinimap": false, // VS Code–style document map; off = not loaded
+    "editorLineWrap": true // soft-wrap long lines (Fresh editor.line_wrap)
   },
   // Default PTY shell when the client omits `shell` on pty_open
   "terminal": {
@@ -95,6 +96,6 @@ Default path: `$XDG_CONFIG_HOME/fresh-gui/config.json` or `~/.config/fresh-gui/c
 }
 ```
 
-Missing file → built-in defaults (`zsh`, system theme, primer palette, hidden dotfiles / `.git`). First **Settings** / `Mod+,` open creates the documented template; later opens also insert any newly added default keys that are missing from an existing file (existing values and comments are kept). Empty shell `args` keep interactive / OSC 7 setup; non-empty args are passed through. JSONC (`//` / `/* */`) is accepted. Named `palette` values match Fresh editor theme names where applicable (colors mapped onto host CSS tokens).
+Missing file → built-in defaults (`zsh`, system theme, primer palette, hidden dotfiles / `.git`, line wrap on). First **Settings** / `Mod+,` open creates the documented template; later opens also insert any newly added default keys that are missing from an existing file (existing values and comments are kept). Empty shell `args` keep interactive / OSC 7 setup; non-empty args are passed through. JSONC (`//` / `/* */`) is accepted. Named `palette` values match Fresh editor theme names where applicable (colors mapped onto host CSS tokens).
 
 See [docs/DESIGN.md](../../docs/DESIGN.md) and [docs/FRESH.md](../../docs/FRESH.md) (Fresh embedding). Security: [docs/SECURITY.md](../../docs/SECURITY.md).

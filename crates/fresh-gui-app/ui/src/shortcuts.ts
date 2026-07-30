@@ -12,6 +12,7 @@ export type ShortcutId =
   | "sidebar.toggle"
   | "editor.save"
   | "editor.markdownPreview"
+  | "editor.toggleLineWrap"
   | "commandPalette.open"
   | "gotoFile.open"
   | "search.focus"
@@ -106,6 +107,12 @@ export const SHORTCUTS: Shortcut[] = [
     defaultBindings: [{ [MOD_PROP]: true, shift: true, key: "v" }],
   },
   {
+    id: "editor.toggleLineWrap",
+    label: "Toggle editor line wrap",
+    // VS Code–style Alt+Z; aligns with Fresh ToggleLineWrap semantics.
+    defaultBindings: [{ alt: true, key: "z" }],
+  },
+  {
     id: "search.focus",
     label: "Find in active pane",
     defaultBindings: [{ [MOD_PROP]: true, key: "f" }],
@@ -152,6 +159,7 @@ export function installShortcuts(handlers: ShortcutHandlers): () => void {
       if (
         id !== "editor.save" &&
         id !== "editor.markdownPreview" &&
+        id !== "editor.toggleLineWrap" &&
         id !== "commandPalette.open" &&
         id !== "gotoFile.open" &&
         id !== "sidebar.toggle" &&

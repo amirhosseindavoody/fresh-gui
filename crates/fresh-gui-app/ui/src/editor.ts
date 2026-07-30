@@ -28,6 +28,8 @@ const themeCompartment = new Compartment();
 const highlightCompartment = new Compartment();
 /** Empty when minimap is off — the `@replit/codemirror-minimap` chunk is never loaded. */
 const minimapCompartment = new Compartment();
+/** Soft wrap (Fresh `editor.line_wrap` / CodeMirror `EditorView.lineWrapping`). */
+const lineWrapCompartment = new Compartment();
 
 const SHELL_LANG = StreamLanguage.define(shell);
 
@@ -288,11 +290,16 @@ export function createEditorView(
     language?: string | null;
     /** When true, dynamically load and mount the document map (minimap). */
     minimap?: boolean;
+    /**
+     * Soft-wrap long lines (Fresh `editor.line_wrap`). Default matches Fresh: on.
+     */
+    lineWrap?: boolean;
     onPathLink?: EditorPathLinkHandler;
   } = {},
 ): EditorView {
   const fontSize = opts.fontSize ?? 14;
   const fontWeight = opts.fontWeight ?? 400;
+  const lineWrap = opts.lineWrap !== false;
   const lang = langForPath(path, { text, language: opts.language });
   const extensions: Extension[] = [
     lineNumbers(),
@@ -307,6 +314,7 @@ export function createEditorView(
     // Always present so we can enable later without recreating the editor;
     // stays empty (no work) until `applyEditorMinimap(view, true)`.
     minimapCompartment.of([]),
+    lineWrapCompartment.of(lineWrap ? EditorView.lineWrapping : []),
     EditorView.updateListener.of((update) => {
       if (update.docChanged) onDocChange();
     }),
@@ -326,6 +334,15 @@ export function createEditorView(
     void applyEditorMinimap(view, true);
   }
   return view;
+}
+
+/**
+ * Toggle soft wrap (Fresh `ToggleLineWrap` / CodeMirror `lineWrapping`).
+ */
+export function applyEditorLineWrap(view: EditorView, enabled: boolean): void {
+  view.dispatch({
+    effects: lineWrapCompartment.reconfigure(enabled ? EditorView.lineWrapping : []),
+  });
 }
 
 /**

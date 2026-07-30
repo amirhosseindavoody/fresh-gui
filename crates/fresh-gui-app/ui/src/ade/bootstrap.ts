@@ -10,6 +10,7 @@ import {
 import { $, $button, b64decode, b64encode, basename, dirname, relativePath } from "../dom";
 import {
   applyEditorFontSize,
+  applyEditorLineWrap,
   applyEditorMinimap,
   applyEditorTheme,
   createEditorView,
@@ -722,7 +723,8 @@ function applyUiSettings(next: UiSettings): void {
     prev.fontFamily !== next.fontFamily ||
     prev.monoFontFamily !== next.monoFontFamily;
   const minimapChanged = prev.editorMinimap !== next.editorMinimap;
-  restyleOpenPanes(getResolvedTheme(), chromeChanged, { minimapChanged });
+  const lineWrapChanged = prev.editorLineWrap !== next.editorLineWrap;
+  restyleOpenPanes(getResolvedTheme(), chromeChanged, { minimapChanged, lineWrapChanged });
   tree.setVisibility({
     showDotfiles: next.showDotfiles,
     showGitDirs: next.showGitDirs,
@@ -775,6 +777,69 @@ async function persistPaletteToConfig(palette: PaletteId): Promise<void> {
   await bufferSave(opened.buffer_id, revAfterEdit);
 }
 
+/** Patch a boolean `ui.<key>` in config.json (JSONC-tolerant). */
+function patchUiBoolInConfigText(text: string, key: string, value: boolean): string {
+  const lit = value ? "true" : "false";
+  const keyRe = new RegExp(`("${key}"\\s*:\\s*)(true|false)`);
+  if (keyRe.test(text)) {
+    return text.replace(keyRe, `$1${lit}`);
+  }
+  if (/"ui"\s*:\s*\{/.test(text)) {
+    return text.replace(/("ui"\s*:\s*\{)/, `$1\n    "${key}": ${lit},`);
+  }
+  const trimmed = text.trim();
+  if (!trimmed || trimmed === "{}") {
+    return `{\n  "ui": {\n    "${key}": ${lit}\n  }\n}\n`;
+  }
+  return text;
+}
+
+async function persistUiBoolToConfig(key: string, value: boolean): Promise<void> {
+  if (!configPath) throw new Error("no config path");
+  const existing = tabs.find(
+    (t): t is EditorTab => t.kind === "editor" && isConfigPath(t.path),
+  );
+  if (existing) {
+    const next = patchUiBoolInConfigText(existing.view.state.doc.toString(), key, value);
+    existing.suppressChange = true;
+    existing.view.dispatch({
+      changes: { from: 0, to: existing.view.state.doc.length, insert: next },
+    });
+    existing.suppressChange = false;
+    existing.dirty = true;
+    const revAfterEdit = await bufferEdit(existing.bufferId, existing.rev, next);
+    existing.rev = revAfterEdit;
+    const saved = await bufferSave(existing.bufferId, existing.rev);
+    existing.rev = saved.rev;
+    existing.dirty = false;
+    existing.preview = false;
+    renderAll();
+    return;
+  }
+  const opened = await editorOpen(configPath, { preview: false });
+  const next = patchUiBoolInConfigText(opened.text, key, value);
+  const revAfterEdit = await bufferEdit(opened.buffer_id, opened.rev, next);
+  await bufferSave(opened.buffer_id, revAfterEdit);
+}
+
+/** Toggle soft wrap (Fresh ToggleLineWrap); persist to config when connected. */
+async function toggleEditorLineWrap(): Promise<void> {
+  const next = !uiSettings.editorLineWrap;
+  applyUiSettings({ ...uiSettings, editorLineWrap: next });
+  setStatusLeft(next ? "editor line wrap on" : "editor line wrap off");
+  if (!configPath || !connected) return;
+  try {
+    await persistUiBoolToConfig("editorLineWrap", next);
+    setStatusLeft(
+      next ? "editor line wrap on · saved to config" : "editor line wrap off · saved to config",
+    );
+  } catch (err) {
+    setStatusLeft(
+      `${next ? "line wrap on" : "line wrap off"} · applied locally (${err instanceof Error ? err.message : String(err)})`,
+    );
+  }
+}
+
 /** Filled inside `bootstrapAde` so command palette can list shortcuts + palettes. */
 let refreshPaletteCommands: (() => void) | null = null;
 
@@ -825,7 +890,7 @@ async function openSettingsFile(): Promise<void> {
 function restyleOpenPanes(
   resolved: ReturnType<typeof resolveTheme>,
   themeChanged: boolean,
-  opts: { minimapChanged?: boolean } = {},
+  opts: { minimapChanged?: boolean; lineWrapChanged?: boolean } = {},
 ): void {
   for (const tab of tabs) {
     if (tab.kind === "terminal") {
@@ -843,6 +908,9 @@ function restyleOpenPanes(
       }
       if (opts.minimapChanged) {
         void applyEditorMinimap(tab.view, uiSettings.editorMinimap);
+      }
+      if (opts.lineWrapChanged) {
+        applyEditorLineWrap(tab.view, uiSettings.editorLineWrap);
       }
     }
   }
@@ -1624,6 +1692,7 @@ async function presentOpenedBuffer(
       theme: getResolvedTheme(),
       language: opened.language,
       minimap: uiSettings.editorMinimap,
+      lineWrap: uiSettings.editorLineWrap,
       onPathLink: (info) => {
         void openEditorTab(info.path, {
           preview: true,
@@ -2242,6 +2311,9 @@ const shortcutHandlers: ShortcutHandlers = {
   },
   "editor.markdownPreview": () => {
     toggleMarkdownPreview();
+  },
+  "editor.toggleLineWrap": () => {
+    void toggleEditorLineWrap();
   },
   "search.focus": () => focusFind(),
   "settings.open": () => {

@@ -41,6 +41,10 @@ export type UiSettings = {
    * minimap module is never loaded.
    */
   editorMinimap: boolean;
+  /**
+   * Soft-wrap long lines in the editor (Fresh `editor.line_wrap`). Default on.
+   */
+  editorLineWrap: boolean;
 };
 
 export type HelloUi = {
@@ -56,6 +60,7 @@ export type HelloUi = {
   showDotfiles?: boolean;
   showGitDirs?: boolean;
   editorMinimap?: boolean;
+  editorLineWrap?: boolean;
 };
 
 const DEFAULTS: UiSettings = {
@@ -71,6 +76,7 @@ const DEFAULTS: UiSettings = {
   showDotfiles: false,
   showGitDirs: false,
   editorMinimap: false,
+  editorLineWrap: true,
 };
 
 export function defaultUiSettings(): UiSettings {
@@ -83,7 +89,7 @@ function clamp(n: number, lo: number, hi: number): number {
 
 function readBool(
   partial: Partial<UiSettings> | HelloUi | null | undefined,
-  key: "webgl" | "showDotfiles" | "showGitDirs" | "editorMinimap",
+  key: "webgl" | "showDotfiles" | "showGitDirs" | "editorMinimap" | "editorLineWrap",
   fallback: boolean,
 ): boolean {
   if (!partial || !(key in partial)) return fallback;
@@ -159,6 +165,7 @@ export function normalizeUiSettings(partial: Partial<UiSettings> | HelloUi | nul
     showDotfiles: readBool(partial, "showDotfiles", DEFAULTS.showDotfiles),
     showGitDirs: readBool(partial, "showGitDirs", DEFAULTS.showGitDirs),
     editorMinimap: readBool(partial, "editorMinimap", DEFAULTS.editorMinimap),
+    editorLineWrap: readBool(partial, "editorLineWrap", DEFAULTS.editorLineWrap),
   };
 }
 

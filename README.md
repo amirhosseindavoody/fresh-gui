@@ -71,9 +71,11 @@ After connect you get terminals, an explorer, and editor tabs in one shell:
 | Open a file | Click or double-click in the tree |
 | Save | `Mod+S` |
 | Find | `Mod+F` |
+| Toggle editor line wrap | `Alt+Z` (or command palette) |
 | Copy selected terminal text | Select with the mouse, then `Mod+C` (no selection → interrupt) |
 | Paste into terminal | `Mod+V` |
-| Command palette | `Mod+P` |
+| Command palette | `Mod+Shift+P` |
+| Go to File | `Mod+P` |
 | Settings | Activity bar gear or `Mod+,` (opens `config.json`) |
 | Copy a path / file ops | Right-click a tree row (New File/Folder, Cut/Copy/Paste, path copies) or a tab (path copies + Close) |
 
@@ -96,7 +98,8 @@ All prefs live in one JSONC file on the **backend** host:
     "editorFontSize": 14,
     "webgl": true,
     "showDotfiles": false, // show .* names in the explorer
-    "showGitDirs": false // show .git folders (separate from showDotfiles)
+    "showGitDirs": false, // show .git folders (separate from showDotfiles)
+    "editorLineWrap": true // soft-wrap long lines; Alt+Z toggles
   },
   "terminal": {
     "shell": { "command": "zsh", "args": [] }
@@ -104,7 +107,7 @@ All prefs live in one JSONC file on the **backend** host:
 }
 ```
 
-Open it from the UI (**Settings** / `Mod+,`), edit, save with `Mod+S`. Theme follows the OS by default; terminal chrome tracks the same theme. Empty shell `args` keep interactive / OSC 7 setup for known shells. Dotfiles and `.git` directories are hidden in the explorer by default; enable them independently via `showDotfiles` / `showGitDirs`.
+Open it from the UI (**Settings** / `Mod+,`), edit, save with `Mod+S`. Theme follows the OS by default; terminal chrome tracks the same theme. Empty shell `args` keep interactive / OSC 7 setup for known shells. Dotfiles and `.git` directories are hidden in the explorer by default; enable them independently via `showDotfiles` / `showGitDirs`. Editor soft wrap follows Fresh `editor.line_wrap` (on by default); toggle with `Alt+Z` or the command palette.
 
 ## Windows host app
 
