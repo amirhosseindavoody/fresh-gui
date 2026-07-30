@@ -4,7 +4,7 @@ How **fresh-gui** embeds and talks to [Fresh](https://github.com/sinelaw/fresh).
 
 ## 1. Role of Fresh
 
-Fresh is the **remote buffer authority** inside the Linux daemon (`fresh-gui`). The host UI (browser or Tauri) never links Fresh crates. It speaks the ADE WebSocket protocol; the daemon translates editor messages into in-process Fresh `Editor` calls.
+Fresh is the **remote buffer authority** inside the Linux daemon (`fresh-gui`). The host UI (browser) never links Fresh crates. It speaks the ADE WebSocket protocol; the daemon translates editor messages into in-process Fresh `Editor` calls.
 
 ```
 ┌──────────────────────┐         ADE /ws (JSON)         ┌────────────────────────────┐

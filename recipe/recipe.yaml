@@ -19,7 +19,7 @@ source:
 
 build:
   number: 0
-  # linux-64 only for MVP (remote daemon; not the Windows host GUI).
+  # linux-64 only (remote daemon + embedded browser UI).
   skip: not linux64
   script: build.sh
 
@@ -56,9 +56,9 @@ about:
   description: |
     Installable Linux binary equivalent to `pixi run serve` / `pixi run serve-release`:
     serves the host web UI and WebSocket ADE API so you can open shells from a
-    browser (or any host that can reach the URL) before using the native GUI client.
+    browser (or any client that can reach the URL).
 
-    Platform: linux-64 only. Install on the remote Linux machine, not the Windows host GUI.
+    Platform: linux-64 only. Install on the remote Linux machine.
   license: GPL-2.0-only
   license_file:
     - LICENSE

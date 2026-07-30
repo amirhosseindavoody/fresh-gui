@@ -23,10 +23,10 @@ backend = { name = "pixi-build-rattler-build", version = "0.*" }
 
 
 [tasks]
-check = "cargo check --workspace --exclude fresh-gui-desktop"
-test = "cargo test --workspace --exclude fresh-gui-desktop"
-build = "cargo build --workspace --exclude fresh-gui-desktop"
-clippy = "cargo clippy --workspace --exclude fresh-gui-desktop --all-targets -- -D warnings"
+check = "cargo check --workspace"
+test = "cargo test --workspace"
+build = "cargo build --workspace"
+clippy = "cargo clippy --workspace --all-targets -- -D warnings"
 fmt = "cargo fmt --all"
 fmt-check = "cargo fmt --all -- --check"
 backend = "cargo run -p fresh-gui --"
@@ -47,7 +47,6 @@ ui = { cwd = "crates/fresh-gui-app/ui", cmd = "bun run dev" }
 ui-install = { cwd = "crates/fresh-gui-app/ui", cmd = "bun install" }
 ui-build = { depends-on = ["ui-install"], cwd = "crates/fresh-gui-app/ui", cmd = "bun run build" }
 ui-serve = "cargo run -p fresh-gui-app -- serve-ui"
-desktop = "cargo run -p fresh-gui-desktop --"
 package = "pixi build -o dist"
 update-version = "scripts/update-version.sh"
 

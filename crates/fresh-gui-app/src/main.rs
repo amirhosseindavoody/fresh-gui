@@ -1,7 +1,7 @@
-//! fresh-gui-app — host ADE shell (Phase 1).
+//! fresh-gui-app — host ADE shell CLI + optional static UI server.
 //!
-//! CLI: connect to a backend and run a PTY smoke test, or open the UI when built
-//! with the `tauri` feature / `fresh-gui-desktop` entry.
+//! CLI: connect to a backend and run a PTY smoke test, or serve `ui/dist`
+//! for local development (`serve-ui`).
 
 use anyhow::{Context, Result};
 use axum::Router;
@@ -41,7 +41,7 @@ enum Cmd {
         #[arg(long, default_value_t = 24)]
         rows: u16,
     },
-    /// Serve the built Vite UI over HTTP (dev stand-in before / alongside Tauri).
+    /// Serve the built Vite UI over HTTP (local static server for `ui/dist`).
     ServeUi {
         #[arg(long, default_value = "127.0.0.1:1420")]
         listen: SocketAddr,
