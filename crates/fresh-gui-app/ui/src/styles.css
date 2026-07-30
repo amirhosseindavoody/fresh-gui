@@ -326,7 +326,16 @@ input:not([data-slot="input"]):focus-visible {
   min-width: 1.7rem;
 }
 
-/* Terax-like tab strip: line TabsList + shared sliding pill */
+/* Terax-like tab strip: pinned group + unpinned scroll strip */
+.tabs-strip {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+}
+
 .tabs {
   position: relative;
   display: flex;
@@ -338,6 +347,19 @@ input:not([data-slot="input"]):focus-visible {
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: thin;
+}
+
+.tabs.pinned-tabs {
+  flex: 0 1 auto;
+  max-width: 45%;
+}
+
+.tabs-pinned-sep {
+  flex-shrink: 0;
+  width: 1px;
+  height: 1.15rem;
+  background: var(--border);
+  margin: 0 0.1rem;
 }
 
 .tab-pill {
@@ -376,6 +398,29 @@ input:not([data-slot="input"]):focus-visible {
   flex-shrink: 0;
   user-select: none;
   transition: color 0.12s ease;
+}
+
+.tab.dragging {
+  opacity: 0.55;
+}
+
+.tab.drag-over {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.tab.pinned .tab-label::before {
+  content: "";
+  display: inline-block;
+  width: 0.55rem;
+  height: 0.55rem;
+  margin-right: 0.28rem;
+  vertical-align: -0.05rem;
+  background: currentColor;
+  opacity: 0.55;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 17v5'/%3E%3Cpath d='M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z'/%3E%3C/svg%3E")
+    center / contain no-repeat;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 17v5'/%3E%3Cpath d='M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z'/%3E%3C/svg%3E")
+    center / contain no-repeat;
 }
 
 .tab:hover {

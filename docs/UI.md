@@ -115,7 +115,7 @@ type PaneNode =
 - **Surfaces:** subtle elevation via border + fill shifts, not card grids.
 - **Icons:** SVG folder/file icons with extension color tones; indent guides + chevrons.
 - **Menus:** flat elevated rows matching shadcn DropdownMenu / ContextMenu (`.ctx-menu` / `.ctx-item`); ADE uses an imperative menu so editor/terminal roots are not remounted. React primitives live in `components/ui/context-menu.tsx` and `dropdown-menu.tsx`.
-- **Tabs:** Terax-style strip — left **menu** for the active tab’s actions (Find / split / save / preview / wrap), compact tab triggers with a shared sliding pill and hover close (`.tab-close`), right **+** to add a terminal or new file. Type-specific chrome stays in the menu so switching tabs does not jump the action strip.
+- **Tabs:** Terax-style strip — left **menu** for the active tab’s actions (Find / split / save / preview / wrap / pin / bulk close), compact tab triggers with a shared sliding pill and hover close (`.tab-close`), drag-to-reorder within the pinned or unpinned group, a dedicated pinned strip when any tab is pinned, right **+** to add a terminal or new file. Type-specific chrome stays in the menu so switching tabs does not jump the action strip.
 
 ### Tokens
 
@@ -147,6 +147,7 @@ Defaults follow [Terax `shortcuts.ts`](https://github.com/crynta/terax-ai/blob/m
 | New terminal tab | `Mod+T` | Inherits cwd when known; also **+** → New Terminal |
 | New file | — | **+** → New File… (prompts under active context) |
 | Close tab or pane | `Mod+W` | Last leaf closes tab; confirm if editor dirty |
+| Close other / all editors / terminals | — | Tab actions menu + command palette |
 | Next / prev tab | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Ctrl even on macOS (Terax) |
 | Jump to tab 1–9 | `Mod+1`…`Mod+9` | |
 | Split pane right | `Mod+D` | Terminal tabs only |
@@ -168,7 +169,7 @@ Defaults follow [Terax `shortcuts.ts`](https://github.com/crynta/terax-ai/blob/m
 **Context menus**
 
 - **File tree:** Open in Terminal, New File…, New Folder…, Cut, Copy, Paste (in-app path clipboard + sandboxed `fs_create` / `fs_copy` / `fs_move`), Delete… (`fs_delete`, permanent), then Copy Path / Relative Path / File Name. Explorer header **↑** re-roots to the parent folder; when a terminal tab is focused it also sends `cd ..`.
-- **Tabs:** path copies when known, plus Close.
+- **Tabs:** Pin / Unpin, path copies when known, plus Close. Tab actions menu and command palette also offer Close Other Tabs / Close All Editors / Close All Terminals / Close Other Terminals.
 
 **Terminal mouse:** drag to select (xterm). If a TUI enables DEC mouse reporting, hold **Shift** while dragging to select instead. Copy clears the selection so the next `Mod+C` is SIGINT (Fresh / VS Code policy).
 
