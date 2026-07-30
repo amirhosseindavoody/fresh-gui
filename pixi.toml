@@ -5,14 +5,14 @@ description = "Terminal-first ADE GUI (host) with remote Fresh backend"
 name = "fresh-gui"
 platforms = ["linux-64"]
 preview = ["pixi-build"]
-version = "2026.730.10"
+version = "2026.730.11"
 
 # Packaged Linux binary (`fresh-gui` + share/fresh-gui/ui) — same role as
 # `pixi run serve`. Install with:
 #   pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git
 [package]
 name = "fresh-gui"
-version = "2026.730.10"
+version = "2026.730.11"
 description = "Linux remote daemon for fresh-gui (browser UI + PTY shells)"
 authors = ["Amirhossein Davoody <amirhossein.davoody@gmail.com>"]
 license = "GPL-2.0"
