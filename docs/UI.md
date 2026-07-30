@@ -173,7 +173,7 @@ Defaults follow [Terax `shortcuts.ts`](https://github.com/crynta/terax-ai/blob/m
 | Open settings | `Mod+,` | Opens backend `config.json` in an editor tab; missing default keys are added (existing values kept) |
 | Connect / disconnect | — | Auto-connect via `?token=` / `sessionStorage`; Disconnect / Reconnect in command palette. Disconnect keeps remote session |
 
-**Context menus:** right-click a tab or file-tree row to copy absolute path, relative path (vs workspace root), or file name; tabs also offer Close.
+**Context menus:** right-click a file-tree row for New File / New Folder, Cut / Copy / Paste, and copy absolute path, relative path (vs workspace root), or file name. Right-click a tab for path copies (when known) plus Close. Menus use flat elevated rows (not chrome buttons).
 
 **Terminal mouse:** drag to select (xterm). If a TUI enables DEC mouse reporting, hold **Shift** while dragging to select instead. Copy clears the selection so the next `Mod+C` is SIGINT (Fresh / VS Code policy).
 
@@ -250,7 +250,7 @@ Connection errors and auth failures use inline strip status; never modal loops.
 - Lightweight SVG file/folder icons + indent guides in the virtualized tree (`src/icons.ts`, `src/tree.ts`) — no heavy icon pack.
 - Skipped `fs_list` pagination for now — row virtualization covers large trees; revisit only if a single directory listing becomes a protocol bottleneck.
 - Theme preference (`system` / `light` / `dark`) + color **palette** (`primer` or Fresh theme names: `nord`, `dracula`, …) via `config.json`; typography (`fontWeight`, `monoFontWeight`, optional font families). Primer-inspired CSS tokens (`data-theme` resolved); named palettes map Fresh theme colors onto the same vars for chrome / xterm / CodeMirror. React 19 + Tailwind v4 + shadcn for chrome; IBM Plex via `@fontsource` (overridable). Settings live in backend `config.json`.
-- Path context menus on tabs and the file tree (copy absolute / relative / name).
+- Path context menus on tabs and the file tree (new file/folder, cut/copy/paste, copy absolute / relative / name).
 - Terminal mouse selection + `Mod+C` / `Mod+V` clipboard (Fresh policy: copy when selected, else interrupt).
 
 ### Out of UI phases (stay in DESIGN Phase 4+)

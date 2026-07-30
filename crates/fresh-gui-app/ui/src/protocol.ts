@@ -38,6 +38,25 @@ export type ClientMessage =
   | { type: "fs_watch"; request_id: string; path: string; recursive: boolean }
   | { type: "fs_unwatch"; watch_id: string }
   | {
+      type: "fs_create";
+      request_id: string;
+      parent: string;
+      name: string;
+      kind: "file" | "dir";
+    }
+  | {
+      type: "fs_copy";
+      request_id: string;
+      sources: string[];
+      destination: string;
+    }
+  | {
+      type: "fs_move";
+      request_id: string;
+      sources: string[];
+      destination: string;
+    }
+  | {
       type: "editor_open";
       request_id: string;
       path: string;
@@ -113,6 +132,9 @@ export type ServerMessage =
       entries: FsEntry[];
     }
   | { type: "fs_authorized"; request_id: string; path: string }
+  | { type: "fs_created"; request_id: string; entry: FsEntry }
+  | { type: "fs_copied"; request_id: string; entries: FsEntry[] }
+  | { type: "fs_moved"; request_id: string; entries: FsEntry[] }
   | {
       type: "editor_opened";
       request_id: string;

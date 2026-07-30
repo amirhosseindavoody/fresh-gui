@@ -1,6 +1,6 @@
-//! Read-only filesystem listing under a sandboxed root (+ Terax-style authorized cwds).
+//! Filesystem listing and mutation under a sandboxed root (+ Terax-style authorized cwds).
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
@@ -145,31 +145,251 @@ impl FsRoot {
 
     pub async fn stat(&self, path: &str) -> Result<FsEntry> {
         let path = self.resolve(path).await?;
-        let meta = fs::symlink_metadata(&path).await?;
-        let kind = if meta.is_dir() {
-            FsKind::Dir
-        } else if meta.is_symlink() {
-            FsKind::Symlink
-        } else if meta.is_file() {
-            FsKind::File
-        } else {
-            FsKind::Other
-        };
-        let name = path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
-        Ok(FsEntry {
-            name,
-            path: path.display().to_string(),
-            kind,
-            size: if meta.is_file() {
-                Some(meta.len())
-            } else {
-                None
-            },
-        })
+        entry_for_path(&path).await
     }
+
+    /// Create an empty file or directory named `name` under `parent`.
+    pub async fn create(&self, parent: &str, name: &str, kind: FsKind) -> Result<FsEntry> {
+        validate_entry_name(name)?;
+        match kind {
+            FsKind::File | FsKind::Dir => {}
+            _ => bail!("fs_create kind must be file or dir"),
+        }
+        let parent_dir = self.resolve(parent).await?;
+        let meta = fs::metadata(&parent_dir).await?;
+        if !meta.is_dir() {
+            bail!("not a directory: {}", parent_dir.display());
+        }
+        let target = parent_dir.join(name);
+        ensure_child_of(&parent_dir, &target)?;
+        if fs::symlink_metadata(&target).await.is_ok() {
+            bail!("already exists: {}", target.display());
+        }
+        match kind {
+            FsKind::Dir => {
+                fs::create_dir(&target)
+                    .await
+                    .with_context(|| format!("create_dir {}", target.display()))?;
+            }
+            FsKind::File => {
+                fs::File::create(&target)
+                    .await
+                    .with_context(|| format!("create file {}", target.display()))?;
+            }
+            _ => unreachable!(),
+        }
+        entry_for_path(&target).await
+    }
+
+    /// Copy each source into `destination` (must be a directory). Name conflicts get a unique suffix.
+    pub async fn copy_into(&self, sources: &[String], destination: &str) -> Result<Vec<FsEntry>> {
+        if sources.is_empty() {
+            bail!("fs_copy requires at least one source");
+        }
+        let dest_dir = self.resolve(destination).await?;
+        let meta = fs::metadata(&dest_dir).await?;
+        if !meta.is_dir() {
+            bail!("destination is not a directory: {}", dest_dir.display());
+        }
+        let mut out = Vec::with_capacity(sources.len());
+        for src in sources {
+            let from = self.resolve(src).await?;
+            if paths_equal(&from, &dest_dir) || is_descendant(&from, &dest_dir) {
+                bail!(
+                    "cannot copy {} into itself or a descendant",
+                    from.display()
+                );
+            }
+            let base = from
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .ok_or_else(|| anyhow::anyhow!("source has no file name: {}", from.display()))?;
+            let to = unique_dest_path(&dest_dir, &base).await?;
+            ensure_child_of(&dest_dir, &to)?;
+            copy_path_recursive(&from, &to).await?;
+            out.push(entry_for_path(&to).await?);
+        }
+        Ok(out)
+    }
+
+    /// Move each source into `destination` (must be a directory).
+    pub async fn move_into(&self, sources: &[String], destination: &str) -> Result<Vec<FsEntry>> {
+        if sources.is_empty() {
+            bail!("fs_move requires at least one source");
+        }
+        let dest_dir = self.resolve(destination).await?;
+        let meta = fs::metadata(&dest_dir).await?;
+        if !meta.is_dir() {
+            bail!("destination is not a directory: {}", dest_dir.display());
+        }
+        let mut out = Vec::with_capacity(sources.len());
+        for src in sources {
+            let from = self.resolve(src).await?;
+            if paths_equal(&from, &dest_dir) || is_descendant(&from, &dest_dir) {
+                bail!(
+                    "cannot move {} into itself or a descendant",
+                    from.display()
+                );
+            }
+            let base = from
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .ok_or_else(|| anyhow::anyhow!("source has no file name: {}", from.display()))?;
+            let to = unique_dest_path(&dest_dir, &base).await?;
+            ensure_child_of(&dest_dir, &to)?;
+            if let Some(parent) = from.parent() {
+                if paths_equal(parent, &dest_dir) && paths_equal(&from, &to) {
+                    out.push(entry_for_path(&from).await?);
+                    continue;
+                }
+            }
+            fs::rename(&from, &to)
+                .await
+                .with_context(|| format!("rename {} → {}", from.display(), to.display()))?;
+            out.push(entry_for_path(&to).await?);
+        }
+        Ok(out)
+    }
+}
+
+fn validate_entry_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("name must not be empty");
+    }
+    if name == "." || name == ".." {
+        bail!("invalid name: {name}");
+    }
+    if name.contains('\0') || name.contains('/') || name.contains('\\') {
+        bail!("name must be a single path segment");
+    }
+    let path = Path::new(name);
+    if path.components().count() != 1 {
+        bail!("name must be a single path segment");
+    }
+    if let Some(Component::Normal(_)) = path.components().next() {
+        Ok(())
+    } else {
+        bail!("invalid name: {name}");
+    }
+}
+
+fn ensure_child_of(parent: &Path, child: &Path) -> Result<()> {
+    if child.parent() == Some(parent) {
+        return Ok(());
+    }
+    bail!(
+        "resolved path escapes parent: {} (parent {})",
+        child.display(),
+        parent.display()
+    );
+}
+
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    a == b
+}
+
+fn is_descendant(ancestor: &Path, path: &Path) -> bool {
+    path.starts_with(ancestor) && path != ancestor
+}
+
+async fn entry_for_path(path: &Path) -> Result<FsEntry> {
+    let meta = fs::symlink_metadata(path).await?;
+    let kind = if meta.is_dir() {
+        FsKind::Dir
+    } else if meta.is_symlink() {
+        FsKind::Symlink
+    } else if meta.is_file() {
+        FsKind::File
+    } else {
+        FsKind::Other
+    };
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    Ok(FsEntry {
+        name,
+        path: path.display().to_string(),
+        kind,
+        size: if meta.is_file() {
+            Some(meta.len())
+        } else {
+            None
+        },
+    })
+}
+
+async fn unique_dest_path(dest_dir: &Path, base_name: &str) -> Result<PathBuf> {
+    let candidate = dest_dir.join(base_name);
+    if fs::symlink_metadata(&candidate).await.is_err() {
+        return Ok(candidate);
+    }
+    let (stem, ext) = split_name(base_name);
+    for i in 1..10_000 {
+        let name = if ext.is_empty() {
+            if i == 1 {
+                format!("{stem} copy")
+            } else {
+                format!("{stem} copy {i}")
+            }
+        } else if i == 1 {
+            format!("{stem} copy.{ext}")
+        } else {
+            format!("{stem} copy {i}.{ext}")
+        };
+        let path = dest_dir.join(&name);
+        if fs::symlink_metadata(&path).await.is_err() {
+            return Ok(path);
+        }
+    }
+    bail!("could not find a free name for {base_name} in {}", dest_dir.display());
+}
+
+fn split_name(name: &str) -> (String, String) {
+    if name == "." || name.starts_with('.') && !name[1..].contains('.') {
+        return (name.to_owned(), String::new());
+    }
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem.to_owned(), ext.to_owned()),
+        _ => (name.to_owned(), String::new()),
+    }
+}
+
+async fn copy_path_recursive(from: &Path, to: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(from).await?;
+    if meta.is_symlink() {
+        let target = fs::read_link(from)
+            .await
+            .with_context(|| format!("read_link {}", from.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(&target, to)
+                .with_context(|| format!("symlink {} → {}", target.display(), to.display()))?;
+        }
+        #[cfg(not(unix))]
+        {
+            bail!("symlink copy is not supported on this platform");
+        }
+        return Ok(());
+    }
+    if meta.is_dir() {
+        fs::create_dir(to)
+            .await
+            .with_context(|| format!("create_dir {}", to.display()))?;
+        let mut rd = fs::read_dir(from).await?;
+        while let Some(ent) = rd.next_entry().await? {
+            let name = ent.file_name();
+            let child_from = ent.path();
+            let child_to = to.join(&name);
+            Box::pin(copy_path_recursive(&child_from, &child_to)).await?;
+        }
+        return Ok(());
+    }
+    fs::copy(from, to)
+        .await
+        .with_context(|| format!("copy {} → {}", from.display(), to.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -209,6 +429,48 @@ mod tests {
         assert_eq!(auth, b.canonicalize().unwrap());
         let (_path, entries) = root.list(&b.display().to_string()).await.unwrap();
         assert!(entries.iter().any(|e| e.name == "out.txt"));
+    }
+
+    #[tokio::test]
+    async fn create_copy_move() {
+        let tmp = tempfile_dir();
+        let root = FsRoot::new(tmp.clone()).unwrap();
+
+        let file = root
+            .create("", "hello.txt", FsKind::File)
+            .await
+            .unwrap();
+        assert_eq!(file.name, "hello.txt");
+        assert_eq!(file.kind, FsKind::File);
+        stdfs::write(tmp.join("hello.txt"), b"hi").unwrap();
+
+        let dir = root.create("", "nested", FsKind::Dir).await.unwrap();
+        assert_eq!(dir.kind, FsKind::Dir);
+
+        let copied = root
+            .copy_into(&[file.path.clone()], &dir.path)
+            .await
+            .unwrap();
+        assert_eq!(copied.len(), 1);
+        assert!(tmp.join("nested/hello.txt").is_file());
+        assert_eq!(stdfs::read(tmp.join("nested/hello.txt")).unwrap(), b"hi");
+
+        let moved = root
+            .move_into(&[file.path.clone()], &dir.path)
+            .await
+            .unwrap();
+        assert_eq!(moved.len(), 1);
+        assert!(!tmp.join("hello.txt").exists());
+        assert!(tmp.join("nested/hello copy.txt").is_file() || moved[0].name.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_bad_names() {
+        let tmp = tempfile_dir();
+        let root = FsRoot::new(tmp).unwrap();
+        assert!(root.create("", "../x", FsKind::File).await.is_err());
+        assert!(root.create("", "a/b", FsKind::File).await.is_err());
+        assert!(root.create("", "", FsKind::File).await.is_err());
     }
 
     fn tempfile_dir() -> PathBuf {

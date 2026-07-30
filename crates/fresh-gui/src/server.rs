@@ -502,6 +502,88 @@ async fn handle_client_msg(
                 }),
             }
         }
+        Message::FsCreate {
+            request_id,
+            parent,
+            name,
+            kind,
+        } => {
+            require_auth(*authed)?;
+            match state.fs_root.create(&parent, &name, kind).await {
+                Ok(entry) => {
+                    send_msg(
+                        sink,
+                        &Message::FsCreated { request_id, entry },
+                    )
+                    .await
+                    .map_err(|_| Message::Error {
+                        code: "send_failed".into(),
+                        message: "failed to send FsCreated".into(),
+                    })?;
+                    Ok(())
+                }
+                Err(err) => Err(Message::Error {
+                    code: "fs_create_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                }),
+            }
+        }
+        Message::FsCopy {
+            request_id,
+            sources,
+            destination,
+        } => {
+            require_auth(*authed)?;
+            match state.fs_root.copy_into(&sources, &destination).await {
+                Ok(entries) => {
+                    send_msg(
+                        sink,
+                        &Message::FsCopied {
+                            request_id,
+                            entries,
+                        },
+                    )
+                    .await
+                    .map_err(|_| Message::Error {
+                        code: "send_failed".into(),
+                        message: "failed to send FsCopied".into(),
+                    })?;
+                    Ok(())
+                }
+                Err(err) => Err(Message::Error {
+                    code: "fs_copy_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                }),
+            }
+        }
+        Message::FsMove {
+            request_id,
+            sources,
+            destination,
+        } => {
+            require_auth(*authed)?;
+            match state.fs_root.move_into(&sources, &destination).await {
+                Ok(entries) => {
+                    send_msg(
+                        sink,
+                        &Message::FsMoved {
+                            request_id,
+                            entries,
+                        },
+                    )
+                    .await
+                    .map_err(|_| Message::Error {
+                        code: "send_failed".into(),
+                        message: "failed to send FsMoved".into(),
+                    })?;
+                    Ok(())
+                }
+                Err(err) => Err(Message::Error {
+                    code: "fs_move_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                }),
+            }
+        }
         Message::EditorOpen {
             request_id,
             path,

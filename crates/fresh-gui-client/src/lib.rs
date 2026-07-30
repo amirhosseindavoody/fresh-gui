@@ -271,6 +271,107 @@ impl Client {
         }
     }
 
+    pub async fn create_entry(
+        &mut self,
+        parent: impl Into<String>,
+        name: impl Into<String>,
+        kind: fresh_gui_protocol::FsKind,
+    ) -> Result<fresh_gui_protocol::FsEntry> {
+        let request_id = format!("fs-create-{}", uuid_simple());
+        send_msg(
+            &mut self.sink,
+            &Message::FsCreate {
+                request_id: request_id.clone(),
+                parent: parent.into(),
+                name: name.into(),
+                kind,
+            },
+        )
+        .await?;
+        loop {
+            match self.recv().await? {
+                Message::FsCreated {
+                    request_id: rid,
+                    entry,
+                } if rid == request_id => return Ok(entry),
+                Message::Error { code, message } => {
+                    bail!("fs create failed: {code}: {message}")
+                }
+                Message::PtyData { .. }
+                | Message::FsChanged { .. }
+                | Message::Pong { .. }
+                | Message::Ping { .. } => continue,
+                other => bail!("unexpected while creating: {other:?}"),
+            }
+        }
+    }
+
+    pub async fn copy_into(
+        &mut self,
+        sources: Vec<String>,
+        destination: impl Into<String>,
+    ) -> Result<Vec<fresh_gui_protocol::FsEntry>> {
+        let request_id = format!("fs-copy-{}", uuid_simple());
+        send_msg(
+            &mut self.sink,
+            &Message::FsCopy {
+                request_id: request_id.clone(),
+                sources,
+                destination: destination.into(),
+            },
+        )
+        .await?;
+        loop {
+            match self.recv().await? {
+                Message::FsCopied {
+                    request_id: rid,
+                    entries,
+                } if rid == request_id => return Ok(entries),
+                Message::Error { code, message } => {
+                    bail!("fs copy failed: {code}: {message}")
+                }
+                Message::PtyData { .. }
+                | Message::FsChanged { .. }
+                | Message::Pong { .. }
+                | Message::Ping { .. } => continue,
+                other => bail!("unexpected while copying: {other:?}"),
+            }
+        }
+    }
+
+    pub async fn move_into(
+        &mut self,
+        sources: Vec<String>,
+        destination: impl Into<String>,
+    ) -> Result<Vec<fresh_gui_protocol::FsEntry>> {
+        let request_id = format!("fs-move-{}", uuid_simple());
+        send_msg(
+            &mut self.sink,
+            &Message::FsMove {
+                request_id: request_id.clone(),
+                sources,
+                destination: destination.into(),
+            },
+        )
+        .await?;
+        loop {
+            match self.recv().await? {
+                Message::FsMoved {
+                    request_id: rid,
+                    entries,
+                } if rid == request_id => return Ok(entries),
+                Message::Error { code, message } => {
+                    bail!("fs move failed: {code}: {message}")
+                }
+                Message::PtyData { .. }
+                | Message::FsChanged { .. }
+                | Message::Pong { .. }
+                | Message::Ping { .. } => continue,
+                other => bail!("unexpected while moving: {other:?}"),
+            }
+        }
+    }
+
     /// Open a path in the Fresh editor and return `(buffer_id, path, language, rev, text)`.
     pub async fn open_editor(
         &mut self,
