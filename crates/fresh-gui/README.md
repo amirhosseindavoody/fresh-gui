@@ -6,16 +6,29 @@ Linux remote daemon: WebSocket ADE API + detachable sessions + PTY + filesystem 
 
 ```bash
 pixi run ui-install   # once (dev)
-pixi run serve        # build UI + start (http://127.0.0.1:7420/ + ws://…/ws)
-pixi run serve-release  # same with Cargo --release (incremental local release testing)
+cd /path/to/your/project
+fresh-gui             # start background session, print URL, return to shell
+fresh-gui             # already running → print status (URL, token, log, pid)
+fresh-gui status      # same status view
+fresh-gui close       # stop the background session
 
-pixi run backend -- --listen 127.0.0.1:7420 --root /path/to/project
-pixi run backend-release -- --listen 127.0.0.1:7420   # release binary, no UI rebuild
-pixi run backend -- --no-editor   # omit editor capability
-pixi run backend -- --no-ui       # WebSocket + /healthz only
+# Foreground (tests / debugging — does not use the per-user session lock):
+fresh-gui --foreground --listen 127.0.0.1:7420 --root /path/to/project
 ```
 
-Open the printed **Local access** URL (includes `?token=`) in a browser — not the bare `ws://` line. A bearer token is always required (auto-generated when unset). Prefer `FRESH_GUI_TOKEN` over `--token` so the secret does not appear in `ps`. After connect, the UI caches the token in tab `sessionStorage` so a reload can re-auth and reattach the session without keeping `?token=` in the URL.
+`fresh-gui` keeps **one background session per user**. Starting it again while a session is live prints the access URL / token and log path instead of starting a second process. Closing the shell that launched it does **not** stop the session — use `fresh-gui close`.
+
+Session files (private to the user):
+
+| Path | Role |
+|------|------|
+| `$XDG_RUNTIME_DIR/fresh-gui/session.lock` | Exclusive flock (one session) |
+| `$XDG_RUNTIME_DIR/fresh-gui/session.json` | pid, URLs, token, root, log path |
+| `$XDG_STATE_HOME/fresh-gui/fresh-gui.log` | Daemon stdout/stderr + tracing |
+
+(Fallbacks: `/tmp/fresh-gui-$UID/` and `~/.local/state/fresh-gui/`.)
+
+Open the printed **Local access** URL (includes `?token=`) in a browser. A bearer token is always required (auto-generated when unset). Prefer `FRESH_GUI_TOKEN` over `--token` so the secret does not appear in `ps`. After connect, the UI caches the token in tab `sessionStorage` so a reload can re-auth and reattach without keeping `?token=` in the URL.
 
 ## Install
 
@@ -42,8 +55,10 @@ Sessions own PTYs; disconnect detaches the subscriber but keeps shells running f
 
 | Flag / env | Meaning |
 |------------|---------|
+| `close` / `status` | Subcommands to stop or inspect the background session |
+| `--foreground` / `FRESH_GUI_FOREGROUND` | Do not detach (integration tests / debugging) |
 | `--listen` / `FRESH_GUI_LISTEN` | Bind address (default `127.0.0.1:7420`; scans next ports unless `--strict-listen`) |
-| `--token` / `FRESH_GUI_TOKEN` | Auth token (prefer env over flag). When unset, a random per-process token is generated and printed once |
+| `--token` / `FRESH_GUI_TOKEN` | Auth token (prefer env over flag). When unset, a random per-process token is generated |
 | `--allow-no-auth` / `FRESH_GUI_ALLOW_NO_AUTH` | Disable auth (**loopback only**; for local tests — not a normal run mode) |
 | `--root` / `FRESH_GUI_FS_ROOT` | FS + editor sandbox (default: cwd) |
 | `--ui-dir` / `FRESH_GUI_UI_DIR` | Override UI assets directory |

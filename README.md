@@ -13,15 +13,20 @@ pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git
 # or a release tag / .conda from https://github.com/amirhosseindavoody/fresh-gui/releases
 
 cd /path/to/your/project
-fresh-gui
+fresh-gui          # starts a background session, prints the URL, returns the shell
+fresh-gui          # already running → reprint URL / token / log path
+fresh-gui close    # stop the session
 ```
 
 The process prints something like:
 
 ```text
-  fresh-gui ready
-  UI:  http://127.0.0.1:7420/
-  WS:  ws://127.0.0.1:7420/ws
+  fresh-gui session
+  pid:  12345
+  UI:   http://127.0.0.1:7420/
+  WS:   ws://127.0.0.1:7420/ws
+  root: /path/to/your/project
+  log:  ~/.local/state/fresh-gui/fresh-gui.log
 
   Local access (this machine):
     http://127.0.0.1:7420/?token=<token>
@@ -29,9 +34,13 @@ The process prints something like:
   From another machine (e.g. your laptop) — SSH tunnel, nothing exposed to the network:
     ssh -L 7420:127.0.0.1:7420 user@your-server
     then open: http://127.0.0.1:7420/?token=<token>
+
+  Stop with: fresh-gui close
 ```
 
-Open the **Local access** URL (token is embedded; the UI auto-connects). A bearer token is **always required**, including on loopback — on shared hosts every local account can reach `127.0.0.1`. When you do not pass `--token` / `FRESH_GUI_TOKEN`, the process generates a random token and prints it once in that banner (never written to disk or structured logs). Prefer `FRESH_GUI_TOKEN=…` over `--token` so the secret does not show up in `ps`.
+Open the **Local access** URL (token is embedded; the UI auto-connects). A bearer token is **always required**, including on loopback — on shared hosts every local account can reach `127.0.0.1`. When you do not pass `--token` / `FRESH_GUI_TOKEN`, the process generates a random token and stores it in the private session meta (mode `0600`) so `fresh-gui` can reprint it later. Prefer `FRESH_GUI_TOKEN=…` over `--token` so the secret does not show up in `ps`.
+
+Only **one background session per user** is allowed (exclusive lock under `$XDG_RUNTIME_DIR/fresh-gui/`). Closing the launching terminal does not stop the session.
 
 Works on older enterprise glibc (2.28+).
 

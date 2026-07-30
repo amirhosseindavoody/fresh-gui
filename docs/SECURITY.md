@@ -49,11 +49,13 @@ Before always-on auth:
   (lets an operator pin a stable token, e.g. to reuse across restarts).
 - Otherwise, **auto-generate** a random token per process start
   (`uuid::Uuid::new_v4()`, 122 bits of OS-RNG entropy, formatted as 32 hex
-  chars). It is never written to disk or config — matches the baseline
+  chars). It is never written to git/config — matches the baseline
   (“tokens never in repo”).
 - The token is **never included in `tracing` structured logs** (only
-  `auth_required: bool` is logged). It is only ever written via plain
-  `println!` in the startup banner, once, to the operator's own terminal.
+  `auth_required: bool` is logged). For the background session, it is stored
+  in the user-private session meta file (`$XDG_RUNTIME_DIR/fresh-gui/session.json`,
+  mode `0600`) so a later `fresh-gui` / `fresh-gui status` can reprint the
+  Local access URL. The meta file is removed on `fresh-gui close`.
 - Prefer `FRESH_GUI_TOKEN` over `--token` so the secret does not appear in
   `ps` / process listings.
 
@@ -63,12 +65,20 @@ Before always-on auth:
 advanced setups but are not the documented path; a `warn!` log fires when the
 bind is non-loopback, nudging the operator back to loopback + SSH tunnel.
 
-### 3.3 Startup banner
+### 3.3 Background session + startup banner
+
+Default `fresh-gui` detaches a per-user daemon (exclusive flock), prints status,
+and returns the shell. Re-running `fresh-gui` reprints status; `fresh-gui close`
+sends SIGTERM. Daemon stdout/stderr go to
+`$XDG_STATE_HOME/fresh-gui/fresh-gui.log` (fallback `~/.local/state/fresh-gui/`).
 
 ```text
-  fresh-gui ready
-  UI:  http://127.0.0.1:7420/
-  WS:  ws://127.0.0.1:7420/ws
+  fresh-gui session
+  pid:  12345
+  UI:   http://127.0.0.1:7420/
+  WS:   ws://127.0.0.1:7420/ws
+  root: /path/to/project
+  log:  ~/.local/state/fresh-gui/fresh-gui.log
 
   Local access (this machine):
     http://127.0.0.1:7420/?token=<token>
@@ -76,6 +86,8 @@ bind is non-loopback, nudging the operator back to loopback + SSH tunnel.
   From another machine (e.g. your laptop) — SSH tunnel, nothing exposed to the network:
     ssh -L 7420:127.0.0.1:7420 <user>@<host>
     then open: http://127.0.0.1:7420/?token=<token>
+
+  Stop with: fresh-gui close
 ```
 
 `<user>` comes from `$USER` / `$LOGNAME`; `<host>` reuses the existing
@@ -116,6 +128,7 @@ this flag; it is not part of the normal operator flow.
 | **Token in shell/browser history** | It's printed once to the terminal and appears in the URL if you paste the printed link. Treat it like a password: don't paste it into chat/tickets, and restart the process (new random token) if you suspect it leaked. The frontend strips it from the address bar after first use to reduce lingering exposure. |
 | **Token in `sessionStorage` for reload reconnect** | Needed so reload can auth after `?token=` is stripped. Scoped to the tab (cleared when the tab closes), wiped on `auth_error`, and never logged. Accessible to page script (same XSS class as any in-memory secret). |
 | **Token in logs/terminal scrollback** | Kept out of `tracing` (which may be centrally aggregated, e.g. journald); it still hits the operator's own terminal scrollback by design (that's the delivery mechanism), so avoid running under a shared/logged terminal multiplexer session. |
+| **Token in `$XDG_RUNTIME_DIR/fresh-gui/session.json`** | Needed so re-running `fresh-gui` can reprint the Local access URL. File mode `0600`, directory `0700`, removed on `fresh-gui close` / daemon exit. Same user-private trust as the lock file — other accounts cannot read it. |
 | **Token comparison timing** | Equal-length compares use a byte-wise XOR fold; length mismatches still short-circuit. In practice the token travels only over loopback or an SSH tunnel, and 122 bits of entropy makes brute forcing infeasible. |
 | **SSH tunnel security depends on normal SSH host/key verification** | No new risk introduced — same trust model as any other SSH usage. Verify host keys as usual; don't blindly accept unknown host keys. |
 | **`--allow-no-auth` misuse** | Restricted to loopback binds only (hard error otherwise) and clearly logged/printed as a warning when used. Intended for local test harnesses only, never documented as a normal run mode. |
@@ -126,5 +139,7 @@ this flag; it is not part of the normal operator flow.
 - TLS / `wss://` support, public (non-loopback) exposure by default, or any
   multi-user account system. The SSH tunnel is the answer to “access from
   another machine,” not a public bind.
-- Persisting or rotating tokens across restarts — a fresh random token per
-  process start is intentional and simpler to reason about.
+- Persisting tokens across daemon *restarts* — a fresh random token per
+  process start is intentional. Within one background session the token is
+  kept in private `session.json` only so status can reprint it; it is not
+  reused after `fresh-gui close`.

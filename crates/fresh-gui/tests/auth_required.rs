@@ -34,6 +34,7 @@ async fn default_requires_auth_token() {
     let addr = free_loopback();
     let bin = env!("CARGO_BIN_EXE_fresh-gui");
     let mut child = Command::new(bin)
+        .arg("--foreground")
         .arg("--listen")
         .arg(addr.to_string())
         .arg("--token")
@@ -70,6 +71,7 @@ async fn invalid_token_is_rejected() {
     let addr = free_loopback();
     let bin = env!("CARGO_BIN_EXE_fresh-gui");
     let mut child = Command::new(bin)
+        .arg("--foreground")
         .arg("--listen")
         .arg(addr.to_string())
         .arg("--token")
@@ -102,6 +104,7 @@ async fn invalid_token_is_rejected() {
 fn allow_no_auth_rejected_on_non_loopback_cli() {
     let bin = env!("CARGO_BIN_EXE_fresh-gui");
     let status = Command::new(bin)
+        .arg("--foreground")
         .arg("--listen")
         .arg("0.0.0.0:17999")
         .arg("--allow-no-auth")

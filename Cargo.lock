@@ -1456,6 +1456,7 @@ dependencies = [
  "fresh-gui-protocol",
  "futures-util",
  "jsonc-parser",
+ "libc",
  "notify 7.0.0",
  "portable-pty",
  "serde",
