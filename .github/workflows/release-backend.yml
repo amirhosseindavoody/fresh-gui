@@ -1,5 +1,6 @@
-# Bump CalVer, build the linux-64 fresh-gui pixi package, and publish
-# a GitHub Release with the .conda artifact.
+# Bump CalVer, build the linux-64 fresh-gui pixi package + standalone
+# binaries (linux-gnu glibc≥2.31, linux-musl, windows-msvc), and publish a
+# GitHub Release.
 #
 # Triggers on every push to main (merge) and on manual dispatch.
 # Commits/tags pushed with GITHUB_TOKEN do not re-trigger this workflow.
@@ -42,6 +43,9 @@ jobs:
       github.repository == 'amirhosseindavoody/fresh-gui' &&
       (github.event_name != 'push' ||
        !startsWith(github.event.head_commit.message, 'chore: release'))
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -162,14 +166,32 @@ jobs:
           {
             echo "## fresh-gui \`${VERSION}\`"
             echo
-            echo "Linux remote daemon (browser UI + WebSocket PTYs), packaged for **linux-64**."
+            echo "Remote daemon (browser UI + WebSocket PTYs)."
             echo
-            echo "### Install from this release"
+            echo "### Assets"
+            echo
+            echo "| Asset | Notes |"
+            echo "|-------|-------|"
+            echo "| \`fresh-gui-*-*.conda\` | Pixi/conda linux-64 package (glibc 2.28+) |"
+            echo "| \`fresh-gui-*-x86_64-unknown-linux-gnu.tar.gz\` | Standalone Linux binary (glibc **≥ 2.31**) |"
+            echo "| \`fresh-gui-*-x86_64-unknown-linux-musl.tar.gz\` | Standalone Linux musl binary (Alpine, static-friendly) |"
+            echo "| \`fresh-gui-*-x86_64-pc-windows-msvc.zip\` | Standalone Windows binary |"
+            echo
+            echo "### Install (pixi / conda)"
             echo
             echo '```bash'
             echo "# download the .conda asset, then:"
             echo "pixi global install ./fresh-gui-${VERSION}-*.conda"
             echo "fresh-gui --help"
+            echo '```'
+            echo
+            echo "### Install (standalone binary)"
+            echo
+            echo '```bash'
+            echo "# Linux (glibc ≥ 2.31) example:"
+            echo "tar -xzf fresh-gui-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+            echo "cd fresh-gui-${VERSION}-x86_64-unknown-linux-gnu"
+            echo "./bin/fresh-gui"
             echo '```'
             echo
             echo "Or install from git at this tag:"
@@ -179,10 +201,11 @@ jobs:
             echo '```'
             echo
             echo "Default settings file: \`~/.config/fresh-gui/config.json\` (theme, fonts, shell)."
+            echo "Windows: \`%APPDATA%\\fresh-gui\\config.json\`."
           } >"${NOTES}"
 
           if gh release view "${TAG}" >/dev/null 2>&1; then
-            echo "Release ${TAG} already exists — uploading assets"
+            echo "Release ${TAG} already exists — uploading conda assets"
             gh release upload "${TAG}" dist/fresh-gui-*.conda dist/SHA256SUMS --clobber
           else
             gh release create "${TAG}" \
@@ -192,3 +215,128 @@ jobs:
               --notes-file "${NOTES}" \
               --verify-tag
           fi
+
+  binaries:
+    name: Binary (${{ matrix.name }})
+    needs: release
+    if: needs.release.result == 'success'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-gnu
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            zig_glibc: "2.31"
+            archive: tar.gz
+          - name: linux-musl
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            zig_glibc: ""
+            archive: tar.gz
+          - name: windows
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            zig_glibc: ""
+            archive: zip
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+          targets: ${{ matrix.target }}
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.2.19"
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-bin-${{ matrix.target }}
+          workspaces: ". -> target"
+
+      - name: Build host UI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd crates/fresh-gui-app/ui
+          bun install --frozen-lockfile
+          bun run build
+          test -f dist/index.html
+
+      - name: Install zig + cargo-zigbuild (linux cross)
+        if: matrix.name == 'linux-gnu' || matrix.name == 'linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz \
+            | tar -xJ -C /tmp
+          echo "/tmp/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild --locked --version 0.19.8
+
+      - name: Build binary (linux-gnu glibc ≥ 2.31)
+        if: matrix.name == 'linux-gnu'
+        shell: bash
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+          CARGO_PROFILE_RELEASE_LTO: thin
+        run: |
+          set -euo pipefail
+          cargo zigbuild --release --locked -p fresh-gui \
+            --target "${{ matrix.target }}.${{ matrix.zig_glibc }}"
+
+      - name: Build binary (linux-musl)
+        if: matrix.name == 'linux-musl'
+        shell: bash
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+          CARGO_PROFILE_RELEASE_LTO: thin
+        run: |
+          set -euo pipefail
+          cargo zigbuild --release --locked -p fresh-gui \
+            --target "${{ matrix.target }}"
+
+      - name: Build binary (windows)
+        if: matrix.name == 'windows'
+        shell: bash
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+          CARGO_PROFILE_RELEASE_LTO: thin
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p fresh-gui \
+            --target "${{ matrix.target }}"
+
+      - name: Package archive
+        shell: bash
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          rm -rf dist/binaries
+          mkdir -p dist/binaries
+          ./scripts/package-binary.sh "${{ matrix.target }}" "${VERSION}" dist/binaries
+          ls -lah dist/binaries
+
+      - name: Upload to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/binaries/fresh-gui-*.${{ matrix.archive }} dist/binaries/fresh-gui-*.${{ matrix.archive }}.sha256)
+          test "${#assets[@]}" -ge 2
+          gh release upload "${TAG}" "${assets[@]}" --clobber

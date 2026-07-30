@@ -1,23 +1,35 @@
 //! Per-user background session: lock file, meta, log path, detach, close.
 //!
-//! Layout (Linux):
+//! Layout (Linux / Unix):
 //! - Runtime (lock + meta): `$XDG_RUNTIME_DIR/fresh-gui/` or `/tmp/fresh-gui-$UID/`
 //! - Log: `$XDG_STATE_HOME/fresh-gui/fresh-gui.log` or `~/.local/state/fresh-gui/…`
 //!
-//! Only one background session per user (exclusive flock on the lock file).
+//! Layout (Windows):
+//! - Runtime + log under `%LOCALAPPDATA%\fresh-gui\` (fallback: `%TEMP%\fresh-gui\`)
+//!
+//! Only one background session per user (exclusive lock on the lock file).
+//! Detach/spawn follows Fresh’s daemon pattern (`vendor/fresh` …/server/daemon).
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
-use std::os::unix::process::CommandExt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+
+#[cfg(unix)]
+use unix as platform;
+#[cfg(windows)]
+use windows as platform;
+
+pub use platform::{is_process_running, spawn_daemon, SessionLock};
 
 const META_NAME: &str = "session.json";
 const LOCK_NAME: &str = "session.lock";
@@ -54,14 +66,14 @@ pub struct SessionPaths {
 
 impl SessionPaths {
     pub fn resolve() -> Result<Self> {
-        let runtime_dir = runtime_dir()?;
-        let state_dir = state_dir()?;
+        let runtime_dir = platform::runtime_dir()?;
+        let state_dir = platform::state_dir()?;
         fs::create_dir_all(&runtime_dir)
             .with_context(|| format!("create runtime dir {}", runtime_dir.display()))?;
         fs::create_dir_all(&state_dir)
             .with_context(|| format!("create state dir {}", state_dir.display()))?;
-        chmod_dir_private(&runtime_dir);
-        chmod_dir_private(&state_dir);
+        platform::chmod_dir_private(&runtime_dir);
+        platform::chmod_dir_private(&state_dir);
         Ok(Self {
             lock_path: runtime_dir.join(LOCK_NAME),
             meta_path: runtime_dir.join(META_NAME),
@@ -70,51 +82,6 @@ impl SessionPaths {
             state_dir,
         })
     }
-}
-
-fn runtime_dir() -> Result<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        let xdg = xdg.trim();
-        if !xdg.is_empty() {
-            return Ok(PathBuf::from(xdg).join("fresh-gui"));
-        }
-    }
-    let uid = unsafe { libc::getuid() };
-    Ok(PathBuf::from(format!("/tmp/fresh-gui-{uid}")))
-}
-
-fn state_dir() -> Result<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
-        let xdg = xdg.trim();
-        if !xdg.is_empty() {
-            return Ok(PathBuf::from(xdg).join("fresh-gui"));
-        }
-    }
-    let home = std::env::var_os("HOME").context("HOME is unset")?;
-    Ok(PathBuf::from(home).join(".local/state/fresh-gui"))
-}
-
-fn chmod_dir_private(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
-    }
-}
-
-fn chmod_file_private(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-    }
-}
-
-pub fn is_process_running(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    Path::new(&format!("/proc/{pid}")).exists()
 }
 
 pub fn read_meta(paths: &SessionPaths) -> Result<Option<SessionMeta>> {
@@ -132,12 +99,7 @@ pub fn write_meta(paths: &SessionPaths, meta: &SessionMeta) -> Result<()> {
     let text = serde_json::to_string_pretty(meta).context("serialize session meta")?;
     let tmp = paths.meta_path.with_extension("json.tmp");
     {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
+        let mut f = platform::open_private_write(&tmp)
             .with_context(|| format!("write {}", tmp.display()))?;
         f.write_all(text.as_bytes())?;
         f.write_all(b"\n")?;
@@ -145,7 +107,7 @@ pub fn write_meta(paths: &SessionPaths, meta: &SessionMeta) -> Result<()> {
     }
     fs::rename(&tmp, &paths.meta_path)
         .with_context(|| format!("rename {}", paths.meta_path.display()))?;
-    chmod_file_private(&paths.meta_path);
+    platform::chmod_file_private(&paths.meta_path);
     Ok(())
 }
 
@@ -167,39 +129,6 @@ pub fn live_session(paths: &SessionPaths) -> Result<Option<SessionMeta>> {
     }
 }
 
-/// Exclusive lock held for the lifetime of the daemon process.
-pub struct SessionLock {
-    _file: File,
-}
-
-impl SessionLock {
-    pub fn try_acquire(paths: &SessionPaths) -> Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .open(&paths.lock_path)
-            .with_context(|| format!("open lock {}", paths.lock_path.display()))?;
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::WouldBlock
-                || err.raw_os_error() == Some(libc::EWOULDBLOCK)
-                || err.raw_os_error() == Some(libc::EAGAIN)
-            {
-                bail!(
-                    "another fresh-gui session is already running for this user \
-                     (lock {}). Run `fresh-gui` for status or `fresh-gui close` to stop it.",
-                    paths.lock_path.display()
-                );
-            }
-            return Err(err).context("flock session.lock");
-        }
-        Ok(Self { _file: file })
-    }
-}
-
 pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -209,62 +138,10 @@ pub fn now_unix() -> u64 {
 
 /// Open the session log for append (private). Used by the daemon child.
 pub fn open_log_file(paths: &SessionPaths) -> Result<File> {
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&paths.log_path)
+    let file = platform::open_private_append(&paths.log_path)
         .with_context(|| format!("open log {}", paths.log_path.display()))?;
-    chmod_file_private(&paths.log_path);
+    platform::chmod_file_private(&paths.log_path);
     Ok(file)
-}
-
-/// Spawn `fresh-gui --daemon-serve …` detached (own session, stdio → log file).
-pub fn spawn_daemon(serve_args: &[String], paths: &SessionPaths) -> Result<u32> {
-    let exe = std::env::current_exe().context("current_exe")?;
-    {
-        let mut file = open_log_file(paths)?;
-        writeln!(
-            file,
-            "\n======== fresh-gui spawn ts={} ========",
-            now_unix()
-        )?;
-    }
-
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&paths.log_path)
-        .with_context(|| format!("open log for child {}", paths.log_path.display()))?;
-    let log_err = log
-        .try_clone()
-        .context("clone log fd for stderr")?;
-
-    let mut cmd = Command::new(&exe);
-    cmd.arg("--daemon-serve");
-    for a in serve_args {
-        cmd.arg(a);
-    }
-    // Propagate cwd so --root defaults stay meaningful.
-    if let Ok(cwd) = std::env::current_dir() {
-        cmd.current_dir(cwd);
-    }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err));
-
-    // Own session / process group so closing the launching terminal does not
-    // SIGHUP the daemon (same approach as Fresh’s unix daemon spawn).
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-
-    let child = cmd.spawn().context("spawn fresh-gui --daemon-serve")?;
-    Ok(child.id())
 }
 
 /// Wait until meta appears with a live pid (and optional bound address).
@@ -332,6 +209,7 @@ pub fn print_session_info(meta: &SessionMeta) {
             .map(|(_, p)| p.to_owned())
             .unwrap_or_else(|| "7420".into());
         let user = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
             .or_else(|_| std::env::var("LOGNAME"))
             .unwrap_or_else(|_| "user".into());
         println!();
@@ -352,7 +230,7 @@ pub fn print_session_info(meta: &SessionMeta) {
     println!();
 }
 
-/// Stop the background session (SIGTERM, then cleanup).
+/// Stop the background session (graceful signal/terminate, then cleanup).
 pub fn close_session(paths: &SessionPaths) -> Result<()> {
     let Some(meta) = read_meta(paths)? else {
         println!("No fresh-gui session is running.");
@@ -361,22 +239,15 @@ pub fn close_session(paths: &SessionPaths) -> Result<()> {
 
     if !is_process_running(meta.pid) {
         remove_session_files(paths);
-        println!("Cleared stale session metadata (process {} was not running).", meta.pid);
+        println!(
+            "Cleared stale session metadata (process {} was not running).",
+            meta.pid
+        );
         return Ok(());
     }
 
     println!("Stopping fresh-gui session (pid {})…", meta.pid);
-    let rc = unsafe { libc::kill(meta.pid as i32, libc::SIGTERM) };
-    if rc != 0 {
-        let err = io::Error::last_os_error();
-        // Already gone.
-        if err.raw_os_error() == Some(libc::ESRCH) {
-            remove_session_files(paths);
-            println!("Session already exited.");
-            return Ok(());
-        }
-        return Err(err).context("SIGTERM daemon");
-    }
+    platform::request_stop(meta.pid)?;
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -389,7 +260,7 @@ pub fn close_session(paths: &SessionPaths) -> Result<()> {
     }
 
     // Escalate.
-    let _ = unsafe { libc::kill(meta.pid as i32, libc::SIGKILL) };
+    platform::force_kill(meta.pid);
     thread::sleep(Duration::from_millis(100));
     remove_session_files(paths);
     println!("Force-killed session {}. Log: {}", meta.pid, meta.log_path);
@@ -445,6 +316,28 @@ pub fn serve_args_for_child(
         args.push(c.display().to_string());
     }
     args
+}
+
+/// Shared helpers used by platform modules when opening private files.
+pub(crate) fn open_options_private_write() -> OpenOptions {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    platform::apply_private_mode(&mut opts);
+    opts
+}
+
+pub(crate) fn open_options_private_append() -> OpenOptions {
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    platform::apply_private_mode(&mut opts);
+    opts
+}
+
+pub(crate) fn open_options_lock() -> OpenOptions {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true);
+    platform::apply_private_mode(&mut opts);
+    opts
 }
 
 #[cfg(test)]

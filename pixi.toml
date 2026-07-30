@@ -48,6 +48,7 @@ ui-install = { cwd = "crates/fresh-gui-app/ui", cmd = "bun install" }
 ui-build = { depends-on = ["ui-install"], cwd = "crates/fresh-gui-app/ui", cmd = "bun run build" }
 ui-serve = "cargo run -p fresh-gui-app -- serve-ui"
 package = "pixi build -o dist"
+package-binary = "scripts/package-binary.sh"
 update-version = "scripts/update-version.sh"
 
 [dependencies]
