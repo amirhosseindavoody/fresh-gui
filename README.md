@@ -1,6 +1,6 @@
 # fresh-gui
 
-A **terminal-first IDE shell** for a remote Linux machine. Run the backend on your server; open shells, edit files, and browse the tree from a browser (or the Windows host app).
+A **terminal-first IDE shell** for a remote Linux machine. Run the backend on your server; open shells, edit files, and browse the tree from a browser.
 
 Inspired by [Terax](https://github.com/crynta/terax-ai). The remote editor core is [Fresh](https://github.com/sinelaw/fresh).
 
@@ -111,18 +111,6 @@ All prefs live in one JSONC file on the **backend** host:
 
 Open it from the UI (**Settings** / `Mod+,`), edit, save with `Mod+S`. Theme follows the OS by default; terminal chrome tracks the same theme. Empty shell `args` keep interactive / OSC 7 setup for known shells. Dotfiles and `.git` directories are hidden in the explorer by default; enable them independently via `showDotfiles` / `showGitDirs`. Editor soft wrap follows Fresh `editor.line_wrap` (on by default); toggle with `Alt+Z` or the command palette.
 
-## Windows host app
-
-A Tauri desktop wrapper can load the same UI. Build installers on Windows (or via CI):
-
-```powershell
-cd crates\fresh-gui-desktop
-npm ci
-npm run build:windows
-```
-
-Details: [docs/WINDOWS.md](./docs/WINDOWS.md).
-
 ## Develop from source
 
 ```bash
@@ -142,7 +130,6 @@ Useful tasks: `pixi run check`, `test`, `build`, `build-release`, `ui` (Vite hot
 |-------|------|
 | `fresh-gui` | Linux daemon (PTY, FS, Fresh editor, embedded UI) |
 | `fresh-gui-app` / `ui/` | Browser UI + small CLI |
-| `fresh-gui-desktop` | Windows Tauri host |
 | `fresh-gui-protocol` / `fresh-gui-client` | Shared wire format + client library |
 
 Deeper design notes (architecture and behavior): [docs/DESIGN.md](./docs/DESIGN.md), [docs/FRESH.md](./docs/FRESH.md) (Fresh embedding), [docs/SECURITY.md](./docs/SECURITY.md), [docs/UI.md](./docs/UI.md). Backend flags and packaging: [crates/fresh-gui/README.md](./crates/fresh-gui/README.md).

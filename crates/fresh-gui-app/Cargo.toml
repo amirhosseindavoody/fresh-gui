@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "Host ADE shell for fresh-gui (CLI + Tauri UI)"
+description = "Host ADE shell for fresh-gui (CLI + browser UI)"
 readme = "README.md"
 
 [[bin]]

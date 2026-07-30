@@ -14,7 +14,7 @@ For every new feature or behavior change in **fresh-gui**, treat [Fresh](https:/
    - Calling into Fresh APIs / types already linked by the backend
    - Extending the host↔backend protocol to surface a Fresh capability
    - Aligning config keys / semantics with Fresh where that is intentional
-3. **Only then invent** — Implement something fresh-gui-specific when Fresh truly lacks the capability, cannot expose it remotely, or the work is purely host chrome (layout, windowing, browser/Tauri UX that Fresh does not own).
+3. **Only then invent** — Implement something fresh-gui-specific when Fresh truly lacks the capability, cannot expose it remotely, or the work is purely host chrome (layout, windowing, browser UX that Fresh does not own).
 4. **Say why** — When a custom path is necessary, briefly note in the PR/commit what Fresh was checked and why it was insufficient (missing API, TUI-only, wrong layer, etc.).
 
 ## Do not

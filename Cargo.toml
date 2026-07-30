@@ -5,7 +5,6 @@ members = [
     "crates/fresh-gui",
     "crates/fresh-gui-client",
     "crates/fresh-gui-app",
-    "crates/fresh-gui-desktop",
 ]
 default-members = [
     "crates/fresh-gui-protocol",

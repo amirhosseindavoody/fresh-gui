@@ -88,7 +88,7 @@ impl Default for Config {
     }
 }
 
-/// Host UI settings (shared with the browser / Tauri chrome).
+/// Host UI settings (shared with the browser UI chrome).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UiConfig {
     /// `system` | `light` | `dark`

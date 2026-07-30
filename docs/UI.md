@@ -32,7 +32,6 @@ Inspired by Terax’s public UI / [TERAX.md](https://github.com/crynta/terax-ai/
 | Source control / git graph | Not present |
 | Web preview / markdown tabs | Markdown preview helper exists for editor; not a separate tab kind |
 | Spaces / multi-project switcher | Not present (ADE sessions cover reconnect) |
-| Custom window controls | Windows Tauri only — follow Tauri defaults |
 | React 19 + Tailwind + shadcn | Yes — chrome in `src/app` + `src/components/ui` (Button, Tabs, DropdownMenu, ContextMenu, Separator, … like Terax); ADE controller remains imperative (`src/ade/bootstrap.ts`) |
 | Large trees via React reconciliation | **No** — explorer stays `VirtualTree` (windowed rows) |
 
@@ -226,5 +225,4 @@ Hybrid model: React mounts the shell; `bootstrapAde()` binds once to stable DOM 
 - [DESIGN.md](./DESIGN.md) — architecture, protocol, Fresh coupling overview.
 - [FRESH.md](./FRESH.md) — how the daemon embeds Fresh editor libraries.
 - [SECURITY.md](./SECURITY.md) — token + SSH tunnel access model.
-- [WINDOWS.md](./WINDOWS.md) — Tauri packaging.
 - [Terax](https://github.com/crynta/terax-ai) — layout, tabs, terminal/editor stacks, polish bar.

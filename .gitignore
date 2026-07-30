@@ -21,8 +21,5 @@ crates/fresh-gui-backend/data/
 # Built conda packages
 dist/
 
-# Tauri
-crates/fresh-gui-desktop/gen/
-crates/fresh-gui-desktop/target/
+# Node
 node_modules/
-crates/fresh-gui-desktop/node_modules/
