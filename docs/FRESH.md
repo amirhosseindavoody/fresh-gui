@@ -171,6 +171,7 @@ Workspace rule: prefer extending Fresh-backed backend surfaces over inventing a 
 |----------|-------------------|
 | `~/.config/fresh-gui/config.json` | fresh-gui daemon config (JSONC) |
 | `terminal.shell` | Same field shape as Fresh shell config; empty `args` keep interactive + OSC 7 setup |
+| `ui.editorLineWrap` | Host soft wrap; mirrors Fresh `editor.line_wrap` (default on). Toggle via `Alt+Z` / command palette |
 | `ui.*` | Host-only prefs → `Hello.ui` |
 | Fresh editor state dir | Ephemeral under `/tmp/fresh-gui-editor-{pid}` for the embedded `Editor` |
 | Fresh user config | Not loaded wholesale into the ADE daemon |

@@ -61,6 +61,9 @@ pub struct HelloUi {
     /// VS Code–style editor document map (minimap). Default off.
     #[serde(default, rename = "editorMinimap")]
     pub editor_minimap: bool,
+    /// Soft-wrap long lines in the host editor (Fresh `editor.line_wrap`). Default on.
+    #[serde(default = "hello_ui_line_wrap", rename = "editorLineWrap")]
+    pub editor_line_wrap: bool,
 }
 
 fn hello_ui_theme() -> String {
@@ -80,6 +83,10 @@ fn hello_ui_font_weight() -> u32 {
 }
 
 fn hello_ui_webgl() -> bool {
+    true
+}
+
+fn hello_ui_line_wrap() -> bool {
     true
 }
 
