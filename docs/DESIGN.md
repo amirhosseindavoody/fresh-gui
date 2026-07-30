@@ -1,6 +1,6 @@
 # fresh-gui Design
 
-Terminal-first IDE shell on a **local host**, connected to a **Linux remote daemon** that embeds [Fresh](https://github.com/sinelaw/fresh) for editor state. Product inspiration: [Terax](https://github.com/crynta/terax-ai). Install and usage: [README.md](../README.md). Host chrome details: [UI.md](./UI.md). Access model: [SECURITY.md](./SECURITY.md).
+Terminal-first IDE shell on a **local host**, connected to a **Linux remote daemon** that embeds [Fresh](https://github.com/sinelaw/fresh) for editor state. Product inspiration: [Terax](https://github.com/crynta/terax-ai). Install and usage: [README.md](../README.md). Host chrome: [UI.md](./UI.md). Fresh embedding: [FRESH.md](./FRESH.md). Access model: [SECURITY.md](./SECURITY.md).
 
 ## 1. Problem
 
@@ -125,7 +125,7 @@ PTY shell defaults come from `config.json` (`terminal.shell`). Bash/zsh hooks em
 
 ### Editor
 
-When enabled, Fresh `Editor` runs in-process on a dedicated `!Send` thread (`EditorWorker`), linked from `vendor/fresh` with the `runtime` feature (plugins off). Path open supports Fresh-style `:line` / `:line:col` suffixes and Ctrl/Cmd+click link detection (`path_link`) with optional terminal cwd.
+When enabled, Fresh `Editor` runs in-process on a dedicated `!Send` thread (`EditorWorker`); see [FRESH.md](./FRESH.md). Path open supports Fresh-style `:line` / `:line:col` suffixes and Ctrl/Cmd+click link detection (`path_link`) with optional terminal cwd.
 
 ### Config
 
@@ -148,7 +148,9 @@ Host chrome is React 19 + Tailwind + shadcn; ADE protocol, xterm, CodeMirror, an
 
 ## 8. Fresh coupling
 
-Fresh is a **git submodule** at `vendor/fresh`, pinned by commit SHA (also recorded in `vendor/fresh.rev` for package builds). Workspace `exclude = ["vendor/fresh"]` keeps Fresh’s own Cargo workspace separate. Backend path deps point at `vendor/fresh/crates/…`.
+Fresh is a **git submodule** at `vendor/fresh`, pinned by commit SHA (also recorded in `vendor/fresh.rev` for package builds). Workspace `exclude = ["vendor/fresh"]` keeps Fresh’s own Cargo workspace separate. The daemon path-depends on `fresh-editor` with `runtime` (plugins / web / Fresh GUI off) and runs `Editor` on a dedicated `!Send` thread.
+
+Full integration detail — vendoring, `EditorHandle`, protocol mapping, path_link, what is *not* from Fresh: **[FRESH.md](./FRESH.md)**.
 
 **Current pin:** `f5f2c4639f7d5ed3d6b3ef3d2343365ced426401` (integration fork). Prefer `https://github.com/amirhosseindavoody/fresh.git`; upstream tracking: `https://github.com/sinelaw/fresh.git`.
 
@@ -197,6 +199,7 @@ fresh-gui/
   LICENSE
   docs/
     DESIGN.md          # this file
+    FRESH.md           # Fresh editor embedding
     UI.md
     SECURITY.md
     WINDOWS.md
