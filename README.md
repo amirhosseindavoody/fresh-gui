@@ -75,11 +75,11 @@ After connect you get terminals, an explorer, and editor tabs in one shell:
 | Paste into terminal | `Mod+V` |
 | Command palette | `Mod+P` |
 | Settings | Activity bar gear or `Mod+,` (opens `config.json`) |
-| Copy a path | Right-click a tab or tree row |
+| Copy a path / file ops | Right-click a tree row (New File/Folder, Cut/Copy/Paste, path copies) or a tab (path copies + Close) |
 
 `Mod` is `Ctrl` on Linux/Windows and `Cmd` on macOS. Disconnect leaves remote sessions and PTYs running so you can reconnect.
 
-Sessions keep shells alive across GUI disconnect. File listing and editor open are sandboxed to `--root` (default: current directory).
+Sessions keep shells alive across GUI disconnect. Explorer list/create/copy/move and editor open are sandboxed to `--root` (default: current directory), plus directories authorized when a terminal cwd leaves that root.
 
 ## Settings
 
@@ -140,7 +140,7 @@ Useful tasks: `pixi run check`, `test`, `build`, `build-release`, `ui` (Vite hot
 | `fresh-gui-desktop` | Windows Tauri host |
 | `fresh-gui-protocol` / `fresh-gui-client` | Shared wire format + client library |
 
-Deeper design notes: [docs/DESIGN.md](./docs/DESIGN.md), [docs/SECURITY.md](./docs/SECURITY.md), [docs/UI.md](./docs/UI.md). Backend flags and packaging: [crates/fresh-gui/README.md](./crates/fresh-gui/README.md).
+Deeper design notes (architecture and behavior): [docs/DESIGN.md](./docs/DESIGN.md), [docs/SECURITY.md](./docs/SECURITY.md), [docs/UI.md](./docs/UI.md). Backend flags and packaging: [crates/fresh-gui/README.md](./crates/fresh-gui/README.md).
 
 ## Releases
 
