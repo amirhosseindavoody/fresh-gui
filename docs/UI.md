@@ -33,7 +33,7 @@ Inspired by Terax’s public UI / [TERAX.md](https://github.com/crynta/terax-ai/
 | Web preview / markdown tabs | Markdown preview helper exists for editor; not a separate tab kind |
 | Spaces / multi-project switcher | Not present (ADE sessions cover reconnect) |
 | Custom window controls | Windows Tauri only — follow Tauri defaults |
-| React 19 + Tailwind + shadcn | Yes — chrome in `src/app` + `src/components/ui`; ADE controller remains imperative (`src/ade/bootstrap.ts`) |
+| React 19 + Tailwind + shadcn | Yes — chrome in `src/app` + `src/components/ui` (Button, Tabs, DropdownMenu, ContextMenu, Separator, … like Terax); ADE controller remains imperative (`src/ade/bootstrap.ts`) |
 | Large trees via React reconciliation | **No** — explorer stays `VirtualTree` (windowed rows) |
 
 ## 3. Information architecture
@@ -115,7 +115,8 @@ type PaneNode =
 - **Typography:** mono for terminal + paths; UI chrome uses a paired sans. Defaults are IBM Plex (overridable).
 - **Surfaces:** subtle elevation via border + fill shifts, not card grids.
 - **Icons:** SVG folder/file icons with extension color tones; indent guides + chevrons.
-- **Menus:** flat elevated rows (`.ctx-menu` / `.ctx-item`), not stacked chrome buttons.
+- **Menus:** flat elevated rows matching shadcn DropdownMenu / ContextMenu (`.ctx-menu` / `.ctx-item`); ADE uses an imperative menu so editor/terminal roots are not remounted. React primitives live in `components/ui/context-menu.tsx` and `dropdown-menu.tsx`.
+- **Tabs:** Terax-style strip — compact triggers, shared sliding pill, close control revealed on hover (`.tab-close`).
 
 ### Tokens
 
@@ -178,14 +179,14 @@ Connection errors and auth failures use inline strip status; never modal loops.
 
 | Module (`ui/src`) | Role |
 |-------------------|------|
-| `app/App.tsx` + `components/ui/*` | React shell chrome (activity, tab actions, status) |
+| `app/App.tsx` + `components/ui/*` | React shell chrome (activity, tab actions, status); shadcn Button / Separator / Tabs / DropdownMenu / ContextMenu |
 | `ade/bootstrap.ts` | ADE controller: protocol, tabs, panes, tree wiring |
 | `panes.ts` | Per-tab recursive pane trees |
 | `terminal.ts` | xterm + WebGL + OSC 7 + clipboard |
 | `tree.ts` | Virtualized explorer + context menu hook |
 | `editor.ts` | CodeMirror 6 editor tabs |
 | `settings.ts` + backend `config.json` | Theme / fonts / shell / explorer prefs |
-| `context-menu.ts` | Flat menus + name prompt for New File/Folder |
+| `context-menu.ts` | Imperative flat menus + name prompt (visual parity with shadcn ContextMenu) |
 | `palette.ts` / `shortcuts.ts` | Command palette and shortcut registry |
 | `tokens.css` / `palettes.ts` / `styles.css` | Theme tokens and chrome CSS |
 | `protocol.ts` | ADE message shapes |

@@ -1260,10 +1260,12 @@ function renderTabs(): void {
     }
     el.appendChild(label);
     const x = document.createElement("button");
-    x.className = "x";
+    x.className = "tab-close";
     x.type = "button";
-    x.textContent = "×";
     x.title = "Close tab";
+    x.setAttribute("aria-label", "Close tab");
+    x.innerHTML =
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>';
     x.addEventListener("click", (ev) => {
       ev.stopPropagation();
       closeTabAt(i);

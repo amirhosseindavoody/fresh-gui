@@ -144,7 +144,7 @@ Linux: Pixi `[package]` + `recipe/` installs `bin/fresh-gui` and UI under `share
 | **Tauri** | `fresh-gui-desktop` loads the same UI assets; WebView dials `/ws` |
 | **CLI** | `fresh-gui-app ping|smoke|attach` via `fresh-gui-client` |
 
-Host chrome is React 19 + Tailwind + shadcn; ADE protocol, xterm, CodeMirror, and the virtualized tree stay imperative TypeScript modules attached once from the React shell. Full IA and shortcuts: [UI.md](./UI.md).
+Host chrome is React 19 + Tailwind + shadcn (Button, Tabs, DropdownMenu, ContextMenu — same family Terax uses); ADE protocol, xterm, CodeMirror, and the virtualized tree stay imperative TypeScript modules attached once from the React shell. Full IA and shortcuts: [UI.md](./UI.md).
 
 ## 8. Fresh coupling
 
