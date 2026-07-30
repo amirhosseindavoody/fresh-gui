@@ -181,15 +181,15 @@ pub fn read_self_status_mem() -> Option<ProcStatusMem> {
 pub fn parse_status_mem(text: &str) -> ProcStatusMem {
     let mut mem = ProcStatusMem::default();
     for line in text.lines() {
-        if mem.rss_kb.is_none() {
-            if let Some(kb) = parse_status_kb_line(line, "VmRSS:") {
-                mem.rss_kb = Some(kb);
-            }
+        if mem.rss_kb.is_none()
+            && let Some(kb) = parse_status_kb_line(line, "VmRSS:")
+        {
+            mem.rss_kb = Some(kb);
         }
-        if mem.hwm_kb.is_none() {
-            if let Some(kb) = parse_status_kb_line(line, "VmHWM:") {
-                mem.hwm_kb = Some(kb);
-            }
+        if mem.hwm_kb.is_none()
+            && let Some(kb) = parse_status_kb_line(line, "VmHWM:")
+        {
+            mem.hwm_kb = Some(kb);
         }
         if mem.rss_kb.is_some() && mem.hwm_kb.is_some() {
             break;
