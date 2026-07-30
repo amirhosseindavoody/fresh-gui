@@ -2,6 +2,13 @@
 
 ## 2026-07-30
 
+### Settings and shortkeys cleanup (#61)
+
+- Embedded default settings catalog at `crates/fresh-gui/defaults/config.json` (JSONC with field comments), compiled into the binary via `include_str!` (Fresh keymap pattern).
+- `config.json` gains a `shortkeys` list: `{ action, shortkey, when }` (Fresh-style action + context; chord as `shortkey` with `Mod` = Cmd/Ctrl). Effective bindings ship in `Hello.shortkeys` (protocol `0.5.0`).
+- Command palette **Preferences: Open Default Settings** opens a temporary catalog file that is deleted when the tab closes; save is rejected (copy into user config to customize).
+- Host `shortcuts.ts` loads bindings from Hello / saved config and honors `when` (`global` | `terminal` | `editor` | `fileExplorer`). Terminal copy-vs-SIGINT stays selection-aware in the clipboard handler (not a when-clause), matching Fresh.
+
 ### Markdown WYSIWYG performance (#52)
 
 - Stopped serializing HTML→markdown and rewriting the CodeMirror document on every keystroke; the preview DOM is the live buffer while WYSIWYG is open, and Turndown runs only on save / toggle-to-source / theme refresh.

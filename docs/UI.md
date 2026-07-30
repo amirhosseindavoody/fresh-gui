@@ -140,7 +140,7 @@ Motion: tab pill slide, sidebar collapse, panel focus / menu appear. No perpetua
 
 ## 6. Interaction map
 
-Defaults follow [Terax `shortcuts.ts`](https://github.com/crynta/terax-ai/blob/main/src/modules/shortcuts/shortcuts.ts). `Mod` = `Cmd` on macOS, `Ctrl` elsewhere.
+Defaults follow [Terax `shortcuts.ts`](https://github.com/crynta/terax-ai/blob/main/src/modules/shortcuts/shortcuts.ts) and are listed in the embedded `defaults/config.json` `shortkeys` array (`action` + `shortkey` chord + Fresh-style `when`). Users override by copying entries into their `config.json`. `Mod` = `Cmd` on macOS, `Ctrl` elsewhere. `when`: `global` (default) | `terminal` | `editor` | `fileExplorer`.
 
 | Action | Shortcut | Notes |
 |--------|----------|-------|
@@ -159,11 +159,12 @@ Defaults follow [Terax `shortcuts.ts`](https://github.com/crynta/terax-ai/blob/m
 | Toggle editor line wrap | `Alt+Z` | Soft wrap (Fresh `line_wrap`); also command palette |
 | Toggle sidebar | `Mod+B` (and `Mod+Shift+B`) | |
 | Find | `Mod+F` | Terminal buffer or editor search |
-| Copy (terminal) | `Mod+C` | Copies when text is selected; otherwise interrupt |
+| Copy (terminal) | `Mod+C` | Copies when text is selected; otherwise interrupt (selection check is in the action body, not a `when` clause) |
 | Paste (terminal) | `Mod+V` | System clipboard → PTY (bracketed paste when supported) |
 | Go to File | `Mod+P` | Path `path[:line[:col]]` |
 | Command palette | `Mod+Shift+P` | |
-| Open settings | `Mod+,` | Opens backend `config.json` in an editor tab |
+| Open settings | `Mod+,` | Opens backend user `config.json` in an editor tab |
+| Open default settings | — | Command palette → **Preferences: Open Default Settings** (temp catalog; deleted on close) |
 | Connect / disconnect | — | Auto-connect via `?token=` / `sessionStorage`; Disconnect / Reconnect in command palette |
 
 **Context menus**
@@ -190,9 +191,9 @@ Connection errors and auth failures use inline strip status; never modal loops.
 | `tree.ts` | Virtualized explorer + context menu hook |
 | `editor.ts` | CodeMirror 6 editor tabs |
 | `markdown-preview.ts` / `markdown-wysiwyg.ts` | Markdown render (GFM / KaTeX / Mermaid) + contenteditable WYSIWYG with toolbar; DOM is authoritative while preview is open, serializes to CodeMirror on flush |
-| `settings.ts` + backend `config.json` | Theme / fonts / shell / explorer prefs |
+| `settings.ts` + backend `config.json` / `defaults/config.json` | Theme / fonts / shell / explorer prefs + shortkeys parse |
 | `context-menu.ts` | Imperative flat menus + name prompt (visual parity with shadcn ContextMenu) |
-| `palette.ts` / `shortcuts.ts` | Command palette and shortcut registry |
+| `palette.ts` / `shortcuts.ts` | Command palette and shortcut registry (bindings from `Hello.shortkeys` / config) |
 | `tokens.css` / `palettes.ts` / `styles.css` | Theme tokens and chrome CSS |
 | `protocol.ts` | ADE message shapes |
 

@@ -21,43 +21,13 @@ pub const FILENAME: &str = "config.json";
 /// Default shell when config omits `terminal.shell` or leaves it empty.
 pub const DEFAULT_SHELL_COMMAND: &str = "zsh";
 
-/// Documented starter file (JSONC) written on first settings open.
-pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"{
-  // Host UI chrome — applied on connect and when this file is saved.
-  "ui": {
-    // system | light | dark  (used when palette is "primer")
-    "theme": "system",
-    // Color pack: primer | nord | dracula | solarized-dark | high-contrast |
-    // nostalgia | dark | light  (Fresh theme names where applicable)
-    "palette": "primer",
-    "terminalFontSize": 14,
-    "editorFontSize": 14,
-    // UI chrome weight (100–900, steps of 100)
-    "fontWeight": 400,
-    // Terminal + editor monospace weight
-    "monoFontWeight": 400,
-    // Optional CSS font-family overrides (empty = IBM Plex)
-    "fontFamily": "",
-    "monoFontFamily": "",
-    "webgl": true,
-    // Explorer: hide .* by default; .git stays hidden unless showGitDirs is true
-    "showDotfiles": false,
-    "showGitDirs": false,
-    // VS Code–style editor document map (minimap). Off = not loaded (no UI cost).
-    "editorMinimap": false,
-    // Soft-wrap long lines (Fresh editor.line_wrap). Default on.
-    "editorLineWrap": true
-  },
-  // Default PTY shell when the client does not pass `shell`.
-  // Empty args keep interactive / OSC 7 setup for known shells.
-  "terminal": {
-    "shell": {
-      "command": "zsh",
-      "args": []
-    }
-  }
-}
-"#;
+/// Sentinel path the host sends to open the embedded default-settings catalog.
+pub const DEFAULT_SETTINGS_OPEN_PATH: &str = "fresh-gui://defaults/config.json";
+
+/// Documented starter / catalog file (JSONC), embedded at build via `include_str!`
+/// (same pattern as Fresh built-in keymaps). Written on first settings open and
+/// shown as a temp file for “Open Default Settings”.
+pub const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../defaults/config.json");
 
 const KNOWN_PALETTES: &[&str] = &[
     "primer",
@@ -77,15 +47,39 @@ pub struct Config {
     pub ui: UiConfig,
     #[serde(default)]
     pub terminal: TerminalConfig,
+    /// Host chrome keyboard shortcuts. Empty → embedded defaults at runtime.
+    #[serde(default)]
+    pub shortkeys: Vec<Shortkey>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
+        // Prefer the embedded catalog so defaults stay in sync with the file.
+        Self::parse(DEFAULT_CONFIG_TEMPLATE).unwrap_or_else(|_| Self {
             ui: UiConfig::default(),
             terminal: TerminalConfig::default(),
-        }
+            shortkeys: Vec::new(),
+        })
     }
+}
+
+/// One host shortcut binding (issue #61 / Fresh-aligned action + when).
+///
+/// `shortkey` is a chord string (`Mod+T`, `Ctrl+Shift+Tab`, `Alt+Z`). `Mod` is
+/// Cmd on macOS and Ctrl elsewhere in the host. `when` is a Fresh-style context
+/// (`global`, `terminal`, `editor`, `fileExplorer`); omit / empty = `global`.
+///
+/// Selection-aware terminal copy vs interrupt is **not** modeled as a when-clause
+/// (same as Fresh): the terminal clipboard action body checks selection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Shortkey {
+    /// Action id handled by the host (`tab.new`, `settings.open`, …).
+    pub action: String,
+    /// Key chord, e.g. `Mod+Shift+P`.
+    pub shortkey: String,
+    /// Fresh-style context clause. Default `global`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
 }
 
 /// Host UI settings (shared with the browser UI chrome).
@@ -239,7 +233,7 @@ impl Config {
             .with_context(|| format!("read config {}", path.display()))?;
         Self::parse(&text)
             .with_context(|| format!("parse config {}", path.display()))
-            .map(|cfg| {
+            .inspect(|cfg| {
                 info!(
                     path = %path.display(),
                     shell = %cfg.resolve_shell().0,
@@ -247,7 +241,6 @@ impl Config {
                     palette = %cfg.ui.palette,
                     "loaded config"
                 );
-                cfg
             })
     }
 
@@ -357,6 +350,68 @@ impl Config {
                 self.terminal.shell = None;
             }
         }
+
+        self.shortkeys.retain(|sk| {
+            let action = sk.action.trim();
+            let chord = sk.shortkey.trim();
+            if action.is_empty() || chord.is_empty() {
+                warn!("dropping shortkey with empty action or shortkey");
+                return false;
+            }
+            true
+        });
+        for sk in &mut self.shortkeys {
+            sk.action = sk.action.trim().to_owned();
+            sk.shortkey = sk.shortkey.trim().to_owned();
+            if let Some(when) = sk.when.take() {
+                let trimmed = when.trim().to_owned();
+                sk.when = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                };
+            }
+        }
+    }
+
+    /// Effective shortcut list: user `shortkeys` when non-empty, else embedded defaults.
+    pub fn effective_shortkeys(&self) -> Vec<Shortkey> {
+        if !self.shortkeys.is_empty() {
+            return self.shortkeys.clone();
+        }
+        match Self::parse(DEFAULT_CONFIG_TEMPLATE) {
+            Ok(defaults) => defaults.shortkeys,
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Write the embedded default catalog to a unique temp path (deleted on tab close).
+    pub fn materialize_defaults_temp() -> Result<PathBuf> {
+        let dir = std::env::temp_dir().join("fresh-gui-defaults");
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("create defaults temp dir {}", dir.display()))?;
+        let path = dir.join(format!(
+            "defaults-{}-{}.json",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let header = concat!(
+            "// READ-ONLY CATALOG — temporary file; deleted when this tab closes.\n",
+            "// Save is rejected. Copy keys into your user ~/.config/fresh-gui/config.json.\n",
+            "//\n",
+        );
+        let mut body = String::from(header);
+        body.push_str(DEFAULT_CONFIG_TEMPLATE);
+        fs::write(&path, body)
+            .with_context(|| format!("write defaults temp {}", path.display()))?;
+        Ok(path)
+    }
+
+    /// True when `path` is the defaults open sentinel (not a real filesystem path).
+    pub fn is_defaults_open_path(path: &str) -> bool {
+        let trimmed = path.trim();
+        trimmed == DEFAULT_SETTINGS_OPEN_PATH
+            || trimmed.strip_suffix('/').unwrap_or(trimmed) == DEFAULT_SETTINGS_OPEN_PATH
     }
 
     /// `(command, args)` for a new PTY when the client did not override `shell`.
@@ -727,6 +782,78 @@ mod tests {
         assert!(!cfg.ui.show_git_dirs);
         assert!(!cfg.ui.editor_minimap);
         assert!(cfg.ui.editor_line_wrap);
+        assert!(
+            !cfg.shortkeys.is_empty(),
+            "embedded defaults must list shortkeys"
+        );
+        assert!(
+            cfg.shortkeys.iter().any(|s| s.action == "settings.open"),
+            "defaults should include settings.open"
+        );
+    }
+
+    #[test]
+    fn effective_shortkeys_falls_back_when_empty() {
+        let cfg = Config {
+            ui: UiConfig::default(),
+            terminal: TerminalConfig::default(),
+            shortkeys: Vec::new(),
+        };
+        let effective = cfg.effective_shortkeys();
+        assert!(!effective.is_empty());
+        assert!(effective.iter().any(|s| s.action == "tab.new"));
+    }
+
+    #[test]
+    fn parses_user_shortkeys() {
+        let cfg = Config::parse(
+            r#"{
+              "shortkeys": [
+                { "action": "tab.new", "shortkey": "Mod+N", "when": "global" }
+              ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.shortkeys.len(), 1);
+        assert_eq!(cfg.shortkeys[0].action, "tab.new");
+        assert_eq!(cfg.shortkeys[0].shortkey, "Mod+N");
+        assert_eq!(
+            cfg.shortkeys[0].when.as_deref().unwrap_or("global"),
+            "global"
+        );
+        assert_eq!(cfg.effective_shortkeys().len(), 1);
+    }
+
+    #[test]
+    fn materialize_defaults_temp_writes_catalog() {
+        let path = Config::materialize_defaults_temp().unwrap();
+        assert!(path.is_file());
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("READ-ONLY CATALOG"));
+        assert!(text.contains("\"shortkeys\""));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ensure_file_adds_shortkeys_when_missing() {
+        let dir = tempfile_dir();
+        let path = dir.join("config.json");
+        fs::write(
+            &path,
+            r#"{
+  "ui": { "theme": "dark" }
+}
+"#,
+        )
+        .unwrap();
+        assert!(Config::ensure_file(&path).unwrap());
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("\"shortkeys\""),
+            "missing shortkeys should be inserted:\n{text}"
+        );
+        let cfg = Config::load_from_path(&path).unwrap();
+        assert!(!cfg.shortkeys.is_empty());
     }
 
     #[test]

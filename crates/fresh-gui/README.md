@@ -94,9 +94,15 @@ Default path: `$XDG_CONFIG_HOME/fresh-gui/config.json` or `~/.config/fresh-gui/c
   // Default PTY shell when the client omits `shell` on pty_open
   "terminal": {
     "shell": { "command": "zsh", "args": [] }
-  }
+  },
+  // Host chrome shortcuts (action + shortkey + when). See defaults/config.json.
+  "shortkeys": [
+    { "action": "tab.new", "shortkey": "Mod+T", "when": "global" }
+  ]
 }
 ```
+
+The embedded catalog lives at `defaults/config.json` and is compiled into the binary (`include_str!`). Opening **Preferences: Open Default Settings** writes a temp copy for browsing; it is deleted when the editor tab closes.
 
 Missing file → built-in defaults (`zsh`, system theme, primer palette, hidden dotfiles / `.git`, line wrap on). First **Settings** / `Mod+,` open creates the documented template; later opens also insert any newly added default keys that are missing from an existing file (existing values and comments are kept). Empty shell `args` keep interactive / OSC 7 setup; non-empty args are passed through. JSONC (`//` / `/* */`) is accepted. Named `palette` values match Fresh editor theme names where applicable (colors mapped onto host CSS tokens).
 

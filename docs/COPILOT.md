@@ -36,7 +36,7 @@ It does **not** expose LSP-style or ghost-text autocomplete APIs for arbitrary e
 | Agent UX | None. No Run Agent, resume metadata, activity indicator, or chat rail. |
 | Editor | CodeMirror 6; syntax highlight only. No `@codemirror/autocomplete`, no LSP over ADE. |
 | Fresh embedding | Buffer open/edit/save only (`runtime`). Plugins / Orchestrator **off**. Fresh’s own TerminalManager unused. |
-| Protocol | ADE `0.4.0`: `ping`, `pty`, `session`, `fs`, `editor`, `scene`. No agent / ACP / completion family. |
+| Protocol | ADE `0.5.0`: `ping`, `pty`, `session`, `fs`, `editor`, `scene`. No agent / ACP / completion family. |
 | Right rail | Reserved (width 0) in [UI.md](./UI.md); AI chat rail was an explicit non-goal vs Terax. |
 
 **Works with zero code:** open a terminal tab, `npm i -g @github/copilot`, authenticate (`/login`), run `copilot` in the workspace root. Disconnect/reattach keeps the PTY alive (session scrollback ~64 KiB). Closing the pane kills the process.

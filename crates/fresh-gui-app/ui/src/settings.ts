@@ -248,6 +248,32 @@ export function stripJsonc(input: string): string {
   return out;
 }
 
+export type ConfigShortkey = {
+  action: string;
+  shortkey: string;
+  when?: string;
+};
+
+/** Parse `shortkeys` from a full `config.json` document (JSONC ok). */
+export function shortkeysFromConfigText(text: string): ConfigShortkey[] {
+  const trimmed = text.trim();
+  if (!trimmed) return [];
+  const parsed = JSON.parse(stripJsonc(trimmed)) as { shortkeys?: unknown };
+  if (!Array.isArray(parsed.shortkeys)) return [];
+  const out: ConfigShortkey[] = [];
+  for (const item of parsed.shortkeys) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Record<string, unknown>;
+    const action = typeof row.action === "string" ? row.action.trim() : "";
+    const shortkey = typeof row.shortkey === "string" ? row.shortkey.trim() : "";
+    if (!action || !shortkey) continue;
+    const when =
+      typeof row.when === "string" && row.when.trim() ? row.when.trim() : undefined;
+    out.push({ action, shortkey, when });
+  }
+  return out;
+}
+
 /** Parse `ui` from a full `config.json` document (JSONC ok). */
 export function uiSettingsFromConfigText(text: string): UiSettings {
   const trimmed = text.trim();

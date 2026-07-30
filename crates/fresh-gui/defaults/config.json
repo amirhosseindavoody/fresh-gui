@@ -1,0 +1,66 @@
+{
+  // Default settings catalog (embedded in the binary).
+  // Open via Preferences: Open Default Settings — a temporary copy is shown
+  // and deleted when the tab closes. Copy entries into your user config.json
+  // (~/.config/fresh-gui/config.json) to customize. Edits to the temp file
+  // are discarded on close (save is rejected).
+
+  // Host UI chrome — applied on connect and when this file is saved.
+  "ui": {
+    // system | light | dark  (used when palette is "primer")
+    "theme": "system",
+    // Color pack: primer | nord | dracula | solarized-dark | high-contrast |
+    // nostalgia | dark | light  (Fresh theme names where applicable)
+    "palette": "primer",
+    "terminalFontSize": 14,
+    "editorFontSize": 14,
+    // UI chrome weight (100–900, steps of 100)
+    "fontWeight": 400,
+    // Terminal + editor monospace weight
+    "monoFontWeight": 400,
+    // Optional CSS font-family overrides (empty = IBM Plex)
+    "fontFamily": "",
+    "monoFontFamily": "",
+    "webgl": true,
+    // Explorer: hide .* by default; .git stays hidden unless showGitDirs is true
+    "showDotfiles": false,
+    "showGitDirs": false,
+    // VS Code–style editor document map (minimap). Off = not loaded (no UI cost).
+    "editorMinimap": false,
+    // Soft-wrap long lines (Fresh editor.line_wrap). Default on.
+    "editorLineWrap": true
+  },
+
+  // Default PTY shell when the client does not pass `shell`.
+  // Empty args keep interactive / OSC 7 setup for known shells.
+  "terminal": {
+    "shell": {
+      "command": "zsh",
+      "args": []
+    }
+  },
+
+  // Host chrome keyboard shortcuts (Fresh-style action + when; chord as shortkey).
+  // Mod = Cmd on macOS, Ctrl elsewhere. `when`: global | terminal | editor | fileExplorer
+  // (omit or "global" = always). Selection-aware terminal copy/SIGINT stays in the
+  // terminal clipboard handler (not expressed as a when-clause).
+  "shortkeys": [
+    { "action": "gotoFile.open", "shortkey": "Mod+P", "when": "global" },
+    { "action": "commandPalette.open", "shortkey": "Mod+Shift+P", "when": "global" },
+    { "action": "tab.new", "shortkey": "Mod+T", "when": "global" },
+    { "action": "tab.close", "shortkey": "Mod+W", "when": "global" },
+    { "action": "tab.next", "shortkey": "Ctrl+Tab", "when": "global" },
+    { "action": "tab.prev", "shortkey": "Ctrl+Shift+Tab", "when": "global" },
+    { "action": "pane.splitRight", "shortkey": "Mod+D", "when": "global" },
+    { "action": "pane.splitDown", "shortkey": "Mod+Shift+D", "when": "global" },
+    { "action": "pane.focusNext", "shortkey": "Mod+]", "when": "global" },
+    { "action": "pane.focusPrev", "shortkey": "Mod+[", "when": "global" },
+    { "action": "sidebar.toggle", "shortkey": "Mod+B", "when": "global" },
+    { "action": "sidebar.toggle", "shortkey": "Mod+Shift+B", "when": "global" },
+    { "action": "editor.save", "shortkey": "Mod+S", "when": "global" },
+    { "action": "editor.markdownPreview", "shortkey": "Mod+Shift+V", "when": "global" },
+    { "action": "editor.toggleLineWrap", "shortkey": "Alt+Z", "when": "global" },
+    { "action": "search.focus", "shortkey": "Mod+F", "when": "global" },
+    { "action": "settings.open", "shortkey": "Mod+,", "when": "global" }
+  ]
+}
