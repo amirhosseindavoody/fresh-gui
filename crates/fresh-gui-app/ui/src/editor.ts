@@ -278,6 +278,15 @@ export function revealEditorLocation(
   view.focus();
 }
 
+/** Replace the full document text (used by markdown WYSIWYG → source sync). */
+export function setEditorDocument(view: EditorView, text: string): void {
+  const cur = view.state.doc.toString();
+  if (cur === text) return;
+  view.dispatch({
+    changes: { from: 0, to: view.state.doc.length, insert: text },
+  });
+}
+
 export function createEditorView(
   parent: HTMLElement,
   text: string,

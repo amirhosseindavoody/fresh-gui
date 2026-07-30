@@ -30,7 +30,7 @@ Inspired by Terax’s public UI / [TERAX.md](https://github.com/crynta/terax-ai/
 | Theme engine + CSS variables | Yes — tokens + xterm/editor follow resolved theme |
 | AI chat rail, agent diffs, composer | **Not shipped** — Terax parity is a non-goal; terminal/ACP agent direction is design-only ([COPILOT.md](./COPILOT.md)); right rail stays reserved |
 | Source control / git graph | Not present |
-| Web preview / markdown tabs | Markdown preview helper exists for editor; not a separate tab kind |
+| Web preview / markdown tabs | Markdown WYSIWYG helper exists for editor tabs (toggle with `Mod+Shift+V`); not a separate tab kind |
 | Spaces / multi-project switcher | Not present (ADE sessions cover reconnect) |
 | React 19 + Tailwind + shadcn | Yes — chrome in `src/app` + `src/components/ui` (Button, Tabs, DropdownMenu, ContextMenu, Separator, … like Terax); ADE controller remains imperative (`src/ade/bootstrap.ts`) |
 | Large trees via React reconciliation | **No** — explorer stays `VirtualTree` (windowed rows) |
@@ -155,7 +155,7 @@ Defaults follow [Terax `shortcuts.ts`](https://github.com/crynta/terax-ai/blob/m
 | Focus next / prev pane | `Mod+]` / `Mod+[` | |
 | Swap pane | `Mod+Alt+Arrow` | |
 | Save buffer | `Mod+S` | Editor tabs; also saves settings `config.json` |
-| Toggle markdown preview | `Mod+Shift+V` | Markdown editor tabs |
+| Toggle markdown WYSIWYG | `Mod+Shift+V` | Markdown editor tabs — editable rendered view (toolbar + formatting shortcuts); toggle back for source |
 | Toggle editor line wrap | `Alt+Z` | Soft wrap (Fresh `line_wrap`); also command palette |
 | Toggle sidebar | `Mod+B` (and `Mod+Shift+B`) | |
 | Find | `Mod+F` | Terminal buffer or editor search |
@@ -189,6 +189,7 @@ Connection errors and auth failures use inline strip status; never modal loops.
 | `terminal.ts` | xterm + WebGL + OSC 7 + clipboard |
 | `tree.ts` | Virtualized explorer + context menu hook |
 | `editor.ts` | CodeMirror 6 editor tabs |
+| `markdown-preview.ts` / `markdown-wysiwyg.ts` | Markdown render (GFM / KaTeX / Mermaid) + contenteditable WYSIWYG with toolbar; serializes back to the CodeMirror buffer |
 | `settings.ts` + backend `config.json` | Theme / fonts / shell / explorer prefs |
 | `context-menu.ts` | Imperative flat menus + name prompt (visual parity with shadcn ContextMenu) |
 | `palette.ts` / `shortcuts.ts` | Command palette and shortcut registry |

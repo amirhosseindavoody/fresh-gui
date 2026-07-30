@@ -16,8 +16,13 @@ import {
   createEditorView,
   openEditorSearch,
   revealEditorLocation,
+  setEditorDocument,
 } from "../editor";
-import { isMarkdownPath, updateMarkdownPreview } from "../markdown-preview";
+import { isMarkdownPath } from "../markdown-preview";
+import {
+  mountMarkdownWysiwyg,
+  type MarkdownWysiwygHandle,
+} from "../markdown-wysiwyg";
 import {
   applyTerminalFontSize,
   applyTerminalTheme,
@@ -122,11 +127,12 @@ interface EditorTab {
   rev: number;
   dirty: boolean;
   preview: boolean;
-  /** Rendered markdown view vs source (only used for markdown paths). */
+  /** Rendered markdown WYSIWYG view vs source (only used for markdown paths). */
   mdView: "source" | "preview";
   view: EditorView;
   host: HTMLElement;
   mdPreviewEl: HTMLElement | null;
+  mdWysiwyg: MarkdownWysiwygHandle | null;
   suppressChange: boolean;
   pinned: boolean;
 }
@@ -1102,6 +1108,12 @@ function createTerminalTab(
 function disposeEditorTab(tab: EditorTab): void {
   send({ type: "editor_close", buffer_id: tab.bufferId });
   try {
+    tab.mdWysiwyg?.destroy();
+  } catch {
+    /* ignore */
+  }
+  tab.mdWysiwyg = null;
+  try {
     tab.view.destroy();
   } catch {
     /* ignore */
@@ -1827,6 +1839,8 @@ function focusActiveTab(): void {
       fitBundle(bundle);
       bundle.term.focus();
     });
+  } else if (active.mdView === "preview" && active.mdWysiwyg) {
+    active.mdWysiwyg.focus();
   } else if (active.mdView === "preview" && active.mdPreviewEl) {
     active.mdPreviewEl.focus();
   } else {
@@ -1837,14 +1851,29 @@ function focusActiveTab(): void {
 function applyEditorMdView(tab: EditorTab, opts: { refresh?: boolean } = {}): void {
   const showPreview = tab.mdView === "preview" && !!tab.mdPreviewEl;
   tab.host.classList.toggle("md-preview-active", showPreview);
-  if (showPreview && tab.mdPreviewEl && opts.refresh) {
-    updateMarkdownPreview(tab.mdPreviewEl, tab.view.state.doc.toString());
+  if (showPreview && tab.mdPreviewEl) {
+    if (!tab.mdWysiwyg) {
+      tab.mdWysiwyg = mountMarkdownWysiwyg(tab.mdPreviewEl, {
+        onChange: (markdown) => {
+          if (tab.mdView !== "preview") return;
+          setEditorDocument(tab.view, markdown);
+        },
+      });
+    }
+    if (opts.refresh) {
+      tab.mdWysiwyg.refresh(tab.view.state.doc.toString());
+    }
+  } else if (tab.mdWysiwyg) {
+    tab.mdWysiwyg.flush();
   }
 }
 
 function toggleMarkdownPreview(): void {
   const active = tabs[activeTabIndex];
   if (active?.kind !== "editor" || !isMarkdownPath(active.path) || !active.mdPreviewEl) return;
+  if (active.mdView === "preview" && active.mdWysiwyg) {
+    active.mdWysiwyg.flush();
+  }
   active.mdView = active.mdView === "preview" ? "source" : "preview";
   applyEditorMdView(active, { refresh: active.mdView === "preview" });
   focusActiveTab();
@@ -2062,6 +2091,7 @@ async function presentOpenedBuffer(
     view,
     host,
     mdPreviewEl,
+    mdWysiwyg: null,
     suppressChange: false,
     pinned: false,
   };
@@ -2114,6 +2144,9 @@ async function openEditorTab(path: string, opts: boolean | OpenEditorOpts = {}):
 async function saveActiveEditor(): Promise<void> {
   const active = tabs[activeTabIndex];
   if (active?.kind !== "editor" || !active.dirty) return;
+  if (active.mdView === "preview" && active.mdWysiwyg) {
+    active.mdWysiwyg.flush();
+  }
   const text = active.view.state.doc.toString();
   setStatusLeft(`saving ${active.path}…`);
   try {
@@ -2615,7 +2648,7 @@ function tabActionsMenuItems(): ContextMenuItem[] {
       const inPreview = active.mdView === "preview";
       items.push({
         kind: "item",
-        label: inPreview ? "Show Source" : "Markdown Preview",
+        label: inPreview ? "Show Source" : "Markdown WYSIWYG",
         hint: "Mod+Shift+V",
         run: () => toggleMarkdownPreview(),
       });
