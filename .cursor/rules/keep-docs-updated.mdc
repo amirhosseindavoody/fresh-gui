@@ -9,10 +9,13 @@ After any code, config, CLI, or architecture change, update the relevant docs in
 
 ## Doc map
 
-| Doc | Update when |
-|-----|-------------|
-| `README.md` | User-facing usage, status, CLI examples, `pixi.toml` config shape, or high-level design highlights change |
-| `docs/DESIGN.md` | Goals, pipeline, types, Pixi integration, asset matching, lockfile, CLI surface, or implementation phases change |
+| Doc                 | Update when                                                                                                      |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `README.md`         | User-facing usage, status, CLI examples, `pixi.toml` config shape, or high-level design highlights change        |
+| `docs/DESIGN.md`    | Goals, pipeline, types, Pixi integration, asset matching, lockfile, CLI surface, or implementation phases change |
+| `docs/UI.md`        | Any UI-related change                                                                                            |
+| `docs/SECURITY.md`  | Any security-related change                                                                                      |
+| `docs/CHANGELOG.md` | Any change to the project (e.g. new feature, bug fix, etc.), provide a new entery for each day's work            |
 
 ## Checklist
 
