@@ -1,14 +1,12 @@
 import { useEffect } from "react";
 import {
-  Columns2,
+  ArrowUp,
   Files,
+  Menu,
   Palette,
   PanelLeftClose,
   Plus,
-  Rows2,
-  Search,
   Settings,
-  Square,
 } from "lucide-react";
 import { bootstrapAde } from "@/ade/bootstrap";
 import { Button } from "@/components/ui/button";
@@ -69,15 +67,28 @@ export function App() {
         <aside id="sidebar" className="sidebar">
           <div className="sidebar-head">
             <h2 id="sidebar-title">Explorer</h2>
-            <Button
-              id="sidebar-toggle"
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              title="Toggle sidebar (Mod+B)"
-            >
-              <PanelLeftClose aria-hidden />
-            </Button>
+            <div className="sidebar-head-actions">
+              <Button
+                id="sidebar-parent"
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                disabled
+                title="Go to parent folder"
+                aria-label="Go to parent folder"
+              >
+                <ArrowUp aria-hidden />
+              </Button>
+              <Button
+                id="sidebar-toggle"
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                title="Toggle sidebar (Mod+B)"
+              >
+                <PanelLeftClose aria-hidden />
+              </Button>
+            </div>
           </div>
           <div id="tree" className="tree" />
         </aside>
@@ -85,76 +96,37 @@ export function App() {
 
         <div id="main-col" className="main-col">
           <div id="tabs-bar" className="tabs-bar">
-            <div className="tabs-actions">
+            <div className="tabs-actions tabs-actions-start">
+              <Button
+                id="tabs-menu"
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                disabled
+                title="Tab actions"
+                aria-label="Tab actions"
+                aria-haspopup="menu"
+              >
+                <Menu aria-hidden />
+              </Button>
+            </div>
+            <Separator orientation="vertical" className="mx-1 h-5 self-center" />
+            <div id="tabs" className="tabs" role="tablist">
+              <div id="tab-pill" className="tab-pill" hidden />
+            </div>
+            <div className="tabs-actions tabs-actions-end">
               <Button
                 id="new-tab"
                 type="button"
                 variant="ghost"
                 size="icon-xs"
                 disabled
-                title="New terminal tab (Mod+T)"
+                title="New tab"
+                aria-label="New tab"
+                aria-haspopup="menu"
               >
                 <Plus aria-hidden />
               </Button>
-              <Button
-                id="split-h"
-                type="button"
-                variant="ghost"
-                size="icon-xs"
-                disabled
-                title="Split pane right (Mod+D)"
-              >
-                <Columns2 aria-hidden />
-              </Button>
-              <Button
-                id="split-v"
-                type="button"
-                variant="ghost"
-                size="icon-xs"
-                disabled
-                title="Split pane down (Mod+Shift+D)"
-              >
-                <Rows2 aria-hidden />
-              </Button>
-              <Button
-                id="split-off"
-                type="button"
-                variant="ghost"
-                size="icon-xs"
-                disabled
-                title="Keep only active pane"
-              >
-                <Square aria-hidden />
-              </Button>
-              <Button id="find-btn" type="button" variant="ghost" size="sm" title="Find (Mod+F)">
-                <Search aria-hidden />
-                Find
-              </Button>
-              <Button
-                id="editor-save"
-                type="button"
-                variant="secondary"
-                size="sm"
-                disabled
-                title="Save (Mod+S)"
-                hidden
-              >
-                Save
-              </Button>
-              <Button
-                id="editor-md-preview"
-                type="button"
-                variant="ghost"
-                size="sm"
-                title="Toggle markdown preview (Mod+Shift+V)"
-                hidden
-              >
-                Preview
-              </Button>
-            </div>
-            <Separator orientation="vertical" className="mx-1 h-5 self-center" />
-            <div id="tabs" className="tabs" role="tablist">
-              <div id="tab-pill" className="tab-pill" hidden />
             </div>
           </div>
 

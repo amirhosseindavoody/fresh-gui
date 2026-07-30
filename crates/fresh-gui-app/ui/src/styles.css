@@ -209,10 +209,18 @@ input:not([data-slot="input"]):focus-visible {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 0.35rem;
   padding: 0 0.55rem 0 1.15rem;
   border-bottom: 1px solid var(--border);
   height: var(--tab-height);
   background: color-mix(in srgb, var(--bg-elevated) 92%, var(--bg));
+}
+
+.sidebar-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.15rem;
+  flex-shrink: 0;
 }
 
 .sidebar-head h2 {
@@ -307,6 +315,10 @@ input:not([data-slot="input"]):focus-visible {
   align-items: center;
   gap: 0.15rem;
   flex-shrink: 0;
+}
+
+.tabs-actions-end {
+  margin-left: 0.15rem;
 }
 
 .tabs-actions button {

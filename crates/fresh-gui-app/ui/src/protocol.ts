@@ -57,6 +57,11 @@ export type ClientMessage =
       destination: string;
     }
   | {
+      type: "fs_delete";
+      request_id: string;
+      paths: string[];
+    }
+  | {
       type: "editor_open";
       request_id: string;
       path: string;
@@ -137,6 +142,7 @@ export type ServerMessage =
   | { type: "fs_created"; request_id: string; entry: FsEntry }
   | { type: "fs_copied"; request_id: string; entries: FsEntry[] }
   | { type: "fs_moved"; request_id: string; entries: FsEntry[] }
+  | { type: "fs_deleted"; request_id: string; paths: string[] }
   | {
       type: "editor_opened";
       request_id: string;

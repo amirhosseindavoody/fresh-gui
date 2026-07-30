@@ -372,6 +372,34 @@ impl Client {
         }
     }
 
+    pub async fn delete_paths(&mut self, paths: Vec<String>) -> Result<Vec<String>> {
+        let request_id = format!("fs-delete-{}", uuid_simple());
+        send_msg(
+            &mut self.sink,
+            &Message::FsDelete {
+                request_id: request_id.clone(),
+                paths,
+            },
+        )
+        .await?;
+        loop {
+            match self.recv().await? {
+                Message::FsDeleted {
+                    request_id: rid,
+                    paths,
+                } if rid == request_id => return Ok(paths),
+                Message::Error { code, message } => {
+                    bail!("fs delete failed: {code}: {message}")
+                }
+                Message::PtyData { .. }
+                | Message::FsChanged { .. }
+                | Message::Pong { .. }
+                | Message::Ping { .. } => continue,
+                other => bail!("unexpected while deleting: {other:?}"),
+            }
+        }
+    }
+
     /// Open a path in the Fresh editor and return `(buffer_id, path, language, rev, text)`.
     pub async fn open_editor(
         &mut self,

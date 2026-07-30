@@ -62,6 +62,7 @@ import { closeFindBar, openFindBar, setSearchTarget } from "../search";
 import {
   copyToClipboard,
   openContextMenu,
+  openContextMenuForAnchor,
   promptName,
   type ContextMenuItem,
 } from "../context-menu";
@@ -156,13 +157,9 @@ let terminalStack: HTMLElement;
 let editorStack: HTMLElement;
 let statusLeft: HTMLElement;
 let statusRight: HTMLElement;
-let editorSaveBtn: HTMLButtonElement;
-let editorMdPreviewBtn: HTMLButtonElement;
+let tabsMenuBtn: HTMLButtonElement;
 let newTabBtn: HTMLButtonElement;
-let splitHBtn: HTMLButtonElement;
-let splitVBtn: HTMLButtonElement;
-let splitOffBtn: HTMLButtonElement;
-let findBtn: HTMLButtonElement;
+let sidebarParentBtn: HTMLButtonElement;
 let activityExplorer: HTMLButtonElement;
 let activityPalette: HTMLButtonElement;
 let activitySettings: HTMLButtonElement;
@@ -191,6 +188,7 @@ let preferredSessionId = "";
 const pendingFs = new Map<string, Pending<{ path: string; entries: FsEntry[] }>>();
 const pendingFsAuth = new Map<string, Pending<{ path: string }>>();
 const pendingFsMutate = new Map<string, Pending<FsEntry[]>>();
+const pendingFsDelete = new Map<string, Pending<string[]>>();
 const pendingEditor = new Map<string, PendingEditor>();
 const pendingEdit = new Map<string, Pending<number>>();
 const pendingSave = new Map<string, Pending<{ path: string; rev: number }>>();
@@ -401,6 +399,20 @@ function fsMove(sources: string[], destination: string): Promise<FsEntry[]> {
   });
 }
 
+function fsDelete(paths: string[]): Promise<string[]> {
+  const request_id = nextRequestId();
+  return new Promise((resolve, reject) => {
+    pendingFsDelete.set(request_id, { resolve, reject });
+    send({ type: "fs_delete", request_id, paths });
+    setTimeout(() => {
+      if (pendingFsDelete.has(request_id)) {
+        pendingFsDelete.delete(request_id);
+        reject(new Error("fs_delete timeout"));
+      }
+    }, 60_000);
+  });
+}
+
 function editorOpen(
   path: string,
   opts: OpenEditorOpts = {},
@@ -507,6 +519,7 @@ function rejectPendingError(msg: Extract<ServerMessage, { type: "error" }>): voi
     tryReject(pendingFs) ||
     tryReject(pendingFsAuth) ||
     tryReject(pendingFsMutate) ||
+    tryReject(pendingFsDelete) ||
     tryReject(pendingEditor) ||
     tryReject(pendingEdit) ||
     tryReject(pendingSave)
@@ -591,10 +604,29 @@ function updateExplorerTitle(rootPath: string): void {
   if (!rootPath) {
     title.textContent = "Explorer";
     title.removeAttribute("title");
+  } else {
+    title.textContent = basename(rootPath) || "Explorer";
+    title.title = rootPath;
+  }
+  updateParentButton();
+}
+
+function explorerParentPath(rootPath: string): string | null {
+  if (!rootPath) return null;
+  const parent = dirname(rootPath);
+  if (!parent) return null;
+  if (normalizePathSafe(parent) === normalizePathSafe(rootPath)) return null;
+  return parent;
+}
+
+function updateParentButton(): void {
+  if (!sidebarParentBtn) return;
+  if (typeof tree === "undefined") {
+    sidebarParentBtn.disabled = true;
     return;
   }
-  title.textContent = basename(rootPath) || "Explorer";
-  title.title = rootPath;
+  const parent = explorerParentPath(tree.getRootPath() || "");
+  sidebarParentBtn.disabled = !connected || !parent;
 }
 
 /** Re-root explorer immediately (authorize outside `--root` first, like Terax). */
@@ -929,24 +961,10 @@ function measurePill(): void {
   tabPill.style.width = `${rect.width}px`;
 }
 
-function updateSaveButton(): void {
-  const active = tabs[activeTabIndex];
-  const editorActive = active?.kind === "editor";
-  const mdActive = editorActive && isMarkdownPath(active.path);
-  editorSaveBtn.hidden = !editorActive;
-  editorSaveBtn.disabled = !editorActive || !active.dirty;
-  editorMdPreviewBtn.hidden = !mdActive;
-  if (mdActive) {
-    const inPreview = active.mdView === "preview";
-    editorMdPreviewBtn.textContent = inPreview ? "Edit" : "Preview";
-    editorMdPreviewBtn.title = inPreview
-      ? "Show markdown source (Mod+Shift+V)"
-      : "Show rendered markdown (Mod+Shift+V)";
-    editorMdPreviewBtn.setAttribute("aria-pressed", inPreview ? "true" : "false");
-  }
-  splitHBtn.hidden = editorActive;
-  splitVBtn.hidden = editorActive;
-  splitOffBtn.hidden = editorActive;
+function setWorkspaceControls(enabled: boolean): void {
+  tabsMenuBtn.disabled = !enabled;
+  newTabBtn.disabled = !enabled;
+  updateParentButton();
 }
 
 function updateStacks(): void {
@@ -964,13 +982,6 @@ function updateStacks(): void {
       if (i === activeTabIndex) applyEditorMdView(t);
     }
   });
-}
-
-function setWorkspaceControls(enabled: boolean): void {
-  newTabBtn.disabled = !enabled;
-  splitHBtn.disabled = !enabled;
-  splitVBtn.disabled = !enabled;
-  splitOffBtn.disabled = !enabled;
 }
 
 function wireTerminalLeaf(ptyId: string, bundle: TermBundle): void {
@@ -1220,6 +1231,56 @@ async function runCreate(parent: string, kind: "file" | "dir"): Promise<void> {
   }
 }
 
+function openTerminalAtPath(abs: string, kind: FsEntry["kind"]): void {
+  if (!connected) {
+    setStatusLeft("connect to open a terminal");
+    return;
+  }
+  const cwd = kind === "dir" ? abs : dirname(abs) || abs;
+  if (!cwd) {
+    setStatusLeft("no folder to open in terminal");
+    return;
+  }
+  const dims = proposedDims(activeTerminalTab());
+  requestNewPty(dims.cols, dims.rows, { kind: "newTab" }, cwd);
+}
+
+function closeEditorsUnderPaths(deleted: string[]): void {
+  const norms = deleted.map(normalizePathSafe);
+  for (let i = tabs.length - 1; i >= 0; i -= 1) {
+    const tab = tabs[i];
+    if (!tab || tab.kind !== "editor") continue;
+    const path = normalizePathSafe(tab.path);
+    if (norms.some((d) => path === d || path.startsWith(`${d}/`))) {
+      closeTabAt(i, { force: true });
+    }
+  }
+}
+
+async function runDelete(abs: string, kind: FsEntry["kind"]): Promise<void> {
+  const label = basename(abs) || abs;
+  const noun = kind === "dir" ? "folder" : "file";
+  if (
+    !confirm(
+      `Permanently delete ${noun} “${label}”?\n\n${abs}\n\nThis cannot be undone.`,
+    )
+  ) {
+    return;
+  }
+  setStatusLeft(`deleting ${label}…`);
+  try {
+    const deleted = await fsDelete([abs]);
+    if (fileClipboard?.paths.some((p) => deleted.some((d) => normalizePathSafe(p) === normalizePathSafe(d) || normalizePathSafe(p).startsWith(`${normalizePathSafe(d)}/`)))) {
+      fileClipboard = null;
+    }
+    closeEditorsUnderPaths(deleted);
+    scheduleTreeRefresh();
+    setStatusLeft(`deleted ${label}`);
+  } catch (err) {
+    setStatusLeft(`delete failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 function pathContextItems(
   absPath: string,
   opts: { kind?: FsEntry["kind"]; includeFileOps?: boolean } = {},
@@ -1236,7 +1297,16 @@ function pathContextItems(
     const workspaceRoot = tree.getWorkspaceRoot() || tree.getRootPath() || "";
     const isWorkspaceRoot =
       !!workspaceRoot && normalizePathSafe(abs) === normalizePathSafe(workspaceRoot);
+    const isViewRoot =
+      !!tree.getRootPath() && normalizePathSafe(abs) === normalizePathSafe(tree.getRootPath());
     items.push(
+      {
+        kind: "item",
+        label: "Open in Terminal",
+        disabled: !connected,
+        run: () => openTerminalAtPath(abs, kind),
+      },
+      { kind: "separator" },
       {
         kind: "item",
         label: "New File…",
@@ -1267,14 +1337,22 @@ function pathContextItems(
         run: () => runPasteInto(parent),
       },
       { kind: "separator" },
+      {
+        kind: "item",
+        label: "Delete…",
+        variant: "destructive",
+        disabled: isWorkspaceRoot || isViewRoot,
+        run: () => runDelete(abs, kind),
+      },
+      { kind: "separator" },
     );
   }
 
   items.push(
     {
       kind: "item",
-      label: "Copy Absolute Path",
-      run: () => copyPathFeedback("absolute path", abs),
+      label: "Copy Path",
+      run: () => copyPathFeedback("path", abs),
     },
     {
       kind: "item",
@@ -1508,7 +1586,6 @@ function toggleMarkdownPreview(): void {
   if (active?.kind !== "editor" || !isMarkdownPath(active.path) || !active.mdPreviewEl) return;
   active.mdView = active.mdView === "preview" ? "source" : "preview";
   applyEditorMdView(active, { refresh: active.mdView === "preview" });
-  updateSaveButton();
   focusActiveTab();
 }
 
@@ -1516,7 +1593,6 @@ function renderAll(): void {
   renderTabs();
   renderPanes();
   updateStacks();
-  updateSaveButton();
   updateStatusRight();
   syncSearchTarget();
   syncDocumentTitle();
@@ -1683,7 +1759,6 @@ async function presentOpenedBuffer(
       tabRef.dirty = true;
       tabRef.preview = false;
       renderTabs();
-      updateSaveButton();
       updateStatusRight();
     },
     {
@@ -2017,6 +2092,14 @@ function onMessage(raw: string): void {
       }
       break;
     }
+    case "fs_deleted": {
+      const pending = pendingFsDelete.get(msg.request_id);
+      if (pending) {
+        pendingFsDelete.delete(msg.request_id);
+        pending.resolve(msg.paths || []);
+      }
+      break;
+    }
     case "editor_opened": {
       const pending = pendingEditor.get(msg.request_id);
       if (pending) {
@@ -2159,6 +2242,157 @@ function openNewTerminalTab(): void {
   requestNewPty(dims.cols, dims.rows, { kind: "newTab" }, resolveSpawnCwd());
 }
 
+function defaultCreateParent(): string {
+  const active = tabs[activeTabIndex];
+  if (active?.kind === "editor") {
+    return dirname(active.path) || pathAnchorRoot();
+  }
+  if (active?.kind === "terminal") {
+    const cwd = active.leaves.get(active.activeLeafId)?.cwd;
+    if (cwd) return cwd;
+  }
+  if (lastTerminalCwd) return lastTerminalCwd;
+  return pathAnchorRoot() || tree.getRootPath() || "";
+}
+
+function openNewFileEditor(): void {
+  const parent = defaultCreateParent();
+  if (!parent) {
+    setStatusLeft("no workspace to create a file in");
+    return;
+  }
+  void runCreate(parent, "file");
+}
+
+function sendPtyInput(ptyId: string, data: string): void {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  send({ type: "pty_data", id: ptyId, data: b64encode(data) });
+}
+
+function goExplorerParent(): void {
+  const active = tabs[activeTabIndex];
+  if (active?.kind === "terminal") {
+    const bundle = active.leaves.get(active.activeLeafId);
+    if (bundle) {
+      sendPtyInput(active.activeLeafId, "cd ..\r");
+      const fromCwd = bundle.cwd || tree.getRootPath();
+      const parent = explorerParentPath(fromCwd);
+      if (parent) syncExplorerToCwd(parent);
+      else {
+        const viewParent = explorerParentPath(tree.getRootPath());
+        if (viewParent) syncExplorerToCwd(viewParent);
+      }
+      bundle.term.focus();
+      return;
+    }
+  }
+
+  const parent = explorerParentPath(tree.getRootPath());
+  if (!parent) {
+    setStatusLeft("already at top");
+    return;
+  }
+  syncExplorerToCwd(parent);
+}
+
+function tabActionsMenuItems(): ContextMenuItem[] {
+  const active = tabs[activeTabIndex];
+  const items: ContextMenuItem[] = [
+    {
+      kind: "item",
+      label: "Find",
+      hint: "Mod+F",
+      run: () => focusFind(),
+    },
+  ];
+  if (!active) return items;
+
+  if (active.kind === "terminal") {
+    items.push(
+      { kind: "separator" },
+      {
+        kind: "item",
+        label: "Split Right",
+        hint: "Mod+D",
+        disabled: !connected,
+        run: () => requestSplit("horizontal"),
+      },
+      {
+        kind: "item",
+        label: "Split Down",
+        hint: "Mod+Shift+D",
+        disabled: !connected,
+        run: () => requestSplit("vertical"),
+      },
+      {
+        kind: "item",
+        label: "Keep Only Active Pane",
+        disabled: !connected || leafCount(active.paneTree) <= 1,
+        run: () => collapseToActiveLeaf(),
+      },
+    );
+  } else {
+    items.push(
+      { kind: "separator" },
+      {
+        kind: "item",
+        label: "Save",
+        hint: "Mod+S",
+        disabled: !active.dirty,
+        run: () => {
+          void saveActiveEditor();
+        },
+      },
+    );
+    if (isMarkdownPath(active.path) && active.mdPreviewEl) {
+      const inPreview = active.mdView === "preview";
+      items.push({
+        kind: "item",
+        label: inPreview ? "Show Source" : "Markdown Preview",
+        hint: "Mod+Shift+V",
+        run: () => toggleMarkdownPreview(),
+      });
+    }
+    items.push({
+      kind: "item",
+      label: "Toggle Line Wrap",
+      hint: "Alt+Z",
+      run: () => {
+        void toggleEditorLineWrap();
+      },
+    });
+  }
+
+  items.push(
+    { kind: "separator" },
+    {
+      kind: "item",
+      label: "Close Tab",
+      hint: "Mod+W",
+      run: () => closeActiveTabOrLeaf(),
+    },
+  );
+  return items;
+}
+
+function newTabMenuItems(): ContextMenuItem[] {
+  return [
+    {
+      kind: "item",
+      label: "New Terminal",
+      hint: "Mod+T",
+      disabled: !connected,
+      run: () => openNewTerminalTab(),
+    },
+    {
+      kind: "item",
+      label: "New File…",
+      disabled: !connected,
+      run: () => openNewFileEditor(),
+    },
+  ];
+}
+
 function requestSplit(mode: SplitMode): void {
   if (!connected) return;
   const tab = activeTerminalTab();
@@ -2233,13 +2467,9 @@ export function bootstrapAde(): void {
   editorStack = $("editor-stack");
   statusLeft = $("status-left");
   statusRight = $("status-right");
-  editorSaveBtn = $button("editor-save");
-  editorMdPreviewBtn = $button("editor-md-preview");
+  tabsMenuBtn = $button("tabs-menu");
   newTabBtn = $button("new-tab");
-  splitHBtn = $button("split-h");
-  splitVBtn = $button("split-v");
-  splitOffBtn = $button("split-off");
-  findBtn = $button("find-btn");
+  sidebarParentBtn = $button("sidebar-parent");
   activityExplorer = $button("activity-explorer");
   activityPalette = $button("activity-palette");
   activitySettings = $button("activity-settings");
@@ -2268,19 +2498,20 @@ export function bootstrapAde(): void {
     showGitDirs: uiSettings.showGitDirs,
   });
   setTreeEmptyHint(true);
+  updateParentButton();
 
-editorSaveBtn.addEventListener("click", () => {
-  void saveActiveEditor();
+tabsMenuBtn.addEventListener("click", (ev) => {
+  ev.preventDefault();
+  ev.stopPropagation();
+  openContextMenuForAnchor(tabsMenuBtn, tabActionsMenuItems(), { align: "start" });
 });
-editorMdPreviewBtn.addEventListener("click", () => {
-  toggleMarkdownPreview();
+newTabBtn.addEventListener("click", (ev) => {
+  ev.preventDefault();
+  ev.stopPropagation();
+  openContextMenuForAnchor(newTabBtn, newTabMenuItems(), { align: "end" });
 });
-newTabBtn.addEventListener("click", openNewTerminalTab);
-splitHBtn.addEventListener("click", () => requestSplit("horizontal"));
-splitVBtn.addEventListener("click", () => requestSplit("vertical"));
-splitOffBtn.addEventListener("click", collapseToActiveLeaf);
+sidebarParentBtn.addEventListener("click", () => goExplorerParent());
 sidebarToggle.addEventListener("click", toggleSidebar);
-findBtn.addEventListener("click", () => focusFind());
 activityExplorer.addEventListener("click", () => {
   toggleSidebar();
   if (!isSidebarCollapsed()) treeEl.focus();

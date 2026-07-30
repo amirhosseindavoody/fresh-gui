@@ -250,6 +250,54 @@ impl FsRoot {
         }
         Ok(out)
     }
+
+    /// Permanently delete each path (file, directory, or symlink). Refuses the
+    /// primary FS root and any authorized cwd root.
+    pub async fn delete_paths(&self, paths: &[String]) -> Result<Vec<String>> {
+        if paths.is_empty() {
+            bail!("fs_delete requires at least one path");
+        }
+
+        let mut targets = Vec::with_capacity(paths.len());
+        for path in paths {
+            if path.is_empty() || path == "." || path == "/" {
+                bail!("cannot delete filesystem root");
+            }
+            let resolved = self.resolve(path).await?;
+            if paths_equal(&resolved, &self.root) {
+                bail!("cannot delete filesystem root: {}", resolved.display());
+            }
+            {
+                let auth = self.authorized.lock().expect("fs authorized lock");
+                for a in auth.iter() {
+                    if paths_equal(&resolved, a) {
+                        bail!("cannot delete authorized root: {}", resolved.display());
+                    }
+                }
+            }
+            targets.push(resolved);
+        }
+
+        let mut deleted = Vec::with_capacity(targets.len());
+        for target in targets {
+            let meta = fs::symlink_metadata(&target)
+                .await
+                .with_context(|| format!("stat {}", target.display()))?;
+            if meta.file_type().is_symlink() || meta.is_file() {
+                fs::remove_file(&target)
+                    .await
+                    .with_context(|| format!("remove_file {}", target.display()))?;
+            } else if meta.is_dir() {
+                fs::remove_dir_all(&target)
+                    .await
+                    .with_context(|| format!("remove_dir_all {}", target.display()))?;
+            } else {
+                bail!("cannot delete special file: {}", target.display());
+            }
+            deleted.push(target.display().to_string());
+        }
+        Ok(deleted)
+    }
 }
 
 fn validate_entry_name(name: &str) -> Result<()> {
@@ -462,6 +510,33 @@ mod tests {
         assert_eq!(moved.len(), 1);
         assert!(!tmp.join("hello.txt").exists());
         assert!(tmp.join("nested/hello copy.txt").is_file() || moved[0].name.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn delete_file_and_dir() {
+        let tmp = tempfile_dir();
+        let root = FsRoot::new(tmp.clone()).unwrap();
+
+        let file = root.create("", "bye.txt", FsKind::File).await.unwrap();
+        stdfs::write(tmp.join("bye.txt"), b"x").unwrap();
+        let dir = root.create("", "gone", FsKind::Dir).await.unwrap();
+        stdfs::write(tmp.join("gone/a.txt"), b"y").unwrap();
+
+        let deleted = root
+            .delete_paths(&[file.path.clone(), dir.path.clone()])
+            .await
+            .unwrap();
+        assert_eq!(deleted.len(), 2);
+        assert!(!tmp.join("bye.txt").exists());
+        assert!(!tmp.join("gone").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_root() {
+        let tmp = tempfile_dir();
+        let root = FsRoot::new(tmp.clone()).unwrap();
+        assert!(root.delete_paths(&[tmp.display().to_string()]).await.is_err());
+        assert!(root.delete_paths(&["".into()]).await.is_err());
     }
 
     #[tokio::test]

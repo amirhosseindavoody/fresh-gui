@@ -66,22 +66,24 @@ After connect you get terminals, an explorer, and editor tabs in one shell:
 
 | Do this | How |
 |---------|-----|
-| New terminal | `Mod+T` or **+** |
-| Split terminal | `Mod+D` / `Mod+Shift+D` |
+| New terminal | `Mod+T` or **+** → New Terminal |
+| New file | **+** → New File… |
+| Split terminal | `Mod+D` / `Mod+Shift+D` (tab actions menu) |
 | Open a file | Click or double-click in the tree |
-| Save | `Mod+S` |
-| Find | `Mod+F` |
-| Toggle editor line wrap | `Alt+Z` (or command palette) |
+| Save | `Mod+S` (or tab actions menu) |
+| Find | `Mod+F` (or tab actions menu) |
+| Toggle editor line wrap | `Alt+Z` (or command palette / tab actions) |
 | Copy selected terminal text | Select with the mouse, then `Mod+C` (no selection → interrupt) |
 | Paste into terminal | `Mod+V` |
 | Command palette | `Mod+Shift+P` |
 | Go to File | `Mod+P` |
 | Settings | Activity bar gear or `Mod+,` (opens `config.json`) |
-| Copy a path / file ops | Right-click a tree row (New File/Folder, Cut/Copy/Paste, path copies) or a tab (path copies + Close) |
+| Copy a path / file ops | Right-click a tree row (Open in Terminal, New File/Folder, Cut/Copy/Paste, Delete, path copies) or a tab (path copies + Close) |
+| Explorer parent | **↑** in the explorer header (also `cd ..` in the focused terminal) |
 
 `Mod` is `Ctrl` on Linux/Windows and `Cmd` on macOS. Disconnect leaves remote sessions and PTYs running so you can reconnect.
 
-Sessions keep shells alive across GUI disconnect. Explorer list/create/copy/move and editor open are sandboxed to `--root` (default: current directory), plus directories authorized when a terminal cwd leaves that root.
+Sessions keep shells alive across GUI disconnect. Explorer list/create/copy/move/delete and editor open are sandboxed to `--root` (default: current directory), plus directories authorized when a terminal cwd leaves that root.
 
 ## Settings
 

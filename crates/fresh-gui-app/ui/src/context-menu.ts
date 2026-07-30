@@ -94,6 +94,24 @@ export function openContextMenu(clientX: number, clientY: number, items: Context
   first?.focus({ preventScroll: true });
 }
 
+/** Open a menu below an anchor control (toolbar / tab-bar buttons). */
+export function openContextMenuForAnchor(
+  anchor: HTMLElement,
+  items: ContextMenuItem[],
+  opts: { align?: "start" | "end" } = {},
+): void {
+  const r = anchor.getBoundingClientRect();
+  openContextMenu(r.left, r.bottom + 4, items);
+  if (!root || root.hidden) return;
+  const m = root.getBoundingClientRect();
+  const pad = 6;
+  let left = opts.align === "end" ? r.right - m.width : r.left;
+  left = Math.max(pad, Math.min(left, window.innerWidth - m.width - pad));
+  const top = Math.min(r.bottom + 4, window.innerHeight - m.height - pad);
+  root.style.left = `${left}px`;
+  root.style.top = `${Math.max(pad, top)}px`;
+}
+
 export async function copyToClipboard(text: string): Promise<boolean> {
   try {
     await navigator.clipboard.writeText(text);
