@@ -73,6 +73,34 @@ async fn fs_list_root() {
     let (_nested_path, nested) = client.list_dir("nested").await.expect("list nested");
     assert!(nested.is_empty());
 
+    let created = client
+        .create_entry("nested", "new.txt", FsKind::File)
+        .await
+        .expect("create file");
+    assert_eq!(created.name, "new.txt");
+    assert_eq!(created.kind, FsKind::File);
+    fs::write(tmp.join("nested/new.txt"), b"payload").unwrap();
+
+    let folder = client
+        .create_entry("", "out", FsKind::Dir)
+        .await
+        .expect("create dir");
+    assert_eq!(folder.kind, FsKind::Dir);
+
+    let copied = client
+        .copy_into(vec![created.path.clone()], folder.path.clone())
+        .await
+        .expect("copy");
+    assert_eq!(copied.len(), 1);
+    assert!(tmp.join("out/new.txt").is_file());
+
+    let moved = client
+        .move_into(vec![created.path.clone()], folder.path.clone())
+        .await
+        .expect("move");
+    assert_eq!(moved.len(), 1);
+    assert!(!tmp.join("nested/new.txt").exists());
+
     let _ = child.kill();
     let _ = child.wait();
     let _ = fs::remove_dir_all(&tmp);

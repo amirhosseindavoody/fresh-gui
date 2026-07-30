@@ -128,9 +128,9 @@ Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `
 
 ### Phase 1b — Read-only file tree ✅
 
-- Protocol `fs` capability: `fs_list` / `fs_stat` (read-only); paths sandboxed under `--root` / `FRESH_GUI_FS_ROOT`.
+- Protocol `fs` capability: `fs_list` / `fs_stat` (read) plus later `fs_create` / `fs_copy` / `fs_move` (sandboxed writes); paths sandboxed under `--root` / `FRESH_GUI_FS_ROOT`.
 - Host UI: sidebar tree (expand dirs, select path as context in status).
-- Tests: `fs::tests::list_and_block_escape`, `fs_list_root` e2e.
+- Tests: `fs::tests::list_and_block_escape`, `fs::tests::create_copy_move`, `fs_list_root` e2e.
 
 ### Phase 1 / packaging — Windows Tauri installers ✅ (unsigned MVP)
 

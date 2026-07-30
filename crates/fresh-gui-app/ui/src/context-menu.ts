@@ -1,10 +1,19 @@
-/** Lightweight right-click / context menu. */
+/** Lightweight right-click / context menu + name prompt. */
 
 export type ContextMenuItem =
-  | { kind: "item"; label: string; disabled?: boolean; run: () => void | Promise<void> }
+  | {
+      kind: "item";
+      label: string;
+      hint?: string;
+      disabled?: boolean;
+      /** Destructive styling (e.g. delete). */
+      variant?: "default" | "destructive";
+      run: () => void | Promise<void>;
+    }
   | { kind: "separator" };
 
 let root: HTMLElement | null = null;
+let promptRoot: HTMLElement | null = null;
 
 function ensureRoot(): HTMLElement {
   if (root) return root;
@@ -48,8 +57,21 @@ export function openContextMenu(clientX: number, clientY: number, items: Context
     btn.type = "button";
     btn.className = "ctx-item";
     btn.setAttribute("role", "menuitem");
-    btn.textContent = item.label;
+    btn.dataset.slot = "menu-item";
+    if (item.variant === "destructive") btn.dataset.variant = "destructive";
     btn.disabled = !!item.disabled;
+
+    const label = document.createElement("span");
+    label.className = "ctx-label";
+    label.textContent = item.label;
+    btn.appendChild(label);
+    if (item.hint) {
+      const hint = document.createElement("span");
+      hint.className = "ctx-hint";
+      hint.textContent = item.hint;
+      btn.appendChild(hint);
+    }
+
     btn.addEventListener("click", (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
@@ -67,6 +89,9 @@ export function openContextMenu(clientX: number, clientY: number, items: Context
   const y = Math.min(clientY, window.innerHeight - rect.height - pad);
   menu.style.left = `${Math.max(pad, x)}px`;
   menu.style.top = `${Math.max(pad, y)}px`;
+
+  const first = menu.querySelector<HTMLButtonElement>("button.ctx-item:not(:disabled)");
+  first?.focus({ preventScroll: true });
 }
 
 export async function copyToClipboard(text: string): Promise<boolean> {
@@ -87,4 +112,99 @@ export async function copyToClipboard(text: string): Promise<boolean> {
       return false;
     }
   }
+}
+
+function ensurePrompt(): {
+  root: HTMLElement;
+  title: HTMLElement;
+  input: HTMLInputElement;
+  cancel: HTMLButtonElement;
+  ok: HTMLButtonElement;
+} {
+  if (promptRoot) {
+    return {
+      root: promptRoot,
+      title: promptRoot.querySelector(".name-prompt-title")!,
+      input: promptRoot.querySelector(".name-prompt-input")!,
+      cancel: promptRoot.querySelector('[data-action="cancel"]')!,
+      ok: promptRoot.querySelector('[data-action="ok"]')!,
+    };
+  }
+  promptRoot = document.createElement("div");
+  promptRoot.className = "name-prompt";
+  promptRoot.hidden = true;
+  promptRoot.innerHTML = `
+    <div class="name-prompt-backdrop" data-close="1"></div>
+    <div class="name-prompt-panel" role="dialog" aria-modal="true">
+      <div class="name-prompt-title"></div>
+      <input class="name-prompt-input" type="text" spellcheck="false" autocomplete="off" />
+      <div class="name-prompt-actions">
+        <button type="button" class="name-prompt-btn" data-action="cancel">Cancel</button>
+        <button type="button" class="name-prompt-btn primary" data-action="ok">Create</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(promptRoot);
+  return {
+    root: promptRoot,
+    title: promptRoot.querySelector(".name-prompt-title")!,
+    input: promptRoot.querySelector(".name-prompt-input")!,
+    cancel: promptRoot.querySelector('[data-action="cancel"]')!,
+    ok: promptRoot.querySelector('[data-action="ok"]')!,
+  };
+}
+
+export type NamePromptOptions = {
+  title: string;
+  initial?: string;
+  placeholder?: string;
+  confirmLabel?: string;
+};
+
+/** Modal name entry used by New File / New Folder. Resolves `null` on cancel. */
+export function promptName(opts: NamePromptOptions): Promise<string | null> {
+  closeContextMenu();
+  const { root, title, input, cancel, ok } = ensurePrompt();
+  title.textContent = opts.title;
+  input.value = opts.initial ?? "";
+  input.placeholder = opts.placeholder ?? "";
+  ok.textContent = opts.confirmLabel ?? "Create";
+  root.hidden = false;
+
+  return new Promise((resolve) => {
+    const finish = (value: string | null) => {
+      root.hidden = true;
+      root.removeEventListener("click", onClick);
+      input.removeEventListener("keydown", onKey);
+      cancel.removeEventListener("click", onCancel);
+      ok.removeEventListener("click", onOk);
+      resolve(value);
+    };
+    const onCancel = () => finish(null);
+    const onOk = () => {
+      const name = input.value.trim();
+      finish(name || null);
+    };
+    const onClick = (ev: Event) => {
+      const t = ev.target as HTMLElement;
+      if (t.dataset.close === "1") finish(null);
+    };
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        finish(null);
+      } else if (ev.key === "Enter") {
+        ev.preventDefault();
+        onOk();
+      }
+    };
+    root.addEventListener("click", onClick);
+    input.addEventListener("keydown", onKey);
+    cancel.addEventListener("click", onCancel);
+    ok.addEventListener("click", onOk);
+    requestAnimationFrame(() => {
+      input.focus();
+      input.select();
+    });
+  });
 }

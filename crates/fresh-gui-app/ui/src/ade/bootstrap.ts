@@ -7,7 +7,7 @@ import {
   type PtyInfo,
   type ServerMessage,
 } from "../protocol";
-import { $, $button, b64decode, b64encode, basename, relativePath } from "../dom";
+import { $, $button, b64decode, b64encode, basename, dirname, relativePath } from "../dom";
 import {
   applyEditorFontSize,
   applyEditorMinimap,
@@ -61,6 +61,7 @@ import { closeFindBar, openFindBar, setSearchTarget } from "../search";
 import {
   copyToClipboard,
   openContextMenu,
+  promptName,
   type ContextMenuItem,
 } from "../context-menu";
 import {
@@ -188,10 +189,15 @@ let preferredSessionId = "";
 
 const pendingFs = new Map<string, Pending<{ path: string; entries: FsEntry[] }>>();
 const pendingFsAuth = new Map<string, Pending<{ path: string }>>();
+const pendingFsMutate = new Map<string, Pending<FsEntry[]>>();
 const pendingEditor = new Map<string, PendingEditor>();
 const pendingEdit = new Map<string, Pending<number>>();
 const pendingSave = new Map<string, Pending<{ path: string; rev: number }>>();
 const pendingPtyIntents: PtyIntent[] = [];
+
+/** In-app explorer clipboard for Cut / Copy / Paste (paths only). */
+type FileClipboard = { mode: "copy" | "cut"; paths: string[] };
+let fileClipboard: FileClipboard | null = null;
 
 let treeRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let treeLoading = false;
@@ -349,6 +355,51 @@ function fsAuthorize(path: string): Promise<{ path: string }> {
   });
 }
 
+function fsCreate(parent: string, name: string, kind: "file" | "dir"): Promise<FsEntry> {
+  const request_id = nextRequestId();
+  return new Promise((resolve, reject) => {
+    pendingFsMutate.set(request_id, {
+      resolve: (entries) => resolve(entries[0]!),
+      reject,
+    });
+    send({ type: "fs_create", request_id, parent: parent || "", name, kind });
+    setTimeout(() => {
+      if (pendingFsMutate.has(request_id)) {
+        pendingFsMutate.delete(request_id);
+        reject(new Error("fs_create timeout"));
+      }
+    }, 15_000);
+  });
+}
+
+function fsCopy(sources: string[], destination: string): Promise<FsEntry[]> {
+  const request_id = nextRequestId();
+  return new Promise((resolve, reject) => {
+    pendingFsMutate.set(request_id, { resolve, reject });
+    send({ type: "fs_copy", request_id, sources, destination });
+    setTimeout(() => {
+      if (pendingFsMutate.has(request_id)) {
+        pendingFsMutate.delete(request_id);
+        reject(new Error("fs_copy timeout"));
+      }
+    }, 60_000);
+  });
+}
+
+function fsMove(sources: string[], destination: string): Promise<FsEntry[]> {
+  const request_id = nextRequestId();
+  return new Promise((resolve, reject) => {
+    pendingFsMutate.set(request_id, { resolve, reject });
+    send({ type: "fs_move", request_id, sources, destination });
+    setTimeout(() => {
+      if (pendingFsMutate.has(request_id)) {
+        pendingFsMutate.delete(request_id);
+        reject(new Error("fs_move timeout"));
+      }
+    }, 60_000);
+  });
+}
+
 function editorOpen(
   path: string,
   opts: OpenEditorOpts = {},
@@ -454,6 +505,7 @@ function rejectPendingError(msg: Extract<ServerMessage, { type: "error" }>): voi
   if (
     tryReject(pendingFs) ||
     tryReject(pendingFsAuth) ||
+    tryReject(pendingFsMutate) ||
     tryReject(pendingEditor) ||
     tryReject(pendingEdit) ||
     tryReject(pendingSave)
@@ -1041,11 +1093,116 @@ async function copyPathFeedback(label: string, value: string): Promise<void> {
   setStatusLeft(ok ? `copied ${label}: ${value}` : `copy failed: ${value}`);
 }
 
-function pathContextItems(absPath: string): ContextMenuItem[] {
+function setFileClipboard(mode: "copy" | "cut", paths: string[]): void {
+  const unique = [...new Set(paths.filter(Boolean))];
+  if (!unique.length) {
+    fileClipboard = null;
+    return;
+  }
+  fileClipboard = { mode, paths: unique };
+  const label = unique.length === 1 ? basename(unique[0]!) : `${unique.length} items`;
+  setStatusLeft(`${mode === "cut" ? "cut" : "copied"} ${label}`);
+}
+
+function pasteTargetDir(entryPath: string, kind: FsEntry["kind"] | "dir"): string {
+  if (kind === "dir") return entryPath;
+  return dirname(entryPath) || tree.getRootPath() || "";
+}
+
+async function runPasteInto(destination: string): Promise<void> {
+  if (!fileClipboard?.paths.length) {
+    setStatusLeft("clipboard is empty");
+    return;
+  }
+  const { mode, paths } = fileClipboard;
+  setStatusLeft(`${mode === "cut" ? "moving" : "copying"}…`);
+  try {
+    const entries =
+      mode === "cut"
+        ? await fsMove(paths, destination)
+        : await fsCopy(paths, destination);
+    if (mode === "cut") fileClipboard = null;
+    scheduleTreeRefresh();
+    const label =
+      entries.length === 1 ? basename(entries[0]!.path) : `${entries.length} items`;
+    setStatusLeft(`${mode === "cut" ? "moved" : "copied"} ${label}`);
+  } catch (err) {
+    setStatusLeft(`${mode} failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+async function runCreate(parent: string, kind: "file" | "dir"): Promise<void> {
+  const title = kind === "dir" ? "New Folder" : "New File";
+  const name = await promptName({
+    title,
+    placeholder: kind === "dir" ? "folder-name" : "file-name.ts",
+    confirmLabel: "Create",
+  });
+  if (!name) return;
+  setStatusLeft(`creating ${name}…`);
+  try {
+    const entry = await fsCreate(parent, name, kind);
+    scheduleTreeRefresh();
+    setStatusLeft(`created ${entry.path}`);
+    if (kind === "file") {
+      void openEditorTab(entry.path, { preview: false });
+    }
+  } catch (err) {
+    setStatusLeft(`create failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+function pathContextItems(
+  absPath: string,
+  opts: { kind?: FsEntry["kind"]; includeFileOps?: boolean } = {},
+): ContextMenuItem[] {
   const abs = absPath;
   const rel = relativePath(abs, pathAnchorRoot());
   const name = basename(abs);
-  return [
+  const includeFileOps = opts.includeFileOps !== false;
+  const kind = opts.kind ?? "file";
+  const items: ContextMenuItem[] = [];
+
+  if (includeFileOps) {
+    const parent = pasteTargetDir(abs, kind);
+    const workspaceRoot = tree.getWorkspaceRoot() || tree.getRootPath() || "";
+    const isWorkspaceRoot =
+      !!workspaceRoot && normalizePathSafe(abs) === normalizePathSafe(workspaceRoot);
+    items.push(
+      {
+        kind: "item",
+        label: "New File…",
+        run: () => runCreate(parent, "file"),
+      },
+      {
+        kind: "item",
+        label: "New Folder…",
+        run: () => runCreate(parent, "dir"),
+      },
+      { kind: "separator" },
+      {
+        kind: "item",
+        label: "Cut",
+        disabled: isWorkspaceRoot,
+        run: () => setFileClipboard("cut", [abs]),
+      },
+      {
+        kind: "item",
+        label: "Copy",
+        disabled: isWorkspaceRoot,
+        run: () => setFileClipboard("copy", [abs]),
+      },
+      {
+        kind: "item",
+        label: "Paste",
+        disabled: !fileClipboard?.paths.length,
+        run: () => runPasteInto(parent),
+      },
+      { kind: "separator" },
+    );
+  }
+
+  items.push(
     {
       kind: "item",
       label: "Copy Absolute Path",
@@ -1061,12 +1218,22 @@ function pathContextItems(absPath: string): ContextMenuItem[] {
       label: "Copy File Name",
       run: () => copyPathFeedback("name", name),
     },
-  ];
+  );
+  return items;
 }
 
-function openPathContextMenu(absPath: string, clientX: number, clientY: number): void {
+function normalizePathSafe(path: string): string {
+  return String(path || "").replace(/\\/g, "/").replace(/\/+$/, "") || "/";
+}
+
+function openPathContextMenu(
+  absPath: string,
+  clientX: number,
+  clientY: number,
+  kind: FsEntry["kind"] = "file",
+): void {
   if (!absPath) return;
-  openContextMenu(clientX, clientY, pathContextItems(absPath));
+  openContextMenu(clientX, clientY, pathContextItems(absPath, { kind, includeFileOps: true }));
 }
 
 function renderTabs(): void {
@@ -1121,12 +1288,12 @@ function renderTabs(): void {
 
       const items: ContextMenuItem[] = [];
       if (tab.kind === "editor") {
-        items.push(...pathContextItems(tab.path));
+        items.push(...pathContextItems(tab.path, { kind: "file", includeFileOps: false }));
         items.push({ kind: "separator" });
       } else {
         const cwd = tab.leaves.get(tab.activeLeafId)?.cwd;
         if (cwd) {
-          items.push(...pathContextItems(cwd));
+          items.push(...pathContextItems(cwd, { kind: "dir", includeFileOps: false }));
           items.push({ kind: "separator" });
         }
       }
@@ -1316,6 +1483,7 @@ function clearTree(): void {
   tree.clear();
   pendingFs.clear();
   pendingFsAuth.clear();
+  pendingFsMutate.clear();
   treeLoaded = false;
   treeLoading = false;
   treeNeedsRefresh = false;
@@ -1761,6 +1929,23 @@ function onMessage(raw: string): void {
       }
       break;
     }
+    case "fs_created": {
+      const pending = pendingFsMutate.get(msg.request_id);
+      if (pending) {
+        pendingFsMutate.delete(msg.request_id);
+        pending.resolve([msg.entry]);
+      }
+      break;
+    }
+    case "fs_copied":
+    case "fs_moved": {
+      const pending = pendingFsMutate.get(msg.request_id);
+      if (pending) {
+        pendingFsMutate.delete(msg.request_id);
+        pending.resolve(msg.entries || []);
+      }
+      break;
+    }
     case "editor_opened": {
       const pending = pendingEditor.get(msg.request_id);
       if (pending) {
@@ -2005,7 +2190,7 @@ export function bootstrapAde(): void {
     onStatus: (text) => setStatusLeft(text),
     noteInteraction: () => noteTreeInteraction(),
     onRootChange: (rootPath) => updateExplorerTitle(rootPath),
-    onContextMenu: (entry, x, y) => openPathContextMenu(entry.path, x, y),
+    onContextMenu: (entry, x, y) => openPathContextMenu(entry.path, x, y, entry.kind),
   });
   tree.setVisibility({
     showDotfiles: uiSettings.showDotfiles,

@@ -273,6 +273,42 @@ pub enum Message {
         watch_id: String,
         paths: Vec<String>,
     },
+    /// Client → backend: create an empty file or directory under `parent`.
+    ///
+    /// `name` must be a single path segment (no separators). `kind` is `file` or `dir`.
+    FsCreate {
+        request_id: String,
+        parent: String,
+        name: String,
+        kind: FsKind,
+    },
+    /// Backend → client after a successful create.
+    FsCreated {
+        request_id: String,
+        entry: FsEntry,
+    },
+    /// Client → backend: copy one or more paths into a destination directory.
+    FsCopy {
+        request_id: String,
+        sources: Vec<String>,
+        destination: String,
+    },
+    /// Backend → client after a successful copy.
+    FsCopied {
+        request_id: String,
+        entries: Vec<FsEntry>,
+    },
+    /// Client → backend: move (cut+paste) one or more paths into a destination directory.
+    FsMove {
+        request_id: String,
+        sources: Vec<String>,
+        destination: String,
+    },
+    /// Backend → client after a successful move.
+    FsMoved {
+        request_id: String,
+        entries: Vec<FsEntry>,
+    },
     /// Client → backend: open a path in the Fresh editor (capability `editor`).
     ///
     /// `path` may include a Fresh-style `:line` / `:line:col` suffix. Optional
@@ -505,6 +541,32 @@ mod tests {
             Message::from_json(&changed.to_json().unwrap()).unwrap(),
             changed
         );
+    }
+
+    #[test]
+    fn fs_mutate_roundtrips() {
+        let create = Message::FsCreate {
+            request_id: "c1".into(),
+            parent: "".into(),
+            name: "a.txt".into(),
+            kind: FsKind::File,
+        };
+        assert_eq!(
+            Message::from_json(&create.to_json().unwrap()).unwrap(),
+            create
+        );
+        let copy = Message::FsCopy {
+            request_id: "c2".into(),
+            sources: vec!["/tmp/a.txt".into()],
+            destination: "/tmp/out".into(),
+        };
+        assert_eq!(Message::from_json(&copy.to_json().unwrap()).unwrap(), copy);
+        let mv = Message::FsMove {
+            request_id: "c3".into(),
+            sources: vec!["/tmp/a.txt".into()],
+            destination: "/tmp/out".into(),
+        };
+        assert_eq!(Message::from_json(&mv.to_json().unwrap()).unwrap(), mv);
     }
 
     #[test]

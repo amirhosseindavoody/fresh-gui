@@ -60,3 +60,12 @@ export function relativePath(abs: string, root: string): string {
   if (a.startsWith(r + "/")) return a.slice(r.length + 1);
   return a;
 }
+
+/** Parent directory of `path`, or `""` when at filesystem root. */
+export function dirname(path: string): string {
+  const n = normalizePath(path);
+  if (n === "/" || !n) return "";
+  const idx = n.lastIndexOf("/");
+  if (idx <= 0) return n.startsWith("/") ? "/" : "";
+  return n.slice(0, idx) || "/";
+}
