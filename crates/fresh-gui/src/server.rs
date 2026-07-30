@@ -21,6 +21,7 @@ use crate::config::Config;
 use crate::editor_worker::EditorHandle;
 use crate::fs::FsRoot;
 use crate::fs_watch::FsWatchStore;
+use crate::memory_monitor::MemoryMonitor;
 use crate::session::SessionStore;
 
 pub struct AppState {
@@ -42,6 +43,7 @@ pub async fn serve_listener(
     ui_dir: Option<std::path::PathBuf>,
     http_url: &str,
     ws_url: &str,
+    memory: Option<Arc<MemoryMonitor>>,
 ) -> Result<()> {
     let addr = listener.local_addr()?;
     let api = Router::new()
@@ -59,12 +61,16 @@ pub async fn serve_listener(
 
     info!(%addr, %http_url, %ws_url, "listening (http UI + ws path /ws)");
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(memory.clone()))
         .await?;
+    // Once-only fallback when the server stops without a signal (tests / errors).
+    if let Some(monitor) = memory {
+        monitor.finish();
+    }
     Ok(())
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(memory: Option<Arc<MemoryMonitor>>) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -85,6 +91,11 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     info!("shutdown signal received");
+    // Log memory summary before graceful drain so `fresh-gui close` still captures
+    // it if connections stall past the SIGKILL deadline.
+    if let Some(monitor) = memory {
+        monitor.finish();
+    }
 }
 
 async fn ws_upgrade(

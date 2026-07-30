@@ -68,11 +68,11 @@ Logistics template: `pixi.toml` + Cargo workspace under `crates/`, CalVer `YYYY.
 
 ### Process model
 
-1. Operator starts **`fresh-gui`** on the Linux machine (background session by default, or `--foreground` for tests).
+1. Operator starts **`fresh-gui`** on the Linux machine (background session by default, or `--foreground` for tests). One daemon process holds the session lock; Fresh Editor runs in-process on a dedicated thread; PTY shells are child processes.
 2. Operator opens the printed Local access URL in a browser; the UI authenticates with the embedded `?token=` (then caches it in tab `sessionStorage`).
 3. After `hello` + `auth`, the client creates or attaches a **session**. Layout is persisted in `layout_set` and `localStorage`.
 4. Terminal panes map to remote PTYs in that session. Explorer and editor talk to sandboxed FS / Fresh buffer APIs over the same socket.
-5. Disconnect detaches the WebSocket subscriber; the session and PTYs keep running for reattach + scrollback replay.
+5. Disconnect detaches the WebSocket subscriber; the session and PTYs keep running for reattach + scrollback.
 
 ## 5. Protocol
 
@@ -107,6 +107,8 @@ Default backend capabilities (omit `editor` / `scene` with `--no-editor`):
 ### Daemon session
 
 Default `fresh-gui` detaches a **per-user background session** (exclusive flock under `$XDG_RUNTIME_DIR/fresh-gui/`), prints status / Local access URL, and returns the shell. Re-running reprints status; `fresh-gui close` stops the daemon. Logs go to `$XDG_STATE_HOME/fresh-gui/fresh-gui.log`. See [SECURITY.md](./SECURITY.md) for token handling in `session.json`.
+
+While serving, the daemon samples its own resident set from `/proc/self/status` (`VmRSS` / `VmHWM`) about every 30 seconds. On SIGTERM / Ctrl-C (before graceful drain completes) it logs structured **average** and **peak** RSS in MB. Measurement covers the backend process only (Axum server, session state, embedded Fresh editor) — not PTY child shells. Fresh has no production memory monitor API; this is host-lifecycle telemetry.
 
 ### Sessions and PTYs
 

@@ -9,6 +9,7 @@ mod daemon;
 mod editor_worker;
 mod fs;
 mod fs_watch;
+mod memory_monitor;
 mod path_open;
 mod pty;
 mod server;
@@ -31,6 +32,7 @@ use crate::daemon::{
 use crate::editor_worker::EditorHandle;
 use crate::fs::FsRoot;
 use crate::fs_watch::FsWatchStore;
+use crate::memory_monitor::{MemoryMonitor, DEFAULT_SAMPLE_INTERVAL};
 use crate::server::AppState;
 use crate::session::SessionStore;
 
@@ -247,6 +249,9 @@ async fn run_server_foreground(args: ServeArgs, write_session_meta: bool) -> Res
     // Bind before spawning Fresh so a busy port fails cleanly (no editor teardown panic).
     let (listener, bound) = bind_listen(args.listen, args.strict_listen).await?;
 
+    // Sample daemon RSS cheaply for the session lifetime; summary is logged on shutdown.
+    let memory = Arc::new(MemoryMonitor::start(DEFAULT_SAMPLE_INTERVAL));
+
     let editor = if args.no_editor {
         info!("Fresh editor disabled (--no-editor)");
         None
@@ -308,7 +313,12 @@ async fn run_server_foreground(args: ServeArgs, write_session_meta: bool) -> Res
         print_startup_banner(bound, &http_url, &ws_url, token.as_deref());
     }
 
-    let result = server::serve_listener(listener, state, ui_dir, &http_url, &ws_url).await;
+    let result =
+        server::serve_listener(listener, state, ui_dir, &http_url, &ws_url, Some(memory.clone()))
+            .await;
+
+    // Fallback if shutdown drained without the signal path finalizing (e.g. serve error).
+    memory.finish();
 
     if let Some(paths) = paths.as_ref() {
         crate::daemon::remove_session_files(paths);
