@@ -141,7 +141,8 @@ Primer-inspired dark/light surfaces live in `src/tokens.css` (palette `primer`).
   "fontWeight": 400,       // UI chrome 100–900
   "monoFontWeight": 400,   // terminal + editor
   "fontFamily": "",        // empty → IBM Plex Sans
-  "monoFontFamily": ""     // empty → IBM Plex Mono
+  "monoFontFamily": "",    // empty → IBM Plex Mono
+  "editorMinimap": false   // document map; off = chunk never loaded
 }
 ```
 
@@ -178,7 +179,7 @@ Defaults follow [Terax `shortcuts.ts`](https://github.com/crynta/terax-ai/blob/m
 
 **Windows note:** `Ctrl+D` is also shell EOF. Prefer Terax behavior: shortcut wins when the host handles it for split; users who need raw EOF can remap. Do not silently switch to VS Code `\` bindings.
 
-Tree: expand/collapse, open file (preview), pin on edit, keyboard nav. Dirty editors show `•` in the tab label. Theme mode, color palette, and fonts live in `config.json` (not a settings modal).
+Tree: expand/collapse, open file (preview), pin on edit, keyboard nav. Dirty editors show `•` in the tab label. Theme mode, color palette, fonts, and optional editor document map (`ui.editorMinimap`) live in `config.json` (not a settings modal). Shell scripts (`.sh` / shebang) get CodeMirror legacy shell highlighting.
 
 Connection errors and auth failures use inline strip status; never modal loops.
 

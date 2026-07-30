@@ -81,6 +81,7 @@ export type HelloUiMsg = {
   webgl?: boolean;
   showDotfiles?: boolean;
   showGitDirs?: boolean;
+  editorMinimap?: boolean;
 };
 
 export type ServerMessage =

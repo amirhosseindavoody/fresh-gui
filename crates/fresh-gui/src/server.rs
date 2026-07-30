@@ -92,6 +92,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             webgl: cfg.ui.webgl,
             show_dotfiles: cfg.ui.show_dotfiles,
             show_git_dirs: cfg.ui.show_git_dirs,
+            editor_minimap: cfg.ui.editor_minimap,
         }
     };
     let mut hello = Hello::backend(

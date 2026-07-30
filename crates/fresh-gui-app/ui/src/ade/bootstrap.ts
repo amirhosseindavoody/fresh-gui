@@ -8,7 +8,14 @@ import {
   type ServerMessage,
 } from "../protocol";
 import { $, $button, b64decode, b64encode, basename, relativePath } from "../dom";
-import { applyEditorFontSize, applyEditorTheme, createEditorView, openEditorSearch, revealEditorLocation } from "../editor";
+import {
+  applyEditorFontSize,
+  applyEditorMinimap,
+  applyEditorTheme,
+  createEditorView,
+  openEditorSearch,
+  revealEditorLocation,
+} from "../editor";
 import { isMarkdownPath, updateMarkdownPreview } from "../markdown-preview";
 import {
   applyTerminalFontSize,
@@ -662,7 +669,8 @@ function applyUiSettings(next: UiSettings): void {
     prev.monoFontWeight !== next.monoFontWeight ||
     prev.fontFamily !== next.fontFamily ||
     prev.monoFontFamily !== next.monoFontFamily;
-  restyleOpenPanes(getResolvedTheme(), chromeChanged);
+  const minimapChanged = prev.editorMinimap !== next.editorMinimap;
+  restyleOpenPanes(getResolvedTheme(), chromeChanged, { minimapChanged });
   tree.setVisibility({
     showDotfiles: next.showDotfiles,
     showGitDirs: next.showGitDirs,
@@ -762,7 +770,11 @@ async function openSettingsFile(): Promise<void> {
 }
 
 /** Restyle open terminals/editors to match the resolved chrome theme / palette. */
-function restyleOpenPanes(resolved: ReturnType<typeof resolveTheme>, themeChanged: boolean): void {
+function restyleOpenPanes(
+  resolved: ReturnType<typeof resolveTheme>,
+  themeChanged: boolean,
+  opts: { minimapChanged?: boolean } = {},
+): void {
   for (const tab of tabs) {
     if (tab.kind === "terminal") {
       for (const bundle of tab.leaves.values()) {
@@ -776,6 +788,9 @@ function restyleOpenPanes(resolved: ReturnType<typeof resolveTheme>, themeChange
         if (tab.mdView === "preview" && tab.mdPreviewEl) {
           applyEditorMdView(tab, { refresh: true });
         }
+      }
+      if (opts.minimapChanged) {
+        void applyEditorMinimap(tab.view, uiSettings.editorMinimap);
       }
     }
   }
@@ -1437,6 +1452,8 @@ async function presentOpenedBuffer(
       fontSize: uiSettings.editorFontSize,
       fontWeight: uiSettings.monoFontWeight,
       theme: getResolvedTheme(),
+      language: opened.language,
+      minimap: uiSettings.editorMinimap,
       onPathLink: (info) => {
         void openEditorTab(info.path, {
           preview: true,

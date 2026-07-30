@@ -70,7 +70,8 @@ Default path: `$XDG_CONFIG_HOME/fresh-gui/config.json` or `~/.config/fresh-gui/c
     "monoFontFamily": "", // empty → IBM Plex Mono
     "webgl": true,
     "showDotfiles": false, // show .* names in the explorer
-    "showGitDirs": false // show .git folders (separate from showDotfiles)
+    "showGitDirs": false, // show .git folders (separate from showDotfiles)
+    "editorMinimap": false // VS Code–style document map; off = not loaded
   },
   // Default PTY shell when the client omits `shell` on pty_open
   "terminal": {

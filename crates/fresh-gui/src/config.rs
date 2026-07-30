@@ -42,7 +42,9 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"{
     "webgl": true,
     // Explorer: hide .* by default; .git stays hidden unless showGitDirs is true
     "showDotfiles": false,
-    "showGitDirs": false
+    "showGitDirs": false,
+    // VS Code–style editor document map (minimap). Off = not loaded (no UI cost).
+    "editorMinimap": false
   },
   // Default PTY shell when the client does not pass `shell`.
   // Empty args keep interactive / OSC 7 setup for known shells.
@@ -117,6 +119,9 @@ pub struct UiConfig {
     /// Show `.git` directories in the explorer. Independent of [`Self::show_dotfiles`]; default off.
     #[serde(default, rename = "showGitDirs")]
     pub show_git_dirs: bool,
+    /// VS Code–style editor document map (minimap). Default off.
+    #[serde(default, rename = "editorMinimap")]
+    pub editor_minimap: bool,
 }
 
 impl Default for UiConfig {
@@ -133,6 +138,7 @@ impl Default for UiConfig {
             webgl: true,
             show_dotfiles: false,
             show_git_dirs: false,
+            editor_minimap: false,
         }
     }
 }
@@ -713,6 +719,13 @@ mod tests {
         assert_eq!(cfg.resolve_shell().0, "zsh");
         assert!(!cfg.ui.show_dotfiles);
         assert!(!cfg.ui.show_git_dirs);
+        assert!(!cfg.ui.editor_minimap);
+    }
+
+    #[test]
+    fn parses_editor_minimap_flag() {
+        let cfg = Config::parse(r#"{"ui":{"editorMinimap":true}}"#).unwrap();
+        assert!(cfg.ui.editor_minimap);
     }
 
     #[test]

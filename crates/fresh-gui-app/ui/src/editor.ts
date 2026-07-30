@@ -17,6 +17,7 @@ import { cpp } from "@codemirror/lang-cpp";
 import { json } from "@codemirror/lang-json";
 import { yaml } from "@codemirror/lang-yaml";
 import { toml } from "@codemirror/legacy-modes/mode/toml";
+import { shell } from "@codemirror/legacy-modes/mode/shell";
 import type { Extension } from "@codemirror/state";
 import type { ResolvedTheme } from "./theme";
 import { logLanguage } from "./log-lang";
@@ -25,6 +26,46 @@ import { detectLinkAt } from "./path-link";
 const fontSizeCompartment = new Compartment();
 const themeCompartment = new Compartment();
 const highlightCompartment = new Compartment();
+/** Empty when minimap is off — the `@replit/codemirror-minimap` chunk is never loaded. */
+const minimapCompartment = new Compartment();
+
+const SHELL_LANG = StreamLanguage.define(shell);
+
+/** Common shell config basenames (Fresh also maps these via shebang / grammar). */
+const SHELL_BASENAMES = new Set([
+  ".bashrc",
+  ".bash_profile",
+  ".bash_login",
+  ".bash_logout",
+  ".zshrc",
+  ".zprofile",
+  ".zlogin",
+  ".zshenv",
+  ".profile",
+  "profile",
+]);
+
+function isShellLanguageHint(language?: string | null): boolean {
+  if (!language) return false;
+  const lower = language.trim().toLowerCase();
+  return (
+    lower === "bash" ||
+    lower === "shell" ||
+    lower === "sh" ||
+    lower === "zsh" ||
+    lower === "fish" ||
+    lower === "ksh" ||
+    lower === "shellscript"
+  );
+}
+
+/** True when the first line is a shell shebang (`#!/bin/bash`, `#!/usr/bin/env zsh`, …). */
+export function hasShellShebang(text: string): boolean {
+  const nl = text.indexOf("\n");
+  const first = (nl === -1 ? text : text.slice(0, nl)).trim();
+  if (!first.startsWith("#!")) return false;
+  return /\b(?:ba|da|a|k|mk|pd)?sh\b|\bzsh\b|\bfish\b/.test(first);
+}
 
 /**
  * Editor chrome + syntax highlight from CSS tokens (`tokens.css`).
@@ -124,9 +165,26 @@ function tokenHighlightStyle(): Extension {
   );
 }
 
-function langForPath(path: string): Extension | null {
+function langForPath(
+  path: string,
+  opts: { text?: string; language?: string | null } = {},
+): Extension | null {
   const lower = path.toLowerCase();
   const base = lower.includes("/") ? lower.slice(lower.lastIndexOf("/") + 1) : lower;
+
+  if (isShellLanguageHint(opts.language)) return SHELL_LANG;
+  if (
+    lower.endsWith(".sh") ||
+    lower.endsWith(".bash") ||
+    lower.endsWith(".zsh") ||
+    lower.endsWith(".fish") ||
+    lower.endsWith(".ksh") ||
+    lower.endsWith(".bats") ||
+    SHELL_BASENAMES.has(base) ||
+    (opts.text != null && hasShellShebang(opts.text))
+  ) {
+    return SHELL_LANG;
+  }
 
   if (lower.endsWith(".rs")) return rust();
   if (
@@ -227,12 +285,15 @@ export function createEditorView(
     fontSize?: number;
     fontWeight?: number;
     theme?: ResolvedTheme;
+    language?: string | null;
+    /** When true, dynamically load and mount the document map (minimap). */
+    minimap?: boolean;
     onPathLink?: EditorPathLinkHandler;
   } = {},
 ): EditorView {
   const fontSize = opts.fontSize ?? 14;
   const fontWeight = opts.fontWeight ?? 400;
-  const lang = langForPath(path);
+  const lang = langForPath(path, { text, language: opts.language });
   const extensions: Extension[] = [
     lineNumbers(),
     highlightActiveLine(),
@@ -243,6 +304,9 @@ export function createEditorView(
     fontSizeCompartment.of(tokenEditorTheme(fontSize, fontWeight)),
     themeCompartment.of([]),
     highlightCompartment.of(tokenHighlightStyle()),
+    // Always present so we can enable later without recreating the editor;
+    // stays empty (no work) until `applyEditorMinimap(view, true)`.
+    minimapCompartment.of([]),
     EditorView.updateListener.of((update) => {
       if (update.docChanged) onDocChange();
     }),
@@ -251,12 +315,35 @@ export function createEditorView(
   if (lang) extensions.push(lang);
   void opts.theme;
 
-  return new EditorView({
+  const view = new EditorView({
     parent,
     state: EditorState.create({
       doc: text,
       extensions,
     }),
+  });
+  if (opts.minimap) {
+    void applyEditorMinimap(view, true);
+  }
+  return view;
+}
+
+/**
+ * Toggle the VS Code–style document map. Enabling dynamic-imports the minimap
+ * chunk; disabling clears the compartment so the plugin DOM is torn down.
+ */
+export async function applyEditorMinimap(view: EditorView, enabled: boolean): Promise<void> {
+  if (!enabled) {
+    view.dispatch({
+      effects: minimapCompartment.reconfigure([]),
+    });
+    return;
+  }
+  const { createMinimapExtension } = await import("./editor-minimap");
+  // View may have been destroyed while the chunk was loading.
+  if (!view.dom.isConnected) return;
+  view.dispatch({
+    effects: minimapCompartment.reconfigure(createMinimapExtension()),
   });
 }
 
