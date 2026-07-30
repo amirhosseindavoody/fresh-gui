@@ -102,7 +102,7 @@ type PaneNode =
 - **Inherited cwd:** new terminal tabs/splits prefer active leaf cwd (OSC 7) or last terminal cwd (not the editor file’s parent).
 - **Explorer root:** follows the active terminal leaf cwd when reachable under the FS sandbox (`VirtualTree.setViewRoot`). `fs_authorize` expands the sandbox when cwd leaves `--root`.
 - **Max leaves per terminal tab:** 4.
-- **Layout persistence:** tab list + `paneTree` + `activeLeafId` + sidebar width in `layout_set` / localStorage (`version: 2`). Pane-tree restore across `session_attach` only when reattached PTYs match persisted leaf ids 1:1; otherwise one terminal tab per PTY. Editor tabs are not restored across reattach.
+- **Layout persistence:** tab list + `paneTree` (leaf `cwd` stamped) + `activeLeafId` + sidebar + per view-root explorer expanded/scroll in `layout_set` / localStorage (`version: 4`). Rust `SessionStore` is the source of truth for the layout string while the daemon is up; reopening `/?token=` reattaches and restores. Multi-tab terminal layouts partition live PTYs (tabs whose leaves ⊆ live set); leftover PTYs become single-pane tabs. Editor tabs are reopened by path on attach. Explorer expanded dirs + scroll are kept per cwd when switching terminals (Fresh `FileExplorerState`-shaped snapshots in the blob — not Fresh workspace disk files). Persistence ends when the session daemon is closed from the CLI.
 - **Close pane vs close tab:** last leaf closes the tab; closing a tab closes remote PTYs / buffers for that tab.
 
 ## 5. Visual language
@@ -134,7 +134,7 @@ Primer-inspired dark/light surfaces live in `src/tokens.css` (palette `primer`).
 }
 ```
 
-Pick a palette from the activity bar swatch, or **Mod+Shift+P** → “Color Palette…”. Choices apply immediately and are written to `config.json` when connected.
+Pick a palette from the activity bar swatch, or **Mod+Shift+P** → “Color Palette…”. Choices apply immediately and are written to `config.json` when connected. Saving `fontWeight` / `monoFontWeight` updates CSS variables and open terminals/editors immediately (no reload).
 
 Motion: tab pill slide, sidebar collapse, panel focus / menu appear. No perpetual ambient animation.
 

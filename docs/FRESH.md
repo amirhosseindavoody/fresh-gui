@@ -150,7 +150,7 @@ Line/column from path or link are returned on `editor_opened` for the **host** t
 | Host chrome | React + Tailwind + shadcn |
 | Plugins / LSP / tree-sitter in the ADE path | Features off; not exposed over the protocol |
 | Orchestrator / coding agents | Fresh plugin not loaded; agent direction for ADE is design-only ([COPILOT.md](./COPILOT.md)) — steal registry/resume patterns, do not embed Orchestrator yet |
-| Editor tabs after reattach | Not restored (buffers not rehydrated by path yet) |
+| Session / explorer restore | Host layout blob in Rust `SessionStore` (`layout_set`); explorer expanded/scroll snapshots mirror Fresh `FileExplorerState` fields without using Fresh workspace files under `$XDG_DATA_HOME/fresh/workspaces` (ADE uses host `VirtualTree` + sandboxed FS) |
 
 ## 7. Host UI wiring
 
@@ -158,7 +158,8 @@ The React shell does not import Fresh. Imperative ADE code in `crates/fresh-gui-
 
 | Module | Role |
 |--------|------|
-| `ade/bootstrap.ts` | `editor_open` / `editor_open_link`, buffer edit/save CAS, tab presentation |
+| `ade/bootstrap.ts` | `editor_open` / `editor_open_link`, buffer edit/save CAS, tab presentation, session layout restore |
+| `layout-persist.ts` | Layout blob v4 schema + restore planner (multi-tab PTYs, editors, explorer snapshots) |
 | `editor.ts` | CodeMirror view; applies snapshot text; reveals line/col from open |
 | `markdown-preview.ts` / `markdown-wysiwyg.ts` | Host markdown render + editable preview; syncs markdown into CodeMirror for ADE save (Fresh Compose plugin is not on the ADE path — see §6) |
 | `path-link.ts` | Host-side hover detector mirrored for UX; open still goes through backend Fresh `detect_link_at` |

@@ -226,7 +226,7 @@ input:not([data-slot="input"]):focus-visible {
 .sidebar-head h2 {
   margin: 0;
   font-size: 0.68rem;
-  font-weight: 600;
+  font-weight: var(--font-ui-weight);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--muted);
@@ -389,7 +389,7 @@ input:not([data-slot="input"]):focus-visible {
   padding: 0 0.25rem 0 0.5rem;
   border-radius: calc(var(--radius-md) - 2px);
   font-size: 0.75rem;
-  font-weight: 500;
+  font-weight: var(--font-ui-weight);
   line-height: 1;
   color: var(--muted);
   cursor: pointer;
@@ -916,6 +916,7 @@ button.tab-close svg {
   inset: 0;
   overflow: auto;
   font-family: var(--font-ui);
+  font-weight: var(--font-ui-weight);
   font-size: 13px;
   line-height: var(--tree-row-height);
 }

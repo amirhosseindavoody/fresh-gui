@@ -13,6 +13,12 @@ export type TreeVisibility = {
   showGitDirs: boolean;
 };
 
+/** Expanded dirs + scroll for one explorer view root (session persistence). */
+export type ExplorerUiState = {
+  expanded: string[];
+  scrollTop: number;
+};
+
 export type TreeCallbacks = {
   onSelect?: (entry: FsEntry | null) => void;
   onOpenFile?: (entry: FsEntry, preview: boolean) => void;
@@ -22,6 +28,13 @@ export type TreeCallbacks = {
   onRootChange?: (rootPath: string) => void;
   /** Right-click on a tree row (file or directory). */
   onContextMenu?: (entry: FsEntry, clientX: number, clientY: number) => void;
+  /** Fired when expanded dirs or scroll change (for session layout persistence). */
+  onExplorerUiChange?: () => void;
+};
+
+export type SetViewRootOpts = {
+  /** Restore expanded/scroll after re-root (issue #55 / Fresh FileExplorerState). */
+  restore?: ExplorerUiState | null;
 };
 
 type Row = {
@@ -90,12 +103,25 @@ export class VirtualTree {
     this.viewport.addEventListener("scroll", () => {
       this.scrollTop = this.viewport.scrollTop;
       this.schedulePaint();
+      this.callbacks.onExplorerUiChange?.();
     });
     host.addEventListener("keydown", (ev) => this.onKey(ev));
   }
 
   getExpandedPaths(): Set<string> {
     return new Set(this.expanded);
+  }
+
+  getScrollTop(): number {
+    return this.scrollTop;
+  }
+
+  /** Snapshot expanded dirs + scroll for the current view root. */
+  captureExplorerUi(): ExplorerUiState {
+    return {
+      expanded: [...this.expanded],
+      scrollTop: this.scrollTop,
+    };
   }
 
   getSelectedPath(): string | null {
@@ -132,8 +158,9 @@ export class VirtualTree {
 
   /**
    * Terax-style re-root. Isolated from `loadRoot` / fs_watch via viewRootInFlight.
+   * Optional `restore` reapplies expanded dirs + scroll (per-cwd session persistence).
    */
-  async setViewRoot(path: string): Promise<boolean> {
+  async setViewRoot(path: string, opts: SetViewRootOpts = {}): Promise<boolean> {
     const listPath = this.workspaceRoot ? this.pathForFsList(path) : path;
     const token = ++this.viewRootToken;
     this.viewRootInFlight = listPath;
@@ -162,6 +189,7 @@ export class VirtualTree {
     const prevCache = new Map(this.childrenCache);
     const prevRows = this.rows;
     const prevSelected = this.selected;
+    const prevScrollTop = this.scrollTop;
 
     this.listRoot = listPath;
     this.expanded.clear();
@@ -178,10 +206,21 @@ export class VirtualTree {
       }
       this.rootPath = listed.path;
       this.childrenCache.set("", listed.entries);
+
+      const restore = opts.restore;
+      if (restore && restore.expanded.length > 0) {
+        this.expanded = new Set(
+          restore.expanded.filter((p) => p !== "" && p !== this.rootPath),
+        );
+        await this.ensureExpandedLoaded();
+        if (token !== this.viewRootToken) return false;
+      }
+
       this.rebuildRows();
       this.selected = this.rootPath || null;
-      this.viewport.scrollTop = 0;
-      this.scrollTop = 0;
+      const scrollTop = restore ? Math.max(0, restore.scrollTop || 0) : 0;
+      this.viewport.scrollTop = scrollTop;
+      this.scrollTop = this.viewport.scrollTop;
       this.schedulePaint();
       this.callbacks.onRootChange?.(this.rootPath);
       return true;
@@ -193,6 +232,8 @@ export class VirtualTree {
       this.childrenCache = prevCache;
       this.rows = prevRows;
       this.selected = prevSelected;
+      this.viewport.scrollTop = prevScrollTop;
+      this.scrollTop = prevScrollTop;
       this.schedulePaint();
       this.callbacks.onRootChange?.(this.rootPath);
       this.callbacks.onStatus?.(
@@ -452,6 +493,7 @@ export class VirtualTree {
       }
       this.rebuildRows();
       this.schedulePaint();
+      this.callbacks.onExplorerUiChange?.();
     }
   }
 
@@ -493,6 +535,7 @@ export class VirtualTree {
         this.expanded.delete(row.path);
         this.rebuildRows();
         this.schedulePaint();
+        this.callbacks.onExplorerUiChange?.();
       } else if (row && row.depth > 0) {
         for (let i = this.selectedIndex() - 1; i >= 0; i--) {
           if (this.rows[i].depth < row.depth) {

@@ -73,7 +73,7 @@ Logistics template: `pixi.toml` + Cargo workspace under `crates/`, CalVer `YYYY.
 
 1. Operator starts **`fresh-gui`** on the Linux machine (background session by default, or `--foreground` for tests). One daemon process holds the session lock; Fresh Editor runs in-process on a dedicated thread; PTY shells are child processes.
 2. Operator opens the printed Local access URL in a browser; the UI authenticates with the embedded `?token=` (then caches it in tab `sessionStorage`).
-3. After `hello` + `auth`, the client creates or attaches a **session**. Layout is persisted in `layout_set` and `localStorage`.
+3. After `hello` + `auth`, the client creates or attaches a **session**. Layout is persisted in Rust via `layout_set` (mirrored to `localStorage` as a cache).
 4. Terminal panes map to remote PTYs in that session. Explorer and editor talk to sandboxed FS / Fresh buffer APIs over the same socket.
 5. Disconnect detaches the WebSocket subscriber; the session and PTYs keep running for reattach + scrollback.
 
@@ -115,7 +115,7 @@ While serving, the daemon samples its own resident set from `/proc/self/status` 
 
 ### Sessions and PTYs
 
-`SessionStore` holds multi-PTY sessions. Closing the WebSocket detaches the subscriber; PTYs keep running. Reattach replays ~64KB of scrollback per PTY and restores layout when the persisted leaf ids match live PTYs 1:1 (otherwise one terminal tab per PTY). Editor tabs are not restored across reattach (buffers are not rehydrated by path yet).
+`SessionStore` holds multi-PTY sessions. Closing the WebSocket detaches the subscriber; PTYs keep running. Reattach replays ~64KB of scrollback per PTY and restores the session layout blob from Rust (`layout_set` / `session_attached.layout`; host `localStorage` is a fallback cache). Layout **v4** partitions live PTYs across multiple terminal tabs (and split trees) when leaf ids are still present, reopens editor tabs by path, restores leaf cwd stamps, and reapplies per view-root explorer expanded/scroll snapshots. Explicit `fresh-gui close` ends the daemon and clears session state.
 
 PTY shell defaults come from `config.json` (`terminal.shell`). Bash/zsh hooks emit OSC 7 so the host can track cwd for new tabs/splits and explorer re-rooting.
 
