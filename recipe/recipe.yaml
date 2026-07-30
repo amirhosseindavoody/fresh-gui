@@ -7,7 +7,7 @@
 # git@github.com:amirhosseindavoody/fresh-gui.git). The build script fetches Fresh
 # from vendor/fresh.rev when the submodule is not checked out.
 context:
-  version: 2026.730.7
+  version: 2026.730.8
 
 package:
   name: fresh-gui
