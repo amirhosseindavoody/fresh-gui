@@ -23,7 +23,7 @@ How operators reach `fresh-gui` on shared hosts. Architecture overview: [DESIGN.
 
 - If `--token` / `FRESH_GUI_TOKEN` is set (and non-empty), use it as-is (lets an operator pin a stable token, e.g. to reuse across restarts).
 - Otherwise, **auto-generate** a random token per process start (`uuid::Uuid::new_v4()`, 122 bits of OS-RNG entropy, formatted as 32 hex chars). It is never written to git/config.
-- The token is **never included in `tracing` structured logs** (only `auth_required: bool` is logged). For the background session, it is stored in the user-private session meta file (`$XDG_RUNTIME_DIR/fresh-gui/session.json`, mode `0600`) so a later `fresh-gui` / `fresh-gui status` can reprint the Local access URL. The meta file is removed on `fresh-gui close`.
+- The token is **never included in `tracing` structured logs** (only `auth_required: bool` is logged). For the background session, it is stored in the user-private session meta file (`$XDG_RUNTIME_DIR/fresh-gui/session.json` on Unix, mode `0600`; `%LOCALAPPDATA%\fresh-gui\session.json` on Windows) so a later `fresh-gui` / `fresh-gui status` can reprint the Local access URL. The meta file is removed on `fresh-gui close`.
 - Prefer `FRESH_GUI_TOKEN` over `--token` so the secret does not appear in `ps` / process listings.
 
 ### 3.2 Bind stays loopback by default
@@ -32,7 +32,7 @@ How operators reach `fresh-gui` on shared hosts. Architecture overview: [DESIGN.
 
 ### 3.3 Background session + startup banner
 
-Default `fresh-gui` detaches a per-user daemon (exclusive flock), prints status, and returns the shell. Re-running `fresh-gui` reprints status; `fresh-gui close` sends SIGTERM. Daemon stdout/stderr go to `$XDG_STATE_HOME/fresh-gui/fresh-gui.log` (fallback `~/.local/state/fresh-gui/`).
+Default `fresh-gui` detaches a per-user daemon (exclusive lock), prints status, and returns the shell. Re-running `fresh-gui` reprints status; `fresh-gui close` stops the daemon. Daemon stdout/stderr go to `$XDG_STATE_HOME/fresh-gui/fresh-gui.log` on Unix (fallback `~/.local/state/fresh-gui/`) or `%LOCALAPPDATA%\fresh-gui\fresh-gui.log` on Windows.
 
 ```text
   fresh-gui session
@@ -72,7 +72,7 @@ After a successful read (and after `auth_ok`), the token is also kept in **`sess
 | **Token in shell/browser history** | It's printed once to the terminal and appears in the URL if you paste the printed link. Treat it like a password: don't paste it into chat/tickets, and restart the process (new random token) if you suspect it leaked. The frontend strips it from the address bar after first use to reduce lingering exposure. |
 | **Token in `sessionStorage` for reload reconnect** | Needed so reload can auth after `?token=` is stripped. Scoped to the tab (cleared when the tab closes), wiped on `auth_error`, and never logged. Accessible to page script (same XSS class as any in-memory secret). |
 | **Token in logs/terminal scrollback** | Kept out of `tracing` (which may be centrally aggregated, e.g. journald); it still hits the operator's own terminal scrollback by design (that's the delivery mechanism), so avoid running under a shared/logged terminal multiplexer session. |
-| **Token in `$XDG_RUNTIME_DIR/fresh-gui/session.json`** | Needed so re-running `fresh-gui` can reprint the Local access URL. File mode `0600`, directory `0700`, removed on `fresh-gui close` / daemon exit. Same user-private trust as the lock file — other accounts cannot read it. |
+| **Token in private `session.json`** | Needed so re-running `fresh-gui` can reprint the Local access URL. Unix: `$XDG_RUNTIME_DIR/fresh-gui/session.json` (mode `0600`, directory `0700`). Windows: `%LOCALAPPDATA%\fresh-gui\session.json`. Removed on `fresh-gui close` / daemon exit. Same user-private trust as the lock file — other accounts cannot read it. |
 | **Token comparison timing** | Equal-length compares use a byte-wise XOR fold; length mismatches still short-circuit. In practice the token travels only over loopback or an SSH tunnel, and 122 bits of entropy makes brute forcing infeasible. |
 | **SSH tunnel security depends on normal SSH host/key verification** | No new risk introduced — same trust model as any other SSH usage. Verify host keys as usual; don't blindly accept unknown host keys. |
 | **`--allow-no-auth` misuse** | Restricted to loopback binds only (hard error otherwise) and clearly logged/printed as a warning when used. Intended for local test harnesses only, never documented as a normal run mode. |
