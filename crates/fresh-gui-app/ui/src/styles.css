@@ -483,6 +483,16 @@ input:not([data-slot="input"]):focus-visible {
   font-family: var(--font-mono);
 }
 
+/* Document map (@replit/codemirror-minimap) — only present when ui.editorMinimap is on. */
+.editor-host .cm-minimap-host {
+  background: var(--editor-gutter-bg);
+  border-left: 1px solid var(--border);
+}
+
+.editor-host .cm-minimap {
+  opacity: 0.92;
+}
+
 .editor-host.md-preview-active .cm-editor {
   display: none !important;
 }

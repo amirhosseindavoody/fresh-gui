@@ -58,6 +58,9 @@ pub struct HelloUi {
     pub show_dotfiles: bool,
     #[serde(default, rename = "showGitDirs")]
     pub show_git_dirs: bool,
+    /// VS Code–style editor document map (minimap). Default off.
+    #[serde(default, rename = "editorMinimap")]
+    pub editor_minimap: bool,
 }
 
 fn hello_ui_theme() -> String {

@@ -36,6 +36,11 @@ export type UiSettings = {
   showDotfiles: boolean;
   /** Show `.git` directories. Independent of `showDotfiles`; default off. */
   showGitDirs: boolean;
+  /**
+   * VS Code–style editor document map (minimap). Off by default; when false the
+   * minimap module is never loaded.
+   */
+  editorMinimap: boolean;
 };
 
 export type HelloUi = {
@@ -50,6 +55,7 @@ export type HelloUi = {
   webgl?: boolean;
   showDotfiles?: boolean;
   showGitDirs?: boolean;
+  editorMinimap?: boolean;
 };
 
 const DEFAULTS: UiSettings = {
@@ -64,6 +70,7 @@ const DEFAULTS: UiSettings = {
   webgl: true,
   showDotfiles: false,
   showGitDirs: false,
+  editorMinimap: false,
 };
 
 export function defaultUiSettings(): UiSettings {
@@ -76,7 +83,7 @@ function clamp(n: number, lo: number, hi: number): number {
 
 function readBool(
   partial: Partial<UiSettings> | HelloUi | null | undefined,
-  key: "webgl" | "showDotfiles" | "showGitDirs",
+  key: "webgl" | "showDotfiles" | "showGitDirs" | "editorMinimap",
   fallback: boolean,
 ): boolean {
   if (!partial || !(key in partial)) return fallback;
@@ -151,6 +158,7 @@ export function normalizeUiSettings(partial: Partial<UiSettings> | HelloUi | nul
     webgl: readBool(partial, "webgl", DEFAULTS.webgl),
     showDotfiles: readBool(partial, "showDotfiles", DEFAULTS.showDotfiles),
     showGitDirs: readBool(partial, "showGitDirs", DEFAULTS.showGitDirs),
+    editorMinimap: readBool(partial, "editorMinimap", DEFAULTS.editorMinimap),
   };
 }
 
