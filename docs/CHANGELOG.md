@@ -2,6 +2,13 @@
 
 ## 2026-07-30
 
+### Markdown WYSIWYG performance (#52)
+
+- Stopped serializing HTML→markdown and rewriting the CodeMirror document on every keystroke; the preview DOM is the live buffer while WYSIWYG is open, and Turndown runs only on save / toggle-to-source / theme refresh.
+- Dirty/pin chrome updates once on first edit instead of re-rendering the tab strip after each debounced sync.
+- Disabled spellcheck on the preview (large KaTeX/Mermaid HTML was a major lag source) and removed the focus inset shadow that repainted the scroll surface.
+- Serialization no longer `cloneNode`s Mermaid SVGs before Turndown.
+
 ### Session state persistence (#55)
 
 - Rust `SessionStore` remains the source of truth for live session UI layout via `layout_set` / attach (host `localStorage` is a cache). Layout blob is now **v4**.
@@ -13,7 +20,7 @@
 ### Markdown WYSIWYG (#52)
 
 - Markdown preview mode (`Mod+Shift+V`) is now an editable WYSIWYG surface with a formatting toolbar (bold/italic/strike/code, headings, lists, quote, code block, link, HR).
-- Edits serialize to GFM markdown (Turndown + GFM plugin) and update the CodeMirror buffer so save / dirty / ADE CAS keep working.
+- Edits stay in the preview DOM while WYSIWYG is open; GFM serialization (Turndown + GFM plugin) runs on save / show-source / theme refresh and then updates the CodeMirror buffer for ADE CAS.
 - KaTeX and Mermaid blocks stay atomic in the preview; double-click edits their source. Task-list checkboxes are interactive.
 - Keyboard shortcuts in the WYSIWYG surface: `Mod+B` / `Mod+I` / `Mod+K` / `Mod+Shift+E` (inline code).
 - Fresh’s Compose/Page View plugin was checked first; it is not available on the ADE path (`runtime` only, plugins off, terminal-cell rendering), so the host preview owns this UX.

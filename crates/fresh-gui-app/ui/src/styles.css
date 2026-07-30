@@ -664,12 +664,15 @@ button.tab-close svg {
   flex: 1;
   min-height: 0;
   overflow: auto;
+  overscroll-behavior: contain;
   padding: 1.25rem 1.5rem 2rem;
   color: var(--text);
   background: var(--bg-elevated);
   font-family: var(--font-ui);
   font-size: 0.95rem;
   line-height: 1.55;
+  /* Isolate scroll/layout work from the rest of the shell (no size containment — flex child). */
+  contain: layout paint style;
 }
 
 .editor-host.md-preview-active .md-preview {
@@ -682,11 +685,13 @@ button.tab-close svg {
 }
 
 .md-preview.md-preview-editable:focus {
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent);
+  /* Avoid inset box-shadow on the scrolling surface (forces large paint on scroll). */
+  outline: none;
 }
 
 .md-preview .md-math {
   cursor: default;
+  contain: layout style;
 }
 
 .md-preview .md-math-display {
@@ -842,6 +847,7 @@ button.tab-close svg {
   padding: 1rem;
   text-align: center;
   overflow: auto;
+  contain: layout style;
 }
 
 .md-preview pre.mermaid svg {

@@ -5,6 +5,10 @@
  * fresh-gui links Fresh with only `runtime` (plugins off) and the host owns
  * interactive editing in CodeMirror / this preview DOM — so editing happens
  * here and serializes back to markdown for the CodeMirror → ADE save path.
+ *
+ * Performance: the preview DOM is the live document while WYSIWYG is open.
+ * Turndown + CodeMirror sync only run on explicit flush (save / leave preview /
+ * theme refresh), not on every keystroke.
  */
 
 import TurndownService from "turndown";
@@ -15,17 +19,23 @@ export type MarkdownWysiwygHandle = {
   /** Re-render from markdown source (resets caret). */
   refresh: (source: string) => void;
   focus: () => void;
-  /** Flush debounced edits into `onChange` immediately. */
-  flush: () => void;
+  /** Serialize the current preview DOM to GFM markdown. */
+  getMarkdown: () => string;
+  /**
+   * Return markdown for CodeMirror. Skips Turndown when the DOM was not edited
+   * since the last refresh.
+   */
+  flush: () => string;
   destroy: () => void;
 };
 
 export type MarkdownWysiwygOptions = {
-  /** Called with markdown after local edits (debounced). */
-  onChange: (markdown: string) => void;
+  /**
+   * Called at most once per edit session when the user first mutates the
+   * preview (dirty/pin chrome). Must stay cheap — no serialization here.
+   */
+  onDirty: () => void;
 };
-
-const SYNC_MS = 220;
 
 function escapeAttr(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
@@ -77,20 +87,18 @@ function createTurndown(): TurndownService {
 
 const turndown = createTurndown();
 
-/** Serialize a preview DOM subtree to GFM markdown. */
+/**
+ * Serialize a preview DOM subtree to GFM markdown.
+ *
+ * Avoids `cloneNode(true)` — Mermaid SVGs can be huge and cloning them freezes
+ * the UI. Turndown only reads the tree; the mermaid rule uses `data-md-source`.
+ */
 export function htmlToMarkdown(root: HTMLElement): string {
-  const clone = root.cloneNode(true) as HTMLElement;
-  // Drop mermaid error chrome; keep data-md-source via the mermaid rule.
-  for (const err of clone.querySelectorAll(".md-mermaid-error")) {
-    err.classList.remove("md-mermaid-error");
-    err.removeAttribute("title");
-  }
-  const md = turndown.turndown(clone);
+  const md = turndown.turndown(root);
   return md.replace(/\n{3,}/g, "\n\n").trimEnd() + (md.trim() ? "\n" : "");
 }
 
 function exec(command: string, value?: string): void {
-  // execCommand remains the practical API for lightweight contenteditable toolbars.
   document.execCommand(command, false, value);
 }
 
@@ -102,7 +110,7 @@ function selectionInside(root: HTMLElement): boolean {
 }
 
 function focusPreview(previewEl: HTMLElement): void {
-  previewEl.focus();
+  previewEl.focus({ preventScroll: true });
 }
 
 function wrapInline(tag: "code" | "strong" | "em" | "del"): void {
@@ -135,39 +143,6 @@ function promptLink(): void {
   const safeLabel = label.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   const safeHref = escapeAttr(href);
   exec("insertHTML", `<a href="${safeHref}">${safeLabel}</a>`);
-}
-
-function editMathNode(
-  el: HTMLElement,
-  previewEl: HTMLElement,
-  commit: (markdown: string) => void,
-  prepareInteractive: () => void,
-): void {
-  const display = el.getAttribute("data-md-display") === "1";
-  const current = el.getAttribute("data-md-math") ?? "";
-  const next = window.prompt(display ? "Edit display math (TeX)" : "Edit inline math (TeX)", current);
-  if (next == null) return;
-  el.setAttribute("data-md-math", next.trim());
-  const md = htmlToMarkdown(previewEl);
-  commit(md);
-  updateMarkdownPreview(previewEl, md);
-  prepareInteractive();
-}
-
-function editMermaidNode(
-  el: HTMLElement,
-  previewEl: HTMLElement,
-  commit: (markdown: string) => void,
-  prepareInteractive: () => void,
-): void {
-  const current = el.getAttribute("data-md-source") ?? "";
-  const next = window.prompt("Edit Mermaid diagram source", current);
-  if (next == null) return;
-  el.setAttribute("data-md-source", next);
-  const md = htmlToMarkdown(previewEl);
-  commit(md);
-  updateMarkdownPreview(previewEl, md);
-  prepareInteractive();
 }
 
 type ToolDef =
@@ -241,7 +216,6 @@ function buildToolbar(previewEl: HTMLElement, after: () => void): HTMLElement {
     btn.setAttribute("aria-label", tool.title);
     btn.textContent = tool.label;
     btn.addEventListener("mousedown", (e) => {
-      // Keep selection in the preview.
       e.preventDefault();
     });
     btn.addEventListener("click", () => run(tool.run));
@@ -252,8 +226,8 @@ function buildToolbar(previewEl: HTMLElement, after: () => void): HTMLElement {
 }
 
 /**
- * Wrap a preview element with a formatting toolbar and enable contenteditable
- * sync back to markdown via `onChange`.
+ * Wrap a preview element with a formatting toolbar and enable contenteditable.
+ * Live typing stays in the DOM; call `flush` / `getMarkdown` to serialize.
  */
 export function mountMarkdownWysiwyg(
   previewEl: HTMLElement,
@@ -268,41 +242,29 @@ export function mountMarkdownWysiwyg(
   shell.className = "md-wysiwyg";
   parent.insertBefore(shell, previewEl);
 
-  let timer: ReturnType<typeof setTimeout> | null = null;
   let destroyed = false;
   let applyingRemote = false;
-  let lastEmitted = "";
+  /** True after a local mutation until flush/refresh. */
+  let domDirty = false;
+  let notifiedDirty = false;
+  /** Last markdown applied via refresh, or produced by flush. */
+  let lastSource = "";
 
-  const emitNow = (): void => {
-    if (destroyed || applyingRemote) return;
-    const md = htmlToMarkdown(previewEl);
-    if (md === lastEmitted) return;
-    lastEmitted = md;
-    opts.onChange(md);
-  };
-
-  const commitMarkdown = (md: string): void => {
+  const notifyDirty = (): void => {
     if (destroyed) return;
-    if (md === lastEmitted) return;
-    lastEmitted = md;
-    opts.onChange(md);
+    domDirty = true;
+    if (notifiedDirty) return;
+    notifiedDirty = true;
+    opts.onDirty();
   };
 
-  const scheduleSync = (): void => {
-    if (destroyed || applyingRemote) return;
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(() => {
-      timer = null;
-      emitNow();
-    }, SYNC_MS);
-  };
-
-  const toolbar = buildToolbar(previewEl, scheduleSync);
+  const toolbar = buildToolbar(previewEl, notifyDirty);
   shell.appendChild(toolbar);
   shell.appendChild(previewEl);
 
   previewEl.contentEditable = "true";
-  previewEl.spellcheck = true;
+  // Spellcheck on large HTML (KaTeX/Mermaid) is a major input/scroll cost.
+  previewEl.spellcheck = false;
   previewEl.tabIndex = 0;
   previewEl.setAttribute("role", "textbox");
   previewEl.setAttribute("aria-multiline", "true");
@@ -330,11 +292,25 @@ export function mountMarkdownWysiwyg(
     }
   };
 
-  const onInput = (): void => scheduleSync();
+  const reRenderFromDom = (): void => {
+    applyingRemote = true;
+    const md = htmlToMarkdown(previewEl);
+    lastSource = md;
+    updateMarkdownPreview(previewEl, md);
+    prepareInteractive();
+    applyingRemote = false;
+  };
+
+  const onInput = (): void => {
+    if (applyingRemote) return;
+    notifyDirty();
+  };
+
   const onCheckbox = (e: Event): void => {
+    if (applyingRemote) return;
     const t = e.target;
     if (!(t instanceof HTMLInputElement) || t.type !== "checkbox") return;
-    scheduleSync();
+    notifyDirty();
   };
 
   const onClick = (e: MouseEvent): void => {
@@ -342,7 +318,6 @@ export function mountMarkdownWysiwyg(
     if (!(t instanceof Element)) return;
     const anchor = t.closest("a");
     if (anchor && previewEl.contains(anchor)) {
-      // Edit mode: don't navigate; Mod/Ctrl-click still opens.
       if (!(e.metaKey || e.ctrlKey)) {
         e.preventDefault();
       }
@@ -355,17 +330,27 @@ export function mountMarkdownWysiwyg(
     const math = t.closest(".md-math");
     if (math instanceof HTMLElement && previewEl.contains(math)) {
       e.preventDefault();
-      applyingRemote = true;
-      editMathNode(math, previewEl, commitMarkdown, prepareInteractive);
-      applyingRemote = false;
+      const display = math.getAttribute("data-md-display") === "1";
+      const current = math.getAttribute("data-md-math") ?? "";
+      const next = window.prompt(
+        display ? "Edit display math (TeX)" : "Edit inline math (TeX)",
+        current,
+      );
+      if (next == null) return;
+      math.setAttribute("data-md-math", next.trim());
+      notifyDirty();
+      reRenderFromDom();
       return;
     }
     const mermaid = t.closest("pre.mermaid");
     if (mermaid instanceof HTMLElement && previewEl.contains(mermaid)) {
       e.preventDefault();
-      applyingRemote = true;
-      editMermaidNode(mermaid, previewEl, commitMarkdown, prepareInteractive);
-      applyingRemote = false;
+      const current = mermaid.getAttribute("data-md-source") ?? "";
+      const next = window.prompt("Edit Mermaid diagram source", current);
+      if (next == null) return;
+      mermaid.setAttribute("data-md-source", next);
+      notifyDirty();
+      reRenderFromDom();
     }
   };
 
@@ -378,22 +363,22 @@ export function mountMarkdownWysiwyg(
       e.preventDefault();
       e.stopPropagation();
       exec("bold");
-      scheduleSync();
+      notifyDirty();
     } else if (key === "i") {
       e.preventDefault();
       e.stopPropagation();
       exec("italic");
-      scheduleSync();
+      notifyDirty();
     } else if (key === "k") {
       e.preventDefault();
       e.stopPropagation();
       promptLink();
-      scheduleSync();
+      notifyDirty();
     } else if (key === "e" && e.shiftKey) {
       e.preventDefault();
       e.stopPropagation();
       wrapInline("code");
-      scheduleSync();
+      notifyDirty();
     }
   };
 
@@ -406,28 +391,28 @@ export function mountMarkdownWysiwyg(
   return {
     refresh(source: string) {
       applyingRemote = true;
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
+      lastSource = source;
       updateMarkdownPreview(previewEl, source);
       prepareInteractive();
-      lastEmitted = htmlToMarkdown(previewEl);
+      domDirty = false;
+      notifiedDirty = false;
       applyingRemote = false;
     },
     focus() {
       focusPreview(previewEl);
     },
+    getMarkdown() {
+      if (!domDirty) return lastSource;
+      return htmlToMarkdown(previewEl);
+    },
     flush() {
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
-      emitNow();
+      if (!domDirty) return lastSource;
+      lastSource = htmlToMarkdown(previewEl);
+      domDirty = false;
+      return lastSource;
     },
     destroy() {
       destroyed = true;
-      if (timer) clearTimeout(timer);
       previewEl.removeEventListener("input", onInput);
       previewEl.removeEventListener("change", onCheckbox);
       previewEl.removeEventListener("click", onClick);
@@ -438,7 +423,6 @@ export function mountMarkdownWysiwyg(
       previewEl.removeAttribute("aria-multiline");
       previewEl.setAttribute("role", "document");
       previewEl.setAttribute("aria-label", "Markdown preview");
-      // Unwrap shell: move preview back, remove toolbar/shell.
       if (shell.parentElement) {
         shell.parentElement.insertBefore(previewEl, shell);
         shell.remove();
