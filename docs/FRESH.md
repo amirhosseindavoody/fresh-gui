@@ -161,7 +161,7 @@ The React shell does not import Fresh. Imperative ADE code in `crates/fresh-gui-
 | `ade/bootstrap.ts` | `editor_open` / `editor_open_link`, buffer edit/save CAS, tab presentation, session layout restore |
 | `layout-persist.ts` | Layout blob v4 schema + restore planner (multi-tab PTYs, editors, explorer snapshots) |
 | `editor.ts` | CodeMirror view; applies snapshot text; reveals line/col from open |
-| `markdown-preview.ts` / `markdown-wysiwyg.ts` | Host markdown render + editable preview; syncs markdown into CodeMirror for ADE save (Fresh Compose plugin is not on the ADE path — see §6) |
+| `markdown-preview.ts` / `markdown-wysiwyg.ts` | Host markdown render + editable preview; DOM is live while open, flushes markdown into CodeMirror for ADE save (Fresh Compose plugin is not on the ADE path — see §6) |
 | `path-link.ts` | Host-side hover detector mirrored for UX; open still goes through backend Fresh `detect_link_at` |
 | `palettes.ts` | Fresh theme colors → CSS tokens |
 | `terminal.ts` / `osc7.ts` | PTY I/O and cwd (feeds open/link `cwd`) |

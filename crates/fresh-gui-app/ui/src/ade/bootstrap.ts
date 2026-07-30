@@ -1011,6 +1011,8 @@ function restyleOpenPanes(
       if (themeChanged) {
         applyEditorTheme(tab.view, resolved);
         if (tab.mdView === "preview" && tab.mdPreviewEl) {
+          // Preserve DOM edits, then re-render for Mermaid theme colors.
+          syncWysiwygToCodeMirror(tab);
           applyEditorMdView(tab, { refresh: true });
         }
       }
@@ -1898,15 +1900,29 @@ function focusActiveTab(): void {
   }
 }
 
+function syncWysiwygToCodeMirror(tab: EditorTab): void {
+  if (!tab.mdWysiwyg) return;
+  const md = tab.mdWysiwyg.flush();
+  tab.suppressChange = true;
+  setEditorDocument(tab.view, md);
+  tab.suppressChange = false;
+}
+
 function applyEditorMdView(tab: EditorTab, opts: { refresh?: boolean } = {}): void {
   const showPreview = tab.mdView === "preview" && !!tab.mdPreviewEl;
   tab.host.classList.toggle("md-preview-active", showPreview);
   if (showPreview && tab.mdPreviewEl) {
     if (!tab.mdWysiwyg) {
       tab.mdWysiwyg = mountMarkdownWysiwyg(tab.mdPreviewEl, {
-        onChange: (markdown) => {
-          if (tab.mdView !== "preview") return;
-          setEditorDocument(tab.view, markdown);
+        onDirty: () => {
+          if (tab.dirty) {
+            tab.preview = false;
+            return;
+          }
+          tab.dirty = true;
+          tab.preview = false;
+          renderTabs();
+          updateStatusRight();
         },
       });
     }
@@ -1914,7 +1930,7 @@ function applyEditorMdView(tab: EditorTab, opts: { refresh?: boolean } = {}): vo
       tab.mdWysiwyg.refresh(tab.view.state.doc.toString());
     }
   } else if (tab.mdWysiwyg) {
-    tab.mdWysiwyg.flush();
+    syncWysiwygToCodeMirror(tab);
   }
 }
 
@@ -1922,7 +1938,7 @@ function toggleMarkdownPreview(): void {
   const active = tabs[activeTabIndex];
   if (active?.kind !== "editor" || !isMarkdownPath(active.path) || !active.mdPreviewEl) return;
   if (active.mdView === "preview" && active.mdWysiwyg) {
-    active.mdWysiwyg.flush();
+    syncWysiwygToCodeMirror(active);
   }
   active.mdView = active.mdView === "preview" ? "source" : "preview";
   applyEditorMdView(active, { refresh: active.mdView === "preview" });
@@ -2199,7 +2215,7 @@ async function saveActiveEditor(): Promise<void> {
   const active = tabs[activeTabIndex];
   if (active?.kind !== "editor" || !active.dirty) return;
   if (active.mdView === "preview" && active.mdWysiwyg) {
-    active.mdWysiwyg.flush();
+    syncWysiwygToCodeMirror(active);
   }
   const text = active.view.state.doc.toString();
   setStatusLeft(`saving ${active.path}…`);
