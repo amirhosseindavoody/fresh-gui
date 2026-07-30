@@ -2,8 +2,9 @@
 
 #![allow(clippy::result_large_err)] // ADE `Message` is the shared error envelope.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use axum::extract::ws::{Message as WsMessage, WebSocket};
@@ -12,12 +13,14 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use base64::Engine;
-use fresh_gui_protocol::{Hello, HelloUi, Message, CAP_EDITOR, CAP_SCENE, PROTOCOL_VERSION};
+use fresh_gui_protocol::{
+    Hello, HelloShortkey, HelloUi, Message, CAP_EDITOR, CAP_SCENE, PROTOCOL_VERSION,
+};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, DEFAULT_SETTINGS_OPEN_PATH};
 use crate::editor_worker::EditorHandle;
 use crate::fs::FsRoot;
 use crate::fs_watch::FsWatchStore;
@@ -35,6 +38,9 @@ pub struct AppState {
     pub config: Arc<std::sync::RwLock<Config>>,
     /// Absolute path to `config.json`.
     pub config_path: PathBuf,
+    /// Ephemeral default-settings catalog buffers: `buffer_id` → temp path.
+    /// Deleted on [`Message::EditorClose`]; save is rejected.
+    pub ephemeral_buffers: Mutex<HashMap<String, PathBuf>>,
 }
 
 pub async fn serve_listener(
@@ -112,9 +118,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     if state.editor.is_none() {
         caps.retain(|c| c != CAP_EDITOR && c != CAP_SCENE);
     }
-    let ui = {
+    let (ui, shortkeys) = {
         let cfg = state.config.read().expect("config lock");
-        HelloUi {
+        let ui = HelloUi {
             theme: cfg.ui.theme.clone(),
             palette: cfg.ui.palette.clone(),
             terminal_font_size: cfg.ui.terminal_font_size,
@@ -128,7 +134,17 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             show_git_dirs: cfg.ui.show_git_dirs,
             editor_minimap: cfg.ui.editor_minimap,
             editor_line_wrap: cfg.ui.editor_line_wrap,
-        }
+        };
+        let shortkeys: Vec<HelloShortkey> = cfg
+            .effective_shortkeys()
+            .into_iter()
+            .map(|sk| HelloShortkey {
+                action: sk.action,
+                shortkey: sk.shortkey,
+                when: sk.when,
+            })
+            .collect();
+        (ui, shortkeys)
     };
     let mut hello = Hello::backend(
         format!("fresh-gui/{}", env!("CARGO_PKG_VERSION")),
@@ -136,6 +152,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     );
     hello.config_path = Some(state.config_path.display().to_string());
     hello.ui = Some(ui);
+    hello.shortkeys = Some(shortkeys);
     let hello = Message::Hello(hello);
     if send_msg(&mut sink, &hello).await.is_err() {
         return;
@@ -629,14 +646,27 @@ async fn handle_client_msg(
                     message: format!("{request_id}: editor capability not available"),
                 });
             };
+            let ephemeral = Config::is_defaults_open_path(&path);
             let resolved = resolve_editor_open(state, &path, cwd.as_deref(), line, column)
                 .await
                 .map_err(|err| Message::Error {
                     code: "editor_open_failed".into(),
                     message: format!("{request_id}: {err:#}"),
                 })?;
-            reply_editor_opened(sink, editor, request_id, resolved.path, preview, resolved.line, resolved.column)
-                .await
+            reply_editor_opened(
+                sink,
+                editor,
+                state,
+                EditorOpenReply {
+                    request_id,
+                    path: resolved.path,
+                    preview,
+                    line: resolved.line,
+                    column: resolved.column,
+                    ephemeral,
+                },
+            )
+            .await
         }
         Message::EditorOpenLink {
             request_id,
@@ -668,11 +698,15 @@ async fn handle_client_msg(
             reply_editor_opened(
                 sink,
                 editor,
-                request_id,
-                resolved.path,
-                preview,
-                resolved.line,
-                resolved.column,
+                state,
+                EditorOpenReply {
+                    request_id,
+                    path: resolved.path,
+                    preview,
+                    line: resolved.line,
+                    column: resolved.column,
+                    ephemeral: false,
+                },
             )
             .await
         }
@@ -684,10 +718,27 @@ async fn handle_client_msg(
                     message: "editor capability not available".into(),
                 });
             };
-            editor.close(buffer_id).await.map_err(|err| Message::Error {
+            editor.close(buffer_id.clone()).await.map_err(|err| Message::Error {
                 code: "editor_close_failed".into(),
                 message: err.to_string(),
             })?;
+            if let Ok(mut map) = state.ephemeral_buffers.lock()
+                && let Some(path) = map.remove(&buffer_id)
+            {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        info!(path = %path.display(), "deleted ephemeral defaults catalog");
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        warn!(
+                            path = %path.display(),
+                            %err,
+                            "failed to delete ephemeral defaults catalog"
+                        );
+                    }
+                }
+            }
             Ok(())
         }
         Message::BufferEdit {
@@ -731,6 +782,19 @@ async fn handle_client_msg(
             base_rev,
         } => {
             require_auth(*authed)?;
+            if state
+                .ephemeral_buffers
+                .lock()
+                .map(|m| m.contains_key(&buffer_id))
+                .unwrap_or(false)
+            {
+                return Err(Message::Error {
+                    code: "defaults_readonly".into(),
+                    message: format!(
+                        "{request_id}: default settings catalog is read-only — copy keys into your user config.json"
+                    ),
+                });
+            }
             let Some(editor) = state.editor.as_ref() else {
                 return Err(Message::Error {
                     code: "editor_unavailable".into(),
@@ -861,9 +925,9 @@ async fn handle_client_msg(
 }
 
 /// Resolve an editor open: settings `config.json` is always allowed (created
-/// on first open, and hydrated with any missing default keys); everything else
-/// uses Fresh path/`cwd` resolution inside the FS sandbox (+ authorized
-/// terminal cwds).
+/// on first open, and hydrated with any missing default keys); the defaults
+/// catalog sentinel materializes a temp JSONC file; everything else uses Fresh
+/// path/`cwd` resolution inside the FS sandbox (+ authorized terminal cwds).
 async fn resolve_editor_open(
     state: &AppState,
     path: &str,
@@ -875,6 +939,20 @@ async fn resolve_editor_open(
         fresh::input::quick_open::parse_path_line_col(path);
     let line = line.or(parsed_line.map(|n| n as u32));
     let column = column.or(parsed_col.map(|n| n as u32));
+
+    if Config::is_defaults_open_path(&path_part) {
+        let temp = Config::materialize_defaults_temp()?;
+        info!(
+            path = %temp.display(),
+            sentinel = DEFAULT_SETTINGS_OPEN_PATH,
+            "opened default settings catalog"
+        );
+        return Ok(crate::path_open::ResolvedOpen {
+            path: temp,
+            line,
+            column,
+        });
+    }
 
     if Config::path_matches(&state.config_path, &path_part)
         || path_part == state.config_path.display().to_string()
@@ -909,19 +987,41 @@ async fn resolve_editor_open(
     crate::path_open::resolve_path_open(&state.fs_root, path, cwd, line, column).await
 }
 
-async fn reply_editor_opened(
-    sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
-    editor: &EditorHandle,
+struct EditorOpenReply {
     request_id: String,
     path: std::path::PathBuf,
     preview: bool,
     line: Option<u32>,
     column: Option<u32>,
+    ephemeral: bool,
+}
+
+async fn reply_editor_opened(
+    sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
+    editor: &EditorHandle,
+    state: &AppState,
+    reply: EditorOpenReply,
 ) -> Result<(), Message> {
-    let opened = editor.open(path, preview).await.map_err(|err| Message::Error {
-        code: "editor_open_failed".into(),
-        message: format!("{request_id}: {err:#}"),
-    })?;
+    let EditorOpenReply {
+        request_id,
+        path,
+        preview,
+        line,
+        column,
+        ephemeral,
+    } = reply;
+    let opened = editor
+        .open(path.clone(), preview)
+        .await
+        .map_err(|err| Message::Error {
+            code: "editor_open_failed".into(),
+            message: format!("{request_id}: {err:#}"),
+        })?;
+    if ephemeral
+        && let Ok(mut map) = state.ephemeral_buffers.lock()
+    {
+        map.insert(opened.buffer_id.clone(), path);
+    }
     send_msg(
         sink,
         &Message::EditorOpened {

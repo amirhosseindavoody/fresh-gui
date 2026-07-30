@@ -268,6 +268,7 @@ async fn run_server_foreground(args: ServeArgs, write_session_meta: bool) -> Res
         watches: FsWatchStore::new(),
         config,
         config_path,
+        ephemeral_buffers: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     let ui_dir = if args.no_ui {

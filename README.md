@@ -110,11 +110,17 @@ All prefs live in one JSONC file on the **backend** host:
   },
   "terminal": {
     "shell": { "command": "zsh", "args": [] }
-  }
+  },
+  // Host chrome shortcuts. Mod = Cmd on macOS, Ctrl elsewhere.
+  // when: global | terminal | editor | fileExplorer (omit = global)
+  "shortkeys": [
+    { "action": "tab.new", "shortkey": "Mod+T", "when": "global" },
+    { "action": "settings.open", "shortkey": "Mod+,", "when": "global" }
+  ]
 }
 ```
 
-Open it from the UI (**Settings** / `Mod+,`), edit, save with `Mod+S`. Theme follows the OS by default; terminal chrome tracks the same theme. Empty shell `args` keep interactive / OSC 7 setup for known shells. Dotfiles and `.git` directories are hidden in the explorer by default; enable them independently via `showDotfiles` / `showGitDirs`. Editor soft wrap follows Fresh `editor.line_wrap` (on by default); toggle with `Alt+Z` or the command palette.
+Open the user file from the UI (**Settings** / `Mod+,`), edit, save with `Mod+S`. **Preferences: Open Default Settings** (command palette) shows the embedded catalog as a temporary read-only file (deleted when the tab closes) so you can see every field and default shortkey. Theme follows the OS by default; terminal chrome tracks the same theme. Empty shell `args` keep interactive / OSC 7 setup for known shells. Dotfiles and `.git` directories are hidden in the explorer by default; enable them independently via `showDotfiles` / `showGitDirs`. Editor soft wrap follows Fresh `editor.line_wrap` (on by default); toggle with `Alt+Z` or the command palette.
 
 ## Develop from source
 

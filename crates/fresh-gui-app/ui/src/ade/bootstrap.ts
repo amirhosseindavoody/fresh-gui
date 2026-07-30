@@ -42,7 +42,13 @@ import {
   removeLeaf,
   splitLeaf,
 } from "../panes";
-import { installShortcuts, type ShortcutHandlers, type ShortcutId } from "../shortcuts";
+import {
+  DEFAULT_SETTINGS_OPEN_PATH,
+  installShortcuts,
+  setActiveShortkeys,
+  type ShortcutHandlers,
+  type ShortcutId,
+} from "../shortcuts";
 import {
   defaultPaletteCommands,
   openGotoFile,
@@ -71,6 +77,7 @@ import {
   loadSettings,
   normalizeUiSettings,
   saveSettings,
+  shortkeysFromConfigText,
   uiSettingsFromConfigText,
   type UiSettings,
 } from "../settings";
@@ -976,7 +983,7 @@ function isConfigPath(path: string): boolean {
   return !!configPath && pathsEqual(path, configPath);
 }
 
-/** Open backend `config.json` as an editor tab (theme, fonts, shell, …). */
+/** Open backend `config.json` as an editor tab (theme, fonts, shell, shortkeys, …). */
 async function openSettingsFile(): Promise<void> {
   if (!connected) {
     setStatusLeft("connect to a backend to edit settings");
@@ -992,6 +999,20 @@ async function openSettingsFile(): Promise<void> {
   }
   await openEditorTab(configPath, false);
   setStatusLeft(`settings: ${configPath} (save with Mod+S)`);
+}
+
+/** Open the embedded default-settings catalog (temp file; deleted on close). */
+async function openDefaultSettingsFile(): Promise<void> {
+  if (!connected) {
+    setStatusLeft("connect to a backend to view default settings");
+    return;
+  }
+  if (!hasEditor) {
+    setStatusLeft("editor unavailable — cannot open default settings");
+    return;
+  }
+  await openEditorTab(DEFAULT_SETTINGS_OPEN_PATH, false);
+  setStatusLeft("default settings (read-only catalog — copy into your user config)");
 }
 
 /** Restyle open terminals/editors to match the resolved chrome theme / palette. */
@@ -2231,6 +2252,7 @@ async function saveActiveEditor(): Promise<void> {
     if (isConfigPath(saved.path) || isConfigPath(active.path)) {
       try {
         applyUiSettings(uiSettingsFromConfigText(text));
+        setActiveShortkeys(shortkeysFromConfigText(text));
         setStatusLeft(
           `saved settings · ${paletteLabel(uiSettings.palette)} · theme ${uiSettings.theme}`,
         );
@@ -2353,6 +2375,7 @@ function onMessage(raw: string): void {
       if (msg.ui) {
         applyUiSettings(normalizeUiSettings(msg.ui));
       }
+      setActiveShortkeys(msg.shortkeys ?? null);
       send({
         type: "hello",
         protocol_version: PROTOCOL_VERSION,
@@ -3016,6 +3039,9 @@ const shortcutHandlers: ShortcutHandlers = {
   "settings.open": () => {
     void openSettingsFile();
   },
+  "settings.openDefaults": () => {
+    void openDefaultSettingsFile();
+  },
 };
 
 function runShortcutId(id: ShortcutId): void {
@@ -3051,6 +3077,13 @@ refreshPaletteCommands = () => {
       label: "Preferences: Color Palette…",
       run: () => openPaletteWithQuery("Color Palette"),
     },
+    {
+      id: "settings.openDefaults.palette",
+      label: "Preferences: Open Default Settings",
+      run: () => {
+        void openDefaultSettingsFile();
+      },
+    },
     ...colorPaletteCommands(),
     {
       id: "tabs.pinActive",
@@ -3080,7 +3113,19 @@ refreshPaletteCommands = () => {
   ]);
 };
 
-installShortcuts(shortcutHandlers);
+installShortcuts(shortcutHandlers, {
+  getContext: () => {
+    const active = tabs[activeTabIndex];
+    const surface =
+      active?.kind === "terminal" ? "terminal" : active?.kind === "editor" ? "editor" : "none";
+    const fileExplorerFocused = !!(
+      treeEl &&
+      document.activeElement &&
+      treeEl.contains(document.activeElement)
+    );
+    return { surface, fileExplorerFocused };
+  },
+});
 refreshPaletteCommands();
 setGotoFileHandler((path) => {
   void openEditorTab(path, {

@@ -1,6 +1,6 @@
 /** ADE WebSocket message shapes used by the host UI (mirrors fresh-gui-protocol). */
 
-export const PROTOCOL_VERSION = "0.4.0";
+export const PROTOCOL_VERSION = "0.5.0";
 
 export type FsKind = "file" | "dir" | "symlink" | "other";
 
@@ -110,6 +110,13 @@ export type HelloUiMsg = {
   editorLineWrap?: boolean;
 };
 
+/** One shortkey from `Hello.shortkeys` / `config.json`. */
+export type HelloShortkeyMsg = {
+  action: string;
+  shortkey: string;
+  when?: string;
+};
+
 export type ServerMessage =
   | {
       type: "hello";
@@ -119,6 +126,7 @@ export type ServerMessage =
       capabilities: string[];
       config_path?: string;
       ui?: HelloUiMsg;
+      shortkeys?: HelloShortkeyMsg[];
     }
   | { type: "auth_ok" }
   | { type: "auth_error"; message: string }

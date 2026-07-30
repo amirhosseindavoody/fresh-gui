@@ -79,7 +79,7 @@ Logistics template: `pixi.toml` + Cargo workspace under `crates/`, CalVer `YYYY.
 
 ## 5. Protocol
 
-Wire format: **JSON text frames** over WebSocket at `/ws`. Protocol version is negotiated in `hello` and must match exactly (`PROTOCOL_VERSION`, currently `0.4.0`). PTY payloads use standard base64 in `pty_data`. Message shapes live in `fresh-gui-protocol` and are mirrored in the host UI (`ui/src/protocol.ts`).
+Wire format: **JSON text frames** over WebSocket at `/ws`. Protocol version is negotiated in `hello` and must match exactly (`PROTOCOL_VERSION`, currently `0.5.0`). PTY payloads use standard base64 in `pty_data`. Message shapes live in `fresh-gui-protocol` and are mirrored in the host UI (`ui/src/protocol.ts`).
 
 This is a **new ADE protocol**, not Fresh `--web` scene. Fresh Editor is an optional capability on top of PTY / session / FS.
 
@@ -132,7 +132,7 @@ When enabled, Fresh `Editor` runs in-process on a dedicated `!Send` thread (`Edi
 
 ### Config
 
-Backend `config.json` (JSONC) holds UI prefs (theme, palette, fonts, explorer visibility, minimap, editor line wrap) and default shell. Snapshot is sent in `Hello.ui`. Settings / `Mod+,` opens the file in an editor tab; saving reloads live prefs. Missing keys are filled without overriding existing values.
+Backend `config.json` (JSONC) holds UI prefs (theme, palette, fonts, explorer visibility, minimap, editor line wrap), default shell, and host `shortkeys` (action + shortkey chord + when). Snapshot is sent in `Hello.ui` / `Hello.shortkeys`. Settings / `Mod+,` opens the user file in an editor tab; **Preferences: Open Default Settings** materializes the embedded catalog (`crates/fresh-gui/defaults/config.json`) as a temp file that is deleted on close (save rejected). Saving the user file reloads live prefs. Missing keys are filled without overriding existing values.
 
 ### Packaging
 

@@ -113,7 +113,7 @@ Capability `editor` (and optional `scene`) on the same `/ws` connection as PTY/F
 | Close | `editor_close` (ADE tracking) |
 | Scene | `scene_get` → `scene_snapshot` (open-buffer list for chrome — **not** Fresh `--web` cell scene) |
 
-Open replies are produced in `server.rs` (`reply_editor_opened`). Settings `config.json` is a special open path: the file is created/hydrated if missing, then opened like any other buffer; a successful save of that path reloads live UI prefs.
+Open replies are produced in `server.rs` (`reply_editor_opened`). Settings `config.json` is a special open path: the file is created/hydrated if missing, then opened like any other buffer; a successful save of that path reloads live UI prefs. `fresh-gui://defaults/config.json` materializes the embedded defaults catalog as a temp file (deleted on `editor_close`; save rejected).
 
 ## 5. Path resolution and link open
 
@@ -173,9 +173,11 @@ Workspace rule: prefer extending Fresh-backed backend surfaces over inventing a 
 | Location | Relation to Fresh |
 |----------|-------------------|
 | `~/.config/fresh-gui/config.json` | fresh-gui daemon config (JSONC) |
+| `crates/fresh-gui/defaults/config.json` | Embedded catalog (`include_str!`); temp open via `fresh-gui://defaults/config.json` |
 | `terminal.shell` | Same field shape as Fresh shell config; empty `args` keep interactive + OSC 7 setup |
 | `ui.editorLineWrap` | Host soft wrap; mirrors Fresh `editor.line_wrap` (default on). Toggle via `Alt+Z` / command palette |
 | `ui.*` | Host-only prefs → `Hello.ui` |
+| `shortkeys` | Host chrome bindings (Fresh-style `action` + `when`; chord as `shortkey`) → `Hello.shortkeys` |
 | Fresh editor state dir | Ephemeral under `/tmp/fresh-gui-editor-{pid}` for the embedded `Editor` |
 | Fresh user config | Not loaded wholesale into the ADE daemon |
 

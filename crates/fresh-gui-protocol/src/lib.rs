@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 /// Protocol version negotiated in [`Hello`].
-pub const PROTOCOL_VERSION: &str = "0.4.0";
+pub const PROTOCOL_VERSION: &str = "0.5.0";
 
 pub const CAP_PING: &str = "ping";
 pub const CAP_PTY: &str = "pty";
@@ -31,6 +31,18 @@ pub struct Hello {
     /// Host UI prefs snapshot from that config (theme / fonts / webgl). Backend only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<HelloUi>,
+    /// Effective host shortkeys (user list or embedded defaults). Backend only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shortkeys: Option<Vec<HelloShortkey>>,
+}
+
+/// One shortcut binding mirrored from `config.json` → `Hello.shortkeys`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HelloShortkey {
+    pub action: String,
+    pub shortkey: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
 }
 
 /// UI section mirrored from `config.json` → `Hello.ui`.
@@ -446,6 +458,7 @@ impl Hello {
             capabilities,
             config_path: None,
             ui: None,
+            shortkeys: None,
         }
     }
 
@@ -457,6 +470,7 @@ impl Hello {
             capabilities,
             config_path: None,
             ui: None,
+            shortkeys: None,
         }
     }
 
@@ -503,7 +517,7 @@ mod tests {
         let json = Message::Hello(hello).to_json().unwrap();
         assert!(json.contains("\"editor\""));
         assert!(json.contains("\"scene\""));
-        assert!(json.contains("0.4.0"));
+        assert!(json.contains("0.5.0"));
     }
 
     #[test]
