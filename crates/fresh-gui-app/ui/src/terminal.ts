@@ -235,4 +235,11 @@ export function applyTerminalFontSize(bundle: TermBundle, size: number): void {
   } catch {
     /* ignore */
   }
+  // WebGL / canvas cells may keep stale glyph atlases until a full refresh.
+  try {
+    const rows = bundle.term.rows;
+    if (rows > 0) bundle.term.refresh(0, rows - 1);
+  } catch {
+    /* ignore */
+  }
 }

@@ -7,7 +7,8 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview --host 127.0.0.1 --port 1420"
+    "preview": "vite preview --host 127.0.0.1 --port 1420",
+    "test": "bun test src"
   },
   "dependencies": {
     "@codemirror/commands": "^6.8.1",

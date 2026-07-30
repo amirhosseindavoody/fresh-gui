@@ -53,6 +53,17 @@ import {
   type PaletteCommand,
 } from "../palette";
 import { VirtualTree } from "../tree";
+import {
+  LAYOUT_VERSION,
+  leafCwdsFromTree,
+  normalizeExplorerRootKey,
+  planSessionRestore,
+  setLeafCwdInTree,
+  stampLeafCwds,
+  type ExplorerSnapshot,
+  type LayoutBlob,
+  type PlannedTerminalRestore,
+} from "../layout-persist";
 import { applyPalette, listPalettes, paletteLabel, type PaletteId } from "../palettes";
 import { getResolvedTheme, initTheme, onResolvedThemeChange, resolveTheme } from "../theme";
 import {
@@ -105,6 +116,9 @@ type OpenEditorOpts = {
   cwd?: string;
   line?: number;
   column?: number;
+  pinned?: boolean;
+  /** Bulk session restore: skip activate / persist / focus. */
+  silent?: boolean;
 };
 
 interface TerminalTab {
@@ -139,24 +153,6 @@ interface EditorTab {
 
 type Tab = TerminalTab | EditorTab;
 type SplitMode = "horizontal" | "vertical";
-
-interface LayoutBlob {
-  version?: number;
-  activeTab?: number;
-  sidebarWidth?: number;
-  sidebarCollapsed?: boolean;
-  tabs?: Array<
-    | {
-        kind: "terminal";
-        id: string;
-        title: string;
-        paneTree: PaneNode;
-        activeLeafId: string;
-        pinned?: boolean;
-      }
-    | { kind: "editor"; id: string; path: string; preview?: boolean; pinned?: boolean }
-  >;
-}
 
 /** Deferred intent consumed by the next `pty_opened` reply (requests are FIFO on one socket). */
 type PtyIntent = { kind: "newTab" } | { kind: "split"; tabId: string; leafId: string; direction: SplitDir };
@@ -242,6 +238,11 @@ const WATCH_IGNORE_DIRS = new Set([
 
 let tabs: Tab[] = [];
 let activeTabIndex = 0;
+/** Suppress layout_set / localStorage writes during bulk session restore. */
+let restoringSession = false;
+/** Per view-root explorer expanded/scroll (also written into the layout blob). */
+const explorerByRoot = new Map<string, ExplorerSnapshot>();
+let explorerPersistTimer: ReturnType<typeof setTimeout> | null = null;
 
 function setStatusLeft(text: string): void {
   statusLeft.textContent = text;
@@ -311,8 +312,16 @@ function applySidebarFromBlob(layout: LayoutBlob): void {
 }
 
 function persistLayout(): void {
+  if (restoringSession) return;
+  rememberCurrentExplorerUi();
+  const cwdByLeaf = new Map<string, string | undefined>();
+  for (const t of tabs) {
+    if (t.kind !== "terminal") continue;
+    for (const [id, bundle] of t.leaves) cwdByLeaf.set(id, bundle.cwd);
+  }
+  const explorerEntries = Object.fromEntries(explorerByRoot.entries());
   const layout: LayoutBlob = {
-    version: 3,
+    version: LAYOUT_VERSION,
     activeTab: activeTabIndex,
     sidebarWidth: Number.parseInt(
       getComputedStyle(document.documentElement).getPropertyValue("--sidebar-width") || "260",
@@ -325,16 +334,52 @@ function persistLayout(): void {
             kind: "terminal",
             id: t.id,
             title: t.title,
-            paneTree: t.paneTree,
+            paneTree: stampLeafCwds(t.paneTree, cwdByLeaf),
             activeLeafId: t.activeLeafId,
             pinned: t.pinned,
           }
         : { kind: "editor", id: t.id, path: t.path, preview: t.preview, pinned: t.pinned },
     ),
+    explorerByRoot: Object.keys(explorerEntries).length > 0 ? explorerEntries : undefined,
   };
   const json = JSON.stringify(layout);
   localStorage.setItem(LAYOUT_KEY, json);
   if (sessionId) send({ type: "layout_set", layout: json });
+}
+
+function rememberCurrentExplorerUi(): void {
+  let root: string;
+  let snap: ExplorerSnapshot;
+  try {
+    root = tree.getRootPath();
+    if (!root) return;
+    snap = tree.captureExplorerUi();
+  } catch {
+    return;
+  }
+  explorerByRoot.set(normalizeExplorerRootKey(root), snap);
+}
+
+function scheduleExplorerPersist(): void {
+  rememberCurrentExplorerUi();
+  if (explorerPersistTimer) clearTimeout(explorerPersistTimer);
+  explorerPersistTimer = setTimeout(() => {
+    explorerPersistTimer = null;
+    persistLayout();
+  }, 250);
+}
+
+function loadExplorerSnapshotsFromBlob(blob: LayoutBlob): void {
+  explorerByRoot.clear();
+  const raw = blob.explorerByRoot;
+  if (!raw || typeof raw !== "object") return;
+  for (const [key, snap] of Object.entries(raw)) {
+    if (!snap || !Array.isArray(snap.expanded)) continue;
+    explorerByRoot.set(normalizeExplorerRootKey(key), {
+      expanded: snap.expanded.filter((p): p is string => typeof p === "string"),
+      scrollTop: typeof snap.scrollTop === "number" ? Math.max(0, snap.scrollTop) : 0,
+    });
+  }
 }
 
 function send(msg: ClientMessage): void {
@@ -668,15 +713,18 @@ function syncExplorerToCwd(cwd: string): void {
   const gen = explorerSyncGen;
   void (async () => {
     try {
+      rememberCurrentExplorerUi();
       await fsAuthorize(cwd);
       if (gen !== explorerSyncGen) return;
-      const ok = await tree.setViewRoot(cwd);
+      const snap = explorerByRoot.get(normalizeExplorerRootKey(cwd)) ?? null;
+      const ok = await tree.setViewRoot(cwd, { restore: snap });
       if (gen !== explorerSyncGen) return;
       if (!ok) {
         setStatusLeft(`explorer stuck at ${tree.getRootPath() || "?"} · want ${cwd}`);
         return;
       }
       updateExplorerTitle(tree.getRootPath() || cwd);
+      rememberCurrentExplorerUi();
     } catch (err) {
       if (gen !== explorerSyncGen) return;
       setStatusLeft(
@@ -702,6 +750,7 @@ function applyLeafCwd(tab: TerminalTab, ptyId: string, cwd: string): void {
   if (!bundle) return;
   if (bundle.cwd === cwd) return;
   bundle.cwd = cwd;
+  tab.paneTree = setLeafCwdInTree(tab.paneTree, ptyId, cwd);
 
   const follow = tab.activeLeafId === ptyId || tab.leaves.size === 1;
   if (follow) {
@@ -720,6 +769,7 @@ function applyLeafCwd(tab: TerminalTab, ptyId: string, cwd: string): void {
     const label = el.querySelector(".pane-label");
     if (label) label.textContent = titleFromCwd(cwd, tab.title);
   });
+  persistLayout();
 }
 
 function syncSearchTarget(): void {
@@ -2093,21 +2143,25 @@ async function presentOpenedBuffer(
     mdPreviewEl,
     mdWysiwyg: null,
     suppressChange: false,
-    pinned: false,
+    pinned: !!opts.pinned,
   };
 
   insertTab(tabRef);
-  activeTabIndex = tabs.indexOf(tabRef);
+  if (!opts.silent) {
+    activeTabIndex = tabs.indexOf(tabRef);
+  }
   if (configPath && pathsEqual(opened.path, configPath)) {
     configPath = opened.path;
   }
-  renderAll();
-  persistLayout();
-  focusActiveTab();
+  if (!opts.silent) {
+    renderAll();
+    persistLayout();
+    focusActiveTab();
+  }
   const jumpLine = opened.line ?? opts.line;
   const jumpCol = opened.column ?? opts.column;
   if (jumpLine != null) revealEditorLocation(view, jumpLine, jumpCol);
-  setStatusLeft(`opened ${opened.path}`);
+  if (!opts.silent) setStatusLeft(`opened ${opened.path}`);
 }
 
 async function openEditorTab(path: string, opts: boolean | OpenEditorOpts = {}): Promise<void> {
@@ -2177,51 +2231,94 @@ async function saveActiveEditor(): Promise<void> {
   }
 }
 
+/** Restore one multi-pane terminal tab from a planned layout entry. */
+function restoreTerminalTabFromPlan(plan: PlannedTerminalRestore): void {
+  const leaves = new Map<string, TermBundle>();
+  const cwds = leafCwdsFromTree(plan.paneTree);
+  for (const id of plan.leafIds) {
+    const bundle = makeTerminal();
+    const cwd = cwds.get(id);
+    if (cwd) {
+      bundle.cwd = cwd;
+      lastTerminalCwd = cwd;
+    }
+    wireTerminalLeaf(id, bundle);
+    leaves.set(id, bundle);
+  }
+  const tab: TerminalTab = {
+    kind: "terminal",
+    id: plan.id || nextTabId(),
+    title: plan.title || titleFromCwd(cwds.get(plan.activeLeafId), "sh"),
+    paneTree: plan.paneTree,
+    leaves,
+    activeLeafId: plan.activeLeafId,
+    pinned: plan.pinned,
+  };
+  insertTab(tab);
+}
+
+/**
+ * Rebuild tabs after `session_attach` from the Rust-owned layout blob
+ * (localStorage is only a fallback when the session has no layout yet).
+ */
+async function restoreSessionFromBlob(blob: LayoutBlob, ptyList: PtyInfo[]): Promise<boolean> {
+  const plan = planSessionRestore(
+    blob,
+    ptyList.map((p) => p.id),
+    { restoreEditors: hasEditor },
+  );
+  if (plan.items.length === 0) return false;
+
+  restoringSession = true;
+  try {
+    for (const item of plan.items) {
+      if (item.kind === "terminal") {
+        restoreTerminalTabFromPlan(item);
+      } else if (item.kind === "orphan") {
+        const bundle = makeTerminal();
+        createTerminalTab(item.ptyId, bundle, { silentActivate: true });
+      } else if (item.kind === "editor") {
+        try {
+          await openEditorTab(item.path, {
+            preview: item.preview,
+            pinned: item.pinned,
+            silent: true,
+          });
+        } catch {
+          /* path may be gone; skip */
+        }
+      }
+    }
+  } finally {
+    restoringSession = false;
+  }
+
+  if (tabs.length === 0) return false;
+
+  normalizeTabOrder();
+  activeTabIndex = Math.min(Math.max(plan.activeTab, 0), tabs.length - 1);
+  renderAll();
+  persistLayout();
+  requestAnimationFrame(() => {
+    fitActiveLeaves();
+    focusActiveTab();
+  });
+  return true;
+}
+
 function afterSessionReady(): void {
   connected = true;
   setWorkspaceControls(true);
   updateStatusRight();
   loadRoot()
-    .then(() => startFsWatch())
-    .catch(() => startFsWatch());
-}
-
-/** Try to restore a single multi-pane terminal tab whose leaf ids exactly match the reattached ptys. */
-function restoreTerminalTabsFromBlob(blob: LayoutBlob, ptyList: PtyInfo[]): boolean {
-  const ptyIds = ptyList.map((p) => p.id);
-  const version = blob.version ?? 0;
-  if (ptyIds.length === 0 || (version !== 2 && version !== 3) || !Array.isArray(blob.tabs)) {
-    return false;
-  }
-  try {
-    for (const tb of blob.tabs) {
-      if (tb.kind !== "terminal") continue;
-      const leafIds = collectLeafIds(tb.paneTree);
-      const sameSet = leafIds.length === ptyIds.length && leafIds.every((id) => ptyIds.includes(id));
-      if (!sameSet) continue;
-      const leaves = new Map<string, TermBundle>();
-      for (const id of leafIds) {
-        const bundle = makeTerminal();
-        wireTerminalLeaf(id, bundle);
-        leaves.set(id, bundle);
-      }
-      const activeLeafId = leafIds.includes(tb.activeLeafId) ? tb.activeLeafId : leafIds[0];
-      const tab: TerminalTab = {
-        kind: "terminal",
-        id: tb.id || nextTabId(),
-        title: tb.title || "sh 1",
-        paneTree: tb.paneTree,
-        leaves,
-        activeLeafId,
-        pinned: !!tb.pinned,
-      };
-      insertTab(tab);
-      return true;
-    }
-  } catch {
-    /* malformed layout blob; fall back to one tab per pty */
-  }
-  return false;
+    .then(() => {
+      syncExplorerToActiveContext();
+      startFsWatch();
+    })
+    .catch(() => {
+      syncExplorerToActiveContext();
+      startFsWatch();
+    });
 }
 
 function onMessage(raw: string): void {
@@ -2291,26 +2388,41 @@ function onMessage(raw: string): void {
         blob = readLayoutBlob();
       }
       applySidebarFromBlob(blob);
+      loadExplorerSnapshotsFromBlob(blob);
 
       const ptyList = msg.ptys || [];
-      const restored = restoreTerminalTabsFromBlob(blob, ptyList);
-      if (!restored) {
-        for (const p of ptyList) {
-          const bundle = makeTerminal();
-          createTerminalTab(p.id, bundle, { silentActivate: true });
+      void (async () => {
+        const restored = await restoreSessionFromBlob(blob, ptyList);
+        if (!restored) {
+          restoringSession = true;
+          try {
+            for (const p of ptyList) {
+              const bundle = makeTerminal();
+              createTerminalTab(p.id, bundle, { silentActivate: true });
+            }
+          } finally {
+            restoringSession = false;
+          }
         }
-      }
 
-      if (terminalTabs().length === 0) {
-        requestNewPty(80, 24, { kind: "newTab" });
-      } else {
-        activeTabIndex = Math.min(Math.max(blob.activeTab ?? 0, 0), tabs.length - 1);
-        renderAll();
-        persistLayout();
-      }
-      afterSessionReady();
-      setStatusLeft(`reattached ${sessionId} (${ptyList.length} ptys)`);
-      updateStatusRight();
+        if (terminalTabs().length === 0 && tabs.every((t) => t.kind !== "terminal")) {
+          // Prefer at least one terminal when the session had only editors or empty layout.
+          if (tabs.length === 0) {
+            requestNewPty(80, 24, { kind: "newTab" });
+          } else {
+            renderAll();
+            persistLayout();
+          }
+        } else if (!restored) {
+          activeTabIndex = Math.min(Math.max(blob.activeTab ?? 0, 0), Math.max(0, tabs.length - 1));
+          renderAll();
+          persistLayout();
+          syncExplorerToActiveContext();
+        }
+        afterSessionReady();
+        setStatusLeft(`reattached ${sessionId} (${ptyList.length} ptys)`);
+        updateStatusRight();
+      })();
       break;
     }
     case "pty_opened": {
@@ -2825,6 +2937,7 @@ export function bootstrapAde(): void {
     noteInteraction: () => noteTreeInteraction(),
     onRootChange: (rootPath) => updateExplorerTitle(rootPath),
     onContextMenu: (entry, x, y) => openPathContextMenu(entry.path, x, y, entry.kind),
+    onExplorerUiChange: () => scheduleExplorerPersist(),
   });
   tree.setVisibility({
     showDotfiles: uiSettings.showDotfiles,
