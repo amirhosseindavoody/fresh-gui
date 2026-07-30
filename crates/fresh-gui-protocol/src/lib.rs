@@ -316,6 +316,16 @@ pub enum Message {
         request_id: String,
         entries: Vec<FsEntry>,
     },
+    /// Client → backend: permanently delete one or more paths under the FS sandbox.
+    FsDelete {
+        request_id: String,
+        paths: Vec<String>,
+    },
+    /// Backend → client after a successful delete.
+    FsDeleted {
+        request_id: String,
+        paths: Vec<String>,
+    },
     /// Client → backend: open a path in the Fresh editor (capability `editor`).
     ///
     /// `path` may include a Fresh-style `:line` / `:line:col` suffix. Optional
@@ -574,6 +584,11 @@ mod tests {
             destination: "/tmp/out".into(),
         };
         assert_eq!(Message::from_json(&mv.to_json().unwrap()).unwrap(), mv);
+        let del = Message::FsDelete {
+            request_id: "c4".into(),
+            paths: vec!["/tmp/a.txt".into()],
+        };
+        assert_eq!(Message::from_json(&del.to_json().unwrap()).unwrap(), del);
     }
 
     #[test]

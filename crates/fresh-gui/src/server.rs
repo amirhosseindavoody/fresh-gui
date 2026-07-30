@@ -585,6 +585,24 @@ async fn handle_client_msg(
                 }),
             }
         }
+        Message::FsDelete { request_id, paths } => {
+            require_auth(*authed)?;
+            match state.fs_root.delete_paths(&paths).await {
+                Ok(paths) => {
+                    send_msg(sink, &Message::FsDeleted { request_id, paths })
+                        .await
+                        .map_err(|_| Message::Error {
+                            code: "send_failed".into(),
+                            message: "failed to send FsDeleted".into(),
+                        })?;
+                    Ok(())
+                }
+                Err(err) => Err(Message::Error {
+                    code: "fs_delete_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                }),
+            }
+        }
         Message::EditorOpen {
             request_id,
             path,
