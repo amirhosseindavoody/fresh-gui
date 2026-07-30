@@ -28,6 +28,8 @@ Session files (private to the user):
 
 (Fallbacks: `/tmp/fresh-gui-$UID/` and `~/.local/state/fresh-gui/`.)
 
+The daemon samples its own RSS about every 30 seconds and, on graceful stop, logs average and peak resident memory (MB). Child PTY processes are excluded.
+
 Open the printed **Local access** URL (includes `?token=`) in a browser. A bearer token is always required (auto-generated when unset). Prefer `FRESH_GUI_TOKEN` over `--token` so the secret does not appear in `ps`. After connect, the UI caches the token in tab `sessionStorage` so a reload can re-auth and reattach without keeping `?token=` in the URL.
 
 ## Install

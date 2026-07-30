@@ -42,6 +42,8 @@ Open the **Local access** URL (token is embedded; the UI auto-connects). A beare
 
 Only **one background session per user** is allowed (exclusive lock under `$XDG_RUNTIME_DIR/fresh-gui/`). Closing the launching terminal does not stop the session.
 
+While the daemon runs it samples its own resident memory (`VmRSS` / `VmHWM` via `/proc/self/status`) about every 30 seconds. On graceful shutdown (`fresh-gui close` / SIGTERM / Ctrl-C) it appends a structured log line with **average** and **peak** RSS in MB. PTY child shells are not included — only the backend process (server + embedded Fresh editor).
+
 Works on older enterprise glibc (2.28+).
 
 ### From your laptop over SSH
