@@ -9,7 +9,7 @@ For every new feature or behavior change in **fresh-gui**, treat [Fresh](https:/
 
 ## Required approach
 
-1. **Search Fresh first** — Before designing a custom implementation, inspect `vendor/fresh` (config, actions, buffers, PTY, FS/explorer, LSP, search, keybindings, plugins, etc.) and how `crates/fresh-gui-backend` already embeds it (`editor_worker`, protocol messages).
+1. **Search Fresh first** — Before designing a custom implementation, inspect `vendor/fresh` (config, actions, buffers, PTY, FS/explorer, LSP, search, keybindings, plugins, etc.) and how `crates/fresh-gui` already embeds it (`editor_worker`, protocol messages). See [docs/FRESH.md](../../docs/FRESH.md).
 2. **Reuse or thin-wrap** — Prefer:
    - Calling into Fresh APIs / types already linked by the backend
    - Extending the host↔backend protocol to surface a Fresh capability
@@ -27,8 +27,10 @@ For every new feature or behavior change in **fresh-gui**, treat [Fresh](https:/
 
 - `vendor/fresh/crates/fresh-editor/` — editor core, config, actions, services
 - `vendor/fresh/crates/fresh-core/` and sibling crates — shared primitives
-- `crates/fresh-gui-backend/src/editor_worker.rs` — in-process Fresh embedding
+- `crates/fresh-gui/src/editor_worker.rs` — in-process Fresh embedding
+- `crates/fresh-gui/src/path_open.rs` — Fresh path_link / `:line:col` resolve
 - `crates/fresh-gui-protocol/` — existing host↔remote surface area
-- `docs/DESIGN.md` — “Fresh as backend of truth” architecture
+- `docs/FRESH.md` — Fresh integration architecture
+- `docs/DESIGN.md` — product architecture overview
 
 Host UI (`crates/fresh-gui-app/ui`) should remain a client of the protocol and Fresh-backed services, not a second editor engine.

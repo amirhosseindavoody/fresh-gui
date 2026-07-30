@@ -218,7 +218,8 @@ Hybrid model: React mounts the shell; `bootstrapAde()` binds once to stable DOM 
 
 ## 10. References
 
-- [DESIGN.md](./DESIGN.md) — architecture, protocol, Fresh coupling.
+- [DESIGN.md](./DESIGN.md) — architecture, protocol, Fresh coupling overview.
+- [FRESH.md](./FRESH.md) — how the daemon embeds Fresh editor libraries.
 - [SECURITY.md](./SECURITY.md) — token + SSH tunnel access model.
 - [WINDOWS.md](./WINDOWS.md) — Tauri packaging.
 - [Terax](https://github.com/crynta/terax-ai) — layout, tabs, terminal/editor stacks, polish bar.
