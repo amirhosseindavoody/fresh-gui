@@ -30,13 +30,16 @@ clippy = "cargo clippy --workspace --exclude fresh-gui-desktop --all-targets -- 
 fmt = "cargo fmt --all"
 fmt-check = "cargo fmt --all -- --check"
 backend = "cargo run -p fresh-gui --"
-# Build UI then run backend (serves ui/dist + /ws on one port).
+# Build UI then start a detached background session (prints URL, returns).
 serve = { depends-on = ["ui-build"], cmd = "cargo run -p fresh-gui --" }
-# Same as `serve`, but Cargo `--release` into `target/release/` so you can
-# exercise release-like performance locally. Incremental: small Rust changes
-# rebuild only what changed — no full `pixi build` / package from scratch.
+# Same as `serve`, but Cargo `--release`. Detaches like a normal `fresh-gui`
+# start (prints URL and returns). Use `--foreground` when you want logs in the
+# terminal: `pixi run backend -- --foreground`.
 # (Packaged installs still use thin LTO + strip via `recipe/build.sh`.)
 serve-release = { depends-on = ["ui-build"], cmd = "cargo run --release -p fresh-gui --" }
+# Stop the current user's detached session.
+close = "cargo run -p fresh-gui -- close"
+status = "cargo run -p fresh-gui -- status"
 build-release = "cargo build --release -p fresh-gui"
 backend-release = "cargo run --release -p fresh-gui --"
 app = "cargo run -p fresh-gui-app --"

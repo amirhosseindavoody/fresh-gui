@@ -1,6 +1,11 @@
 //! fresh-gui — remote ADE daemon (PTY + FS + optional Fresh editor).
+//!
+//! Default UX: start a **background** per-user session, print the access URL,
+//! and return the terminal. Re-running `fresh-gui` prints status; `fresh-gui close`
+//! stops the session.
 
 mod config;
+mod daemon;
 mod editor_worker;
 mod fs;
 mod fs_watch;
@@ -15,10 +20,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing::{info, warn};
 
 use crate::config::Config;
+use crate::daemon::{
+    close_session, live_session, print_session_info, serve_args_for_child, spawn_daemon,
+    wait_until_ready, write_meta, SessionLock, SessionMeta, SessionPaths,
+};
 use crate::editor_worker::EditorHandle;
 use crate::fs::FsRoot;
 use crate::fs_watch::FsWatchStore;
@@ -29,8 +38,37 @@ use crate::session::SessionStore;
 const LISTEN_PORT_FALLBACK_SPAN: u16 = 64;
 
 #[derive(Debug, Parser)]
-#[command(name = "fresh-gui", version, about = "Remote daemon for fresh-gui")]
-struct Args {
+#[command(
+    name = "fresh-gui",
+    version,
+    about = "Remote daemon for fresh-gui — one background session per user"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    serve: ServeArgs,
+
+    /// Internal: run as the background server process (stdio already redirected).
+    #[arg(long = "daemon-serve", hide = true, env = "FRESH_GUI_DAEMON_SERVE")]
+    daemon_serve: bool,
+
+    /// Run the server in the foreground (do not detach). For tests / debugging.
+    #[arg(long, env = "FRESH_GUI_FOREGROUND")]
+    foreground: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Stop the background session for this user.
+    Close,
+    /// Print URL / token / log path for the running session (if any).
+    Status,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct ServeArgs {
     /// Listen address (default loopback). Prefer SSH tunnels over non-loopback binds.
     /// If the port is busy, the next free ports on the same host are tried
     /// (unless `--strict-listen`).
@@ -43,7 +81,7 @@ struct Args {
 
     /// Shared auth token (also `FRESH_GUI_TOKEN`). Prefer the env var over this flag so
     /// the secret does not appear in `ps` output. When unset, a random token is
-    /// generated for this process (printed once in the startup banner).
+    /// generated for this process (printed once / stored in the private session meta).
     #[arg(long, env = "FRESH_GUI_TOKEN")]
     token: Option<String>,
 
@@ -81,16 +119,107 @@ struct Args {
     config: Option<PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Command::Close) => {
+            let paths = SessionPaths::resolve()?;
+            close_session(&paths)
+        }
+        Some(Command::Status) => {
+            let paths = SessionPaths::resolve()?;
+            match live_session(&paths)? {
+                Some(meta) => {
+                    print_session_info(&meta);
+                    Ok(())
+                }
+                None => {
+                    println!("No fresh-gui session is running.");
+                    println!("Start one with: fresh-gui");
+                    Ok(())
+                }
+            }
+        }
+        None if cli.daemon_serve => {
+            // Background child: lock + serve until SIGTERM.
+            // Stdio is already redirected to the session log by the parent spawn.
+            init_tracing_stdout();
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("tokio runtime")?;
+            rt.block_on(run_daemon_child(cli.serve))
+        }
+        None if cli.foreground => {
+            init_tracing_stdout();
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("tokio runtime")?;
+            rt.block_on(run_server_foreground(cli.serve, /*write_meta=*/ false))
+        }
+        None => start_or_status(cli.serve),
+    }
+}
+
+fn start_or_status(serve: ServeArgs) -> Result<()> {
+    let paths = SessionPaths::resolve()?;
+    if let Some(meta) = live_session(&paths)? {
+        print_session_info(&meta);
+        return Ok(());
+    }
+
+    let child_args = serve_args_for_child(
+        &serve.listen.to_string(),
+        serve.strict_listen,
+        serve.token.as_deref(),
+        serve.allow_no_auth,
+        serve.root.as_deref(),
+        serve.no_editor,
+        serve.ui_dir.as_deref(),
+        serve.no_ui,
+        serve.public_host.as_deref(),
+        serve.config.as_deref(),
+    );
+
+    let child_pid = spawn_daemon(&child_args, &paths)?;
+    eprintln!("Starting fresh-gui in the background (spawn pid {child_pid})…");
+
+    let meta = wait_until_ready(&paths).with_context(|| {
+        format!(
+            "daemon failed to start — check the log at {}",
+            paths.log_path.display()
+        )
+    })?;
+    print_session_info(&meta);
+    Ok(())
+}
+
+async fn run_daemon_child(serve: ServeArgs) -> Result<()> {
+    let paths = SessionPaths::resolve()?;
+    // Hold the lock for the process lifetime (dropped on exit).
+    let _lock = SessionLock::try_acquire(&paths)?;
+    run_server_foreground(serve, /*write_meta=*/ true).await
+}
+
+fn init_tracing_stdout() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_ansi(false)
         .init();
+}
 
-    let args = Args::parse();
+async fn run_server_foreground(args: ServeArgs, write_session_meta: bool) -> Result<()> {
+    let paths = if write_session_meta {
+        Some(SessionPaths::resolve()?)
+    } else {
+        None
+    };
+
     let loopback = args.listen.ip().is_loopback();
     let AuthSetup { token, require_auth } =
         resolve_auth(loopback, args.token.as_deref(), args.allow_no_auth)?;
@@ -103,14 +232,12 @@ async fn main() -> Result<()> {
     }
     if args.allow_no_auth {
         warn!("--allow-no-auth: authentication disabled (loopback test mode only)");
-        eprintln!();
-        eprintln!("  WARNING: --allow-no-auth is enabled (no bearer token). Loopback test mode only.");
-        eprintln!();
     }
 
     let root_path = args
         .root
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let root_display = root_path.display().to_string();
     let fs_root = FsRoot::new(root_path).context("init FS root")?;
 
     let (config, config_path) = Config::load(args.config.as_deref()).context("load config")?;
@@ -156,13 +283,39 @@ async fn main() -> Result<()> {
         config = %state.config_path.display(),
         "starting fresh-gui"
     );
-    // Plain lines so the launch URL is obvious in `pixi run serve` output.
-    // The token is printed here once (operator terminal only) — never via tracing.
-    print_startup_banner(bound, &http_url, &ws_url, token.as_deref());
 
-    server::serve_listener(listener, state, ui_dir, &http_url, &ws_url)
-        .await
-        .context("server exited with error")
+    if let Some(paths) = paths.as_ref() {
+        let local_url = token
+            .as_ref()
+            .map(|t| format!("http://127.0.0.1:{}/?token={t}", bound.port()));
+        let meta = SessionMeta {
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            bound: bound.to_string(),
+            http_url: http_url.clone(),
+            ws_url: ws_url.clone(),
+            local_url,
+            token: token.clone(),
+            require_auth,
+            root: root_display,
+            log_path: paths.log_path.display().to_string(),
+            started_at_unix: crate::daemon::now_unix(),
+        };
+        write_meta(paths, &meta)?;
+        info!(path = %paths.meta_path.display(), "wrote session meta");
+    } else {
+        // Foreground / test mode: still print the banner to the terminal.
+        print_startup_banner(bound, &http_url, &ws_url, token.as_deref());
+    }
+
+    let result = server::serve_listener(listener, state, ui_dir, &http_url, &ws_url).await;
+
+    if let Some(paths) = paths.as_ref() {
+        crate::daemon::remove_session_files(paths);
+        info!("removed session meta");
+    }
+
+    result.context("server exited with error")
 }
 
 #[derive(Debug)]
