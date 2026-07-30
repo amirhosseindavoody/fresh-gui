@@ -1,7 +1,7 @@
 {
   "name": "fresh-gui-desktop",
   "private": true,
-  "version": "26.7.30001",
+  "version": "26.7.30002",
   "description": "Tauri 2 host + Windows NSIS/MSI packaging for fresh-gui",
   "scripts": {
     "tauri": "tauri",
