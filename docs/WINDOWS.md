@@ -1,6 +1,6 @@
 # Windows host packaging (Tauri)
 
-The Windows MVP host is `fresh-gui-desktop` (Tauri 2). Installers are **NSIS** (`.exe`) and **MSI** (WiX).
+The Windows host is `fresh-gui-desktop` (Tauri 2). Installers are **NSIS** (`.exe`) and **MSI** (WiX). Builds are **unsigned**; code signing and auto-update are not part of the current packaging path.
 
 ## Version mapping (CalVer → WiX)
 
@@ -40,7 +40,3 @@ Artifacts (under the **repo root** `target\`):
 ## CI
 
 GitHub Actions workflow [`.github/workflows/windows-tauri.yml`](../.github/workflows/windows-tauri.yml) builds NSIS + MSI on `windows-latest` and uploads artifacts.
-
-## Scope note
-
-Full polish (code signing, auto-update) remains Phase 4. This packaging path produces unsigned installers suitable for MVP distribution and testing.

@@ -49,7 +49,7 @@ The package ships `bin/fresh-gui` and UI assets under `share/fresh-gui/ui`.
 | `GET /healthz` | Liveness |
 | `WS /ws` | ADE JSON frames |
 
-Sessions own PTYs; disconnect detaches the subscriber but keeps shells running for reattach + scrollback. Fresh `Editor` (capability `editor`) handles open / edit / save with revision CAS. `fs_watch` refreshes the tree; thin ADE `scene` lists open buffers.
+Sessions own PTYs; disconnect detaches the subscriber but keeps shells running for reattach + scrollback. Fresh `Editor` (capability `editor`) handles open / edit / save with revision CAS. Sandboxed FS supports list / create / copy / move plus `fs_watch` for tree refresh; thin ADE `scene` lists open buffers.
 
 ## Flags
 
