@@ -133,7 +133,7 @@ Useful tasks: `pixi run check`, `test`, `build`, `build-release`, `ui` (Vite hot
 
 | Piece | Role |
 |-------|------|
-| `fresh-gui` | Linux daemon (PTY, FS, Fresh editor, embedded UI) |
+| `fresh-gui` | Daemon (PTY, FS, Fresh editor, embedded UI) — Linux + Windows |
 | `fresh-gui-app` / `ui/` | Browser UI + small CLI |
 | `fresh-gui-protocol` / `fresh-gui-client` | Shared wire format + client library |
 
@@ -141,7 +141,16 @@ Deeper design notes (architecture and behavior): [docs/DESIGN.md](./docs/DESIGN.
 
 ## Releases
 
-CalVer `YYYY.MMDD.N`. Pushes to `main` bump the version, build the linux-64 package, and publish a [GitHub Release](https://github.com/amirhosseindavoody/fresh-gui/releases) (see `.github/workflows/release-backend.yml`). The version-bump commit rebases if `main` moved during the build. Manual bump: `pixi run update-version`.
+CalVer `YYYY.MMDD.N`. Pushes to `main` bump the version, build the linux-64 `.conda` package, and publish a [GitHub Release](https://github.com/amirhosseindavoody/fresh-gui/releases) with standalone binaries (see `.github/workflows/release-backend.yml`):
+
+| Asset | Platform |
+|-------|----------|
+| `fresh-gui-*-*.conda` | linux-64 via Pixi (glibc 2.28+) |
+| `fresh-gui-*-x86_64-unknown-linux-gnu.tar.gz` | Linux standalone (glibc ≥ 2.31) |
+| `fresh-gui-*-x86_64-unknown-linux-musl.tar.gz` | Linux musl (Alpine / static-friendly) |
+| `fresh-gui-*-x86_64-pc-windows-msvc.zip` | Windows standalone |
+
+Standalone archives unpack to `bin/fresh-gui` + `share/fresh-gui/ui` (same layout as the conda package). The version-bump commit rebases if `main` moved during the build. Manual bump: `pixi run update-version`.
 
 ## License
 

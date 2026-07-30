@@ -5,8 +5,9 @@
 //! Color packs under `ui.palette` reuse Fresh theme names where applicable
 //! (`nord`, `dracula`, …) mapped onto host CSS tokens.
 //!
-//! Default path (Linux): `$XDG_CONFIG_HOME/fresh-gui/config.json`
+//! Default path (Unix): `$XDG_CONFIG_HOME/fresh-gui/config.json`
 //! (falls back to `~/.config/fresh-gui/config.json`).
+//! Windows: `%APPDATA%\fresh-gui\config.json`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,7 +20,10 @@ use tracing::{info, warn};
 pub const FILENAME: &str = "config.json";
 
 /// Default shell when config omits `terminal.shell` or leaves it empty.
+#[cfg(unix)]
 pub const DEFAULT_SHELL_COMMAND: &str = "zsh";
+#[cfg(windows)]
+pub const DEFAULT_SHELL_COMMAND: &str = "powershell";
 
 /// Documented starter file (JSONC) written on first settings open.
 pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"{
@@ -380,7 +384,8 @@ impl Config {
     }
 }
 
-/// `$XDG_CONFIG_HOME/fresh-gui/config.json` or `~/.config/fresh-gui/config.json`.
+/// Unix: `$XDG_CONFIG_HOME/fresh-gui/config.json` or `~/.config/fresh-gui/config.json`.
+/// Windows: `%APPDATA%\fresh-gui\config.json`.
 pub fn default_config_path() -> PathBuf {
     default_config_dir().join(FILENAME)
 }
@@ -392,6 +397,15 @@ pub fn default_config_dir() -> PathBuf {
             return PathBuf::from(xdg).join("fresh-gui");
         }
     }
+    #[cfg(windows)]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let appdata = appdata.trim();
+            if !appdata.is_empty() {
+                return PathBuf::from(appdata).join("fresh-gui");
+            }
+        }
+    }
     home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
@@ -400,6 +414,7 @@ pub fn default_config_dir() -> PathBuf {
 
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .filter(|h| !h.is_empty())
         .map(PathBuf::from)
 }

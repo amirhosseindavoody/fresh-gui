@@ -12,7 +12,7 @@ Developers often keep a Windows or macOS laptop as the interactive machine and a
 
 ### Goals
 
-- **Split deployment:** browser host UI ↔ Linux remote backend.
+- **Split deployment:** browser host UI ↔ remote daemon (Linux or Windows).
 - **Terminal-first UX:** multi-tab / split PTY as the primary surface, with editor and explorer as peers.
 - **Fresh as backend of truth:** reuse Fresh crates for buffer/editor semantics; do not re-implement editor core in the host UI.
 - **Pixi + Cargo workspace** for reproducible Rust development.
@@ -62,13 +62,13 @@ Logistics template: `pixi.toml` + Cargo workspace under `crates/`, CalVer `YYYY.
 | Crate | Binary? | Role |
 |-------|---------|------|
 | `fresh-gui-protocol` | no | Versioned messages, capability constants, errors |
-| `fresh-gui` | yes (`fresh-gui`) | Linux daemon: HTTP UI + WebSocket ADE, sessions, PTY, FS, Fresh editor |
+| `fresh-gui` | yes (`fresh-gui`) | Daemon: HTTP UI + WebSocket ADE, sessions, PTY, FS, Fresh editor (Linux + Windows) |
 | `fresh-gui-client` | no | Dial, auth, typed request helpers |
 | `fresh-gui-app` | yes (`fresh-gui-app`) | CLI (`ping` / `smoke` / `attach` / `serve-ui`) + Vite/TS UI (`ui/`) |
 
 ### Process model
 
-1. Operator starts **`fresh-gui`** on the Linux machine (background session by default, or `--foreground` for tests). One daemon process holds the session lock; Fresh Editor runs in-process on a dedicated thread; PTY shells are child processes.
+1. Operator starts **`fresh-gui`** on the remote machine (background session by default, or `--foreground` for tests). One daemon process holds the session lock; Fresh Editor runs in-process on a dedicated thread; PTY shells are child processes.
 2. Operator opens the printed Local access URL in a browser; the UI authenticates with the embedded `?token=` (then caches it in tab `sessionStorage`).
 3. After `hello` + `auth`, the client creates or attaches a **session**. Layout is persisted in `layout_set` and `localStorage`.
 4. Terminal panes map to remote PTYs in that session. Explorer and editor talk to sandboxed FS / Fresh buffer APIs over the same socket.
@@ -133,7 +133,14 @@ Backend `config.json` (JSONC) holds UI prefs (theme, palette, fonts, explorer vi
 
 ### Packaging
 
-Linux: Pixi `[package]` + `recipe/` installs `bin/fresh-gui` and UI under `share/fresh-gui/ui`. Recipe fetches the pinned Fresh tree via `vendor/fresh.rev` when submodules are missing. CI on `main` bumps CalVer and publishes GitHub Releases.
+Pixi `[package]` + `recipe/` installs `bin/fresh-gui` and UI under `share/fresh-gui/ui` (linux-64 conda). Recipe fetches the pinned Fresh tree via `vendor/fresh.rev` when submodules are missing.
+
+CI on `main` bumps CalVer and publishes a GitHub Release with:
+
+- the linux-64 `.conda` artifact
+- standalone archives (`scripts/package-binary.sh`) for **linux-gnu (glibc ≥ 2.31)**, **linux-musl**, and **windows-msvc** — each with `bin/fresh-gui` + `share/fresh-gui/ui`
+
+Background session detach follows Fresh’s daemon pattern (`vendor/fresh` …/server/daemon): `setsid` on Unix, `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` on Windows.
 
 ## 7. Host surfaces
 
@@ -163,10 +170,10 @@ Bump the pin with `git -C vendor/fresh fetch && git -C vendor/fresh checkout --d
 
 ## 9. Development environment
 
-- **Pixi** (conda-forge): tasks `check`, `test`, `build`, `clippy`, `fmt`, `ui` / `ui-install` / `ui-build`, `serve`, `package`, `update-version`.
+- **Pixi** (conda-forge): tasks `check`, `test`, `build`, `clippy`, `fmt`, `ui` / `ui-install` / `ui-build`, `serve`, `package`, `package-binary`, `update-version`.
 - **Rust** via Pixi / rust-version `1.97` (edition 2024).
 - **Bun** for the Vite/TS UI (`crates/fresh-gui-app/ui/bun.lock`).
-- **Versioning:** CalVer `YYYY.MMDD.N` (e.g. `2026.730.2`). `scripts/update-version.sh` bumps workspace manifests; CI also bumps and publishes backend Releases.
+- **Versioning:** CalVer `YYYY.MMDD.N` (e.g. `2026.730.2`). `scripts/update-version.sh` bumps workspace manifests; CI also bumps and publishes backend Releases (conda + standalone linux-gnu / musl / windows binaries).
 
 ## 10. Security
 
@@ -212,4 +219,5 @@ fresh-gui/
   recipe/              # Pixi / rattler-build package
   scripts/
     update-version.sh
+    package-binary.sh  # standalone release archives (gnu / musl / windows)
 ```
