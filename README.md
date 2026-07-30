@@ -80,6 +80,9 @@ After connect you get terminals, an explorer, and editor tabs in one shell:
 | Settings | Activity bar gear or `Mod+,` (opens `config.json`) |
 | Copy a path / file ops | Right-click a tree row (Open in Terminal, New File/Folder, Cut/Copy/Paste, Delete, path copies) or a tab (path copies + Close) |
 | Explorer parent | **↑** in the explorer header (also `cd ..` in the focused terminal) |
+| Reorder tabs | Drag a tab within the pinned or unpinned group |
+| Pin tab | Tab actions menu / right-click / command palette |
+| Close many tabs | Tab actions menu or command palette (other / all editors / all terminals) |
 
 `Mod` is `Ctrl` on Linux/Windows and `Cmd` on macOS. Disconnect leaves remote sessions and PTYs running so you can reconnect.
 

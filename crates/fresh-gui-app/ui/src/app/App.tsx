@@ -111,8 +111,14 @@ export function App() {
               </Button>
             </div>
             <Separator orientation="vertical" className="mx-1 h-5 self-center" />
-            <div id="tabs" className="tabs" role="tablist">
-              <div id="tab-pill" className="tab-pill" hidden />
+            <div className="tabs-strip">
+              <div id="pinned-tabs" className="tabs pinned-tabs" role="tablist" hidden>
+                <div id="pinned-tab-pill" className="tab-pill" hidden />
+              </div>
+              <div id="pinned-tabs-sep" className="tabs-pinned-sep" role="separator" hidden />
+              <div id="tabs" className="tabs" role="tablist">
+                <div id="tab-pill" className="tab-pill" hidden />
+              </div>
             </div>
             <div className="tabs-actions tabs-actions-end">
               <Button

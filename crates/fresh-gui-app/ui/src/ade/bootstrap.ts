@@ -110,6 +110,8 @@ interface TerminalTab {
   paneTree: PaneNode;
   leaves: Map<string, TermBundle>;
   activeLeafId: string;
+  /** Pinned tabs live in a dedicated strip and stay before unpinned tabs. */
+  pinned: boolean;
 }
 
 interface EditorTab {
@@ -126,6 +128,7 @@ interface EditorTab {
   host: HTMLElement;
   mdPreviewEl: HTMLElement | null;
   suppressChange: boolean;
+  pinned: boolean;
 }
 
 type Tab = TerminalTab | EditorTab;
@@ -137,8 +140,15 @@ interface LayoutBlob {
   sidebarWidth?: number;
   sidebarCollapsed?: boolean;
   tabs?: Array<
-    | { kind: "terminal"; id: string; title: string; paneTree: PaneNode; activeLeafId: string }
-    | { kind: "editor"; id: string; path: string; preview?: boolean }
+    | {
+        kind: "terminal";
+        id: string;
+        title: string;
+        paneTree: PaneNode;
+        activeLeafId: string;
+        pinned?: boolean;
+      }
+    | { kind: "editor"; id: string; path: string; preview?: boolean; pinned?: boolean }
   >;
 }
 
@@ -151,6 +161,9 @@ let sidebarResizer: HTMLElement;
 let treeEl: HTMLElement;
 let tabsEl: HTMLElement;
 let tabPill: HTMLElement;
+let pinnedTabsEl: HTMLElement;
+let pinnedTabPill: HTMLElement;
+let pinnedTabsSep: HTMLElement;
 let panesEl: HTMLElement;
 let emptyStack: HTMLElement;
 let terminalStack: HTMLElement;
@@ -293,7 +306,7 @@ function applySidebarFromBlob(layout: LayoutBlob): void {
 
 function persistLayout(): void {
   const layout: LayoutBlob = {
-    version: 2,
+    version: 3,
     activeTab: activeTabIndex,
     sidebarWidth: Number.parseInt(
       getComputedStyle(document.documentElement).getPropertyValue("--sidebar-width") || "260",
@@ -302,8 +315,15 @@ function persistLayout(): void {
     sidebarCollapsed: isSidebarCollapsed(),
     tabs: tabs.map((t) =>
       t.kind === "terminal"
-        ? { kind: "terminal", id: t.id, title: t.title, paneTree: t.paneTree, activeLeafId: t.activeLeafId }
-        : { kind: "editor", id: t.id, path: t.path, preview: t.preview },
+        ? {
+            kind: "terminal",
+            id: t.id,
+            title: t.title,
+            paneTree: t.paneTree,
+            activeLeafId: t.activeLeafId,
+            pinned: t.pinned,
+          }
+        : { kind: "editor", id: t.id, path: t.path, preview: t.preview, pinned: t.pinned },
     ),
   };
   const json = JSON.stringify(layout);
@@ -948,17 +968,36 @@ function restyleOpenPanes(
   }
 }
 
-function measurePill(): void {
-  const activeEl = tabsEl.querySelector(".tab.active");
-  if (!(activeEl instanceof HTMLElement) || tabs.length === 0) {
-    tabPill.hidden = true;
+function measurePillIn(
+  listEl: HTMLElement,
+  pillEl: HTMLElement,
+): void {
+  const activeEl = listEl.querySelector(".tab.active");
+  if (!(activeEl instanceof HTMLElement)) {
+    pillEl.hidden = true;
     return;
   }
-  tabPill.hidden = false;
-  const tabsRect = tabsEl.getBoundingClientRect();
+  pillEl.hidden = false;
+  const listRect = listEl.getBoundingClientRect();
   const rect = activeEl.getBoundingClientRect();
-  tabPill.style.left = `${rect.left - tabsRect.left + tabsEl.scrollLeft}px`;
-  tabPill.style.width = `${rect.width}px`;
+  pillEl.style.left = `${rect.left - listRect.left + listEl.scrollLeft}px`;
+  pillEl.style.width = `${rect.width}px`;
+}
+
+function measurePill(): void {
+  if (tabs.length === 0) {
+    tabPill.hidden = true;
+    pinnedTabPill.hidden = true;
+    return;
+  }
+  const active = tabs[activeTabIndex];
+  if (active?.pinned) {
+    tabPill.hidden = true;
+    measurePillIn(pinnedTabsEl, pinnedTabPill);
+  } else {
+    pinnedTabPill.hidden = true;
+    measurePillIn(tabsEl, tabPill);
+  }
 }
 
 function setWorkspaceControls(enabled: boolean): void {
@@ -1036,7 +1075,7 @@ function fitActiveLeaves(): void {
 function createTerminalTab(
   ptyId: string,
   bundle: TermBundle,
-  opts: { silentActivate?: boolean; title?: string } = {},
+  opts: { silentActivate?: boolean; title?: string; pinned?: boolean } = {},
 ): TerminalTab {
   const title = opts.title || `sh ${terminalTabs().length + 1}`;
   const tab: TerminalTab = {
@@ -1046,10 +1085,11 @@ function createTerminalTab(
     paneTree: { type: "leaf", id: ptyId },
     leaves: new Map([[ptyId, bundle]]),
     activeLeafId: ptyId,
+    pinned: !!opts.pinned,
   };
   wireTerminalLeaf(ptyId, bundle);
-  tabs.push(tab);
-  if (!opts.silentActivate) activeTabIndex = tabs.length - 1;
+  insertTab(tab);
+  if (!opts.silentActivate) activeTabIndex = tabs.indexOf(tab);
   renderAll();
   persistLayout();
   requestAnimationFrame(() => {
@@ -1123,6 +1163,94 @@ function closeTabAt(index: number, opts: { force?: boolean } = {}): void {
     return;
   }
   closeWholeTerminalTab(tab);
+}
+
+/** Close every tab matching `pred`, iterating by object identity so indices stay valid. */
+function closeTabsMatching(pred: (tab: Tab) => boolean): void {
+  const targets = tabs.filter(pred);
+  for (const tab of targets) {
+    const index = tabs.indexOf(tab);
+    if (index >= 0) closeTabAt(index);
+  }
+}
+
+function closeAllEditors(): void {
+  closeTabsMatching((tab) => tab.kind === "editor");
+}
+
+function closeAllTerminals(): void {
+  closeTabsMatching((tab) => tab.kind === "terminal");
+}
+
+function closeOtherTerminals(): void {
+  const active = tabs[activeTabIndex];
+  closeTabsMatching((tab) => tab.kind === "terminal" && tab !== active);
+}
+
+function closeOtherTabs(): void {
+  const active = tabs[activeTabIndex];
+  if (!active) return;
+  closeTabsMatching((tab) => tab !== active);
+}
+
+/** Keep pinned tabs before unpinned; preserve active tab identity. */
+function normalizeTabOrder(): void {
+  const active = tabs[activeTabIndex];
+  const pinned = tabs.filter((t) => t.pinned);
+  const unpinned = tabs.filter((t) => !t.pinned);
+  tabs = [...pinned, ...unpinned];
+  if (active) activeTabIndex = Math.max(0, tabs.indexOf(active));
+}
+
+function insertTab(tab: Tab): void {
+  if (tab.pinned) {
+    const pinnedCount = tabs.filter((t) => t.pinned).length;
+    tabs.splice(pinnedCount, 0, tab);
+  } else {
+    tabs.push(tab);
+  }
+}
+
+function setTabPinned(tab: Tab, pinned: boolean): void {
+  if (tab.pinned === pinned) return;
+  const active = tabs[activeTabIndex];
+  tab.pinned = pinned;
+  normalizeTabOrder();
+  if (active) activeTabIndex = Math.max(0, tabs.indexOf(active));
+  renderAll();
+  persistLayout();
+  syncExplorerToActiveContext();
+  syncDocumentTitle();
+  focusActiveTab();
+}
+
+function toggleActiveTabPinned(): void {
+  const active = tabs[activeTabIndex];
+  if (!active) return;
+  setTabPinned(active, !active.pinned);
+}
+
+/**
+ * Move the tab at `fromIndex` so it is inserted before `insertBefore`
+ * (indexes refer to the array before the move). Clamped within its pin group.
+ */
+function reorderTab(fromIndex: number, insertBefore: number): void {
+  if (fromIndex < 0 || fromIndex >= tabs.length) return;
+  if (insertBefore === fromIndex || insertBefore === fromIndex + 1) return;
+  const active = tabs[activeTabIndex];
+  const tab = tabs[fromIndex]!;
+  tabs.splice(fromIndex, 1);
+  let insert = insertBefore > fromIndex ? insertBefore - 1 : insertBefore;
+  const pinnedCount = tabs.filter((t) => t.pinned).length;
+  if (tab.pinned) {
+    insert = Math.max(0, Math.min(insert, pinnedCount));
+  } else {
+    insert = Math.max(pinnedCount, Math.min(insert, tabs.length));
+  }
+  tabs.splice(insert, 0, tab);
+  if (active) activeTabIndex = Math.max(0, tabs.indexOf(active));
+  renderAll();
+  persistLayout();
 }
 
 /** Mod+W: close only the active pane if the active tab has more than one; otherwise close the tab. */
@@ -1382,77 +1510,210 @@ function openPathContextMenu(
   openContextMenu(clientX, clientY, pathContextItems(absPath, { kind, includeFileOps: true }));
 }
 
-function renderTabs(): void {
-  const pill = tabPill;
-  tabsEl.innerHTML = "";
-  tabsEl.appendChild(pill);
+const TAB_DRAG_THRESHOLD_PX = 4;
 
-  tabs.forEach((tab, i) => {
-    const el = document.createElement("div");
-    el.className = "tab";
-    el.dataset.index = String(i);
-    if (i === activeTabIndex) el.classList.add("active");
+type TabDragState = {
+  fromIndex: number;
+  startX: number;
+  startY: number;
+  dragging: boolean;
+  pointerId: number;
+  overIndex: number | null;
+};
+
+let tabDrag: TabDragState | null = null;
+/** Ignore the click that follows a completed tab drag. */
+let suppressNextTabClick = false;
+
+function clearTabDragOver(): void {
+  for (const el of document.querySelectorAll(".tab.drag-over, .tab.dragging")) {
+    el.classList.remove("drag-over", "dragging");
+  }
+}
+
+function tabIndexFromPoint(clientX: number, clientY: number, pinned: boolean): number | null {
+  const list = pinned ? pinnedTabsEl : tabsEl;
+  const nodes = [...list.querySelectorAll<HTMLElement>(".tab")];
+  if (nodes.length === 0) return null;
+  for (const el of nodes) {
+    const rect = el.getBoundingClientRect();
+    if (clientX < rect.left || clientX > rect.right) continue;
+    if (clientY < rect.top - 8 || clientY > rect.bottom + 8) continue;
+    const mid = rect.left + rect.width / 2;
+    const index = Number(el.dataset.index);
+    if (!Number.isFinite(index)) continue;
+    return clientX < mid ? index : Math.min(index + 1, tabs.length);
+  }
+  // Past the end of the strip → append within this group.
+  const last = nodes[nodes.length - 1]!;
+  const lastIndex = Number(last.dataset.index);
+  if (!Number.isFinite(lastIndex)) return null;
+  const rect = last.getBoundingClientRect();
+  if (clientX >= rect.right) return lastIndex + 1;
+  return lastIndex;
+}
+
+function endTabDrag(ev: PointerEvent): void {
+  if (!tabDrag || tabDrag.pointerId !== ev.pointerId) return;
+  const state = tabDrag;
+  tabDrag = null;
+  clearTabDragOver();
+  if (!state.dragging) return;
+  suppressNextTabClick = true;
+  const fromTab = tabs[state.fromIndex];
+  if (!fromTab) return;
+  const insertBefore = tabIndexFromPoint(ev.clientX, ev.clientY, fromTab.pinned);
+  if (insertBefore == null) return;
+  reorderTab(state.fromIndex, insertBefore);
+}
+
+function onTabPointerMove(ev: PointerEvent): void {
+  if (!tabDrag || tabDrag.pointerId !== ev.pointerId) return;
+  const dx = ev.clientX - tabDrag.startX;
+  const dy = ev.clientY - tabDrag.startY;
+  if (!tabDrag.dragging) {
+    if (Math.hypot(dx, dy) < TAB_DRAG_THRESHOLD_PX) return;
+    tabDrag.dragging = true;
+    const fromEl = document.querySelector(`.tab[data-index="${tabDrag.fromIndex}"]`);
+    fromEl?.classList.add("dragging");
+  }
+  clearTabDragOver();
+  const fromTab = tabs[tabDrag.fromIndex];
+  if (!fromTab) return;
+  const insertBefore = tabIndexFromPoint(ev.clientX, ev.clientY, fromTab.pinned);
+  tabDrag.overIndex = insertBefore;
+  if (insertBefore == null) return;
+  const highlightIndex =
+    insertBefore >= tabs.length ? tabs.length - 1 : insertBefore;
+  const overEl = document.querySelector(`.tab[data-index="${highlightIndex}"]`);
+  overEl?.classList.add("drag-over");
+  const fromEl = document.querySelector(`.tab[data-index="${tabDrag.fromIndex}"]`);
+  fromEl?.classList.add("dragging");
+}
+
+function onTabPointerUp(ev: PointerEvent): void {
+  endTabDrag(ev);
+}
+
+function activateTabAt(index: number): void {
+  if (index < 0 || index >= tabs.length) return;
+  activeTabIndex = index;
+  renderAll();
+  persistLayout();
+  syncExplorerToActiveContext();
+  syncDocumentTitle();
+  focusActiveTab();
+}
+
+function buildTabElement(tab: Tab, index: number): HTMLElement {
+  const el = document.createElement("div");
+  el.className = "tab";
+  el.dataset.index = String(index);
+  if (index === activeTabIndex) el.classList.add("active");
+  if (tab.pinned) el.classList.add("pinned");
+  if (tab.kind === "editor") {
+    if (tab.preview) el.classList.add("preview");
+    if (tab.dirty) el.classList.add("dirty");
+  }
+  el.setAttribute("role", "tab");
+  el.setAttribute("aria-selected", index === activeTabIndex ? "true" : "false");
+
+  const label = document.createElement("span");
+  label.className = "tab-label";
+  label.textContent = tabLabel(tab);
+  if (tab.kind === "editor") label.title = tab.path;
+  else if (tab.leaves.get(tab.activeLeafId)?.cwd) {
+    label.title = tab.leaves.get(tab.activeLeafId)!.cwd!;
+  }
+  el.appendChild(label);
+
+  const x = document.createElement("button");
+  x.className = "tab-close";
+  x.type = "button";
+  x.title = "Close tab";
+  x.setAttribute("aria-label", "Close tab");
+  x.innerHTML =
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>';
+  x.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    closeTabAt(index);
+  });
+  el.appendChild(x);
+
+  el.addEventListener("click", () => {
+    if (suppressNextTabClick) {
+      suppressNextTabClick = false;
+      return;
+    }
+    activateTabAt(index);
+  });
+
+  el.addEventListener("pointerdown", (ev) => {
+    if (ev.button !== 0) return;
+    if ((ev.target as HTMLElement | null)?.closest?.(".tab-close")) return;
+    tabDrag = {
+      fromIndex: index,
+      startX: ev.clientX,
+      startY: ev.clientY,
+      dragging: false,
+      pointerId: ev.pointerId,
+      overIndex: null,
+    };
+  });
+
+  el.addEventListener("contextmenu", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    activateTabAt(index);
+
+    const items: ContextMenuItem[] = [];
+    items.push({
+      kind: "item",
+      label: tab.pinned ? "Unpin Tab" : "Pin Tab",
+      run: () => setTabPinned(tab, !tab.pinned),
+    });
+    items.push({ kind: "separator" });
     if (tab.kind === "editor") {
-      if (tab.preview) el.classList.add("preview");
-      if (tab.dirty) el.classList.add("dirty");
-    }
-    el.setAttribute("role", "tab");
-    const label = document.createElement("span");
-    label.className = "tab-label";
-    label.textContent = tabLabel(tab);
-    if (tab.kind === "editor") label.title = tab.path;
-    else if (tab.leaves.get(tab.activeLeafId)?.cwd) {
-      label.title = tab.leaves.get(tab.activeLeafId)!.cwd!;
-    }
-    el.appendChild(label);
-    const x = document.createElement("button");
-    x.className = "tab-close";
-    x.type = "button";
-    x.title = "Close tab";
-    x.setAttribute("aria-label", "Close tab");
-    x.innerHTML =
-      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>';
-    x.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      closeTabAt(i);
-    });
-    el.appendChild(x);
-    el.addEventListener("click", () => {
-      activeTabIndex = i;
-      renderAll();
-      persistLayout();
-      syncExplorerToActiveContext();
-      syncDocumentTitle();
-      focusActiveTab();
-    });
-    el.addEventListener("contextmenu", (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      activeTabIndex = i;
-      renderAll();
-      persistLayout();
-      syncExplorerToActiveContext();
-      syncDocumentTitle();
-
-      const items: ContextMenuItem[] = [];
-      if (tab.kind === "editor") {
-        items.push(...pathContextItems(tab.path, { kind: "file", includeFileOps: false }));
+      items.push(...pathContextItems(tab.path, { kind: "file", includeFileOps: false }));
+      items.push({ kind: "separator" });
+    } else {
+      const cwd = tab.leaves.get(tab.activeLeafId)?.cwd;
+      if (cwd) {
+        items.push(...pathContextItems(cwd, { kind: "dir", includeFileOps: false }));
         items.push({ kind: "separator" });
-      } else {
-        const cwd = tab.leaves.get(tab.activeLeafId)?.cwd;
-        if (cwd) {
-          items.push(...pathContextItems(cwd, { kind: "dir", includeFileOps: false }));
-          items.push({ kind: "separator" });
-        }
       }
-      items.push({
-        kind: "item",
-        label: "Close",
-        run: () => closeTabAt(i),
-      });
-      openContextMenu(ev.clientX, ev.clientY, items);
+    }
+    items.push({
+      kind: "item",
+      label: "Close",
+      run: () => closeTabAt(tabs.indexOf(tab) >= 0 ? tabs.indexOf(tab) : index),
     });
-    tabsEl.appendChild(el);
+    openContextMenu(ev.clientX, ev.clientY, items);
+  });
+
+  return el;
+}
+
+function renderTabs(): void {
+  const unpinnedPill = tabPill;
+  const pinnedPill = pinnedTabPill;
+  tabsEl.innerHTML = "";
+  tabsEl.appendChild(unpinnedPill);
+  pinnedTabsEl.innerHTML = "";
+  pinnedTabsEl.appendChild(pinnedPill);
+
+  const pinned = tabs.filter((t) => t.pinned);
+  const unpinned = tabs.filter((t) => !t.pinned);
+  pinnedTabsEl.hidden = pinned.length === 0;
+  pinnedTabsSep.hidden = pinned.length === 0;
+
+  pinned.forEach((tab) => {
+    const index = tabs.indexOf(tab);
+    pinnedTabsEl.appendChild(buildTabElement(tab, index));
+  });
+  unpinned.forEach((tab) => {
+    const index = tabs.indexOf(tab);
+    tabsEl.appendChild(buildTabElement(tab, index));
   });
 
   requestAnimationFrame(measurePill);
@@ -1802,14 +2063,16 @@ async function presentOpenedBuffer(
     host,
     mdPreviewEl,
     suppressChange: false,
+    pinned: false,
   };
 
-  tabs.push(tabRef);
-  activeTabIndex = tabs.length - 1;
+  insertTab(tabRef);
+  activeTabIndex = tabs.indexOf(tabRef);
   if (configPath && pathsEqual(opened.path, configPath)) {
     configPath = opened.path;
   }
   renderAll();
+  persistLayout();
   focusActiveTab();
   const jumpLine = opened.line ?? opts.line;
   const jumpCol = opened.column ?? opts.column;
@@ -1893,7 +2156,10 @@ function afterSessionReady(): void {
 /** Try to restore a single multi-pane terminal tab whose leaf ids exactly match the reattached ptys. */
 function restoreTerminalTabsFromBlob(blob: LayoutBlob, ptyList: PtyInfo[]): boolean {
   const ptyIds = ptyList.map((p) => p.id);
-  if (ptyIds.length === 0 || blob.version !== 2 || !Array.isArray(blob.tabs)) return false;
+  const version = blob.version ?? 0;
+  if (ptyIds.length === 0 || (version !== 2 && version !== 3) || !Array.isArray(blob.tabs)) {
+    return false;
+  }
   try {
     for (const tb of blob.tabs) {
       if (tb.kind !== "terminal") continue;
@@ -1914,8 +2180,9 @@ function restoreTerminalTabsFromBlob(blob: LayoutBlob, ptyList: PtyInfo[]): bool
         paneTree: tb.paneTree,
         leaves,
         activeLeafId,
+        pinned: !!tb.pinned,
       };
-      tabs.push(tab);
+      insertTab(tab);
       return true;
     }
   } catch {
@@ -2367,9 +2634,39 @@ function tabActionsMenuItems(): ContextMenuItem[] {
     { kind: "separator" },
     {
       kind: "item",
+      label: active.pinned ? "Unpin Tab" : "Pin Tab",
+      run: () => setTabPinned(active, !active.pinned),
+    },
+    { kind: "separator" },
+    {
+      kind: "item",
       label: "Close Tab",
       hint: "Mod+W",
       run: () => closeActiveTabOrLeaf(),
+    },
+    {
+      kind: "item",
+      label: "Close Other Tabs",
+      disabled: tabs.length <= 1,
+      run: () => closeOtherTabs(),
+    },
+    {
+      kind: "item",
+      label: "Close All Editors",
+      disabled: !tabs.some((t) => t.kind === "editor"),
+      run: () => closeAllEditors(),
+    },
+    {
+      kind: "item",
+      label: "Close All Terminals",
+      disabled: !tabs.some((t) => t.kind === "terminal"),
+      run: () => closeAllTerminals(),
+    },
+    {
+      kind: "item",
+      label: "Close Other Terminals",
+      disabled: !tabs.some((t) => t.kind === "terminal" && t !== active),
+      run: () => closeOtherTerminals(),
     },
   );
   return items;
@@ -2461,6 +2758,9 @@ export function bootstrapAde(): void {
   treeEl = $("tree");
   tabsEl = $("tabs");
   tabPill = $("tab-pill");
+  pinnedTabsEl = $("pinned-tabs");
+  pinnedTabPill = $("pinned-tab-pill");
+  pinnedTabsSep = $("pinned-tabs-sep");
   panesEl = $("panes");
   emptyStack = $("empty-stack");
   terminalStack = $("terminal-stack");
@@ -2524,6 +2824,10 @@ activitySettings.addEventListener("click", () => {
 });
 
 tabsEl.addEventListener("scroll", () => requestAnimationFrame(measurePill));
+pinnedTabsEl.addEventListener("scroll", () => requestAnimationFrame(measurePill));
+window.addEventListener("pointermove", onTabPointerMove);
+window.addEventListener("pointerup", onTabPointerUp);
+window.addEventListener("pointercancel", onTabPointerUp);
 
 const shortcutHandlers: ShortcutHandlers = {
   "gotoFile.open": () => openGotoFile(),
@@ -2586,6 +2890,31 @@ refreshPaletteCommands = () => {
       run: () => openPaletteWithQuery("Color Palette"),
     },
     ...colorPaletteCommands(),
+    {
+      id: "tabs.pinActive",
+      label: "Tabs: Pin / Unpin Active",
+      run: () => toggleActiveTabPinned(),
+    },
+    {
+      id: "tabs.closeOther",
+      label: "Tabs: Close Other Tabs",
+      run: () => closeOtherTabs(),
+    },
+    {
+      id: "tabs.closeAllEditors",
+      label: "Tabs: Close All Editors",
+      run: () => closeAllEditors(),
+    },
+    {
+      id: "tabs.closeAllTerminals",
+      label: "Tabs: Close All Terminals",
+      run: () => closeAllTerminals(),
+    },
+    {
+      id: "tabs.closeOtherTerminals",
+      label: "Tabs: Close Other Terminals",
+      run: () => closeOtherTerminals(),
+    },
   ]);
 };
 
