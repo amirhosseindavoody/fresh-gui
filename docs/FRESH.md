@@ -149,6 +149,7 @@ Line/column from path or link are returned on `editor_opened` for the **host** t
 | Host terminal UX | xterm.js WebGL |
 | Host chrome | React + Tailwind + shadcn |
 | Plugins / LSP / tree-sitter in the ADE path | Features off; not exposed over the protocol |
+| Orchestrator / coding agents | Fresh plugin not loaded; agent direction for ADE is design-only ([COPILOT.md](./COPILOT.md)) — steal registry/resume patterns, do not embed Orchestrator yet |
 | Editor tabs after reattach | Not restored (buffers not rehydrated by path yet) |
 
 ## 7. Host UI wiring
