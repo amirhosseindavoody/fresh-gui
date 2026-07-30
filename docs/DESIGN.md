@@ -1,267 +1,156 @@
 # fresh-gui Design
 
-Terminal-first IDE GUI on the **local host**, powered by a **remote Fresh editor backend**. Product inspiration: [Terax](https://github.com/crynta/terax-ai). Backend performance and semantics: [Fresh](https://github.com/sinelaw/fresh). Repo logistics mirror [pixi-mise](https://github.com/amirhosseindavoody/pixi-mise): Pixi-managed Rust workspace, `docs/` for design, phased implementation. User-facing install and usage: [README.md](../README.md).
+Terminal-first IDE shell on a **local host**, connected to a **Linux remote daemon** that embeds [Fresh](https://github.com/sinelaw/fresh) for editor state. Product inspiration: [Terax](https://github.com/crynta/terax-ai). Install and usage: [README.md](../README.md). Host chrome details: [UI.md](./UI.md). Access model: [SECURITY.md](./SECURITY.md).
 
 ## 1. Problem
 
-Developers often keep a Windows (or macOS) laptop as the interactive machine and a Linux box (or WSL, cloud VM) as the real workspace. Existing options either:
+Developers often keep a Windows or macOS laptop as the interactive machine and a Linux box (WSL, lab node, cloud VM) as the real workspace. Alternatives either stream a full remote IDE, put a thin browser UI on the same machine as the editor (`fresh --web`), or ship a native GUI in-process with the editor.
 
-- run a full IDE remotely and stream pixels (latency, heavy chrome), or
-- put a thin browser UI on the same machine as the editor (`fresh --web`), or
-- ship a native GUI in-process with the editor (`fresh` + `fresh-gui` / winit).
+**fresh-gui** uses a different split: a **local, terminal-first ADE shell** that speaks a versioned WebSocket protocol to a **Fresh-backed daemon on the remote machine**. The remote owns files, PTYs, and editor buffers; the host owns windowing, layout, and input devices.
 
-**fresh-gui** targets a different split: a **local, terminal-first ADE shell** that connects to a **Fresh session daemon on the remote machine**. The remote owns files, PTY, LSP, and editor state; the host owns windowing, layout, and input devices.
+## 2. Goals and non-goals
 
-## 2. Goals and Non-Goals
+### Goals
 
-### Goals (MVP)
+- **Split deployment:** host GUI (browser or Tauri) ↔ Linux remote backend.
+- **Terminal-first UX:** multi-tab / split PTY as the primary surface, with editor and explorer as peers.
+- **Fresh as backend of truth:** reuse Fresh crates for buffer/editor semantics; do not re-implement editor core in the host UI.
+- **Pixi + Cargo workspace** for reproducible Rust development.
+- **Documented, versioned protocol** between host and remote with capability negotiation.
+- **Secure-by-default remote access:** always-on bearer token; loopback bind + SSH tunnel as the supported remote path.
 
-- **Split deployment:** Windows host GUI ↔ Linux remote backend.
-- **Terminal-first UX:** multi-tab / split PTY as the primary surface (Terax-like), with editor/explorer as peers—not an afterthought.
-- **Fresh as backend of truth:** reuse Fresh crates / session model; do not re-implement buffer, PTY, or LSP logic in the GUI.
-- **Pixi + Cargo workspace** for reproducible Rust development (pixi-mise-shaped layout).
-- **Documented protocol** between host and remote with versioned messages.
-- **Secure-by-default remote access** (auth + encrypted transport) before any public exposure.
+### Non-goals
 
-### Non-Goals (MVP)
-
-- Feature parity with Terax AI agents, themes marketplace, or web preview.
-- Replacing Fresh’s TUI or shipping as a fork of Fresh itself.
-- macOS / Linux host GUI (post-MVP; architecture should not block them).
+- Feature parity with Terax AI agents, theme marketplaces, or web preview panes.
+- Replacing Fresh’s TUI or shipping as a fork of Fresh.
 - Multi-user collaborative editing.
-- Packaging to winget / conda-forge on day one (Pixi/`recipe/` package and GitHub Releases cover the Linux daemon; broader channel publishing is later).
+- Publishing to winget / conda-forge as a primary channel (Pixi global install and GitHub Releases cover distribution today).
+- Public TLS / `wss://` exposure by default (SSH tunnel is the remote-access answer).
 
-## 3. Prior Art
+## 3. Prior art
 
-### 3.1 Terax
+### Terax
 
-[Terax](https://github.com/crynta/terax-ai): Tauri 2 + Rust + React, ~7–8 MB, terminal-first ADE with WebGL xterm, CodeMirror, source control, AI side panel. **Local monolith**—PTY and UI share one process. We borrow layout and “terminal is the hero” product sense, not the in-process architecture.
+[Terax](https://github.com/crynta/terax-ai): Tauri 2 + Rust + React, terminal-first ADE with WebGL xterm and CodeMirror. **Local monolith**—PTY and UI share one process. fresh-gui borrows layout and “terminal is the hero” product sense, not the in-process architecture.
 
-### 3.2 Fresh
+### Fresh
 
-Fresh is a high-performance terminal editor (Rust) with:
+Fresh is a high-performance terminal editor (Rust) with a TUI, an in-process GUI surface, and `fresh --web` over a scene WebSocket. Orchestrator already models SSH / remote workspaces. This project adds a **host-native ADE GUI** that treats Fresh as an explicit remote service via a PTY-first ADE protocol (not Fresh `--web` scene envelopes).
 
-| Surface | Role |
-|---------|------|
-| TUI (`crossterm`) | Primary product |
-| `crates/fresh-gui` | In-process winit + wgpu ratatui window |
-| `fresh --web` + `web-ui/` | Browser chrome over the **same** `Editor` via WebSocket scene push |
+### pixi-mise
 
-Orchestrator already models **SSH / remote workspaces** (sessions live on remote authorities). That is complementary: Fresh can already *be* remote-aware internally; this project adds a **host-native ADE GUI** that treats Fresh as an explicit remote service.
+Logistics template: `pixi.toml` + Cargo workspace under `crates/`, CalVer `YYYY.MMDD.N`, `scripts/update-version.sh`, optional `recipe/` for packaging.
 
-Relevant Fresh docs (in the Fresh tree): `docs/architecture.md`, `docs/internal/web-ui.md`, orchestrator / per-session backend designs.
-
-### 3.3 pixi-mise
-
-Logistics template: `pixi.toml` + Cargo workspace under `crates/`, `docs/DESIGN.md`, CalVer `YYYY.MMDD.N`, `scripts/update-version.sh`, optional `recipe/` later.
-
-## 4. Architecture Overview
+## 4. Architecture overview
 
 ```
 ┌─────────────────────────────┐         ┌──────────────────────────────────┐
-│  Host (Windows MVP)         │         │  Remote (Linux MVP)              │
-│                             │  TLS /  │                                  │
-│  fresh-gui-app              │  SSH    │  fresh-gui               │
-│    layout, tabs, chrome     │◄───────►│    wraps Fresh session / Editor  │
-│    terminal renderer        │  proto  │    PTY, files, LSP, buffers      │
-│                             │         │                                  │
-│  fresh-gui-client           │         │  fresh-editor / fresh-core / …   │
-│    connect, auth, framing   │         │  (path or git dep on Fresh)      │
+│  Host                       │         │  Remote (Linux)                  │
+│                             │  SSH    │                                  │
+│  Browser UI or              │  tunnel │  fresh-gui                       │
+│  fresh-gui-desktop (Tauri)  │◄───────►│    sessions, PTY, FS, config     │
+│    layout, tabs, chrome     │  /ws    │    embeds Fresh Editor (optional)│
+│    xterm + CodeMirror       │  JSON   │                                  │
+│                             │         │  vendor/fresh (submodule)        │
+│  fresh-gui-client (CLI)     │         │                                  │
 └─────────────────────────────┘         └──────────────────────────────────┘
                  ▲                                        ▲
-                 │                                        │
                  └──────── fresh-gui-protocol ────────────┘
-                           (shared message types)
 ```
 
-### 4.1 Crates
+### Crates
 
-| Crate | Binary? | Platform (MVP) | Responsibility |
-|-------|---------|----------------|----------------|
-| `fresh-gui-protocol` | no | all | Versioned messages, capability negotiation, errors |
-| `fresh-gui` | yes (`fresh-gui`) | linux | Daemon: bind transport, host Fresh session(s), serve protocol |
-| `fresh-gui-client` | no | all (host) | Dial, auth, reconnect, typed RPC / streams |
-| `fresh-gui-app` | yes (`fresh-gui-app`) | all | CLI (`ping`/`smoke`/`attach`/`serve-ui`) + Vite/TS UI (`ui/`) |
-| `fresh-gui-desktop` | yes (`fresh-gui-desktop`) | windows | Tauri 2 window loading `fresh-gui-app/ui` |
+| Crate | Binary? | Role |
+|-------|---------|------|
+| `fresh-gui-protocol` | no | Versioned messages, capability constants, errors |
+| `fresh-gui` | yes (`fresh-gui`) | Linux daemon: HTTP UI + WebSocket ADE, sessions, PTY, FS, Fresh editor |
+| `fresh-gui-client` | no | Dial, auth, typed request helpers |
+| `fresh-gui-app` | yes (`fresh-gui-app`) | CLI (`ping` / `smoke` / `attach` / `serve-ui`) + Vite/TS UI (`ui/`) |
+| `fresh-gui-desktop` | yes (`fresh-gui-desktop`) | Tauri 2 window loading `fresh-gui-app/ui` |
 
-Dev machines (e.g. WSL) may build backend + protocol + client locally; the Windows GUI is cross-built or built on Windows CI / a Windows host.
+### Process model
 
-### 4.2 Process model
+1. Operator starts **`fresh-gui`** on the Linux machine (background session by default, or `--foreground` for tests).
+2. Operator opens the printed Local access URL (browser) or the Tauri host; the UI authenticates with the embedded `?token=` (then caches it in tab `sessionStorage`).
+3. After `hello` + `auth`, the client creates or attaches a **session**. Layout is persisted in `layout_set` and `localStorage`.
+4. Terminal panes map to remote PTYs in that session. Explorer and editor talk to sandboxed FS / Fresh buffer APIs over the same socket.
+5. Disconnect detaches the WebSocket subscriber; the session and PTYs keep running for reattach + scrollback replay.
 
-1. Operator starts **`fresh-gui`** on the Linux remote (systemd user unit, `pixi run`, or SSH remote-command).
-2. Operator starts **`fresh-gui-desktop`** (or the browser UI) on the host, enters host:port (or SSH jump), authenticates.
-3. GUI opens one or more **sessions** (working directory / project). Backend creates or attaches a Fresh editor session.
-4. Terminal panes map to remote PTYs managed by Fresh (or a thin PTY bridge if MVP scopes editor later—see open decisions).
-5. Disconnect leaves the remote session running when the backend supports detach (align with Fresh session daemon semantics where possible).
+## 5. Protocol
 
-## 5. Protocol (sketch)
+Wire format: **JSON text frames** over WebSocket at `/ws`. Protocol version is negotiated in `hello` and must match exactly (`PROTOCOL_VERSION`, currently `0.4.0`). PTY payloads use standard base64 in `pty_data`. Message shapes live in `fresh-gui-protocol` and are mirrored in the host UI (`ui/src/protocol.ts`).
 
-**Resolved (D1):** new ADE protocol, **PTY-first**. Do **not** reuse Fresh `--web` scene as the primary wire. Fresh Editor / scene may be added later as optional capabilities (Phase 3+), not as the MVP transport.
+This is a **new ADE protocol**, not Fresh `--web` scene. Fresh Editor is an optional capability on top of PTY / session / FS.
 
-The protocol crate owns:
+### Capabilities
 
-- **Hello / version** — `protocol_version`, backend implementation id, advertised capabilities (e.g. `pty`, later `scene` / `fs`).
-- **Auth** — token / mTLS / SSH-channel; reject anonymous binds on non-loopback.
-- **Session** — create / attach / list; layout blob; PTYs survive GUI disconnect (Phase 2).
-- **Streams (MVP / Phase 1)** — terminal I/O (bytes + resize) under a `pty` capability.
-- **Streams (Phase 1b)** — read-only remote file tree under an `fs` capability (list / stat); negotiated, not required for Phase 1 connect.
-- **Streams (Phase 3+)** — optional Fresh scene diffs, diagnostics — negotiated via capabilities.
-- **Control** — ping/pong, graceful shutdown, error envelopes.
+Default backend capabilities (omit `editor` / `scene` with `--no-editor`):
 
-Wire framing (**Phase 1 choice**): **JSON text frames over WebSocket** at path `/ws`. PTY payloads use standard base64 in `pty_data`. Not Fresh web-ui message shapes.
+| Capability | Role |
+|------------|------|
+| `ping` | Liveness |
+| `pty` | Create / data / resize / close |
+| `session` | Create / attach / list; `layout_set`; PTYs belong to a session |
+| `fs` | List, authorize, stat, watch; create / copy / move under the sandbox |
+| `editor` | Open / edit / save / close via embedded Fresh |
+| `scene` | Thin ADE open-buffer list (`scene_get` / `scene_snapshot`) |
 
-## 6. MVP Scope (phased)
+### Message families
 
-### Phase 0 — Scaffold ✅
+- **Control** — `hello`, `auth` / `auth_ok` / `auth_error`, `ping` / `pong`, `error`.
+- **Session** — `session_create` / `session_attach` / `session_list`, `layout_set`.
+- **PTY** — `pty_open` (optional `cwd` / `shell`), `pty_data`, `pty_resize`, `pty_close` / `pty_closed`.
+- **FS** — `fs_list` / `fs_stat` / `fs_authorize`; `fs_watch` / `fs_unwatch` / `fs_changed`; `fs_create` / `fs_copy` / `fs_move` (and matching result messages). Paths are sandboxed under `--root` / `FRESH_GUI_FS_ROOT`, plus directories authorized via `fs_authorize` (terminal cwd sync outside the primary root).
+- **Editor** — `editor_open` / `editor_open_link` / `editor_opened`, `buffer_snapshot`, `buffer_edit` / `buffer_changed`, `buffer_save` / `buffer_saved`, `editor_close` (revision CAS on edit/save).
+- **Scene** — `scene_get` / `scene_snapshot` (open buffers for host chrome; not Fresh cell scene).
 
-- `docs/DESIGN.md`, Pixi + Cargo workspace, crate stubs, README.
-- No Fresh linkage yet; protocol types are placeholders.
-- Decisions D1–D5 resolved; `vendor/fresh` submodule pinned.
+## 6. Backend behavior
 
-### Phase 1 — Remote PTY loop (D4) ✅ (core)
+### Daemon session
 
-- Backend exposes authenticated PTY create/read/write/resize over WebSocket (`/ws`).
-- Host: Tauri 2 crate (`fresh-gui-desktop`) loads the Vite-built UI (`ui/dist`); Linux/WSL can use `pixi run serve` (backend embeds `ui/dist` on the same port as `/ws`) or `pixi run ui` (Vite) when iterating on chrome.
-- Host CLI: `fresh-gui-app ping|smoke|attach` via `fresh-gui-client`.
-- Integration test: `pty_smoke_echo`.
-- Remaining / follow-ups: reconnect UX polish, measured latency on real SSH forwards.
+Default `fresh-gui` detaches a **per-user background session** (exclusive flock under `$XDG_RUNTIME_DIR/fresh-gui/`), prints status / Local access URL, and returns the shell. Re-running reprints status; `fresh-gui close` stops the daemon. Logs go to `$XDG_STATE_HOME/fresh-gui/fresh-gui.log`. See [SECURITY.md](./SECURITY.md) for token handling in `session.json`.
 
-### Phase 1b — Read-only file tree ✅
+### Sessions and PTYs
 
-- Protocol `fs` capability: `fs_list` / `fs_stat` (read) plus later `fs_create` / `fs_copy` / `fs_move` (sandboxed writes); paths sandboxed under `--root` / `FRESH_GUI_FS_ROOT`.
-- Host UI: sidebar tree (expand dirs, select path as context in status).
-- Tests: `fs::tests::list_and_block_escape`, `fs::tests::create_copy_move`, `fs_list_root` e2e.
+`SessionStore` holds multi-PTY sessions. Closing the WebSocket detaches the subscriber; PTYs keep running. Reattach replays ~64KB of scrollback per PTY and restores layout when the persisted leaf ids match live PTYs 1:1 (otherwise one terminal tab per PTY). Editor tabs are not restored across reattach (buffers are not rehydrated by path yet).
 
-### Phase 1 / packaging — Windows Tauri installers ✅ (unsigned MVP)
+PTY shell defaults come from `config.json` (`terminal.shell`). Bash/zsh hooks emit OSC 7 so the host can track cwd for new tabs/splits and explorer re-rooting.
 
-- Brought forward from Phase 4 for MVP host distribution.
-- NSIS + MSI via `crates/fresh-gui-desktop` (`npm run build:windows`); CI: `.github/workflows/windows-tauri.yml`.
-- Bundle version is a WiX-safe mapping of CalVer (e.g. `2026.728.1` → `26.7.28001`); see `docs/WINDOWS.md`.
-- Code signing + auto-update remain Phase 4.
+### Filesystem
 
-### Phase 2 — Multi-tab / splits + session detach ✅
+`FsRoot` lists and mutates only under the sandbox root and authorized directories:
 
-- Protocol `session` capability (`0.2.0`): `session_create` / `session_attach` / `session_list`, `layout_set`; PTYs belong to a session.
-- Backend `SessionStore`: multi-PTY per session, ~64KB scrollback replay on reattach, subscriber detach on WS close (PTYs keep running).
-- Host UI: tab bar, H/V splits, session id in localStorage; reconnect reattaches and restores layout + scrollback.
-- Tests: `session_detach_reattach_keeps_pty`, `multi_pty_in_session`.
+- **Read:** `list`, `stat`, recursive `fs_watch` (skips noisy trees such as `.git`, `target`, `node_modules`, …).
+- **Write:** `create` (empty file or directory), `copy_into`, `move_into` (conflict names get a ` copy` / ` copy N` suffix). Names must be a single path segment.
 
-### Phase 3 — Editor surface (Fresh pull-in)
+### Editor
 
-#### Phase 3a — Open / snapshot ✅
+When enabled, Fresh `Editor` runs in-process on a dedicated `!Send` thread (`EditorWorker`), linked from `vendor/fresh` with the `runtime` feature (plugins off). Path open supports Fresh-style `:line` / `:line:col` suffixes and Ctrl/Cmd+click link detection (`path_link`) with optional terminal cwd.
 
-- Optional `editor` capability: `editor_open` / `editor_opened` / `buffer_snapshot` / `editor_close`.
-- Backend embeds Fresh `Editor` in-process on a dedicated `!Send` thread (`EditorWorker`); path dep on `vendor/fresh` (`runtime` feature, plugins off for MVP).
-- Host UI: double-click file in tree → editor pane.
-- Test: `editor_open_snapshot`.
+### Config
 
-#### Phase 3b — Edit / save + CodeMirror ✅
+Backend `config.json` (JSONC) holds UI prefs (theme, palette, fonts, explorer visibility, minimap) and default shell. Snapshot is sent in `Hello.ui`. Settings / `Mod+,` opens the file in an editor tab; saving reloads live prefs. Missing keys are filled without overriding existing values.
 
-- Protocol `0.4.0`: `buffer_edit` / `buffer_changed` / `buffer_save` / `buffer_saved` with revision CAS.
-- Host UI: CodeMirror 6 pane (Phase UI-1); Ctrl/Cmd+S save; dirty indicator.
-- Host UI stack: Vite + React 19 + Tailwind + shadcn under `crates/fresh-gui-app/ui` (Bun via Pixi for install/scripts; xterm/CodeMirror from registry; no CDN). ADE protocol/controller remains typed TypeScript modules attached to the React shell.
-- Test: `editor_edit_save_reopen`.
+### Packaging
 
-#### Phase 3c — fs_watch + thin scene ✅
+Linux: Pixi `[package]` + `recipe/` installs `bin/fresh-gui` and UI under `share/fresh-gui/ui`. Recipe fetches the pinned Fresh tree via `vendor/fresh.rev` when submodules are missing. CI on `main` bumps CalVer and publishes GitHub Releases. Windows: unsigned NSIS + MSI via `fresh-gui-desktop` (see [WINDOWS.md](./WINDOWS.md)).
 
-- `fs_watch` / `fs_watch_started` / `fs_unwatch` / `fs_changed` (notify); UI refreshes tree on change.
-- Optional `scene` capability: ADE `scene_get` / `scene_snapshot` listing open buffers (not Fresh `--web` cell scene).
-- Still deferred: full Fresh web-ui scene envelopes, merging Fresh session detach with ADE sessions.
+## 7. Host surfaces
 
-### Phase UI — Host chrome polish (see [UI.md](./UI.md))
+| Surface | How it connects |
+|---------|-----------------|
+| **Embedded UI** | Served from the same port as `/ws` (`GET /` → `ui/dist` or packaged `share/fresh-gui/ui`) |
+| **Vite dev** | `pixi run ui` on `:1420`, points at the backend WS |
+| **Tauri** | `fresh-gui-desktop` loads the same UI assets; WebView dials `/ws` |
+| **CLI** | `fresh-gui-app ping|smoke|attach` via `fresh-gui-client` |
 
-- **UI-1 ✅** — Terax-inspired chrome: status bar, unified terminal/editor tabs, tokenized theme, CodeMirror 6, xterm WebGL, tab pill, collapsible sidebar, dirty/preview affordances (silent `?token=` auto-connect; no top connect form).
-- **UI-2 ✅** — per-tab recursive pane trees (max 4 leaves), shortcut registry + command palette, virtualized explorer, richer `layout_set` blob (see [UI.md](./UI.md)).
-- **UI-3 ✅** — OSC 7 cwd, search, activity bar, lightweight file badges, system/light/dark theme, settings via `config.json` (see [UI.md](./UI.md)).
-- Do not conflate with packaging polish below.
+Host chrome is React 19 + Tailwind + shadcn; ADE protocol, xterm, CodeMirror, and the virtualized tree stay imperative TypeScript modules attached once from the React shell. Full IA and shortcuts: [UI.md](./UI.md).
 
-### Phase 4 — Polish / packaging
+## 8. Fresh coupling
 
-- Code signing, auto-update story, hardening.
-- **Linux backend Pixi package ✅:** `[package]` + `recipe/` builds installable
-  `fresh-gui` with UI under `share/fresh-gui/ui`
-  (`pixi global install --git …` / GitHub Releases `.conda` / `pixi run package`).
-  Recipe fetches the pinned Fresh tree via `vendor/fresh.rev` when git submodules
-  are not initialized. CI on `main` bumps CalVer and publishes Releases
-  (`.github/workflows/release-backend.yml`).
-- (Unsigned Windows NSIS + MSI already available from Phase 1 packaging.)
-- Host **visual** polish is Phase UI / [UI.md](./UI.md), not this section.
+Fresh is a **git submodule** at `vendor/fresh`, pinned by commit SHA (also recorded in `vendor/fresh.rev` for package builds). Workspace `exclude = ["vendor/fresh"]` keeps Fresh’s own Cargo workspace separate. Backend path deps point at `vendor/fresh/crates/…`.
 
-## 7. Development Environment
-
-### Pixi
-
-- Channels: conda-forge.
-- Platforms: at least `linux-64` for backend/dev on WSL; `win-64` added when GUI builds are routine.
-- Tasks: `check`, `test`, `build`, `clippy`, `fmt`, `ui` / `ui-install` / `ui-build` / `ui-serve`, `package`, `update-version`.
-- Rust toolchain via Pixi `rust` dependency (same idea as pixi-mise).
-- **Bun** via Pixi (`bun` conda-forge package) for the Vite/TS UI install and scripts — faster than npm; lockfile is `crates/fresh-gui-app/ui/bun.lock`.
-- **Package build:** `preview = ["pixi-build"]` + `pixi-build-rattler-build` + `recipe/recipe.yaml`
-  (mirrors pixi-mise). Requires Fresh submodule present for path builds.
-
-### Fresh dependency
-
-**Resolved (D3):** git submodule at `vendor/fresh`, pinned by commit SHA. Backend Cargo deps use `path = "../../vendor/fresh/crates/…"`. Phase 3a links `fresh-editor` (`runtime`) into `fresh-gui`; workspace `exclude = ["vendor/fresh"]` keeps Fresh’s own workspace metadata.
-
-### Versioning
-
-CalVer compatible with Cargo: `YYYY.MMDD.N` (e.g. `2026.728.1`). `scripts/update-version.sh` bumps workspace manifests; CI on `main` also bumps and publishes backend Releases.
-
-## 8. Security (baseline)
-
-Full design: **[SECURITY.md](./SECURITY.md)** (always-on token + SSH tunnel).
-
-- **Always-on bearer token**, including on the default loopback bind. Shared multi-user hosts can reach `127.0.0.1`; an unauthenticated loopback ADE (PTY + FS) is not safe. Token is taken from `--token` / `FRESH_GUI_TOKEN`, or auto-generated per process start and printed once in the startup banner (never in `tracing` logs or on disk). Prefer the env var over the CLI flag so the secret does not appear in `ps`.
-- No unauthenticated listen on `0.0.0.0`. Non-loopback binds still require a token and emit a warning; the documented remote path is **SSH tunnel → loopback**.
-- Prefer SSH port-forward (printed on startup) over raw public TCP / TLS for MVP.
-- Escape hatch `--allow-no-auth` is **loopback-only** and intended for local integration tests, not normal operation.
-- Tokens never in repo; treat the printed `?token=` URL like a password.
-- Capability negotiation so older GUIs fail closed against newer backends when incompatible.
-
-## 9. License
-
-**Resolved (D5):** the entire `fresh-gui` project (all crates) is **GPL-2.0**, matching [Fresh](https://github.com/sinelaw/fresh). The `vendor/fresh` submodule remains under Fresh’s own GPL-2.0 terms.
-
-## 10. Decisions
-
-### Resolved
-
-#### D1 — Transport / protocol base — **B**
-
-**Decision:** New ADE protocol (PTY-first). Pull Fresh Editor/scene in later as optional capabilities (Phase 3+).
-
-| Option | Pros | Cons |
-|--------|------|------|
-| A. Reuse Fresh `fresh --web` WebSocket + scene | Real Editor already; less new protocol | Scene is editor-centric; terminal-first ADE may fight the grid model |
-| **B. New ADE protocol (PTY-first) + optional scene later** ✓ | Clean MVP (Phase 1 PTY); Terax-like UX freedom | Duplicate some session concepts; more design work |
-| C. SSH + local Fresh only (no custom daemon) | Minimal new code | Weak split-host product |
-
-#### D2 — Host GUI stack — **A**
-
-**Decision:** Tauri 2 + web frontend with **xterm.js** (WebGL renderer), Terax-like. Rust side owns connection/`fresh-gui-client`; UI owns layout and terminal panes.
-
-| Option | Pros | Cons |
-|--------|------|------|
-| **A. Tauri 2 + web frontend** (xterm.js) ✓ | Fast UI iteration, WebGL xterm, large ecosystem | Web stack + Rust bridge; package size vs egui |
-| B. egui / iced / GPUI | Pure Rust | Weaker terminal emulator ecosystem |
-| C. Native webview wrapping Fresh web-ui | Reuses Fresh UI | Not terminal-first ADE; scene-centric |
-
-#### D3 — Fresh coupling — **submodule + git rev pin**
-
-**Decision:** Vendor Fresh as a **git submodule** at `vendor/fresh`, pinned to an explicit **git revision** (not a floating branch). Cargo path dependencies point into `vendor/fresh/crates/…` when the backend links Fresh (Phase 3+; optional earlier for PTY helpers).
-
-| Option | Pros | Cons |
-|--------|------|------|
-| A. Path dependency on sibling checkout | Fast local iteration | Not portable |
-| B. Cargo git dependency only | Reproducible in Cargo.lock | No in-tree sources; awkward patches |
-| **C. Submodule + pin by git rev** ✓ | Explicit pin, portable clone, editable tree | Extra `submodule update` step |
-| D. crates.io only | Clean | APIs may not ship for this use |
-
-**Current pin (Phase 0):** `f5f2c4639f7d5ed3d6b3ef3d2343365ced426401` (`Merge upstream/master into master` on the integration fork). Also recorded in `vendor/fresh.rev` for package builds that cannot rely on submodule checkout.
-
-**Remote:** prefer the fork used for integration work (`https://github.com/amirhosseindavoody/fresh.git`); bump the pin with `git -C vendor/fresh fetch && git -C vendor/fresh checkout --detach <rev>` then stage `vendor/fresh` **and** update `vendor/fresh.rev` to the same SHA. Upstream tracking: `https://github.com/sinelaw/fresh.git`.
-
-**Clone:**
+**Current pin:** `f5f2c4639f7d5ed3d6b3ef3d2343365ced426401` (integration fork). Prefer `https://github.com/amirhosseindavoody/fresh.git`; upstream tracking: `https://github.com/sinelaw/fresh.git`.
 
 ```bash
 git clone --recurse-submodules https://github.com/amirhosseindavoody/fresh-gui.git
@@ -269,56 +158,58 @@ git clone --recurse-submodules https://github.com/amirhosseindavoody/fresh-gui.g
 git submodule update --init --recursive
 ```
 
-#### D4 — MVP feature cut — **PTY now, file tree next**
+Bump the pin with `git -C vendor/fresh fetch && git -C vendor/fresh checkout --detach <rev>`, then stage `vendor/fresh` **and** update `vendor/fresh.rev` to the same SHA.
 
-**Decision:** Phase 1 is **PTY-only**. A **read-only remote file tree** follows immediately as **Phase 1b** (not deferred to editor work). Full Fresh scene stays Phase 3.
+## 9. Development environment
 
-| Option | Pros | Cons |
-|--------|------|------|
-| **A. PTY-only (Phase 1)** ✓ | Ships a useful remote terminal ADE shell quickly | No explorer yet |
-| **B. File tree next (Phase 1b)** ✓ | IDE-like chrome soon after PTY | Extra protocol surface, sequenced deliberately |
-| C. Full Fresh scene from day one | Maximum Fresh leverage | Delays terminal-first polish |
+- **Pixi** (conda-forge): tasks `check`, `test`, `build`, `clippy`, `fmt`, `ui` / `ui-install` / `ui-build`, `serve`, `package`, `update-version`.
+- **Rust** via Pixi / rust-version `1.97` (edition 2024).
+- **Bun** for the Vite/TS UI (`crates/fresh-gui-app/ui/bun.lock`).
+- **Versioning:** CalVer `YYYY.MMDD.N` (e.g. `2026.730.2`). `scripts/update-version.sh` bumps workspace manifests; CI also bumps and publishes backend Releases.
 
-#### D5 — License — **GPL-2.0 (entire project)**
+## 10. Security
 
-**Decision:** License all `fresh-gui` crates under **GPL-2.0** (same as Fresh). No split licensing.
+Always-on bearer token (including loopback), default bind `127.0.0.1:7420`, SSH tunnel for remote access, `--allow-no-auth` loopback-only for tests. Full design: [SECURITY.md](./SECURITY.md).
 
-| Option | Pros | Cons |
-|--------|------|------|
-| MIT / Apache host + GPL backend | Permissive reuse of protocol/GUI | Two regimes to maintain |
-| **GPL-2.0 everywhere** ✓ | Simple; always safe when linking Fresh | Copyleft on host/protocol too |
+## 11. License
 
-All decisions D1–D5 are resolved.
+The entire `fresh-gui` project (all crates) is **GPL-2.0**, matching Fresh. The `vendor/fresh` submodule remains under Fresh’s own GPL-2.0 terms.
 
----
+## 12. Architecture decisions
 
-## 11. Repository Layout
+These are settled product choices, kept here as rationale—not a backlog.
+
+| ID | Choice | Why |
+|----|--------|-----|
+| **D1** | New ADE protocol (PTY-first); Fresh `--web` scene is not the wire | Terminal-first UX without fighting an editor-centric grid scene |
+| **D2** | Tauri 2 + web frontend (xterm.js WebGL) | Fast UI iteration and a mature terminal emulator; Rust owns the client library |
+| **D3** | Fresh as submodule + git rev pin | Portable, editable, explicit pin; also mirrored in `vendor/fresh.rev` for packaging |
+| **D4** | PTY + FS + editor as layered capabilities | Useful remote shell first; explorer and Fresh editor negotiate as capabilities |
+| **D5** | GPL-2.0 everywhere | Same license as Fresh; no split licensing |
+
+## 13. Repository layout
 
 ```
 fresh-gui/
-  Cargo.toml              # workspace
-  Cargo.lock
+  Cargo.toml / Cargo.lock
   pixi.toml / pixi.lock
   README.md
   LICENSE
-  .gitignore
   docs/
-    DESIGN.md             # this file
+    DESIGN.md          # this file
+    UI.md
+    SECURITY.md
+    WINDOWS.md
   vendor/
-    fresh/                # git submodule (pinned rev; see D3)
+    fresh/             # git submodule
+    fresh.rev          # pin for package builds
   crates/
     fresh-gui-protocol/
     fresh-gui/
     fresh-gui-client/
-    fresh-gui-app/            # CLI + Vite/TS UI (`ui/`, builds to `ui/dist`)
-    fresh-gui-desktop/        # Tauri 2 host (Windows MVP)
+    fresh-gui-app/     # CLI + ui/
+    fresh-gui-desktop/ # Tauri host
+  recipe/              # Pixi / rattler-build package
   scripts/
     update-version.sh
 ```
-
-## 12. Success Criteria (MVP)
-
-- From Windows GUI: connect to Linux backend, open a shell, type with acceptable latency on LAN / SSH.
-- Backend process can run detached; reconnect restores the same PTY session(s).
-- `pixi run check` and `pixi run test` pass on the Linux/WSL dev machine.
-- Decisions D1–D5 resolved (PTY-first ADE; Tauri 2 + xterm.js; Fresh submodule + rev pin; Phase 1 PTY then 1b file tree; GPL-2.0 everywhere).

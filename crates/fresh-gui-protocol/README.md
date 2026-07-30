@@ -1,5 +1,5 @@
 # fresh-gui-protocol
 
-Versioned message types shared by the Windows host GUI and the Linux remote backend.
+Versioned ADE message types shared by the host UI / client and the Linux remote backend (`hello`, session, PTY, FS, editor, scene).
 
-See [docs/DESIGN.md](../../docs/DESIGN.md).
+See [docs/DESIGN.md](../../docs/DESIGN.md) §5.
