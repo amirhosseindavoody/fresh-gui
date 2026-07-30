@@ -28,7 +28,7 @@ Inspired by Terax’s public UI / [TERAX.md](https://github.com/crynta/terax-ai/
 | Sliding “pill” active-tab indicator | Yes |
 | CodeMirror 6 + xterm WebGL | Yes |
 | Theme engine + CSS variables | Yes — tokens + xterm/editor follow resolved theme |
-| AI chat rail, agent diffs, composer | **No** — explicit non-goal |
+| AI chat rail, agent diffs, composer | **Not shipped** — Terax parity is a non-goal; terminal/ACP agent direction is design-only ([COPILOT.md](./COPILOT.md)); right rail stays reserved |
 | Source control / git graph | Not present |
 | Web preview / markdown tabs | Markdown preview helper exists for editor; not a separate tab kind |
 | Spaces / multi-project switcher | Not present (ADE sessions cover reconnect) |
@@ -216,14 +216,17 @@ Hybrid model: React mounts the shell; `bootstrapAde()` binds once to stable DOM 
 
 ## 9. Non-goals (UI)
 
-- Feature parity with Terax AI, agents, or theme marketplace.
+- Feature parity with Terax AI chrome, agent diffs marketplace, or theme marketplace.
 - Replacing Fresh’s TUI or embedding Fresh `--web` as the host chrome.
-- Pixel-perfect Terax clone (different product: remote ADE, GPL, no AI).
+- Pixel-perfect Terax clone (different product: remote ADE, GPL).
 - Marketing landing page inside the app window.
+
+Agent panels (right rail) may appear later per [COPILOT.md](./COPILOT.md); that is not Terax parity.
 
 ## 10. References
 
 - [DESIGN.md](./DESIGN.md) — architecture, protocol, Fresh coupling overview.
 - [FRESH.md](./FRESH.md) — how the daemon embeds Fresh editor libraries.
 - [SECURITY.md](./SECURITY.md) — token + SSH tunnel access model.
+- [COPILOT.md](./COPILOT.md) — Copilot CLI / ACP design (issue #49).
 - [Terax](https://github.com/crynta/terax-ai) — layout, tabs, terminal/editor stacks, polish bar.

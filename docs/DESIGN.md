@@ -21,11 +21,14 @@ Developers often keep a Windows or macOS laptop as the interactive machine and a
 
 ### Non-goals
 
-- Feature parity with Terax AI agents, theme marketplaces, or web preview panes.
+- Feature parity with Terax AI chrome (composer rail, agent diffs marketplace) or theme marketplaces / web preview panes.
+- Embedding the VS Code Copilot extension, or treating Copilot CLI as an inline-autocomplete engine (see [COPILOT.md](./COPILOT.md)).
 - Replacing Fresh’s TUI or shipping as a fork of Fresh.
 - Multi-user collaborative editing.
 - Publishing to winget / conda-forge as a primary channel (Pixi global install and GitHub Releases cover distribution today).
 - Public TLS / `wss://` exposure by default (SSH tunnel is the remote-access answer).
+
+**Agent direction (design only):** terminal-first Copilot CLI / ACP integration is under design in [COPILOT.md](./COPILOT.md) — not shipped.
 
 ## 3. Prior art
 
@@ -201,6 +204,7 @@ fresh-gui/
     FRESH.md           # Fresh editor embedding
     UI.md
     SECURITY.md
+    COPILOT.md         # Copilot CLI / ACP agent design (issue #49)
   vendor/
     fresh/             # git submodule
     fresh.rev          # pin for package builds

@@ -137,7 +137,7 @@ Useful tasks: `pixi run check`, `test`, `build`, `build-release`, `ui` (Vite hot
 | `fresh-gui-app` / `ui/` | Browser UI + small CLI |
 | `fresh-gui-protocol` / `fresh-gui-client` | Shared wire format + client library |
 
-Deeper design notes (architecture and behavior): [docs/DESIGN.md](./docs/DESIGN.md), [docs/FRESH.md](./docs/FRESH.md) (Fresh embedding), [docs/SECURITY.md](./docs/SECURITY.md), [docs/UI.md](./docs/UI.md). Backend flags and packaging: [crates/fresh-gui/README.md](./crates/fresh-gui/README.md).
+Deeper design notes (architecture and behavior): [docs/DESIGN.md](./docs/DESIGN.md), [docs/FRESH.md](./docs/FRESH.md) (Fresh embedding), [docs/SECURITY.md](./docs/SECURITY.md), [docs/UI.md](./docs/UI.md), [docs/COPILOT.md](./docs/COPILOT.md) (Copilot CLI / ACP design). Backend flags and packaging: [crates/fresh-gui/README.md](./crates/fresh-gui/README.md).
 
 ## Releases
 
