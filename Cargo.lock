@@ -1445,7 +1445,7 @@ dependencies = [
 
 [[package]]
 name = "fresh-gui"
-version = "2026.730.3"
+version = "2026.730.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -1470,7 +1470,7 @@ dependencies = [
 
 [[package]]
 name = "fresh-gui-app"
-version = "2026.730.3"
+version = "2026.730.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -1485,7 +1485,7 @@ dependencies = [
 
 [[package]]
 name = "fresh-gui-client"
-version = "2026.730.3"
+version = "2026.730.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1500,7 +1500,7 @@ dependencies = [
 
 [[package]]
 name = "fresh-gui-desktop"
-version = "2026.730.3"
+version = "2026.730.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -1510,7 +1510,7 @@ dependencies = [
 
 [[package]]
 name = "fresh-gui-protocol"
-version = "2026.730.3"
+version = "2026.730.4"
 dependencies = [
  "serde",
  "serde_json",
