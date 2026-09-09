@@ -122,7 +122,7 @@ Open it from the UI (**Settings** / `Mod+,`), edit, save with `Mod+S`. Theme fol
 git clone https://github.com/amirhosseindavoody/fresh-gui.git
 cd fresh-gui
 git submodule update --init --recursive
-pixi install
+pixi install          # rust, bun, python from pixi.toml
 pixi run ui-install   # once
 
 pixi run serve        # build UI + start backend (prints UI / WS URLs)

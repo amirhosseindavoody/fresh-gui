@@ -169,6 +169,7 @@ Bump the pin with `git -C vendor/fresh fetch && git -C vendor/fresh checkout --d
 - **Pixi** (conda-forge): tasks `check`, `test`, `build`, `clippy`, `fmt`, `ui` / `ui-install` / `ui-build`, `serve`, `package`, `update-version`.
 - **Rust** via Pixi / rust-version `1.97` (edition 2024).
 - **Bun** for the Vite/TS UI (`crates/fresh-gui-app/ui/bun.lock`).
+- **Python** via Pixi (`python >=3.14.7,<3.15`) so `pixi run python` is available in the workspace env.
 - **Versioning:** CalVer `YYYY.MMDD.N` (e.g. `2026.730.2`). `scripts/update-version.sh` bumps workspace manifests; CI also bumps and publishes backend Releases.
 
 ## 10. Security

@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-09
+
+- Added **Python** as a Pixi workspace dependency (`pixi add python` → `python >=3.14.7,<3.15` in `pixi.toml` / `pixi.lock`). Use `pixi run python`.
+
 ## 2026-07-30
 
 ### Markdown WYSIWYG performance (#52)
