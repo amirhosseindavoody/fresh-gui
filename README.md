@@ -4,6 +4,64 @@ A **terminal-first IDE shell** for a remote Linux machine. Run the backend on yo
 
 Inspired by [Terax](https://github.com/crynta/terax-ai) (layout and terminal-first product sense — not Tauri). The remote editor core is [Fresh](https://github.com/sinelaw/fresh). The host is a renderer only: it speaks `fresh-gui-protocol` over WebSocket; Fresh stays buffer authority on the daemon.
 
+## Install
+
+Linux (x86_64):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/amirhosseindavoody/fresh-gui/main/scripts/install.sh | sh
+```
+
+Windows (PowerShell 5.1+, x86_64):
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/amirhosseindavoody/fresh-gui/main/scripts/install.ps1 | iex"
+```
+
+Review the Windows script before running it:
+
+```powershell
+powershell -c "irm https://raw.githubusercontent.com/amirhosseindavoody/fresh-gui/main/scripts/install.ps1 | more"
+```
+
+The script reads the latest [GitHub Release](https://github.com/amirhosseindavoody/fresh-gui/releases) for this machine, checks the `.sha256` file published next to each archive, and copies:
+
+| Binary | Role |
+|--------|------|
+| `fresh-gui-app` | Native GPUI host (primary) |
+| `fresh-gui` | Headless daemon, for this machine or for `remote daemon --path` |
+
+into `~/.fresh-gui/bin` (Windows: `%USERPROFILE%\.fresh-gui\bin`) and prepends that directory to `PATH` (shell rc / profile on Unix, the user `PATH` on Windows). Open a new terminal afterward. Published hosts are Linux x86_64 and Windows x86_64. macOS has no release build.
+
+The default is **both** archives when the release contains them. Linux uses the gnu builds (`x86_64-unknown-linux-gnu`). Alpine (or `FRESH_GUI_LIBC=musl`) installs the musl daemon; the GPUI client is gnu-only, so that install skips `fresh-gui-app` unless you set `FRESH_GUI_LIBC=gnu`.
+
+| Setting | Shell | PowerShell |
+|---------|-------|------------|
+| Version (`latest` or `2026.921.5` / `v2026.921.5`) | `FRESH_GUI_VERSION` | `-FreshGuiVersion` or `$env:FRESH_GUI_VERSION` |
+| Install prefix | `FRESH_GUI_HOME` (default `~/.fresh-gui`) | `-FreshGuiHome` or `$env:FRESH_GUI_HOME` |
+| Bin directory | `FRESH_GUI_BIN_DIR` | `$env:FRESH_GUI_BIN_DIR` |
+| GitHub repo | `FRESH_GUI_REPOURL` | `-FreshGuiRepourl` or `$env:FRESH_GUI_REPOURL` |
+| Skip PATH edit | `FRESH_GUI_NO_PATH_UPDATE=1` | `-NoPathUpdate` or `$env:FRESH_GUI_NO_PATH_UPDATE=1` |
+| What to install (`both`, `client`, `daemon`) | `FRESH_GUI_COMPONENTS` | `-FreshGuiComponents` or `$env:FRESH_GUI_COMPONENTS` |
+| Linux libc (`gnu`, `musl`) | `FRESH_GUI_LIBC` | — |
+| Print the plan and exit | `FRESH_GUI_DRY_RUN=1` | `-DryRun` or `$env:FRESH_GUI_DRY_RUN=1` |
+
+`irm | iex` picks up the environment variables. Named parameters apply when you run the file (`powershell -File .\scripts\install.ps1 -FreshGuiVersion 2026.921.5 -NoPathUpdate`).
+
+```bash
+# pinned release, client only, leave PATH alone
+curl -fsSL https://raw.githubusercontent.com/amirhosseindavoody/fresh-gui/main/scripts/install.sh | \
+  FRESH_GUI_VERSION=2026.921.5 FRESH_GUI_COMPONENTS=client FRESH_GUI_NO_PATH_UPDATE=1 sh
+```
+
+```powershell
+$env:FRESH_GUI_VERSION = '2026.921.5'
+$env:FRESH_GUI_COMPONENTS = 'client'
+irm https://raw.githubusercontent.com/amirhosseindavoody/fresh-gui/main/scripts/install.ps1 | iex
+```
+
+The Linux client needs glibc ≥ 2.39, an X11 or Wayland session, fontconfig, and a Vulkan loader (`libvulkan.so.1`). The daemon gnu build needs glibc ≥ 2.31. Pixi remains available for the daemon alone (below).
+
 ## Install the backend (Linux)
 
 On the machine that holds your project:
@@ -66,7 +124,7 @@ Do not bind publicly by default. Non-loopback listens still require a token and 
 
 The native host can save an SSH target, install the Linux daemon if it is missing, and open a local tunnel to ADE `/ws`. Auth is your normal OpenSSH setup (keys, agent, `~/.ssh/config`). The app does not prompt for a password: `ssh user@host` must already succeed non-interactively (`BatchMode`).
 
-Download the host from a [GitHub Release](https://github.com/amirhosseindavoody/fresh-gui/releases) (or build it with `pixi run gui`):
+The [installer](#install) places `fresh-gui-app` on `PATH`. You can also download the host from a [GitHub Release](https://github.com/amirhosseindavoody/fresh-gui/releases) (or build it with `pixi run gui`):
 
 | Asset | Laptop |
 |-------|--------|

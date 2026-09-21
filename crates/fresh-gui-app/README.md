@@ -25,7 +25,7 @@ fresh-gui-app remote connect lab                  # GPUI window; closing it clos
 
 OpenSSH only (`ssh` / `scp` on `PATH`, keys or agent). Targets are stored in `~/.config/fresh-gui/remotes.json` (`%APPDATA%\fresh-gui\remotes.json` on Windows). The ADE token is not saved.
 
-GitHub Releases publish this host as `fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` (`./fresh-gui-app`) and `fresh-gui-client-*-x86_64-pc-windows-msvc.zip` (`fresh-gui-app.exe`).
+GitHub Releases publish this host as `fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` (`./fresh-gui-app`) and `fresh-gui-client-*-x86_64-pc-windows-msvc.zip` (`fresh-gui-app.exe`). The repo installer (`scripts/install.sh`, `scripts/install.ps1`) downloads that archive, checks `.sha256`, and puts `fresh-gui-app` on `PATH`. See the root [README](../../README.md#install).
 
 ```bash
 tar -xzf fresh-gui-client-YYYY.MMDD.N-x86_64-unknown-linux-gnu.tar.gz

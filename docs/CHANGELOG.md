@@ -2,6 +2,11 @@
 
 ## 2026-09-21
 
+### One-line installers
+
+- `scripts/install.sh` (`curl -fsSL …/scripts/install.sh | sh`) and `scripts/install.ps1` (`irm …/scripts/install.ps1 | iex`) download the GitHub Release for this machine, verify the sibling `.sha256` when it is published, and install `fresh-gui-app` plus `fresh-gui` into `~/.fresh-gui/bin` (Windows: `%USERPROFILE%\.fresh-gui\bin`), then update PATH.
+- `latest` follows the Releases redirect (archive names include the CalVer). `FRESH_GUI_VERSION` / `-FreshGuiVersion` pins a tag. `FRESH_GUI_HOME`, `FRESH_GUI_REPOURL`, `FRESH_GUI_COMPONENTS` (`both` / `client` / `daemon`), and `FRESH_GUI_NO_PATH_UPDATE` / `-NoPathUpdate` match the pixi installer shape. Linux prefers the gnu assets; `FRESH_GUI_LIBC=musl` selects the musl daemon (the GPUI client is gnu-only).
+
 ### Denser GPUI chrome
 
 - Title bar (30px), activity rail (36px, small icon buttons), explorer header (26px), tree rows (22px), tab strip (`TabBar::small()`, 24px), and status bar (22px) drop the medium gpui-component padding and min heights that made the shell look sparse next to VS Code / Zed.
