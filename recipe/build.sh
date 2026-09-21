@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and install fresh-gui + host UI assets (Linux package).
+# Build and install the headless fresh-gui daemon (Linux package).
 set -euo pipefail
 
 : "${PREFIX:?PREFIX must be set}"
@@ -50,17 +50,6 @@ ensure_vendor_fresh() {
 
 ensure_vendor_fresh
 
-echo "Building host UI…"
-(
-  cd crates/fresh-gui-app/ui
-  # package.json overrides rollup → @rollup/wasm-node so Vite does not load the
-  # native @rollup/rollup-linux-* addon (needs GLIBC_2.32+; many enterprise
-  # linux-64 hosts still ship 2.28–2.31 — see issue #3).
-  bun install --frozen-lockfile
-  bun run build
-  test -f dist/index.html
-)
-
 echo "Installing fresh-gui…"
 export CARGO_PROFILE_RELEASE_STRIP="${CARGO_PROFILE_RELEASE_STRIP:-symbols}"
 # Prefer thin LTO: fat LTO can OOM on smaller cloud/VPS machines during install.
@@ -72,17 +61,6 @@ cargo auditable install \
   --bin fresh-gui \
   --root "${PREFIX}" \
   --path crates/fresh-gui
-
-echo "Installing UI assets…"
-mkdir -p "${PREFIX}/share/fresh-gui/ui"
-# Copy built assets but skip Vite sourcemaps (keeps the package lean).
-if command -v rsync >/dev/null 2>&1; then
-  rsync -a --exclude='*.map' crates/fresh-gui-app/ui/dist/ "${PREFIX}/share/fresh-gui/ui/"
-else
-  (cd crates/fresh-gui-app/ui/dist && tar -cf - --exclude='*.map' .) \
-    | (cd "${PREFIX}/share/fresh-gui/ui" && tar -xf -)
-fi
-test -f "${PREFIX}/share/fresh-gui/ui/index.html"
 
 echo "Bundling third-party licenses…"
 cargo-bundle-licenses --format yaml --output ./THIRDPARTY.yml

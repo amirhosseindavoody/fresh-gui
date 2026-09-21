@@ -47,7 +47,7 @@ Default `fresh-gui` detaches a per-user daemon (exclusive lock), prints status, 
 
   From another machine (e.g. your laptop) — SSH tunnel, nothing exposed to the network:
     ssh -L 7420:127.0.0.1:7420 <user>@<host>
-    then open: http://127.0.0.1:7420/?token=<token>
+    fresh-gui-app --backend 'http://127.0.0.1:7420/?token=<token>'
 
   Stop with: fresh-gui close
 ```

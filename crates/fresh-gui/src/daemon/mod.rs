@@ -220,7 +220,7 @@ pub fn print_session_info(meta: &SessionMeta) {
             "  From another machine (e.g. your laptop) — SSH tunnel, nothing exposed to the network:"
         );
         println!("    ssh -L {port}:127.0.0.1:{port} {user}@your-server");
-        println!("    then open: {local}");
+        println!("    fresh-gui-app --backend '{local}'");
     } else if !meta.require_auth {
         println!();
         println!("  auth: disabled (--allow-no-auth)");

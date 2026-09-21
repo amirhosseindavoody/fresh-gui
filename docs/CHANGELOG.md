@@ -7,6 +7,7 @@
 - The release workflow builds `fresh-gui-app` for `x86_64-unknown-linux-gnu` on `ubuntu-latest` and uploads `fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` plus `.sha256`, using the same `scripts/package-client.sh` layout as the Windows client. Daemon archives are unchanged.
 - Pull requests that touch the client build compile and package that archive without bumping CalVer or publishing a Release (the bump job stays push/dispatch-only).
 - Linux runtime: glibc ≥ 2.39, an X11 or Wayland session, fontconfig, and a Vulkan loader (`libvulkan.so.1` is loaded on demand). Directly linked libraries are libxcb and libxkbcommon. This is not the daemon's glibc 2.31 zigbuild.
+- Daemon packages (`.conda` and standalone archives) no longer include `share/fresh-gui/ui`. Release CI does not build the Vite shell. The daemon stays headless unless `--ui-dir` is set. `crates/fresh-gui-app/ui` remains in the tree and is not the product host.
 
 ### SSH remote bootstrap for the GPUI host
 

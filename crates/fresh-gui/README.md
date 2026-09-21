@@ -30,7 +30,7 @@ Session files (private to the user):
 
 The daemon samples its own RSS about every 30 seconds and, on graceful stop, logs average and peak resident memory (MB). Child PTY processes are excluded.
 
-Open the printed **Local access** URL in `fresh-gui-app` (`pixi run gui -- --backend 'http://127.0.0.1:7420/?token=…'`) or in a browser. A bearer token is always required (auto-generated when unset). Prefer `FRESH_GUI_TOKEN` over `--token` so the secret does not appear in `ps`. The Vite UI caches the token in tab `sessionStorage` so a reload can re-auth and reattach without keeping `?token=` in the URL.
+Open the printed **Local access** URL in `fresh-gui-app` (`pixi run gui -- --backend 'http://127.0.0.1:7420/?token=…'`). A bearer token is always required (auto-generated when unset). Prefer `FRESH_GUI_TOKEN` over `--token` so the secret does not appear in `ps`. The daemon does not serve a browser UI.
 
 ## Install
 
@@ -42,13 +42,13 @@ pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git
 fresh-gui
 ```
 
-The package / archive ships `bin/fresh-gui` and UI assets under `share/fresh-gui/ui`. The native GPUI host is a separate release asset (`fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` or the Windows `.zip`), not inside the daemon archive.
+The package / archive ships the headless `bin/fresh-gui` binary. The native GPUI host is a separate release asset (`fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` or the Windows `.zip`).
 
 ## Endpoints
 
 | Route | Role |
 |-------|------|
-| `GET /` | Host UI (`share/fresh-gui/ui` or `ui/dist` in dev) |
+| `GET /` | Empty unless `--ui-dir` is set (not shipped) |
 | `GET /healthz` | Liveness |
 | `WS /ws` | ADE JSON frames |
 

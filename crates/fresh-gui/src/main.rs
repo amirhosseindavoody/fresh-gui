@@ -100,12 +100,12 @@ struct ServeArgs {
     #[arg(long, env = "FRESH_GUI_NO_EDITOR")]
     no_editor: bool,
 
-    /// Directory of built host UI (`index.html` from `ui/dist`). Served at `/`.
-    /// Default: search common workspace/package paths. Empty / missing → API only.
+    /// Optional directory of static files (`index.html`) to serve at `/`.
+    /// Unset: headless WebSocket + health only. The product host is `fresh-gui-app`.
     #[arg(long, env = "FRESH_GUI_UI_DIR")]
     ui_dir: Option<PathBuf>,
 
-    /// Do not serve the web UI (WebSocket + health only).
+    /// Do not serve static files, even when `--ui-dir` is set (WebSocket + health only).
     #[arg(long, env = "FRESH_GUI_NO_UI")]
     no_ui: bool,
 
@@ -396,7 +396,7 @@ fn print_startup_banner(bound: SocketAddr, http_url: &str, ws_url: &str, token: 
             "  From another machine (e.g. your laptop) — SSH tunnel, nothing exposed to the network:"
         );
         println!("    ssh -L {port}:127.0.0.1:{port} {user}@{host}");
-        println!("    then open: {local}");
+        println!("    fresh-gui-app --backend '{local}'");
     }
     println!();
 }
@@ -574,81 +574,35 @@ fn is_assigned_domain(name: &str) -> bool {
     true
 }
 
-/// Pick a directory that contains `index.html` for the embedded web UI.
+/// Serve static files only when `--ui-dir` points at a directory with `index.html`.
+/// The default daemon is headless; the host is the native GPUI client.
 fn resolve_ui_dir(explicit: Option<&std::path::Path>) -> Option<PathBuf> {
-    if let Some(dir) = explicit {
-        let dir = dir.to_path_buf();
-        if dir.join("index.html").is_file() {
-            info!(dir = %dir.display(), "serving web UI");
-            return Some(dir);
-        }
-        tracing::warn!(
-            dir = %dir.display(),
-            "ui-dir missing index.html — API only (run `pixi run ui-build`)"
-        );
+    let Some(dir) = explicit else {
         return None;
+    };
+    let dir = dir.to_path_buf();
+    if dir.join("index.html").is_file() {
+        info!(dir = %dir.display(), "serving static files from --ui-dir");
+        return Some(dir);
     }
-
-    for dir in ui_dir_candidates() {
-        let Ok(dir) = dir.canonicalize() else {
-            continue;
-        };
-        if dir.join("index.html").is_file() {
-            info!(dir = %dir.display(), "serving web UI");
-            return Some(dir);
-        }
-    }
-
     tracing::warn!(
-        "no web UI found (expected share/fresh-gui/ui or crates/fresh-gui-app/ui/dist) — API only; \
-         install the pixi package or run `pixi run ui-build`"
+        dir = %dir.display(),
+        "ui-dir missing index.html — WebSocket only"
     );
     None
-}
-
-/// Search order for packaged installs, then workspace / dev layouts.
-fn ui_dir_candidates() -> Vec<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-
-    // Pixi / conda package layout: $PREFIX/bin/fresh-gui → ../share/fresh-gui/ui
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("../share/fresh-gui/ui"));
-            candidates.push(parent.join("ui"));
-            candidates.push(parent.join("../ui/dist"));
-        }
-    }
-    if let Ok(prefix) = std::env::var("CONDA_PREFIX") {
-        candidates.push(PathBuf::from(prefix).join("share/fresh-gui/ui"));
-    }
-
-    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fresh-gui-app/ui/dist"));
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("crates/fresh-gui-app/ui/dist"));
-        candidates.push(cwd.join("ui/dist"));
-        candidates.push(cwd.join("share/fresh-gui/ui"));
-    }
-
-    candidates
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         display_host_port, format_host_port, host_has_port, is_assigned_domain, public_urls,
-        resolve_auth, ui_dir_candidates,
+        resolve_auth, resolve_ui_dir,
     };
     use std::net::SocketAddr;
 
     #[test]
-    fn ui_dir_candidates_include_packaged_share_layout() {
-        let candidates = ui_dir_candidates();
-        assert!(
-            candidates
-                .iter()
-                .any(|p| p.to_string_lossy().contains("share/fresh-gui/ui")),
-            "expected a share/fresh-gui/ui candidate, got {candidates:?}"
-        );
+    fn default_daemon_does_not_serve_a_ui_dir() {
+        assert!(resolve_ui_dir(None).is_none());
     }
 
     #[test]

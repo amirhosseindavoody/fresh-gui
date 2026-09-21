@@ -65,14 +65,14 @@ Logistics template: `pixi.toml` + Cargo workspace under `crates/`, CalVer `YYYY.
 | Crate | Binary? | Role |
 |-------|---------|------|
 | `fresh-gui-protocol` | no | Versioned messages, capability constants, errors |
-| `fresh-gui` | yes (`fresh-gui`) | Daemon: HTTP UI + WebSocket ADE, sessions, PTY, FS, Fresh editor (Linux primary; Windows binary also released) |
+| `fresh-gui` | yes (`fresh-gui`) | Headless daemon: WebSocket ADE, sessions, PTY, FS, Fresh editor (Linux primary; Windows binary also released) |
 | `fresh-gui-client` | no | Dial, auth, typed request helpers |
-| `fresh-gui-app` | yes (`fresh-gui-app`) | Native GPUI host (default) + CLI (`ping` / `smoke` / `attach` / `serve-ui`) + optional Vite/TS UI (`ui/`) |
+| `fresh-gui-app` | yes (`fresh-gui-app`) | Native GPUI host (default) + CLI (`ping` / `smoke` / `attach` / `serve-ui`). `ui/` is an unshipped Vite tree |
 
 ### Process model
 
 1. Operator starts **`fresh-gui`** on the remote machine (background session by default, or `--foreground` for tests). One daemon process holds the session lock; Fresh Editor runs in-process on a dedicated thread; PTY shells are child processes. Linux is the documented remote; the same daemon binary is also released for Windows.
-2. Operator runs **`fresh-gui-app`** with the printed Local access URL (`?token=`) or `ws://…/ws` plus `FRESH_GUI_TOKEN`. The native host authenticates and creates/attaches a session. (The daemon still serves a Vite UI at `GET /` for browser smoke tests.)
+2. Operator runs **`fresh-gui-app`** with the printed Local access URL (`?token=`) or `ws://…/ws` plus `FRESH_GUI_TOKEN`. The native host authenticates and creates/attaches a session. The daemon does not serve a browser UI unless `--ui-dir` is set.
 3. After `hello` + `auth`, the client creates or attaches a **session**. Layout persistence (`layout_set` v4) is implemented for the Vite host; native v1 does not restore it yet.
 4. Terminal panes map to remote PTYs in that session. Explorer and editor talk to sandboxed FS / Fresh buffer APIs over the same socket.
 5. Disconnect detaches the WebSocket subscriber; the session and PTYs keep running for reattach + scrollback.
@@ -136,16 +136,16 @@ Backend `config.json` (JSONC) holds UI prefs (theme, palette, fonts, explorer vi
 
 ### Packaging
 
-Pixi `[package]` + `recipe/` installs `bin/fresh-gui` and the browser UI under `share/fresh-gui/ui` (linux-64 `.conda`, glibc 2.28+). Recipe fetches the pinned Fresh tree via `vendor/fresh.rev` when submodules are missing.
+Pixi `[package]` + `recipe/` installs the headless `bin/fresh-gui` (linux-64 `.conda`, glibc 2.28+). Recipe fetches the pinned Fresh tree via `vendor/fresh.rev` when submodules are missing. It does not build or install a browser UI.
 
 CI on `main` (and `workflow_dispatch`) bumps CalVer and publishes a GitHub Release with:
 
 | Asset | What it is |
 |-------|------------|
-| `fresh-gui-*-*.conda` | linux-64 daemon + packaged browser UI |
-| `fresh-gui-*-x86_64-unknown-linux-gnu.tar.gz` | same layout, glibc ≥ 2.31 (`scripts/package-binary.sh`) |
-| `fresh-gui-*-x86_64-unknown-linux-musl.tar.gz` | same layout, musl |
-| `fresh-gui-*-x86_64-pc-windows-msvc.zip` | same layout, Windows daemon |
+| `fresh-gui-*-*.conda` | linux-64 headless daemon |
+| `fresh-gui-*-x86_64-unknown-linux-gnu.tar.gz` | headless daemon, glibc ≥ 2.31 (`scripts/package-binary.sh`) |
+| `fresh-gui-*-x86_64-unknown-linux-musl.tar.gz` | headless daemon, musl |
+| `fresh-gui-*-x86_64-pc-windows-msvc.zip` | headless daemon, Windows |
 | `fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` | Linux GPUI host only (`fresh-gui-app`), built on `ubuntu-latest` |
 | `fresh-gui-client-*-x86_64-pc-windows-msvc.zip` | Windows GPUI host only (`fresh-gui-app.exe`) |
 
@@ -156,8 +156,8 @@ CI on `main` (and `workflow_dispatch`) bumps CalVer and publishes a GitHub Relea
 | Surface | How it connects |
 |---------|-----------------|
 | **Native GPUI host (primary)** | `fresh-gui-app` / `pixi run gui` — gpui-kit 0.6.6 (`gpui-pre` = 0.3.6, same snapshot gpui-component requires). Speaks ADE over `fresh-gui-client`. |
-| **Embedded Vite UI** | Served from the same port as `/ws` (`GET /` → `ui/dist` or packaged `share/fresh-gui/ui`) — smoke / packaged browser path |
-| **Vite dev** | `pixi run ui` on `:1420`, points at the backend WS |
+| **Static files** | Only if the daemon is started with `--ui-dir` (not shipped, not the product) |
+| **Vite tree** | `crates/fresh-gui-app/ui` remains in the repo and is not built in Release CI |
 | **CLI** | `fresh-gui-app ping\|smoke\|attach` via `fresh-gui-client` |
 | **SSH bootstrap** | `fresh-gui-app remote add` / `remote connect` — OpenSSH only |
 

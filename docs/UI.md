@@ -2,7 +2,9 @@
 
 Product UI for the **local host** ADE shell. Architecture and protocol: [DESIGN.md](./DESIGN.md). User overview: [README.md](../README.md).
 
-**Primary host (this revision):** native GPUI + gpui-component (`crates/fresh-gui-app`, default `fresh-gui-app` / `pixi run gui`). Zed / VS Code-like chrome: activity bar, collapsible explorer, unified terminal + editor tabs, status bar, command palette. Connection is silent (`--backend` printed Local access URL with `?token=`, or `ws://…/ws` + `FRESH_GUI_TOKEN`).
+**Primary host:** native GPUI + gpui-component (`crates/fresh-gui-app`, default `fresh-gui-app` / `pixi run gui`), published as `fresh-gui-client-*` for Linux and Windows. Zed / VS Code-like chrome: activity bar, collapsible explorer, unified terminal + editor tabs, status bar, command palette. Connection is silent (`--backend` printed Local access URL with `?token=`, or `ws://…/ws` + `FRESH_GUI_TOKEN`).
+
+The sections below that describe the Vite/React shell are leftover notes for `crates/fresh-gui-app/ui`. That tree is not built in Release CI and is not installed with the daemon. A future browser host would be this GPUI UI via WebAssembly, which is out of scope here.
 
 **Vite/React host** (`crates/fresh-gui-app/ui`) is demoted to smoke tests and the daemon’s packaged `GET /`. It still includes a status bar, unified terminal/editor tabs, CodeMirror 6, xterm WebGL, per-tab pane trees, shortcuts + command palette, virtualized explorer, OSC 7 cwd sync, find, activity bar, system/light/dark theme with named palettes, and path/file context menus.
 
