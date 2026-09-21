@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use base64::Engine;
 use fresh_gui_protocol::{Message, PtyInfo, SessionInfo};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::debug;
 use uuid::Uuid;
 

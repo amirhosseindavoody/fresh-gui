@@ -1,6 +1,6 @@
 # fresh-gui
 
-Linux remote daemon: WebSocket ADE API + detachable sessions + PTY + filesystem + optional Fresh editor + embedded host UI.
+Linux remote daemon: WebSocket ADE API + detachable sessions + PTY + filesystem + optional Fresh editor + optional embedded Vite UI (the primary host is native `fresh-gui-app`).
 
 ## Run
 
@@ -30,7 +30,7 @@ Session files (private to the user):
 
 The daemon samples its own RSS about every 30 seconds and, on graceful stop, logs average and peak resident memory (MB). Child PTY processes are excluded.
 
-Open the printed **Local access** URL (includes `?token=`) in a browser. A bearer token is always required (auto-generated when unset). Prefer `FRESH_GUI_TOKEN` over `--token` so the secret does not appear in `ps`. After connect, the UI caches the token in tab `sessionStorage` so a reload can re-auth and reattach without keeping `?token=` in the URL.
+Open the printed **Local access** URL in `fresh-gui-app` (`pixi run gui -- --backend 'http://127.0.0.1:7420/?token=…'`) or in a browser. A bearer token is always required (auto-generated when unset). Prefer `FRESH_GUI_TOKEN` over `--token` so the secret does not appear in `ps`. The Vite UI caches the token in tab `sessionStorage` so a reload can re-auth and reattach without keeping `?token=` in the URL.
 
 ## Install
 

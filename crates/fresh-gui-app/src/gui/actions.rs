@@ -1,0 +1,43 @@
+//! Window-level ADE actions (command palette + keybindings).
+
+use gpui_kit::{App, KeyBinding, actions};
+
+actions!(
+    fresh_gui,
+    [
+        NewTerminal,
+        CloseTab,
+        SaveBuffer,
+        ToggleSidebar,
+        ToggleCommandPalette,
+        GoToFile,
+        OpenSettings,
+        Reconnect,
+        Disconnect,
+        NextTab,
+        PrevTab,
+    ]
+);
+
+pub fn init(cx: &mut App) {
+    cx.bind_keys(vec![
+        KeyBinding::new("ctrl-t", NewTerminal, None),
+        KeyBinding::new("ctrl-w", CloseTab, None),
+        KeyBinding::new("ctrl-s", SaveBuffer, None),
+        KeyBinding::new("ctrl-b", ToggleSidebar, None),
+        KeyBinding::new("ctrl-shift-p", ToggleCommandPalette, None),
+        KeyBinding::new("ctrl-p", GoToFile, None),
+        KeyBinding::new("ctrl-,", OpenSettings, None),
+        KeyBinding::new("ctrl-tab", NextTab, None),
+        KeyBinding::new("ctrl-shift-tab", PrevTab, None),
+        KeyBinding::new("ctrl-shift-r", Reconnect, None),
+    ]);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn module_compiles() {
+        assert!(true);
+    }
+}

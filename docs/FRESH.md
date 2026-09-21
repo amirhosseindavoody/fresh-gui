@@ -4,20 +4,20 @@ How **fresh-gui** embeds and talks to [Fresh](https://github.com/sinelaw/fresh).
 
 ## 1. Role of Fresh
 
-Fresh is the **remote buffer authority** inside the Linux daemon (`fresh-gui`). The host UI (browser) never links Fresh crates. It speaks the ADE WebSocket protocol; the daemon translates editor messages into in-process Fresh `Editor` calls.
+Fresh is the **remote buffer authority** inside the Linux daemon (`fresh-gui`). The host UI (native GPUI, or optional browser) never links Fresh crates. It speaks the ADE WebSocket protocol; the daemon translates editor messages into in-process Fresh `Editor` calls.
 
 ```
 ┌──────────────────────┐         ADE /ws (JSON)         ┌────────────────────────────┐
 │  Host UI             │◄──────────────────────────────►│  fresh-gui (Linux)          │
-│  CodeMirror, xterm,  │   editor_open / buffer_edit /  │  EditorHandle ──► Fresh     │
-│  React chrome        │   buffer_save / …              │  Editor (!Send thread)      │
+│  GPUI / optional Vite│   editor_open / buffer_edit /  │  EditorHandle ──► Fresh     │
+│  (renderer only)     │   buffer_save / …              │  Editor (!Send thread)      │
 └──────────────────────┘                                 │  vendor/fresh (submodule)   │
                                                          └────────────────────────────┘
 ```
 
 **Fresh owns:** open file → buffer text, language mode, disk save via Fresh’s filesystem, path-link / `:line:col` parsing helpers.
 
-**fresh-gui owns:** ADE protocol, sessions, PTY, FS sandbox for the explorer, host rendering (CodeMirror / xterm), revision CAS on the wire, config chrome (`ui.*`).
+**fresh-gui owns:** ADE protocol, sessions, PTY, FS sandbox for the explorer, host rendering (GPUI VTE/editor view, or CodeMirror / xterm in the Vite UI), revision CAS on the wire, config chrome (`ui.*`).
 
 This is intentional: the wire is a **PTY-first ADE protocol**, not Fresh `--web` scene envelopes (see DESIGN D1).
 
@@ -55,6 +55,8 @@ The Rust crate name imported in code is `fresh` (lib name of `fresh-editor`).
 | `gui` | **off** | Fresh’s own wgpu GUI crate is not linked (name collision only with this repo’s `fresh-gui`) |
 
 Package builds (`recipe/build.sh`) call `ensure_vendor_fresh()`: init the submodule if possible, otherwise shallow-fetch `vendor/fresh.rev`.
+
+**Follow-up:** this pin is upstream `a0408d3031aaea08df63bac94c2c24e522fb1b4a` because the integration fork master had not merged that tip yet. Re-point at `amirhosseindavoody/fresh` after the sync PR lands.
 
 ### Bumping Fresh
 
@@ -193,7 +195,8 @@ Workspace rule: prefer extending Fresh-backed backend surfaces over inventing a 
 | `crates/fresh-gui/src/pty.rs` | Host PTY (not Fresh terminal) |
 | `crates/fresh-gui/src/fs.rs` | Explorer FS sandbox |
 | `crates/fresh-gui-protocol/src/lib.rs` | `editor_*` / `buffer_*` / `scene_*` messages |
-| `crates/fresh-gui-app/ui/src/ade/bootstrap.ts` | Host editor protocol controller |
+| `crates/fresh-gui-app/src/gui/` | Native GPUI ADE host (renderer) |
+| `crates/fresh-gui-app/ui/src/ade/bootstrap.ts` | Vite host editor protocol controller |
 | `crates/fresh-gui-app/ui/src/palettes.ts` | Fresh theme colors → host tokens |
 | `recipe/build.sh` | Ensure Fresh pin for package builds |
 
@@ -201,6 +204,6 @@ Workspace rule: prefer extending Fresh-backed backend surfaces over inventing a 
 
 1. Clone with submodules (or let `recipe/build.sh` fetch `fresh.rev`).
 2. `fresh-gui` starts → optional Fresh `Editor` thread → Hello advertises `editor` + `scene`.
-3. Host opens a path → ADE `editor_open` → Fresh open → snapshot to CodeMirror.
+3. Host opens a path → ADE `editor_open` → Fresh open → snapshot to the host editor view (GPUI `Editor`, or CodeMirror in the Vite UI).
 4. Edits replace full buffer text under ADE revision CAS; save writes through Fresh.
 5. Disable embedding with `--no-editor` for a PTY/FS-only daemon.

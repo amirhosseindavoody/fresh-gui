@@ -112,8 +112,14 @@ async fn multi_pty_in_session() {
 
     let mut c = Client::connect(ConnectOptions::new(&ws)).await.unwrap();
     c.create_session(None).await.unwrap();
-    let a = c.open_pty(80, 24, None, Some("/bin/bash".into())).await.unwrap();
-    let b = c.open_pty(80, 24, None, Some("/bin/bash".into())).await.unwrap();
+    let a = c
+        .open_pty(80, 24, None, Some("/bin/bash".into()))
+        .await
+        .unwrap();
+    let b = c
+        .open_pty(80, 24, None, Some("/bin/bash".into()))
+        .await
+        .unwrap();
     assert_ne!(a, b);
     let listed = c.list_sessions().await.unwrap();
     assert_eq!(listed[0].pty_count, 2);

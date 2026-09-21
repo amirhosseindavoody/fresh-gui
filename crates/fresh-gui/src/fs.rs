@@ -3,7 +3,7 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use fresh_gui_protocol::{FsEntry, FsKind};
 use tokio::fs;
 
@@ -195,10 +195,7 @@ impl FsRoot {
         for src in sources {
             let from = self.resolve(src).await?;
             if paths_equal(&from, &dest_dir) || is_descendant(&from, &dest_dir) {
-                bail!(
-                    "cannot copy {} into itself or a descendant",
-                    from.display()
-                );
+                bail!("cannot copy {} into itself or a descendant", from.display());
             }
             let base = from
                 .file_name()
@@ -226,10 +223,7 @@ impl FsRoot {
         for src in sources {
             let from = self.resolve(src).await?;
             if paths_equal(&from, &dest_dir) || is_descendant(&from, &dest_dir) {
-                bail!(
-                    "cannot move {} into itself or a descendant",
-                    from.display()
-                );
+                bail!("cannot move {} into itself or a descendant", from.display());
             }
             let base = from
                 .file_name()
@@ -390,7 +384,10 @@ async fn unique_dest_path(dest_dir: &Path, base_name: &str) -> Result<PathBuf> {
             return Ok(path);
         }
     }
-    bail!("could not find a free name for {base_name} in {}", dest_dir.display());
+    bail!(
+        "could not find a free name for {base_name} in {}",
+        dest_dir.display()
+    );
 }
 
 fn split_name(name: &str) -> (String, String) {
@@ -459,7 +456,11 @@ mod tests {
                 || entries.len() >= 2
         );
         assert!(entries.iter().any(|e| e.name == "a.txt"));
-        assert!(entries.iter().any(|e| e.name == "sub" && e.kind == FsKind::Dir));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.name == "sub" && e.kind == FsKind::Dir)
+        );
 
         let escape = root.resolve("../").await;
         assert!(escape.is_err());
@@ -484,10 +485,7 @@ mod tests {
         let tmp = tempfile_dir();
         let root = FsRoot::new(tmp.clone()).unwrap();
 
-        let file = root
-            .create("", "hello.txt", FsKind::File)
-            .await
-            .unwrap();
+        let file = root.create("", "hello.txt", FsKind::File).await.unwrap();
         assert_eq!(file.name, "hello.txt");
         assert_eq!(file.kind, FsKind::File);
         stdfs::write(tmp.join("hello.txt"), b"hi").unwrap();
@@ -535,7 +533,11 @@ mod tests {
     async fn delete_refuses_root() {
         let tmp = tempfile_dir();
         let root = FsRoot::new(tmp.clone()).unwrap();
-        assert!(root.delete_paths(&[tmp.display().to_string()]).await.is_err());
+        assert!(
+            root.delete_paths(&[tmp.display().to_string()])
+                .await
+                .is_err()
+        );
         assert!(root.delete_paths(&["".into()]).await.is_err());
     }
 

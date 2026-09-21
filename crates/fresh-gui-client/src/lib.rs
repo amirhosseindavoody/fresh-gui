@@ -2,16 +2,14 @@
 
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::Engine;
-use fresh_gui_protocol::{
-    Hello, Message, PtyInfo, SceneBuffer, SessionInfo, PROTOCOL_VERSION,
-};
+use fresh_gui_protocol::{Hello, Message, PROTOCOL_VERSION, PtyInfo, SceneBuffer, SessionInfo};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::{
-    connect_async, tungstenite::Message as WsMessage, MaybeTlsStream, WebSocketStream,
+    MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message as WsMessage,
 };
 use url::Url;
 
@@ -151,9 +149,7 @@ impl Client {
                 Message::Error { code, message } => {
                     bail!("session list failed: {code}: {message}")
                 }
-                Message::PtyData { .. }
-                | Message::Pong { .. }
-                | Message::Ping { .. } => continue,
+                Message::PtyData { .. } | Message::Pong { .. } | Message::Ping { .. } => continue,
                 other => bail!("unexpected while listing sessions: {other:?}"),
             }
         }
@@ -230,13 +226,7 @@ impl Client {
     }
 
     pub async fn close_pty(&mut self, id: &str) -> Result<()> {
-        send_msg(
-            &mut self.sink,
-            &Message::PtyClose {
-                id: id.to_owned(),
-            },
-        )
-        .await
+        send_msg(&mut self.sink, &Message::PtyClose { id: id.to_owned() }).await
     }
 
     pub async fn list_dir(
@@ -605,6 +595,14 @@ impl Client {
 
     pub async fn recv(&mut self) -> Result<Message> {
         recv_msg(&mut self.stream).await
+    }
+
+    /// Send a protocol message without waiting for a matching reply.
+    ///
+    /// The native host uses this together with [`Self::recv`] in a select loop
+    /// so PTY data is never dropped while waiting on FS/editor replies.
+    pub async fn send(&mut self, msg: Message) -> Result<()> {
+        send_msg(&mut self.sink, &msg).await
     }
 
     pub fn decode_pty_data(data_b64: &str) -> Result<Vec<u8>> {

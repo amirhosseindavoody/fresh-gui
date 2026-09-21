@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use fresh::app::Editor;
 use fresh::config::Config;
 use fresh::config_io::DirectoryContext;
@@ -176,10 +176,7 @@ impl EditorHandle {
 }
 
 fn build_editor(working_dir: &Path) -> Result<Editor> {
-    let state_dir = std::env::temp_dir().join(format!(
-        "fresh-gui-editor-{}",
-        std::process::id()
-    ));
+    let state_dir = std::env::temp_dir().join(format!("fresh-gui-editor-{}", std::process::id()));
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("create editor state dir {}", state_dir.display()))?;
     let dir_context = DirectoryContext::for_testing(&state_dir);
@@ -233,7 +230,8 @@ fn run_loop(mut editor: Editor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     text,
                     reply,
                 } => {
-                    let result = edit_buffer(&mut editor, &mut tracked, &buffer_id, base_rev, &text);
+                    let result =
+                        edit_buffer(&mut editor, &mut tracked, &buffer_id, base_rev, &text);
                     let _ = reply.send(result);
                 }
                 Cmd::Save {

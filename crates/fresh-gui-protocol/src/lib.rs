@@ -522,7 +522,10 @@ mod tests {
             path: "/tmp/a.rs".into(),
             rev: 1,
         };
-        assert_eq!(Message::from_json(&saved.to_json().unwrap()).unwrap(), saved);
+        assert_eq!(
+            Message::from_json(&saved.to_json().unwrap()).unwrap(),
+            saved
+        );
     }
 
     #[test]
@@ -549,7 +552,10 @@ mod tests {
             path: "".into(),
             recursive: true,
         };
-        assert_eq!(Message::from_json(&start.to_json().unwrap()).unwrap(), start);
+        assert_eq!(
+            Message::from_json(&start.to_json().unwrap()).unwrap(),
+            start
+        );
         let changed = Message::FsChanged {
             watch_id: "w".into(),
             paths: vec!["/tmp/a".into()],

@@ -52,7 +52,9 @@ async fn pty_close_kills_shell_process() {
     wait_health(addr);
     let ws = format!("ws://{addr}/ws");
 
-    let mut c = Client::connect(ConnectOptions::new(&ws)).await.expect("connect");
+    let mut c = Client::connect(ConnectOptions::new(&ws))
+        .await
+        .expect("connect");
     let _sid = c.create_session(None).await.expect("create");
     let pty = c
         .open_pty(80, 24, None, Some("/bin/bash".into()))
@@ -63,10 +65,7 @@ async fn pty_close_kills_shell_process() {
     let _ = std::fs::remove_file(&marker);
 
     // Publish shell PID, then replace the shell with a long sleep so kill targets a live process.
-    let cmd = format!(
-        "echo $$ > {}; exec sleep 600\n",
-        marker.to_string_lossy()
-    );
+    let cmd = format!("echo $$ > {}; exec sleep 600\n", marker.to_string_lossy());
     c.write_pty(&pty, cmd.as_bytes()).await.expect("write");
 
     let pid = {
@@ -84,7 +83,10 @@ async fn pty_close_kills_shell_process() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     };
-    assert!(proc_alive(pid), "expected shell pid {pid} to be alive before close");
+    assert!(
+        proc_alive(pid),
+        "expected shell pid {pid} to be alive before close"
+    );
 
     c.close_pty(&pty).await.expect("close");
 

@@ -45,7 +45,11 @@ async fn editor_open_snapshot() {
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&tmp).unwrap();
     let marker = "fresh-gui-editor-phase3a";
-    fs::write(tmp.join("sample.rs"), format!("// {marker}\nfn main() {{}}\n")).unwrap();
+    fs::write(
+        tmp.join("sample.rs"),
+        format!("// {marker}\nfn main() {{}}\n"),
+    )
+    .unwrap();
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap();

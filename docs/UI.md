@@ -1,8 +1,12 @@
 # fresh-gui Host UI
 
-Product UI for the **local host** ADE shell (`crates/fresh-gui-app/ui`). Architecture and protocol: [DESIGN.md](./DESIGN.md). User overview: [README.md](../README.md).
+Product UI for the **local host** ADE shell. Architecture and protocol: [DESIGN.md](./DESIGN.md). User overview: [README.md](../README.md).
 
-The shipped UI includes a status bar, unified terminal/editor tabs, CodeMirror 6, xterm WebGL, per-tab pane trees, shortcuts + command palette, virtualized explorer, OSC 7 cwd sync, find, activity bar, system/light/dark theme with named palettes and typography via `config.json`, and path/file context menus. Connection is silent (`?token=` / `sessionStorage` auto-connect); there is no top connect form.
+**Primary host (this revision):** native GPUI + gpui-component (`crates/fresh-gui-app`, default `fresh-gui-app` / `pixi run gui`). Zed / VS Code-like chrome: activity bar, collapsible explorer, unified terminal + editor tabs, status bar, command palette. Connection is silent (`--backend` printed Local access URL with `?token=`, or `ws://…/ws` + `FRESH_GUI_TOKEN`).
+
+**Vite/React host** (`crates/fresh-gui-app/ui`) is demoted to smoke tests and the daemon’s packaged `GET /`. It still includes a status bar, unified terminal/editor tabs, CodeMirror 6, xterm WebGL, per-tab pane trees, shortcuts + command palette, virtualized explorer, OSC 7 cwd sync, find, activity bar, system/light/dark theme with named palettes, and path/file context menus.
+
+The rest of this document describes the **Vite** information architecture (still the feature-complete reference). Native v1 implements a subset — see §11.
 
 ## 1. Goals
 
@@ -10,7 +14,7 @@ The shipped UI includes a status bar, unified terminal/editor tabs, CodeMirror 6
 - **Editor and explorer are peers:** same tab chrome, shared focus model, shared shortcuts.
 - **Remote-aware chrome.** Connection, session, and capability state are first-class (unlike Terax’s local monolith).
 - **Dense, calm, premium.** Intentional motion, clear hierarchy, no decorative clutter.
-- **Stay dense.** React + shadcn own chrome; editor-core and PTY stay Fresh / xterm / CodeMirror.
+- **Stay dense.** Native chrome is gpui-component; the Vite path uses React + shadcn. Editor-core and PTY stay Fresh / xterm or VTE.
 
 ## 2. Borrow from Terax vs diverge
 
@@ -224,7 +228,26 @@ Hybrid model: React mounts the shell; `bootstrapAde()` binds once to stable DOM 
 
 Agent panels (right rail) may appear later per [COPILOT.md](./COPILOT.md); that is not Terax parity.
 
-## 10. References
+## 10. Native GPUI host (v1)
+
+`crates/fresh-gui-app/src/gui/` is the primary renderer. It reuses `fresh-gui-client` + ADE; it does **not** link Fresh.
+
+| Native v1 | Status |
+|-----------|--------|
+| Connect / auth / session (`?token=` URL or `--token`) | Yes |
+| Activity bar + collapsible explorer (`fs_list`) | Yes |
+| Unified terminal + editor tabs | Yes (one pane per tab; no splits) |
+| Status bar (connection, session, capabilities) | Yes |
+| Command palette + Go to File | Yes |
+| PTY I/O (VTE grid, OSC 7 tab title/cwd) | Yes (no WebGL xterm, no mouse select / clipboard chords yet) |
+| Editor open / edit / save (gpui `Editor` view of Fresh snapshots) | Yes |
+| Pane splits, layout v4 restore, markdown WYSIWYG, minimap | **Vite only** |
+| Context menus, find, palettes / typography packs, tab pin/reorder | **Vite only** |
+| Ctrl/Cmd+click path_link | **Vite only** |
+
+Linux-only GUI path in this repo: X11 or Wayland, fontconfig, wgpu/Vulkan. `pixi.toml` platform is `linux-64`.
+
+## 11. References
 
 - [DESIGN.md](./DESIGN.md) — architecture, protocol, Fresh coupling overview.
 - [FRESH.md](./FRESH.md) — how the daemon embeds Fresh editor libraries.
