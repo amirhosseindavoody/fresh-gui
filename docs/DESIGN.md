@@ -65,13 +65,13 @@ Logistics template: `pixi.toml` + Cargo workspace under `crates/`, CalVer `YYYY.
 | Crate | Binary? | Role |
 |-------|---------|------|
 | `fresh-gui-protocol` | no | Versioned messages, capability constants, errors |
-| `fresh-gui` | yes (`fresh-gui`) | Linux daemon: HTTP UI + WebSocket ADE, sessions, PTY, FS, Fresh editor |
+| `fresh-gui` | yes (`fresh-gui`) | Daemon: HTTP UI + WebSocket ADE, sessions, PTY, FS, Fresh editor (Linux primary; Windows binary also released) |
 | `fresh-gui-client` | no | Dial, auth, typed request helpers |
 | `fresh-gui-app` | yes (`fresh-gui-app`) | Native GPUI host (default) + CLI (`ping` / `smoke` / `attach` / `serve-ui`) + optional Vite/TS UI (`ui/`) |
 
 ### Process model
 
-1. Operator starts **`fresh-gui`** on the Linux machine (background session by default, or `--foreground` for tests). One daemon process holds the session lock; Fresh Editor runs in-process on a dedicated thread; PTY shells are child processes.
+1. Operator starts **`fresh-gui`** on the remote machine (background session by default, or `--foreground` for tests). One daemon process holds the session lock; Fresh Editor runs in-process on a dedicated thread; PTY shells are child processes. Linux is the documented remote; the same daemon binary is also released for Windows.
 2. Operator runs **`fresh-gui-app`** with the printed Local access URL (`?token=`) or `ws://…/ws` plus `FRESH_GUI_TOKEN`. The native host authenticates and creates/attaches a session. (The daemon still serves a Vite UI at `GET /` for browser smoke tests.)
 3. After `hello` + `auth`, the client creates or attaches a **session**. Layout persistence (`layout_set` v4) is implemented for the Vite host; native v1 does not restore it yet.
 4. Terminal panes map to remote PTYs in that session. Explorer and editor talk to sandboxed FS / Fresh buffer APIs over the same socket.
@@ -109,7 +109,7 @@ Default backend capabilities (omit `editor` / `scene` with `--no-editor`):
 
 ### Daemon session
 
-Default `fresh-gui` detaches a **per-user background session** (exclusive flock under `$XDG_RUNTIME_DIR/fresh-gui/`), prints status / Local access URL, and returns the shell. Re-running reprints status; `fresh-gui close` stops the daemon. Logs go to `$XDG_STATE_HOME/fresh-gui/fresh-gui.log`. See [SECURITY.md](./SECURITY.md) for token handling in `session.json`.
+Default `fresh-gui` detaches a **per-user background session** (exclusive lock under `$XDG_RUNTIME_DIR/fresh-gui/` on Unix, or `%LOCALAPPDATA%\fresh-gui\` on Windows), prints status / Local access URL, and returns the shell. Re-running reprints status; `fresh-gui close` stops the daemon. Logs go to `$XDG_STATE_HOME/fresh-gui/fresh-gui.log` on Unix (fallback `~/.local/state/fresh-gui/`) or `%LOCALAPPDATA%\fresh-gui\fresh-gui.log` on Windows. Detach follows Fresh’s daemon pattern (`setsid` on Unix; `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` on Windows). See [SECURITY.md](./SECURITY.md) for token handling in `session.json`.
 
 While serving, the daemon samples its own resident set from `/proc/self/status` (`VmRSS` / `VmHWM`) about every 30 seconds. On SIGTERM / Ctrl-C (before graceful drain completes) it logs structured **average** and **peak** RSS in MB. Measurement covers the backend process only (Axum server, session state, embedded Fresh editor) — not PTY child shells. Fresh has no production memory monitor API; this is host-lifecycle telemetry.
 
@@ -136,7 +136,18 @@ Backend `config.json` (JSONC) holds UI prefs (theme, palette, fonts, explorer vi
 
 ### Packaging
 
-Linux: Pixi `[package]` + `recipe/` installs `bin/fresh-gui` and UI under `share/fresh-gui/ui`. Recipe fetches the pinned Fresh tree via `vendor/fresh.rev` when submodules are missing. CI on `main` bumps CalVer and publishes GitHub Releases.
+Pixi `[package]` + `recipe/` installs `bin/fresh-gui` and the browser UI under `share/fresh-gui/ui` (linux-64 `.conda`, glibc 2.28+). Recipe fetches the pinned Fresh tree via `vendor/fresh.rev` when submodules are missing.
+
+CI on `main` (and `workflow_dispatch`) bumps CalVer and publishes a GitHub Release with:
+
+| Asset | What it is |
+|-------|------------|
+| `fresh-gui-*-*.conda` | linux-64 daemon + packaged browser UI |
+| `fresh-gui-*-x86_64-unknown-linux-gnu.tar.gz` | same layout, glibc ≥ 2.31 (`scripts/package-binary.sh`) |
+| `fresh-gui-*-x86_64-unknown-linux-musl.tar.gz` | same layout, musl |
+| `fresh-gui-*-x86_64-pc-windows-msvc.zip` | same layout, Windows daemon |
+
+The native GPUI host (`fresh-gui-app`) is **not** in these artifacts. Build it from a checkout (`pixi run gui`). `pixi.toml` stays `linux-64`.
 
 ## 7. Host surfaces
 
@@ -159,7 +170,7 @@ Fresh is a **git submodule** at `vendor/fresh`, pinned by commit SHA (also recor
 
 Full integration detail — vendoring, `EditorHandle`, protocol mapping, path_link, what is *not* from Fresh: **[FRESH.md](./FRESH.md)**.
 
-**Current pin:** `ddfc322bc977fc21c4c837ae79906c04a5717c58` on the integration fork `master` ([fresh#3](https://github.com/amirhosseindavoody/fresh/pull/3) merged). Same tree as the pre-merge trial `31c311bfa44fbbdb4c8b258357af3c1d7d0e81c6` (upstream through `a0408d30` plus the fork sync). Embedding APIs used by `crates/fresh-gui` (`Config::load_with_layers`, `Editor::with_working_dir`, `open_file` / preview, `replace_content`, `path_link`) compiled unchanged (`cargo check -p fresh-gui`).
+**Current pin:** `14f7d28b7ab18b6cdefc75ab94c5df34044ae3d0` on the integration fork `master` ([fresh#4](https://github.com/amirhosseindavoody/fresh/pull/4) merged on top of [fresh#3](https://github.com/amirhosseindavoody/fresh/pull/3)). The delta from `ddfc322` is CI/plugin-test only (`markdown_compose.ts`, `test_focus_log.ts`); embedding still links `fresh-editor` with feature `runtime` only.
 
 ```bash
 git clone --recurse-submodules https://github.com/amirhosseindavoody/fresh-gui.git
@@ -171,10 +182,10 @@ Bump the pin with `git -C vendor/fresh fetch && git -C vendor/fresh checkout --d
 
 ## 9. Development environment
 
-- **Pixi** (conda-forge): tasks `check`, `test`, `build`, `clippy`, `fmt`, `gui`, `ui` / `ui-install` / `ui-build`, `serve`, `package`, `update-version`.
+- **Pixi** (conda-forge): tasks `check`, `test`, `build`, `clippy`, `fmt`, `gui`, `ui` / `ui-install` / `ui-build`, `serve`, `package`, `package-binary`, `update-version`.
 - **Rust** via Pixi / rust-version `1.97` (edition 2024).
 - **Bun** for the Vite/TS UI (`crates/fresh-gui-app/ui/bun.lock`).
-- **Versioning:** CalVer `YYYY.MMDD.N` (e.g. `2026.730.2`). `scripts/update-version.sh` bumps workspace manifests; CI also bumps and publishes backend Releases.
+- **Versioning:** CalVer `YYYY.MMDD.N` (e.g. `2026.921.2`). `scripts/update-version.sh` bumps workspace manifests; CI also bumps and publishes backend Releases (linux-64 `.conda` plus standalone linux-gnu / musl / windows daemon archives).
 
 ## 10. Security
 
@@ -221,4 +232,5 @@ fresh-gui/
   recipe/              # Pixi / rattler-build package
   scripts/
     update-version.sh
+    package-binary.sh  # standalone release archives (gnu / musl / windows)
 ```

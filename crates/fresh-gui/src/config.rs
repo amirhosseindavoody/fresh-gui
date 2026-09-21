@@ -5,8 +5,9 @@
 //! Color packs under `ui.palette` reuse Fresh theme names where applicable
 //! (`nord`, `dracula`, …) mapped onto host CSS tokens.
 //!
-//! Default path (Linux): `$XDG_CONFIG_HOME/fresh-gui/config.json`
+//! Default path (Unix): `$XDG_CONFIG_HOME/fresh-gui/config.json`
 //! (falls back to `~/.config/fresh-gui/config.json`).
+//! Windows: `%APPDATA%\fresh-gui\config.json`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,11 +19,14 @@ use tracing::{info, warn};
 /// Filename under the config directory (same as Fresh).
 pub const FILENAME: &str = "config.json";
 
-/// Default shell when config omits `terminal.shell` or leaves it empty.
-pub const DEFAULT_SHELL_COMMAND: &str = "zsh";
+macro_rules! define_shell_defaults {
+    ($shell:literal) => {
+        /// Default shell when config omits `terminal.shell` or leaves it empty.
+        pub const DEFAULT_SHELL_COMMAND: &str = $shell;
 
-/// Documented starter file (JSONC) written on first settings open.
-pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"{
+        /// Documented starter file (JSONC) written on first settings open.
+        pub const DEFAULT_CONFIG_TEMPLATE: &str = concat!(
+            r#"{
   // Host UI chrome — applied on connect and when this file is saved.
   "ui": {
     // system | light | dark  (used when palette is "primer")
@@ -52,12 +56,22 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"{
   // Empty args keep interactive / OSC 7 setup for known shells.
   "terminal": {
     "shell": {
-      "command": "zsh",
+      "command": ""#,
+            $shell,
+            r#"",
       "args": []
     }
   }
 }
-"#;
+"#
+        );
+    };
+}
+
+#[cfg(unix)]
+define_shell_defaults!("zsh");
+#[cfg(windows)]
+define_shell_defaults!("powershell");
 
 const KNOWN_PALETTES: &[&str] = &[
     "primer",
@@ -380,7 +394,8 @@ impl Config {
     }
 }
 
-/// `$XDG_CONFIG_HOME/fresh-gui/config.json` or `~/.config/fresh-gui/config.json`.
+/// Unix: `$XDG_CONFIG_HOME/fresh-gui/config.json` or `~/.config/fresh-gui/config.json`.
+/// Windows: `%APPDATA%\fresh-gui\config.json`.
 pub fn default_config_path() -> PathBuf {
     default_config_dir().join(FILENAME)
 }
@@ -392,6 +407,15 @@ pub fn default_config_dir() -> PathBuf {
             return PathBuf::from(xdg).join("fresh-gui");
         }
     }
+    #[cfg(windows)]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let appdata = appdata.trim();
+            if !appdata.is_empty() {
+                return PathBuf::from(appdata).join("fresh-gui");
+            }
+        }
+    }
     home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
@@ -400,6 +424,7 @@ pub fn default_config_dir() -> PathBuf {
 
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .filter(|h| !h.is_empty())
         .map(PathBuf::from)
 }
@@ -567,7 +592,7 @@ mod tests {
     fn default_resolves_to_zsh_and_system_theme() {
         let cfg = Config::default();
         let (cmd, args) = cfg.resolve_shell();
-        assert_eq!(cmd, "zsh");
+        assert_eq!(cmd, DEFAULT_SHELL_COMMAND);
         assert!(args.is_empty());
         assert_eq!(cfg.ui.theme, "system");
         assert_eq!(cfg.ui.palette, "primer");
@@ -577,7 +602,7 @@ mod tests {
     #[test]
     fn missing_file_uses_defaults() {
         let cfg = Config::load_from_path(Path::new("/no/such/fresh-gui-config.json")).unwrap();
-        assert_eq!(cfg.resolve_shell().0, "zsh");
+        assert_eq!(cfg.resolve_shell().0, DEFAULT_SHELL_COMMAND);
         assert_eq!(cfg.ui.theme, "system");
         assert_eq!(cfg.ui.palette, "primer");
     }
@@ -613,7 +638,7 @@ mod tests {
         let path = dir.join("config.json");
         fs::write(&path, r#"{"terminal":{"shell":{"command":"  "}}}"#).unwrap();
         let cfg = Config::load_from_path(&path).unwrap();
-        assert_eq!(cfg.resolve_shell().0, "zsh");
+        assert_eq!(cfg.resolve_shell().0, DEFAULT_SHELL_COMMAND);
     }
 
     #[test]
@@ -623,7 +648,7 @@ mod tests {
         assert!(Config::ensure_file(&path).unwrap());
         assert!(path.is_file());
         let cfg = Config::load_from_path(&path).unwrap();
-        assert_eq!(cfg.resolve_shell().0, "zsh");
+        assert_eq!(cfg.resolve_shell().0, DEFAULT_SHELL_COMMAND);
         assert_eq!(cfg.ui.theme, "system");
         assert_eq!(cfg.ui.palette, "primer");
         assert!(!Config::ensure_file(&path).unwrap());
@@ -682,7 +707,7 @@ mod tests {
         assert_eq!(cfg.ui.terminal_font_size, 18);
         assert_eq!(cfg.ui.palette, "primer");
         assert_eq!(cfg.ui.font_weight, 400);
-        assert_eq!(cfg.resolve_shell().0, "zsh");
+        assert_eq!(cfg.resolve_shell().0, DEFAULT_SHELL_COMMAND);
 
         // Second call is a no-op.
         assert!(!Config::ensure_file(&path).unwrap());
@@ -719,7 +744,7 @@ mod tests {
         assert_eq!(cfg.ui.palette, "primer");
         assert_eq!(cfg.ui.font_weight, 400);
         assert_eq!(cfg.ui.mono_font_weight, 400);
-        assert_eq!(cfg.resolve_shell().0, "zsh");
+        assert_eq!(cfg.resolve_shell().0, DEFAULT_SHELL_COMMAND);
         assert!(!cfg.ui.show_dotfiles);
         assert!(!cfg.ui.show_git_dirs);
         assert!(!cfg.ui.editor_minimap);

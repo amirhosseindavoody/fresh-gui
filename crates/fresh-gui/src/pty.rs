@@ -147,7 +147,7 @@ impl PtySession {
 }
 
 fn shell_basename(shell: &str) -> &str {
-    shell.rsplit('/').next().unwrap_or(shell)
+    shell.rsplit(['/', '\\']).next().unwrap_or(shell)
 }
 
 fn shell_init_dir() -> PathBuf {

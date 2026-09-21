@@ -1,6 +1,6 @@
 # fresh-gui
 
-Linux remote daemon: WebSocket ADE API + detachable sessions + PTY + filesystem + optional Fresh editor + optional embedded Vite UI (the primary host is native `fresh-gui-app`).
+Remote ADE daemon: WebSocket ADE API + detachable sessions + PTY + filesystem + optional Fresh editor + optional embedded Vite UI (the primary host is native `fresh-gui-app`). Runs on **Linux** (documented remote) and **Windows** (standalone release binary).
 
 ## Run
 
@@ -22,11 +22,11 @@ Session files (private to the user):
 
 | Path | Role |
 |------|------|
-| `$XDG_RUNTIME_DIR/fresh-gui/session.lock` | Exclusive flock (one session) |
-| `$XDG_RUNTIME_DIR/fresh-gui/session.json` | pid, URLs, token, root, log path |
-| `$XDG_STATE_HOME/fresh-gui/fresh-gui.log` | Daemon stdout/stderr + tracing |
+| `$XDG_RUNTIME_DIR/fresh-gui/session.lock` (Linux) / `%LOCALAPPDATA%\fresh-gui\session.lock` (Windows) | Exclusive lock (one session) |
+| `…/session.json` | pid, URLs, token, root, log path |
+| `$XDG_STATE_HOME/fresh-gui/fresh-gui.log` (Linux) / `%LOCALAPPDATA%\fresh-gui\fresh-gui.log` (Windows) | Daemon stdout/stderr + tracing |
 
-(Fallbacks: `/tmp/fresh-gui-$UID/` and `~/.local/state/fresh-gui/`.)
+(Linux fallbacks: `/tmp/fresh-gui-$UID/` and `~/.local/state/fresh-gui/`.)
 
 The daemon samples its own RSS about every 30 seconds and, on graceful stop, logs average and peak resident memory (MB). Child PTY processes are excluded.
 
@@ -38,10 +38,11 @@ Open the printed **Local access** URL in `fresh-gui-app` (`pixi run gui -- --bac
 pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git
 # or a release .conda / --tag from GitHub Releases
 # or from a checkout: pixi global install --path .
+# or unpack a release binary archive (linux-gnu / musl / windows) and run ./bin/fresh-gui
 fresh-gui
 ```
 
-The package ships `bin/fresh-gui` and UI assets under `share/fresh-gui/ui`.
+The package / archive ships `bin/fresh-gui` and UI assets under `share/fresh-gui/ui`. The native GPUI host is not inside that archive.
 
 ## Endpoints
 
@@ -71,7 +72,7 @@ Sessions own PTYs; disconnect detaches the subscriber but keeps shells running f
 
 ## Config
 
-Default path: `$XDG_CONFIG_HOME/fresh-gui/config.json` or `~/.config/fresh-gui/config.json`.
+Default path: `$XDG_CONFIG_HOME/fresh-gui/config.json` or `~/.config/fresh-gui/config.json` (Windows: `%APPDATA%\fresh-gui\config.json`).
 
 ```jsonc
 {

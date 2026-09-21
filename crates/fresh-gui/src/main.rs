@@ -115,8 +115,8 @@ struct ServeArgs {
     public_host: Option<String>,
 
     /// Path to JSON config (default: `$XDG_CONFIG_HOME/fresh-gui/config.json`
-    /// or `~/.config/fresh-gui/config.json`). Missing file → built-in defaults
-    /// (default shell: `zsh`).
+    /// or `~/.config/fresh-gui/config.json`; Windows: `%APPDATA%\fresh-gui\config.json`).
+    /// Missing file → built-in defaults (shell: `zsh` on Unix, `powershell` on Windows).
     #[arg(long, env = "FRESH_GUI_CONFIG")]
     config: Option<PathBuf>,
 }

@@ -136,11 +136,11 @@ pixi run gui -- --backend 'http://127.0.0.1:7420/?token=…'   # native host
 
 The Vite UI is optional (`pixi run ui-install` once, then `pixi run ui` or `pixi run serve` which still embeds `ui/dist` on the daemon).
 
-Useful tasks: `pixi run check`, `test`, `build`, `gui`, `ui` (Vite hot reload on `:1420`), `package` (write `.conda` under `./dist`).
+Useful tasks: `pixi run check`, `test`, `build`, `gui`, `ui` (Vite hot reload on `:1420`), `package` (write `.conda` under `./dist`), `package-binary` (standalone archive; pass target and version).
 
 | Piece | Role |
 |-------|------|
-| `fresh-gui` | Linux daemon (PTY, FS, Fresh editor, optional embedded browser UI) |
+| `fresh-gui` | Daemon (PTY, FS, Fresh editor, optional embedded browser UI) — Linux primary, Windows binary also released |
 | `fresh-gui-app` | Native GPUI host (default) + CLI (`ping` / `smoke` / `attach` / `serve-ui`) |
 | `fresh-gui-app/ui` | Vite/React ADE shell (smoke / packaged `GET /`) |
 | `fresh-gui-protocol` / `fresh-gui-client` | Shared wire format + client library |
@@ -149,7 +149,16 @@ Deeper design notes (architecture and behavior): [docs/DESIGN.md](./docs/DESIGN.
 
 ## Releases
 
-CalVer `YYYY.MMDD.N`. Pushes to `main` bump the version, build the linux-64 package, and publish a [GitHub Release](https://github.com/amirhosseindavoody/fresh-gui/releases) (see `.github/workflows/release-backend.yml`). The version-bump commit rebases if `main` moved during the build. Manual bump: `pixi run update-version`.
+CalVer `YYYY.MMDD.N`. Pushes to `main` (and manual `workflow_dispatch`) bump the version and publish a [GitHub Release](https://github.com/amirhosseindavoody/fresh-gui/releases) (see `.github/workflows/release-backend.yml`):
+
+| Asset | Platform |
+|-------|----------|
+| `fresh-gui-*-*.conda` | linux-64 via Pixi (glibc 2.28+) |
+| `fresh-gui-*-x86_64-unknown-linux-gnu.tar.gz` | Linux standalone (glibc ≥ 2.31) |
+| `fresh-gui-*-x86_64-unknown-linux-musl.tar.gz` | Linux musl (Alpine / static-friendly) |
+| `fresh-gui-*-x86_64-pc-windows-msvc.zip` | Windows standalone daemon |
+
+Standalone archives unpack to `bin/fresh-gui` + `share/fresh-gui/ui` (same layout as the conda package). These assets are the **daemon** and the packaged browser UI. The native GPUI host is not in the release; use `pixi run gui` from a checkout. The version-bump commit rebases if `main` moved during the build. Manual bump: `pixi run update-version`.
 
 ## License
 
