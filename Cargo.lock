@@ -2457,6 +2457,8 @@ dependencies = [
  "gpui-kit",
  "gpui-pre",
  "gpui-pre-platform",
+ "serde",
+ "serde_json",
  "tokio",
  "tower-http",
  "tracing",

@@ -5,12 +5,16 @@
 //! `serve-ui` still serves the Vite `ui/dist` bundle for browser smoke tests.
 
 mod gui;
+mod ssh;
 
 use anyhow::{Context, Result};
 use axum::Router;
 use clap::{Parser, Subcommand};
 use fresh_gui_client::{Client, ConnectOptions, smoke_echo};
 use fresh_gui_protocol::{Message, PROTOCOL_VERSION};
+use ssh::{
+    DaemonSource, SshTarget, Toolchain, bootstrap, load_remotes, remotes_config_path, save_remotes,
+};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tower_http::services::ServeDir;
@@ -50,6 +54,11 @@ enum Cmd {
         #[arg(long, default_value_t = 24)]
         rows: u16,
     },
+    /// Saved SSH remotes: install the Linux daemon if needed, tunnel ADE, open the GPUI host.
+    Remote {
+        #[command(subcommand)]
+        cmd: RemoteCmd,
+    },
     /// Serve the built Vite UI over HTTP (browser smoke tests; not the primary host).
     ServeUi {
         #[arg(long, default_value = "127.0.0.1:1420")]
@@ -57,6 +66,45 @@ enum Cmd {
         /// Directory with index.html (defaults to `ui/dist` from a Vite build).
         #[arg(long)]
         dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RemoteCmd {
+    /// Save `user@host` or an OpenSSH `Host` alias. Auth is the system `ssh` client.
+    Add {
+        name: String,
+        destination: String,
+        /// SSH port (`ssh -p`).
+        #[arg(long)]
+        port: Option<u16>,
+        /// Identity file (`ssh -i`).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+        /// Remote workspace passed to `fresh-gui --root` when this host starts the daemon.
+        #[arg(long)]
+        root: Option<String>,
+        /// Local tunnel port. Omit to use 7420 when it is free, otherwise an ephemeral port.
+        #[arg(long)]
+        local_port: Option<u16>,
+    },
+    /// List saved SSH targets.
+    List,
+    /// Remove a saved SSH target.
+    Remove { name: String },
+    /// Probe, install or start the remote daemon, open a tunnel, and launch the GPUI host.
+    Connect { name: String },
+    /// Choose the Linux daemon binary used when the remote does not have `fresh-gui`.
+    Daemon {
+        /// Release `.tar.gz` URL (asset that contains `bin/fresh-gui`).
+        #[arg(long)]
+        url: Option<String>,
+        /// Local Linux `fresh-gui` binary, or a `.tar.gz` archive of one.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Clear a saved path/URL and use the latest GitHub linux-gnu release (the default).
+        #[arg(long)]
+        github_latest: bool,
     },
 }
 
@@ -79,6 +127,7 @@ fn main() -> Result<()> {
         Cmd::Ping => tokio_block_on(cmd_ping(backend, token)),
         Cmd::Smoke => tokio_block_on(cmd_smoke(backend, token)),
         Cmd::Attach { cols, rows } => tokio_block_on(cmd_attach(backend, token, cols, rows)),
+        Cmd::Remote { cmd } => cmd_remote(cmd),
         Cmd::ServeUi { listen, dir } => tokio_block_on(cmd_serve_ui(listen, dir)),
     }
 }
@@ -181,6 +230,149 @@ async fn cmd_attach(backend: String, token: Option<String>, cols: u16, rows: u16
         }
     }
     Ok(())
+}
+
+fn cmd_remote(cmd: RemoteCmd) -> Result<()> {
+    let path = remotes_config_path()?;
+    match cmd {
+        RemoteCmd::Add {
+            name,
+            destination,
+            port,
+            identity,
+            root,
+            local_port,
+        } => {
+            let mut file = load_remotes(&path)?;
+            file.add(SshTarget {
+                name: name.clone(),
+                destination: destination.clone(),
+                port,
+                identity: identity.map(|p| p.display().to_string()),
+                remote_root: root,
+                local_port,
+            })?;
+            save_remotes(&path, &file)?;
+            println!(
+                "Saved SSH target '{name}' ({destination}) in {}",
+                path.display()
+            );
+            println!("Connect with: fresh-gui-app remote connect {name}");
+            Ok(())
+        }
+        RemoteCmd::List => {
+            let file = load_remotes(&path)?;
+            if file.targets.is_empty() {
+                println!("No saved SSH targets ({})", path.display());
+                println!("Add one with: fresh-gui-app remote add <name> <user@host>");
+                return Ok(());
+            }
+            println!("SSH targets ({})", path.display());
+            for target in &file.targets {
+                let mut extra = String::new();
+                if let Some(port) = target.port {
+                    extra.push_str(&format!("  port {port}"));
+                }
+                if let Some(root) = &target.remote_root {
+                    extra.push_str(&format!("  root {root}"));
+                }
+                println!("  {}  {}{extra}", target.name, target.destination);
+            }
+            let source = DaemonSource::resolve(&file, None, None);
+            if let Some(daemon_path) = source.path {
+                println!("Daemon binary: {}", daemon_path.display());
+            } else if let Some(url) = source.url {
+                println!("Daemon URL: {url}");
+            } else {
+                println!("Daemon binary: latest GitHub linux-gnu release");
+            }
+            Ok(())
+        }
+        RemoteCmd::Remove { name } => {
+            let mut file = load_remotes(&path)?;
+            let removed = file.remove(&name)?;
+            save_remotes(&path, &file)?;
+            println!(
+                "Removed SSH target '{}' ({}) from {}",
+                removed.name,
+                removed.destination,
+                path.display()
+            );
+            Ok(())
+        }
+        RemoteCmd::Connect { name } => cmd_remote_connect(&path, &name),
+        RemoteCmd::Daemon {
+            url,
+            path: daemon_path,
+            github_latest,
+        } => cmd_remote_daemon(&path, url, daemon_path, github_latest),
+    }
+}
+
+fn cmd_remote_daemon(
+    path: &std::path::Path,
+    url: Option<String>,
+    daemon_path: Option<PathBuf>,
+    github_latest: bool,
+) -> Result<()> {
+    let chosen = [url.is_some(), daemon_path.is_some(), github_latest]
+        .iter()
+        .filter(|set| **set)
+        .count();
+    if chosen != 1 {
+        anyhow::bail!("pass exactly one of --url, --path, or --github-latest");
+    }
+    let mut file = load_remotes(path)?;
+    if github_latest {
+        file.daemon_url = None;
+        file.daemon_path = None;
+        save_remotes(path, &file)?;
+        println!("Daemon source: latest GitHub linux-gnu release");
+    } else if let Some(url) = url {
+        let url = url.trim().to_string();
+        anyhow::ensure!(!url.is_empty(), "daemon URL is empty");
+        file.daemon_url = Some(url.clone());
+        file.daemon_path = None;
+        save_remotes(path, &file)?;
+        println!("Daemon URL: {url}");
+    } else if let Some(daemon_path) = daemon_path {
+        anyhow::ensure!(
+            daemon_path.is_file(),
+            "daemon path {} is not a file",
+            daemon_path.display()
+        );
+        file.daemon_path = Some(daemon_path.display().to_string());
+        file.daemon_url = None;
+        save_remotes(path, &file)?;
+        println!("Daemon path: {}", daemon_path.display());
+    }
+    println!("Saved in {}", path.display());
+    println!("FRESH_GUI_DAEMON_PATH and FRESH_GUI_DAEMON_URL override this file for one connect.");
+    Ok(())
+}
+
+fn cmd_remote_connect(path: &std::path::Path, name: &str) -> Result<()> {
+    let file = load_remotes(path)?;
+    let target = file.get(name)?.clone();
+    let env_path = std::env::var("FRESH_GUI_DAEMON_PATH").ok();
+    let env_url = std::env::var("FRESH_GUI_DAEMON_URL").ok();
+    let daemon = DaemonSource::resolve(&file, env_path.as_deref(), env_url.as_deref());
+    let session = bootstrap(&target, &daemon, &Toolchain::default(), |line| {
+        eprintln!("{line}");
+    })?;
+    eprintln!(
+        "Tunnel ready. Opening the GPUI host at {} ({})",
+        session.ws_url, session.destination
+    );
+    let gui_target = gui::ConnectTarget {
+        ws_url: session.ws_url.clone(),
+        token: session.token.clone(),
+        label: Some(session.destination.clone()),
+    };
+    let result = gui::run_target(gui_target);
+    drop(session);
+    eprintln!("Closed SSH tunnel.");
+    result
 }
 
 async fn cmd_serve_ui(listen: SocketAddr, dir: Option<PathBuf>) -> Result<()> {
