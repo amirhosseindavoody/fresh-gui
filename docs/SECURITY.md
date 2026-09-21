@@ -60,7 +60,13 @@ The UI's `?token=` query param (if present) is read on load and used to auto-con
 
 After a successful read (and after `auth_ok`), the token is also kept in **`sessionStorage`** (`fresh-gui.authToken`) for this browser tab. Reloading the page reuses that cache plus the existing `localStorage` session id so the client can auth and `session_attach` again without the token remaining in the URL. The cache is cleared on `auth_error` and when the tab is closed (`sessionStorage` lifetime) — it is not written to disk by the backend and is not shared across tabs.
 
-### 3.5 Test escape hatch
+### 3.5 SSH bootstrap from the native host
+
+`fresh-gui-app remote connect` is another way to build the same loopback tunnel. It uses the **local OpenSSH client** (`ssh` / `scp`): keys, agent, and `~/.ssh/config`. The host does not collect passwords (`BatchMode=yes`). Host-key checking stays at OpenSSH defaults.
+
+The ADE token is read from the remote user's private `session.json` over that SSH session and kept in the client process for the WebSocket handshake. It is **not** written to `remotes.json`, not passed on the client argv, and not written to tracing logs. If a failed start's banner is shown, `token=` / `?token=` values are redacted. The tunnel binds `127.0.0.1` only. A missing daemon is copied to `~/.local/bin/fresh-gui` on the remote account you SSH as — same Unix user the daemon will run as.
+
+### 3.6 Test escape hatch
 
 `--allow-no-auth` (also `FRESH_GUI_ALLOW_NO_AUTH`) disables authentication **only on loopback**. Non-loopback + `--allow-no-auth` is a hard error. When enabled, the process logs and prints a clear warning. Integration tests use this flag; it is not part of the normal operator flow.
 
@@ -74,7 +80,8 @@ After a successful read (and after `auth_ok`), the token is also kept in **`sess
 | **Token in logs/terminal scrollback** | Kept out of `tracing` (which may be centrally aggregated, e.g. journald); it still hits the operator's own terminal scrollback by design (that's the delivery mechanism), so avoid running under a shared/logged terminal multiplexer session. |
 | **Token in private `session.json`** | Needed so re-running `fresh-gui` can reprint the Local access URL. Unix: `$XDG_RUNTIME_DIR/fresh-gui/session.json` (mode `0600`, directory `0700`). Windows: `%LOCALAPPDATA%\fresh-gui\session.json`. Removed on `fresh-gui close` / daemon exit. Same user-private trust as the lock file — other accounts cannot read it. |
 | **Token comparison timing** | Equal-length compares use a byte-wise XOR fold; length mismatches still short-circuit. In practice the token travels only over loopback or an SSH tunnel, and 122 bits of entropy makes brute forcing infeasible. |
-| **SSH tunnel security depends on normal SSH host/key verification** | No new risk introduced — same trust model as any other SSH usage. Verify host keys as usual; don't blindly accept unknown host keys. |
+| **SSH tunnel security depends on normal SSH host/key verification** | No new risk introduced — same trust model as any other SSH usage. Verify host keys as usual; don't blindly accept unknown host keys. `remote connect` does not change `StrictHostKeyChecking`. |
+| **SSH bootstrap copies a daemon binary onto the remote account** | The bytes come from a path or URL you configured (or the project's GitHub release). They are installed as `~/.local/bin/fresh-gui` for the SSH user and started as that user. The ADE token stays in that user's `session.json` and in the client process; it is not written to `remotes.json`. |
 | **`--allow-no-auth` misuse** | Restricted to loopback binds only (hard error otherwise) and clearly logged/printed as a warning when used. Intended for local test harnesses only, never documented as a normal run mode. |
 | **No rate limiting / lockout on failed auth attempts** | Not added — 122-bit token search space is not meaningfully brute-forceable even without rate limiting. |
 

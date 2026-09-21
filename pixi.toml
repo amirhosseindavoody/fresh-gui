@@ -52,6 +52,8 @@ ui-serve = "cargo run -p fresh-gui-app -- serve-ui"
 package = "pixi build -o dist"
 # Standalone archive: `pixi run package-binary -- <target> <version> [out-dir]`
 package-binary = "scripts/package-binary.sh"
+# GPUI host archive: `pixi run package-client -- <target> <version> [out-dir]`
+package-client = "scripts/package-client.sh"
 update-version = "scripts/update-version.sh"
 
 [dependencies]

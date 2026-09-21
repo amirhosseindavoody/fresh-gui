@@ -1075,7 +1075,7 @@ impl Render for Workspace {
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(self.target.ws_url.clone()),
+                                .child(self.target.chrome_label()),
                         ),
                 ),
             )

@@ -21,6 +21,16 @@ pixi run ui-serve    # serve ui/dist on :1420
 
 **Native host:** silent connect from `--backend` (`http://…/?token=` or `ws://…/ws`). `Ctrl+T` new terminal, explorer click to open, `Ctrl+S` save, `Ctrl+Shift+P` command palette, `Ctrl+,` settings (`config.json` on the backend). Disconnect keeps the backend session.
 
+**SSH remote:** save a Linux target and let the host install the daemon, start it headless, and tunnel `/ws`.
+
+```bash
+fresh-gui-app remote add lab user@server --root /path/to/project
+fresh-gui-app remote daemon --path ./fresh-gui    # or --url <linux-gnu.tar.gz>, or omit for GitHub latest
+fresh-gui-app remote connect lab                  # GPUI window; closing it closes the tunnel
+```
+
+OpenSSH only (`ssh` / `scp` on `PATH`, keys or agent). Targets are stored in `~/.config/fresh-gui/remotes.json` (`%APPDATA%\fresh-gui\remotes.json` on Windows). The ADE token is not saved.
+
 Linux needs an X11 or Wayland display, fontconfig, and a working wgpu/Vulkan backend. Combined with gpui-kit (Apache-2.0) the application is GPL-3.0-or-later.
 
 Product overview: [README.md](../../README.md). Architecture: [docs/DESIGN.md](../../docs/DESIGN.md), [docs/UI.md](../../docs/UI.md).

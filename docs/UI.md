@@ -235,6 +235,7 @@ Agent panels (right rail) may appear later per [COPILOT.md](./COPILOT.md); that 
 | Native v1 | Status |
 |-----------|--------|
 | Connect / auth / session (`?token=` URL or `--token`) | Yes |
+| SSH target add + auto-install + tunnel (`remote connect`) | Yes (CLI before the window; title bar shows the destination) |
 | Activity bar + collapsible explorer (`fs_list`) | Yes |
 | Unified terminal + editor tabs | Yes (one pane per tab; no splits) |
 | Status bar (connection, session, capabilities) | Yes |

@@ -17,17 +17,20 @@ use gpui_kit::*;
 
 use crate::gui::workspace::Workspace;
 
-pub use connect::parse_connect_target;
+pub use connect::{ConnectTarget, parse_connect_target};
 
 /// Launch the native ADE window. Blocks until the last window closes.
 pub fn run(backend: String, token: Option<String>) -> Result<()> {
+    run_target(parse_connect_target(&backend, token))
+}
+
+/// Same as [`run`], with an already-parsed target (used after SSH bootstrap).
+pub fn run_target(target: ConnectTarget) -> Result<()> {
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
 
     app.run(move |cx| {
         gpui_kit::init(cx);
         actions::init(cx);
-
-        let target = parse_connect_target(&backend, token.clone());
         let mut window_size = size(px(1280.0), px(800.0));
         if let Some(display) = cx.primary_display() {
             let display_size = display.bounds().size;

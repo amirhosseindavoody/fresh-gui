@@ -4,6 +4,8 @@
 pub struct ConnectTarget {
     pub ws_url: String,
     pub token: Option<String>,
+    /// Shown in the title bar (SSH destination). The WebSocket URL stays local.
+    pub label: Option<String>,
 }
 
 /// Turn a CLI `--backend` plus optional `--token` into a WebSocket URL.
@@ -15,7 +17,21 @@ pub fn parse_connect_target(backend: &str, cli_token: Option<String>) -> Connect
     let (base, query_token) = split_query_token(trimmed);
     let token = cli_token.or(query_token);
     let ws_url = to_ws_url(&base);
-    ConnectTarget { ws_url, token }
+    ConnectTarget {
+        ws_url,
+        token,
+        label: None,
+    }
+}
+
+impl ConnectTarget {
+    /// Title-bar text. SSH sessions show the destination next to the tunnel URL.
+    pub fn chrome_label(&self) -> String {
+        match &self.label {
+            Some(label) if !label.is_empty() => format!("{label}  {}", self.ws_url),
+            _ => self.ws_url.clone(),
+        }
+    }
 }
 
 /// Split `path[:line[:col]]` the way the command-palette Go to File prompt does.

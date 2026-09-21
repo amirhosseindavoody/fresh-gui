@@ -146,8 +146,9 @@ CI on `main` (and `workflow_dispatch`) bumps CalVer and publishes a GitHub Relea
 | `fresh-gui-*-x86_64-unknown-linux-gnu.tar.gz` | same layout, glibc ≥ 2.31 (`scripts/package-binary.sh`) |
 | `fresh-gui-*-x86_64-unknown-linux-musl.tar.gz` | same layout, musl |
 | `fresh-gui-*-x86_64-pc-windows-msvc.zip` | same layout, Windows daemon |
+| `fresh-gui-client-*-x86_64-pc-windows-msvc.zip` | Windows GPUI host only (`fresh-gui-app.exe`) |
 
-The native GPUI host (`fresh-gui-app`) is **not** in these artifacts. Build it from a checkout (`pixi run gui`). `pixi.toml` stays `linux-64`.
+`pixi.toml` stays `linux-64`. The client archive is built by `scripts/package-client.sh` (no embedded Vite UI). Linux GPUI builds stay a source checkout (`pixi run gui`).
 
 ## 7. Host surfaces
 
@@ -157,6 +158,20 @@ The native GPUI host (`fresh-gui-app`) is **not** in these artifacts. Build it f
 | **Embedded Vite UI** | Served from the same port as `/ws` (`GET /` → `ui/dist` or packaged `share/fresh-gui/ui`) — smoke / packaged browser path |
 | **Vite dev** | `pixi run ui` on `:1420`, points at the backend WS |
 | **CLI** | `fresh-gui-app ping\|smoke\|attach` via `fresh-gui-client` |
+| **SSH bootstrap** | `fresh-gui-app remote add` / `remote connect` — OpenSSH only |
+
+### SSH remote bootstrap
+
+The GPUI host can reach a Linux box without a hand-made tunnel. Saved targets (`user@host` or an OpenSSH `Host` alias) live in `~/.config/fresh-gui/remotes.json` (Windows: `%APPDATA%\fresh-gui\remotes.json`). That file stores destinations, not ADE tokens.
+
+`remote connect` shells out to the system `ssh` / `scp` (keys, agent, `ssh_config`; `BatchMode=yes`, so there is no password prompt):
+
+1. Run a probe over SSH. It checks `~/.local/bin/fresh-gui` (then `PATH`) and the daemon's private `session.json` (`$XDG_RUNTIME_DIR/fresh-gui/` or `/tmp/fresh-gui-$UID`).
+2. If the binary is missing, download or unpack a Linux daemon (saved path, saved release URL, `FRESH_GUI_DAEMON_PATH` / `FRESH_GUI_DAEMON_URL`, or the latest GitHub `x86_64-unknown-linux-gnu` `.tar.gz`) and `scp` it to `~/.local/bin/fresh-gui`.
+3. If no session is running, start `fresh-gui --no-ui` (optional `--root`) and read the token from `session.json`.
+4. Open `ssh -N -L 127.0.0.1:<local>:127.0.0.1:<remote>` and hand `ws://127.0.0.1:<local>/ws` plus the token to the GPUI window. Closing the window kills the tunnel; the remote daemon keeps running.
+
+Fresh Orchestrator already models SSH workspaces, but that code is TUI/plugin-only and is not linked into the ADE daemon (`fresh-editor` feature `runtime`). The host does not reimplement an SSH client. There is no multi-workspace registry beyond this flat target list.
 
 The ADE protocol did **not** need to change for the native host: only the renderer switched from browser (React/CodeMirror/xterm) to GPUI. Fresh remains on the daemon. Combined license is GPL-3.0-or-later (host, matching Fresh) plus Apache-2.0 (gpui-kit). Apache-2.0 can be combined with GPL-3.0, so the binary is GPL-3.0-or-later.
 
@@ -182,10 +197,10 @@ Bump the pin with `git -C vendor/fresh fetch && git -C vendor/fresh checkout --d
 
 ## 9. Development environment
 
-- **Pixi** (conda-forge): tasks `check`, `test`, `build`, `clippy`, `fmt`, `gui`, `ui` / `ui-install` / `ui-build`, `serve`, `package`, `package-binary`, `update-version`.
+- **Pixi** (conda-forge): tasks `check`, `test`, `build`, `clippy`, `fmt`, `gui`, `ui` / `ui-install` / `ui-build`, `serve`, `package`, `package-binary`, `package-client`, `update-version`.
 - **Rust** via Pixi / rust-version `1.97` (edition 2024).
 - **Bun** for the Vite/TS UI (`crates/fresh-gui-app/ui/bun.lock`).
-- **Versioning:** CalVer `YYYY.MMDD.N` (e.g. `2026.921.2`). `scripts/update-version.sh` bumps workspace manifests; CI also bumps and publishes backend Releases (linux-64 `.conda` plus standalone linux-gnu / musl / windows daemon archives).
+- **Versioning:** CalVer `YYYY.MMDD.N` (e.g. `2026.921.3`). `scripts/update-version.sh` bumps workspace manifests; CI also bumps and publishes backend Releases (linux-64 `.conda`, standalone linux-gnu / musl / windows daemon archives, and a Windows GPUI client archive).
 
 ## 10. Security
 
@@ -232,5 +247,6 @@ fresh-gui/
   recipe/              # Pixi / rattler-build package
   scripts/
     update-version.sh
-    package-binary.sh  # standalone release archives (gnu / musl / windows)
+    package-binary.sh  # standalone daemon archives (gnu / musl / windows)
+    package-client.sh  # GPUI host archive (Windows client release)
 ```

@@ -64,6 +64,34 @@ fresh-gui-app --backend 'http://127.0.0.1:7420/?token=…'
 
 Do not bind publicly by default. Non-loopback listens still require a token and log a warning; SSH tunnel + loopback is the supported remote path.
 
+### Windows or Linux client (auto-install over SSH)
+
+The native host can save an SSH target, install the Linux daemon if it is missing, and open a local tunnel to ADE `/ws`. Auth is your normal OpenSSH setup (keys, agent, `~/.ssh/config`). The app does not prompt for a password: `ssh user@host` must already succeed non-interactively (`BatchMode`).
+
+```bash
+# on the laptop (Windows or Linux fresh-gui-app)
+fresh-gui-app remote add lab user@server
+# or an OpenSSH Host alias from ~/.ssh/config:
+fresh-gui-app remote add lab my-server --root /path/to/project
+
+# optional — pin the Linux daemon (default: latest GitHub linux-gnu release)
+fresh-gui-app remote daemon --path ./fresh-gui-linux
+fresh-gui-app remote daemon --url 'https://github.com/amirhosseindavoody/fresh-gui/releases/download/vYYYY.MMDD.N/fresh-gui-YYYY.MMDD.N-x86_64-unknown-linux-gnu.tar.gz'
+# one-shot overrides: FRESH_GUI_DAEMON_PATH, FRESH_GUI_DAEMON_URL
+
+fresh-gui-app remote list
+fresh-gui-app remote connect lab
+```
+
+On `remote connect` the host:
+
+1. SSHs to the target and checks for a `fresh-gui` binary plus a live session (`session.json`).
+2. If the binary is missing, copies a Linux daemon to `~/.local/bin/fresh-gui` (from the path, the URL, or the latest GitHub `x86_64-unknown-linux-gnu` release).
+3. If no session is running, starts `fresh-gui --no-ui` (headless) and reads the token from the remote session file.
+4. Opens `ssh -L 127.0.0.1:<local>:127.0.0.1:<remote>` and connects the GPUI window to `ws://127.0.0.1:<local>/ws`.
+
+Closing the window closes the tunnel. The remote daemon keeps running; the next `remote connect` reuses it. Saved targets live in `~/.config/fresh-gui/remotes.json` (Windows: `%APPDATA%\fresh-gui\remotes.json`). Tokens are not stored there. `ssh` and `scp` must be on `PATH` (OpenSSH).
+
 ## Using the native host
 
 Primary UI is **`fresh-gui-app`** (GPUI + [gpui-component](https://github.com/longbridge/gpui-component) via gpui-kit). Same machine as the daemon, or a laptop after the SSH tunnel:
@@ -157,8 +185,9 @@ CalVer `YYYY.MMDD.N`. Pushes to `main` (and manual `workflow_dispatch`) bump the
 | `fresh-gui-*-x86_64-unknown-linux-gnu.tar.gz` | Linux standalone (glibc ≥ 2.31) |
 | `fresh-gui-*-x86_64-unknown-linux-musl.tar.gz` | Linux musl (Alpine / static-friendly) |
 | `fresh-gui-*-x86_64-pc-windows-msvc.zip` | Windows standalone daemon |
+| `fresh-gui-client-*-x86_64-pc-windows-msvc.zip` | Windows GPUI host (`fresh-gui-app.exe`) |
 
-Standalone archives unpack to `bin/fresh-gui` + `share/fresh-gui/ui` (same layout as the conda package). These assets are the **daemon** and the packaged browser UI. The native GPUI host is not in the release; use `pixi run gui` from a checkout. The version-bump commit rebases if `main` moved during the build. Manual bump: `pixi run update-version`.
+Daemon archives unpack to `bin/fresh-gui` + `share/fresh-gui/ui` (same layout as the conda package). The **client** archive is only the native GPUI host, for a Windows laptop that talks to a Linux daemon (see [Windows or Linux client](#windows-or-linux-client-auto-install-over-ssh)). The version-bump commit rebases if `main` moved during the build. Manual bump: `pixi run update-version`.
 
 ## License
 
