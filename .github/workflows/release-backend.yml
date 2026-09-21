@@ -556,7 +556,10 @@ jobs:
           archives=(dist/client/fresh-gui-client-*.tar.gz)
           test "${#archives[@]}" -eq 1
           test -f "${archives[0]}.sha256"
-          tar -tzf "${archives[0]}" | grep -q '/fresh-gui-app$'
+          # Read the listing fully. `tar | grep -q` under pipefail fails with
+          # SIGPIPE once grep exits on the first match.
+          listing="$(tar -tzf "${archives[0]}")"
+          grep -q '/fresh-gui-app$' <<<"${listing}"
           (cd dist/client && sha256sum -c ./*.tar.gz.sha256)
 
       - name: Upload to GitHub Release
