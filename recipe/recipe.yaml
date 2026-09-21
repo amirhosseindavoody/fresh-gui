@@ -59,7 +59,7 @@ about:
     browser (or any client that can reach the URL).
 
     Platform: linux-64 only. Install on the remote Linux machine.
-  license: GPL-2.0-only
+  license: GPL-3.0-or-later
   license_file:
     - LICENSE
     - THIRDPARTY.yml

@@ -177,7 +177,7 @@ Always-on bearer token (including loopback), default bind `127.0.0.1:7420`, SSH 
 
 ## 11. License
 
-The entire `fresh-gui` project (all crates) is **GPL-2.0**, matching Fresh. The `vendor/fresh` submodule remains under Fresh’s own GPL-2.0 terms.
+The entire `fresh-gui` project (all crates) is **GPL-3.0-or-later**, matching Fresh. The `vendor/fresh` submodule remains under Fresh’s own GPL-3.0-or-later terms.
 
 ## 12. Architecture decisions
 
@@ -189,7 +189,7 @@ These are settled product choices, kept here as rationale—not a backlog.
 | **D2** | Browser UI (React + xterm.js WebGL + CodeMirror) | Fast UI iteration and a mature terminal emulator; Rust owns the daemon and client library |
 | **D3** | Fresh as submodule + git rev pin | Portable, editable, explicit pin; also mirrored in `vendor/fresh.rev` for packaging |
 | **D4** | PTY + FS + editor as layered capabilities | Useful remote shell first; explorer and Fresh editor negotiate as capabilities |
-| **D5** | GPL-2.0 everywhere | Same license as Fresh; no split licensing |
+| **D5** | GPL-3.0-or-later everywhere | Same license as Fresh; no split licensing |
 
 ## 13. Repository layout
 

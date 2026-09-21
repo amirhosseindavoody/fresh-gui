@@ -145,4 +145,4 @@ CalVer `YYYY.MMDD.N`. Pushes to `main` bump the version, build the linux-64 pack
 
 ## License
 
-[GPL-2.0](./LICENSE) (same as Fresh).
+[GPL-3.0-or-later](./LICENSE) (same as Fresh).

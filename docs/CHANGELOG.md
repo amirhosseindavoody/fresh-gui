@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-09-21
+
+### Relicense to GPL-3.0-or-later
+
+- Replaced the root `LICENSE` with GNU GPL Version 3 (same text as Fresh) and set workspace / packaging SPDX to `GPL-3.0-or-later` so fresh-gui matches [Fresh](https://github.com/sinelaw/fresh) (`GPL-3.0-or-later`).
+
 ## 2026-07-30
 
 ### Markdown WYSIWYG performance (#52)
