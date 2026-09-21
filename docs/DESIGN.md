@@ -25,7 +25,7 @@ Developers often keep a Windows or macOS laptop as the interactive machine and a
 - Embedding the VS Code Copilot extension, or treating Copilot CLI as an inline-autocomplete engine (see [COPILOT.md](./COPILOT.md)).
 - Replacing Fresh’s TUI or shipping as a fork of Fresh.
 - Multi-user collaborative editing.
-- Publishing to winget / conda-forge as a primary channel (Pixi global install and GitHub Releases cover distribution today).
+- Publishing to winget / conda-forge as a primary channel (the install scripts, Pixi global install, and GitHub Releases cover distribution today).
 - Public TLS / `wss://` exposure by default (SSH tunnel is the remote-access answer).
 
 **Agent direction (design only):** terminal-first Copilot CLI / ACP integration is under design in [COPILOT.md](./COPILOT.md) — not shipped.
@@ -151,6 +151,8 @@ CI on `main` (and `workflow_dispatch`) bumps CalVer and publishes a GitHub Relea
 
 `pixi.toml` stays `linux-64`. Client archives are built by `scripts/package-client.sh` (no embedded Vite UI). `pixi run gui` remains the from-source host. The Linux client is built on `ubuntu-latest` and needs glibc ≥ 2.39 (not the daemon's glibc 2.31 zigbuild), a display, fontconfig, and a Vulkan loader.
 
+`scripts/install.sh` and `scripts/install.ps1` are the one-line installers (`curl | sh`, `irm | iex`). They resolve `latest` from the GitHub Releases redirect (asset names include the CalVer), download the **client and daemon** for the host OS, verify the sibling `.sha256` when that asset exists, and copy `fresh-gui-app` and `fresh-gui` into `~/.fresh-gui/bin` (Windows: `%USERPROFILE%\.fresh-gui\bin`), then update PATH. `FRESH_GUI_COMPONENTS=client|daemon` installs one of them. Linux defaults to the gnu assets; `FRESH_GUI_LIBC=musl` (also auto-detected on Alpine) selects the musl daemon. The GPUI client is published for gnu only, so a musl install skips it. If the default install asks for both and one archive is missing from that tag, the other is still installed. Windows assets use a `.zip` name; current releases are GNU tar files inside that name (Info-ZIP was not on the runner), so the installers sniff the magic and extract with `tar` or with unzip / `Expand-Archive`. See [README.md](../README.md#install).
+
 ## 7. Host surfaces
 
 | Surface | How it connects |
@@ -247,4 +249,6 @@ fresh-gui/
     update-version.sh
     package-binary.sh  # standalone daemon archives (gnu / musl / windows)
     package-client.sh  # GPUI host archives (Linux tar.gz, Windows zip)
+    install.sh         # curl | sh installer (client + daemon)
+    install.ps1        # Windows irm | iex installer
 ```

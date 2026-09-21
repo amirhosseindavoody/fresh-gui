@@ -34,6 +34,11 @@ Open the printed **Local access** URL in `fresh-gui-app` (`pixi run gui -- --bac
 ## Install
 
 ```bash
+# client + daemon into ~/.fresh-gui/bin (see the repo README)
+curl -fsSL https://raw.githubusercontent.com/amirhosseindavoody/fresh-gui/main/scripts/install.sh | sh
+# daemon only:
+curl -fsSL https://raw.githubusercontent.com/amirhosseindavoody/fresh-gui/main/scripts/install.sh | FRESH_GUI_COMPONENTS=daemon sh
+
 pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git
 # or a release .conda / --tag from GitHub Releases
 # or from a checkout: pixi global install --path .
