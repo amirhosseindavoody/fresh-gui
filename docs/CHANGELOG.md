@@ -11,7 +11,7 @@
 - Primary host is now a native **gpui-kit 0.6.6** / gpui-component desktop shell (`fresh-gui-app`, default subcommand). It speaks existing ADE `/ws` JSON via `fresh-gui-client` (protocol unchanged). Vite/React UI remains for smoke tests and packaged `GET /`.
 - Workspace: activity bar, collapsible explorer, unified terminal/editor tabs, status bar, command palette, Go to File. Terminal is a VTE view of remote PTY bytes; editor tabs are gpui `Editor` views of Fresh snapshots (save = `buffer_edit` + `buffer_save`).
 - `gpui` / `gpui_platform` pinned to **gpui-pre 0.3.6** (the snapshot gpui-component requires) to avoid duplicate-crate type errors.
-- Vendored Fresh bumped to upstream `a0408d3031aaea08df63bac94c2c24e522fb1b4a`. Embedding APIs compiled unchanged. Re-point at the integration fork once its sync PR merges.
+- Vendored Fresh pinned to the integration fork trial `31c311bfa44fbbdb4c8b258357af3c1d7d0e81c6` (`cursor/sync-upstream-master-ea42`, [fresh#3](https://github.com/amirhosseindavoody/fresh/pull/3)). `cargo check -p fresh-gui` succeeded with no embedding API changes. Project license is **GPL-3.0-or-later**, matching upstream Fresh (previously GPL-2.0-only).
 - Linux GUI needs X11 or Wayland, fontconfig, and wgpu/Vulkan. Native v1 gaps vs the Vite UI: splits, markdown WYSIWYG, minimap, context menus, layout v4 restore, WebGL xterm, find, palettes, tab pin/reorder.
 
 ## 2026-07-30

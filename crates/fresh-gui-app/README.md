@@ -21,6 +21,6 @@ pixi run ui-serve    # serve ui/dist on :1420
 
 **Native host:** silent connect from `--backend` (`http://…/?token=` or `ws://…/ws`). `Ctrl+T` new terminal, explorer click to open, `Ctrl+S` save, `Ctrl+Shift+P` command palette, `Ctrl+,` settings (`config.json` on the backend). Disconnect keeps the backend session.
 
-Linux needs an X11 or Wayland display, fontconfig, and a working wgpu/Vulkan backend. Combined with gpui-kit (Apache-2.0) the application is GPL-2.0.
+Linux needs an X11 or Wayland display, fontconfig, and a working wgpu/Vulkan backend. Combined with gpui-kit (Apache-2.0) the application is GPL-3.0-or-later.
 
 Product overview: [README.md](../../README.md). Architecture: [docs/DESIGN.md](../../docs/DESIGN.md), [docs/UI.md](../../docs/UI.md).

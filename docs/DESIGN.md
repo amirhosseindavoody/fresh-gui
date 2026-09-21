@@ -147,7 +147,7 @@ Linux: Pixi `[package]` + `recipe/` installs `bin/fresh-gui` and UI under `share
 | **Vite dev** | `pixi run ui` on `:1420`, points at the backend WS |
 | **CLI** | `fresh-gui-app ping\|smoke\|attach` via `fresh-gui-client` |
 
-The ADE protocol did **not** need to change for the native host: only the renderer switched from browser (React/CodeMirror/xterm) to GPUI. Fresh remains on the daemon. Combined license is GPL-2.0 (host) + Apache-2.0 (gpui-kit), which is fine as GPL-2.0 for the binary.
+The ADE protocol did **not** need to change for the native host: only the renderer switched from browser (React/CodeMirror/xterm) to GPUI. Fresh remains on the daemon. Combined license is GPL-3.0-or-later (host, matching Fresh) plus Apache-2.0 (gpui-kit). Apache-2.0 can be combined with GPL-3.0, so the binary is GPL-3.0-or-later.
 
 Native v1 chrome: activity bar, collapsible explorer, unified terminal/editor tabs, status bar, command palette, Go to File. Terminal is a VTE grid of remote PTY bytes (not Fresh `TerminalManager`). Editor tabs use gpui-component `Editor` as a **view** of Fresh snapshots (save is local dirty + `buffer_edit` then `buffer_save`). Full IA for the Vite UI and remaining native gaps: [UI.md](./UI.md).
 
@@ -159,7 +159,7 @@ Fresh is a **git submodule** at `vendor/fresh`, pinned by commit SHA (also recor
 
 Full integration detail — vendoring, `EditorHandle`, protocol mapping, path_link, what is *not* from Fresh: **[FRESH.md](./FRESH.md)**.
 
-**Current pin:** `a0408d3031aaea08df63bac94c2c24e522fb1b4a` (upstream `sinelaw/fresh` master). The integration fork (`amirhosseindavoody/fresh`) had not yet merged that tip when this pin was taken; re-point `vendor/fresh` + `vendor/fresh.rev` at the fork once the sync PR lands. Embedding APIs used by `crates/fresh-gui` (`Config::load_with_layers`, `Editor::with_working_dir`, `open_file` / preview, `replace_content`, `path_link`) compiled unchanged against this revision.
+**Current pin:** `31c311bfa44fbbdb4c8b258357af3c1d7d0e81c6` on the integration fork branch `cursor/sync-upstream-master-ea42` ([fresh#3](https://github.com/amirhosseindavoody/fresh/pull/3), draft). That commit includes upstream through `a0408d30` plus the fork sync. Embedding APIs used by `crates/fresh-gui` (`Config::load_with_layers`, `Editor::with_working_dir`, `open_file` / preview, `replace_content`, `path_link`) compiled unchanged (`cargo check -p fresh-gui`). Re-pin to fork `master` when that PR merges.
 
 ```bash
 git clone --recurse-submodules https://github.com/amirhosseindavoody/fresh-gui.git
