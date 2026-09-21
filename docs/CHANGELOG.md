@@ -5,7 +5,7 @@
 ### Fresh pin and standalone release binaries
 
 - Vendored Fresh moved to fork `master` `14f7d28b7ab18b6cdefc75ab94c5df34044ae3d0` ([fresh#4](https://github.com/amirhosseindavoody/fresh/pull/4)). The change from `ddfc322` is CI/plugin-test only. Embedding still uses `fresh-editor` feature `runtime` only.
-- GitHub Releases publish standalone daemon archives beside the linux-64 `.conda` package: linux-gnu (glibc ≥ 2.31), linux-musl, and windows-msvc (`scripts/package-binary.sh`). Each archive is `bin/fresh-gui` + `share/fresh-gui/ui`. The native GPUI host (`fresh-gui-app`) is not a release asset.
+- GitHub Releases publish standalone daemon archives beside the linux-64 `.conda` package: linux-gnu (glibc ≥ 2.31), linux-musl, and windows-msvc (`scripts/package-binary.sh`). Each archive is `bin/fresh-gui` + `share/fresh-gui/ui`. The native GPUI host (`fresh-gui-app`) is not a release asset. The binary jobs install Bun `1.3.11` to match the UI `packageManager` / lockfile.
 - Daemon session lock/spawn is split into unix/windows modules (Fresh daemon pattern: `setsid` vs `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`) so the Windows binary builds. Windows session files live under `%LOCALAPPDATA%\fresh-gui\`; config defaults to `%APPDATA%\fresh-gui\config.json`.
 
 ### Relicense to GPL-3.0-or-later

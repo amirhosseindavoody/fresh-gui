@@ -19,15 +19,14 @@ use tracing::{info, warn};
 /// Filename under the config directory (same as Fresh).
 pub const FILENAME: &str = "config.json";
 
-/// Default shell when config omits `terminal.shell` or leaves it empty.
-#[cfg(unix)]
-pub const DEFAULT_SHELL_COMMAND: &str = "zsh";
-#[cfg(windows)]
-pub const DEFAULT_SHELL_COMMAND: &str = "powershell";
+macro_rules! define_shell_defaults {
+    ($shell:literal) => {
+        /// Default shell when config omits `terminal.shell` or leaves it empty.
+        pub const DEFAULT_SHELL_COMMAND: &str = $shell;
 
-/// Documented starter file (JSONC) written on first settings open.
-pub const DEFAULT_CONFIG_TEMPLATE: &str = concat!(
-    r#"{
+        /// Documented starter file (JSONC) written on first settings open.
+        pub const DEFAULT_CONFIG_TEMPLATE: &str = concat!(
+            r#"{
   // Host UI chrome — applied on connect and when this file is saved.
   "ui": {
     // system | light | dark  (used when palette is "primer")
@@ -58,14 +57,21 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = concat!(
   "terminal": {
     "shell": {
       "command": ""#,
-    DEFAULT_SHELL_COMMAND,
-    r#"",
+            $shell,
+            r#"",
       "args": []
     }
   }
 }
 "#
-);
+        );
+    };
+}
+
+#[cfg(unix)]
+define_shell_defaults!("zsh");
+#[cfg(windows)]
+define_shell_defaults!("powershell");
 
 const KNOWN_PALETTES: &[&str] = &[
     "primer",
