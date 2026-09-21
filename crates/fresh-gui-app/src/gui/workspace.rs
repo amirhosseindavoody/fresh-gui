@@ -874,7 +874,7 @@ impl Workspace {
                 ..
             } => {
                 let pty_id = pty_id.clone();
-                let text = screen.visible_text();
+                let lines = screen.visible_lines();
                 let focused = focus.is_focused(window);
                 div()
                     .id("terminal-pane")
@@ -903,12 +903,20 @@ impl Workspace {
                         }
                     }))
                     .child(
-                        div()
+                        v_flex()
                             .id("term-scroll")
                             .size_full()
-                            .overflow_scroll()
-                            .whitespace_nowrap()
-                            .child(text)
+                            .overflow_y_scroll()
+                            .children(lines.into_iter().map(|line| {
+                                div()
+                                    .h(px(18.))
+                                    .whitespace_nowrap()
+                                    .child(if line.is_empty() {
+                                        " ".to_string()
+                                    } else {
+                                        line
+                                    })
+                            }))
                             .when(focused, |this| this.opacity(1.))
                             .when(!focused, |this| this.opacity(0.85)),
                     )

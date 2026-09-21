@@ -51,7 +51,7 @@ impl TermScreen {
         self.trim_scrollback();
     }
 
-    pub fn visible_text(&self) -> String {
+    pub fn visible_lines(&self) -> Vec<String> {
         let start = self.rows_data.len().saturating_sub(self.rows);
         self.rows_data[start..]
             .iter()
@@ -59,8 +59,11 @@ impl TermScreen {
                 let s: String = row.iter().collect();
                 s.trim_end().to_string()
             })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .collect()
+    }
+
+    pub fn visible_text(&self) -> String {
+        self.visible_lines().join("\n")
     }
 
     fn current_line(&mut self) -> &mut Vec<char> {
@@ -117,6 +120,47 @@ impl TermScreen {
         }
     }
 
+    fn erase_below(&mut self) {
+        self.erase_line_from_cursor();
+        let start = self.cursor_row + 1;
+        for row in self.rows_data.iter_mut().skip(start) {
+            for c in row.iter_mut() {
+                *c = ' ';
+            }
+        }
+    }
+
+    fn erase_above(&mut self) {
+        let end = self.cursor_row;
+        for row in self.rows_data.iter_mut().take(end) {
+            for c in row.iter_mut() {
+                *c = ' ';
+            }
+        }
+        self.ensure_cursor();
+        let col = self.cursor_col;
+        let line = self.current_line();
+        for c in line.iter_mut().take(col + 1) {
+            *c = ' ';
+        }
+    }
+
+    fn erase_line_to_cursor(&mut self) {
+        self.ensure_cursor();
+        let col = self.cursor_col;
+        let line = self.current_line();
+        for c in line.iter_mut().take(col + 1) {
+            *c = ' ';
+        }
+    }
+
+    fn erase_line(&mut self) {
+        self.ensure_cursor();
+        for c in self.current_line().iter_mut() {
+            *c = ' ';
+        }
+    }
+
     fn erase_display(&mut self) {
         let origin = self.screen_origin();
         for row in self.rows_data.iter_mut().skip(origin) {
@@ -127,6 +171,14 @@ impl TermScreen {
         self.cursor_row = origin;
         self.cursor_col = 0;
     }
+}
+
+fn raw_param(params: &Params, idx: usize, default: u16) -> u16 {
+    params
+        .iter()
+        .nth(idx)
+        .and_then(|p| p.first().copied())
+        .unwrap_or(default)
 }
 
 impl Perform for TermScreen {
@@ -199,8 +251,16 @@ impl Perform for TermScreen {
                 let col = first(1, 1).saturating_sub(1) as usize;
                 self.cup(row, col);
             }
-            'J' => self.erase_display(),
-            'K' => self.erase_line_from_cursor(),
+            'J' => match raw_param(params, 0, 0) {
+                0 => self.erase_below(),
+                1 => self.erase_above(),
+                _ => self.erase_display(),
+            },
+            'K' => match raw_param(params, 0, 0) {
+                0 => self.erase_line_from_cursor(),
+                1 => self.erase_line_to_cursor(),
+                _ => self.erase_line(),
+            },
             'm' => {}
             _ => {}
         }
@@ -282,6 +342,15 @@ mod tests {
         let text = s.visible_text();
         assert!(text.contains("hello"));
         assert!(text.contains("world"));
+    }
+
+    #[test]
+    fn erase_below_keeps_earlier_lines() {
+        let mut s = TermScreen::new(40, 8);
+        s.feed(b"hello\r\nworld\x1b[0J");
+        let text = s.visible_text();
+        assert!(text.contains("hello"), "{text}");
+        assert!(text.contains("world"), "{text}");
     }
 
     #[test]

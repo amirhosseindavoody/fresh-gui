@@ -151,7 +151,7 @@ The ADE protocol did **not** need to change for the native host: only the render
 
 Native v1 chrome: activity bar, collapsible explorer, unified terminal/editor tabs, status bar, command palette, Go to File. Terminal is a VTE grid of remote PTY bytes (not Fresh `TerminalManager`). Editor tabs use gpui-component `Editor` as a **view** of Fresh snapshots (save is local dirty + `buffer_edit` then `buffer_save`). Full IA for the Vite UI and remaining native gaps: [UI.md](./UI.md).
 
-Linux GUI needs X11 or Wayland, fontconfig, and a working wgpu/Vulkan (or software) backend. macOS/Windows GPUI builds are not the documented path yet (`pixi.toml` is `linux-64`).
+Linux GUI needs X11 or Wayland, fontconfig, and a working wgpu/Vulkan (or software) backend. macOS/Windows GPUI builds are not the documented path yet (`pixi.toml` is `linux-64`). Linking `fresh-gui-app` (`cargo run` / `cargo test`) also needs a C++ toolchain (`g++` / `libstdc++`) because gpui-kit pulls native GPU/text stacks.
 
 ## 8. Fresh coupling
 

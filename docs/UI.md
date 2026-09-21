@@ -239,7 +239,7 @@ Agent panels (right rail) may appear later per [COPILOT.md](./COPILOT.md); that 
 | Unified terminal + editor tabs | Yes (one pane per tab; no splits) |
 | Status bar (connection, session, capabilities) | Yes |
 | Command palette + Go to File | Yes |
-| PTY I/O (VTE grid, OSC 7 tab title/cwd) | Yes (no WebGL xterm, no mouse select / clipboard chords yet) |
+| PTY I/O (VTE grid, OSC 7 tab title/cwd) | Yes (plain text rows; prompt color/escape sequences may show literally; no WebGL xterm, mouse select, or clipboard chords yet) |
 | Editor open / edit / save (gpui `Editor` view of Fresh snapshots) | Yes |
 | Pane splits, layout v4 restore, markdown WYSIWYG, minimap | **Vite only** |
 | Context menus, find, palettes / typography packs, tab pin/reorder | **Vite only** |
