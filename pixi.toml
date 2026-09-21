@@ -15,7 +15,7 @@ name = "fresh-gui"
 version = "2026.730.15"
 description = "Linux remote daemon for fresh-gui (browser UI + PTY shells)"
 authors = ["Amirhossein Davoody <amirhossein.davoody@gmail.com>"]
-license = "GPL-2.0"
+license = "GPL-3.0-or-later"
 repository = "https://github.com/amirhosseindavoody/fresh-gui"
 
 [package.build]
