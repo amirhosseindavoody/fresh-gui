@@ -4,12 +4,12 @@ How **fresh-gui** embeds and talks to [Fresh](https://github.com/sinelaw/fresh).
 
 ## 1. Role of Fresh
 
-Fresh is the **remote buffer authority** inside the Linux daemon (`fresh-gui`). The host UI (native GPUI, or optional browser) never links Fresh crates. It speaks the ADE WebSocket protocol; the daemon translates editor messages into in-process Fresh `Editor` calls.
+Fresh is the **remote buffer authority** inside the Linux daemon (`fresh-gui`). The host UI (native GPUI) never links Fresh crates. It speaks the ADE WebSocket protocol; the daemon translates editor messages into in-process Fresh `Editor` calls.
 
 ```
 ┌──────────────────────┐         ADE /ws (JSON)         ┌────────────────────────────┐
 │  Host UI             │◄──────────────────────────────►│  fresh-gui (Linux)          │
-│  GPUI / optional Vite│   editor_open / buffer_edit /  │  EditorHandle ──► Fresh     │
+│  GPUI               │   editor_open / buffer_edit /  │  EditorHandle ──► Fresh     │
 │  (renderer only)     │   buffer_save / …              │  Editor (!Send thread)      │
 └──────────────────────┘                                 │  vendor/fresh (submodule)   │
                                                          └────────────────────────────┘
@@ -17,7 +17,7 @@ Fresh is the **remote buffer authority** inside the Linux daemon (`fresh-gui`). 
 
 **Fresh owns:** open file → buffer text, language mode, disk save via Fresh’s filesystem, path-link / `:line:col` parsing helpers.
 
-**fresh-gui owns:** ADE protocol, sessions, PTY, FS sandbox for the explorer, host rendering (GPUI VTE/editor view, or CodeMirror / xterm in the Vite UI), revision CAS on the wire, config chrome (`ui.*`).
+**fresh-gui owns:** ADE protocol, sessions, PTY, FS sandbox for the explorer, GPUI host rendering (VTE grid and editor view), revision CAS on the wire, config chrome (`ui.*`).
 
 This is intentional: the wire is a **PTY-first ADE protocol**, not Fresh `--web` scene envelopes (see DESIGN D1).
 
@@ -147,28 +147,18 @@ Line/column from path or link are returned on `editor_opened` for the **host** t
 | Wire protocol | ADE JSON over `/ws` — not Fresh `--web` scene |
 | PTY | Host `portable-pty` + OSC 7 hooks (`pty.rs`); Fresh’s `TerminalManager` unused |
 | Explorer FS | Sandboxed `fs.rs` / `fs_watch.rs` (list, create, copy, move, watch). Fresh `StdFileSystem` is only used inside the editor for buffer I/O |
-| Host editing UX | CodeMirror 6 (syntax highlight, minimap, search); markdown tabs also get a host WYSIWYG preview (`markdown-wysiwyg.ts`) because Fresh Compose/Page View is a plugin and plugins are not enabled on the ADE path |
-| Host terminal UX | xterm.js WebGL |
-| Host chrome | React + Tailwind + shadcn |
+| Host editing UX | gpui-component `Editor` view of Fresh snapshots (save is `buffer_edit` then `buffer_save`). Fresh Compose/Page View is a plugin and plugins are not enabled on the ADE path |
+| Host terminal UX | VTE grid of remote PTY bytes |
+| Host chrome | GPUI + gpui-component |
 | Plugins / LSP / tree-sitter in the ADE path | Features off; not exposed over the protocol |
 | Orchestrator / coding agents | Fresh plugin not loaded; agent direction for ADE is design-only ([COPILOT.md](./COPILOT.md)) — steal registry/resume patterns, do not embed Orchestrator yet |
 | Session / explorer restore | Host layout blob in Rust `SessionStore` (`layout_set`); explorer expanded/scroll snapshots mirror Fresh `FileExplorerState` fields without using Fresh workspace files under `$XDG_DATA_HOME/fresh/workspaces` (ADE uses host `VirtualTree` + sandboxed FS) |
 
 ## 7. Host UI wiring
 
-The React shell does not import Fresh. Imperative ADE code in `crates/fresh-gui-app/ui`:
+The GPUI host does not import Fresh. It speaks ADE through `fresh-gui-client` (`crates/fresh-gui-app/src/gui/`). Editor tabs are a view of Fresh snapshots; save sends `buffer_edit` then `buffer_save`. Terminal tabs are a VTE grid of PTY bytes.
 
-| Module | Role |
-|--------|------|
-| `ade/bootstrap.ts` | `editor_open` / `editor_open_link`, buffer edit/save CAS, tab presentation, session layout restore |
-| `layout-persist.ts` | Layout blob v4 schema + restore planner (multi-tab PTYs, editors, explorer snapshots) |
-| `editor.ts` | CodeMirror view; applies snapshot text; reveals line/col from open |
-| `markdown-preview.ts` / `markdown-wysiwyg.ts` | Host markdown render + editable preview; DOM is live while open, flushes markdown into CodeMirror for ADE save (Fresh Compose plugin is not on the ADE path — see §6) |
-| `path-link.ts` | Host-side hover detector mirrored for UX; open still goes through backend Fresh `detect_link_at` |
-| `palettes.ts` | Fresh theme colors → CSS tokens |
-| `terminal.ts` / `osc7.ts` | PTY I/O and cwd (feeds open/link `cwd`) |
-
-Workspace rule: prefer extending Fresh-backed backend surfaces over inventing a second editor engine in the TypeScript UI (see `.cursor/rules/leverage-fresh-editor.mdc`).
+Workspace rule: prefer extending Fresh-backed backend surfaces over inventing a second editor engine in the host (see `.cursor/rules/leverage-fresh-editor.mdc`).
 
 ## 8. Config touchpoints
 
@@ -196,14 +186,12 @@ Workspace rule: prefer extending Fresh-backed backend surfaces over inventing a 
 | `crates/fresh-gui/src/fs.rs` | Explorer FS sandbox |
 | `crates/fresh-gui-protocol/src/lib.rs` | `editor_*` / `buffer_*` / `scene_*` messages |
 | `crates/fresh-gui-app/src/gui/` | Native GPUI ADE host (renderer) |
-| `crates/fresh-gui-app/ui/src/ade/bootstrap.ts` | Vite host editor protocol controller |
-| `crates/fresh-gui-app/ui/src/palettes.ts` | Fresh theme colors → host tokens |
 | `recipe/build.sh` | Ensure Fresh pin for package builds |
 
 ## 10. Operational summary
 
 1. Clone with submodules (or let `recipe/build.sh` fetch `fresh.rev`).
 2. `fresh-gui` starts → optional Fresh `Editor` thread → Hello advertises `editor` + `scene`.
-3. Host opens a path → ADE `editor_open` → Fresh open → snapshot to the host editor view (GPUI `Editor`, or CodeMirror in the Vite UI).
+3. Host opens a path → ADE `editor_open` → Fresh open → snapshot to the GPUI editor view.
 4. Edits replace full buffer text under ADE revision CAS; save writes through Fresh.
 5. Disable embedding with `--no-editor` for a PTY/FS-only daemon.

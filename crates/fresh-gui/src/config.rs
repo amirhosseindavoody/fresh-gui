@@ -102,7 +102,7 @@ impl Default for Config {
     }
 }
 
-/// Host UI settings (shared with the browser UI chrome).
+/// Host UI settings sent on the ADE hello (GPUI chrome).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UiConfig {
     /// `system` | `light` | `dark`

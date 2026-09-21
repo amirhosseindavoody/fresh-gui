@@ -4,21 +4,22 @@
 
 ### Linux GPUI client on GitHub Releases
 
-- The release workflow builds `fresh-gui-app` for `x86_64-unknown-linux-gnu` on `ubuntu-latest` and uploads `fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` plus `.sha256`, using the same `scripts/package-client.sh` layout as the Windows client. Daemon archives are unchanged.
+- The release workflow builds `fresh-gui-app` for `x86_64-unknown-linux-gnu` on `ubuntu-latest` and uploads `fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` plus `.sha256`, using the same `scripts/package-client.sh` layout as the Windows client. Daemon archives stay a separate matrix and are headless `bin/fresh-gui`.
 - Pull requests that touch the client build compile and package that archive without bumping CalVer or publishing a Release (the bump job stays push/dispatch-only).
 - Linux runtime: glibc ≥ 2.39, an X11 or Wayland session, fontconfig, and a Vulkan loader (`libvulkan.so.1` is loaded on demand). Directly linked libraries are libxcb and libxkbcommon. This is not the daemon's glibc 2.31 zigbuild.
-- Daemon packages (`.conda` and standalone archives) no longer include `share/fresh-gui/ui`. Release CI does not build the Vite shell. The daemon stays headless unless `--ui-dir` is set. `crates/fresh-gui-app/ui` remains in the tree and is not the product host.
+- Daemon packages (`.conda` and standalone archives) no longer include `share/fresh-gui/ui`. Release CI does not build a browser shell. The daemon is headless ADE (`/ws` + `/healthz`). `--no-ui` is still accepted so existing SSH connect commands keep working.
+- Removed the Vite/React host (`crates/fresh-gui-app/ui`), `serve-ui`, and `--ui-dir`. A later web UI would be the GPUI client via WebAssembly, which is not in this change.
 
 ### SSH remote bootstrap for the GPUI host
 
 - `fresh-gui-app remote add|list|remove|connect` saves OpenSSH targets (`user@host` or a `Host` alias) in `remotes.json`. Auth stays with the system `ssh` client (no password prompt).
 - Connect probes the remote for a `fresh-gui` binary and a live session. If the binary is missing it copies a Linux daemon (local path, release URL, or the latest GitHub linux-gnu asset) to `~/.local/bin/fresh-gui`, starts `fresh-gui --no-ui`, reads the token from `session.json`, and opens a loopback tunnel into the GPUI window.
-- Release workflow also publishes `fresh-gui-client-*-x86_64-pc-windows-msvc.zip` (GPUI host). Existing daemon archives are unchanged.
+- Release workflow also publishes `fresh-gui-client-*-x86_64-pc-windows-msvc.zip` (GPUI host). Daemon archives are the headless binary, separate from the client.
 
 ### Fresh pin and standalone release binaries
 
 - Vendored Fresh moved to fork `master` `14f7d28b7ab18b6cdefc75ab94c5df34044ae3d0` ([fresh#4](https://github.com/amirhosseindavoody/fresh/pull/4)). The change from `ddfc322` is CI/plugin-test only. Embedding still uses `fresh-editor` feature `runtime` only.
-- GitHub Releases publish standalone daemon archives beside the linux-64 `.conda` package: linux-gnu (glibc ≥ 2.31), linux-musl, and windows-msvc (`scripts/package-binary.sh`). Each archive is `bin/fresh-gui` + `share/fresh-gui/ui`. The native GPUI host (`fresh-gui-app`) is not inside those daemon archives. The binary jobs install Bun `1.3.11` to match the UI `packageManager` / lockfile.
+- GitHub Releases publish standalone daemon archives beside the linux-64 `.conda` package: linux-gnu (glibc ≥ 2.31), linux-musl, and windows-msvc (`scripts/package-binary.sh`). Those archives were first published with `share/fresh-gui/ui`; later the same day they became headless `bin/fresh-gui` only (see above). The native GPUI host (`fresh-gui-app`) is a separate client asset.
 - Daemon session lock/spawn is split into unix/windows modules (Fresh daemon pattern: `setsid` vs `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`) so the Windows binary builds. Windows session files live under `%LOCALAPPDATA%\fresh-gui\`; config defaults to `%APPDATA%\fresh-gui\config.json`.
 
 ### Relicense to GPL-3.0-or-later
@@ -27,11 +28,11 @@
 
 ### Native GPUI host + Fresh pin toward upstream
 
-- Primary host is now a native **gpui-kit 0.6.6** / gpui-component desktop shell (`fresh-gui-app`, default subcommand). It speaks existing ADE `/ws` JSON via `fresh-gui-client` (protocol unchanged). Vite/React UI remains for smoke tests and packaged `GET /`.
+- Primary host is now a native **gpui-kit 0.6.6** / gpui-component desktop shell (`fresh-gui-app`, default subcommand). It speaks existing ADE `/ws` JSON via `fresh-gui-client` (protocol unchanged). The Vite/React shell that still existed at this point was removed later the same day.
 - Workspace: activity bar, collapsible explorer, unified terminal/editor tabs, status bar, command palette, Go to File. Terminal is a VTE view of remote PTY bytes; editor tabs are gpui `Editor` views of Fresh snapshots (save = `buffer_edit` + `buffer_save`).
 - `gpui` / `gpui_platform` pinned to **gpui-pre 0.3.6** (the snapshot gpui-component requires) to avoid duplicate-crate type errors.
 - Vendored Fresh pinned to fork `master` `ddfc322bc977fc21c4c837ae79906c04a5717c58` after [fresh#3](https://github.com/amirhosseindavoody/fresh/pull/3) merged (same tree as trial `31c311bfa44fbbdb4c8b258357af3c1d7d0e81c6`). `cargo check -p fresh-gui` succeeded with no embedding API changes. Project license is **GPL-3.0-or-later**, matching upstream Fresh.
-- Linux GUI needs X11 or Wayland, fontconfig, and wgpu/Vulkan. Native v1 gaps vs the Vite UI: splits, markdown WYSIWYG, minimap, context menus, layout v4 restore, WebGL xterm, find, palettes, tab pin/reorder.
+- Linux GUI needs X11 or Wayland, fontconfig, and wgpu/Vulkan. Native v1 gaps: splits, markdown WYSIWYG, minimap, context menus, layout v4 restore, mouse selection in the terminal, find, palettes, tab pin/reorder.
 
 ## 2026-07-30
 

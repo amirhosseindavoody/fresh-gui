@@ -115,7 +115,7 @@ Mirrors Fresh Orchestrator’s agent registry **without** enabling Fresh plugins
 **What:** Daemon or host becomes an ACP client. Spawn `copilot --acp --stdio` on the remote (or connect TCP loopback). Host right rail (or modal) shows streaming messages, plans, tool calls; user answers `requestPermission`; optional client `fs/*` and `terminal/*` capabilities map to ADE FS / PTY.
 
 ```
-┌─ Host UI (browser) ─┐     ADE /ws      ┌─ fresh-gui daemon ─┐     stdio      ┌─ copilot --acp ─┐
+┌─ Host UI (GPUI) ───┐     ADE /ws      ┌─ fresh-gui daemon ─┐     stdio      ┌─ copilot --acp ─┐
 │ Agent panel / rail  │◄───────────────►│ ACP bridge         │◄─────────────►│ Copilot agent   │
 │ Permission prompts  │   agent_* msgs  │ (remote process)   │   NDJSON      │ (subscriber)    │
 │ Editor refreshes    │                 │ FS/PTY adapters    │               └─────────────────┘
@@ -235,7 +235,7 @@ Do **not** invent agent→editor script control in Phase 1 (Fresh’s `FRESH_CMD
 
 ### 7.1 Ownership
 
-**ACP child process runs on the remote** (next to the workspace). The browser never spawns `copilot` locally (auth, files, and tools would be wrong machine).
+**ACP child process runs on the remote** (next to the workspace). The GPUI host never spawns `copilot` locally (auth, files, and tools would be the wrong machine).
 
 Recommended: **daemon owns** the ACP subprocess and translates to ADE messages. Host UI remains a thin client (same as editor/PTY).
 
@@ -290,7 +290,7 @@ For issue #49’s autocomplete ask:
 |----|--------|-----|
 | **C1** | Agentic first; autocomplete separate | Matches what Copilot CLI actually is |
 | **C2** | Phase 1 = PTY launcher, not chat rail | Terminal-first; minimal protocol change; Fresh Orchestrator pattern |
-| **C3** | Phase 2 = ACP via daemon, not browser-spawned CLI | Correct machine, sandbox, lifecycle |
+| **C3** | Phase 2 = ACP via daemon, not a host-spawned CLI | Correct machine, sandbox, lifecycle |
 | **C4** | Do not load Fresh Orchestrator plugin into ADE yet | Terminal/window model mismatch; steal patterns instead |
 | **C5** | No Copilot credentials in fresh-gui | CLI owns auth; smaller security surface |
 | **C6** | Soften “no AI” non-goal to “no Terax-parity AI chrome” | Allows terminal/ACP agents without committing to Terax feature set |

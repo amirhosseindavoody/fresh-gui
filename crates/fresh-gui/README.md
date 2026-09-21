@@ -1,11 +1,10 @@
 # fresh-gui
 
-Remote ADE daemon: WebSocket ADE API + detachable sessions + PTY + filesystem + optional Fresh editor + optional embedded Vite UI (the primary host is native `fresh-gui-app`). Runs on **Linux** (documented remote) and **Windows** (standalone release binary).
+Remote ADE daemon: WebSocket ADE API + detachable sessions + PTY + filesystem + optional Fresh editor. The host is native `fresh-gui-app`. Runs on **Linux** (documented remote) and **Windows** (standalone release binary). The daemon does not serve a browser UI.
 
 ## Run
 
 ```bash
-pixi run ui-install   # once (dev)
 cd /path/to/your/project
 fresh-gui             # start background session, print URL, return to shell
 fresh-gui             # already running → print status (URL, token, log, pid)
@@ -48,7 +47,7 @@ The package / archive ships the headless `bin/fresh-gui` binary. The native GPUI
 
 | Route | Role |
 |-------|------|
-| `GET /` | Empty unless `--ui-dir` is set (not shipped) |
+| `GET /` | Not served (headless daemon) |
 | `GET /healthz` | Liveness |
 | `WS /ws` | ADE JSON frames |
 
@@ -64,8 +63,7 @@ Sessions own PTYs; disconnect detaches the subscriber but keeps shells running f
 | `--token` / `FRESH_GUI_TOKEN` | Auth token (prefer env over flag). When unset, a random per-process token is generated |
 | `--allow-no-auth` / `FRESH_GUI_ALLOW_NO_AUTH` | Disable auth (**loopback only**; for local tests — not a normal run mode) |
 | `--root` / `FRESH_GUI_FS_ROOT` | FS + editor sandbox (default: cwd) |
-| `--ui-dir` / `FRESH_GUI_UI_DIR` | Override UI assets directory |
-| `--no-ui` / `FRESH_GUI_NO_UI` | API only |
+| `--no-ui` / `FRESH_GUI_NO_UI` | Accepted for compatibility; the daemon is always headless |
 | `--no-editor` / `FRESH_GUI_NO_EDITOR` | Omit Fresh editor |
 | `--public-host` / `FRESH_GUI_PUBLIC_HOST` | Hostname in startup UI/WS URLs (else FQDN / bind address) |
 | `--config` / `FRESH_GUI_CONFIG` | Path to `config.json` |

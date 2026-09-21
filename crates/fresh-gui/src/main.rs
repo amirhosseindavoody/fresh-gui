@@ -100,12 +100,7 @@ struct ServeArgs {
     #[arg(long, env = "FRESH_GUI_NO_EDITOR")]
     no_editor: bool,
 
-    /// Optional directory of static files (`index.html`) to serve at `/`.
-    /// Unset: headless WebSocket + health only. The product host is `fresh-gui-app`.
-    #[arg(long, env = "FRESH_GUI_UI_DIR")]
-    ui_dir: Option<PathBuf>,
-
-    /// Do not serve static files, even when `--ui-dir` is set (WebSocket + health only).
+    /// Accepted for compatibility. The daemon is always headless (WebSocket + health only).
     #[arg(long, env = "FRESH_GUI_NO_UI")]
     no_ui: bool,
 
@@ -179,7 +174,6 @@ fn start_or_status(serve: ServeArgs) -> Result<()> {
         serve.allow_no_auth,
         serve.root.as_deref(),
         serve.no_editor,
-        serve.ui_dir.as_deref(),
         serve.no_ui,
         serve.public_host.as_deref(),
         serve.config.as_deref(),
@@ -272,12 +266,6 @@ async fn run_server_foreground(args: ServeArgs, write_session_meta: bool) -> Res
         config_path,
     });
 
-    let ui_dir = if args.no_ui {
-        None
-    } else {
-        resolve_ui_dir(args.ui_dir.as_deref())
-    };
-
     let (http_url, ws_url) = public_urls(bound, args.public_host.as_deref());
     info!(
         listen = %bound,
@@ -318,7 +306,6 @@ async fn run_server_foreground(args: ServeArgs, write_session_meta: bool) -> Res
     let result = server::serve_listener(
         listener,
         state,
-        ui_dir,
         &http_url,
         &ws_url,
         Some(memory.clone()),
@@ -574,36 +561,13 @@ fn is_assigned_domain(name: &str) -> bool {
     true
 }
 
-/// Serve static files only when `--ui-dir` points at a directory with `index.html`.
-/// The default daemon is headless; the host is the native GPUI client.
-fn resolve_ui_dir(explicit: Option<&std::path::Path>) -> Option<PathBuf> {
-    let Some(dir) = explicit else {
-        return None;
-    };
-    let dir = dir.to_path_buf();
-    if dir.join("index.html").is_file() {
-        info!(dir = %dir.display(), "serving static files from --ui-dir");
-        return Some(dir);
-    }
-    tracing::warn!(
-        dir = %dir.display(),
-        "ui-dir missing index.html — WebSocket only"
-    );
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         display_host_port, format_host_port, host_has_port, is_assigned_domain, public_urls,
-        resolve_auth, resolve_ui_dir,
+        resolve_auth,
     };
     use std::net::SocketAddr;
-
-    #[test]
-    fn default_daemon_does_not_serve_a_ui_dir() {
-        assert!(resolve_ui_dir(None).is_none());
-    }
 
     #[test]
     fn assigned_domain_requires_dotted_non_local_name() {

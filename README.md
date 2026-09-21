@@ -1,6 +1,6 @@
 # fresh-gui
 
-A **terminal-first IDE shell** for a remote Linux machine. Run the backend on your server; open shells, edit files, and browse the tree from a **native GPUI host** (Zed / VS Code feel). A browser ADE UI remains available for smoke tests.
+A **terminal-first IDE shell** for a remote Linux machine. Run the backend on your server; open shells, edit files, and browse the tree from the **native GPUI host** (`fresh-gui-app`, Zed / VS Code feel). Download the Linux or Windows client, add an SSH remote, and connect.
 
 Inspired by [Terax](https://github.com/crynta/terax-ai) (layout and terminal-first product sense — not Tauri). The remote editor core is [Fresh](https://github.com/sinelaw/fresh). The host is a renderer only: it speaks `fresh-gui-protocol` over WebSocket; Fresh stays buffer authority on the daemon.
 
@@ -137,9 +137,9 @@ After connect you get terminals, an explorer, and editor tabs in one shell:
 | Next / prev tab | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
 | Reconnect | `Ctrl+Shift+R` or command palette |
 
-The product host is this GPUI client. Release daemon packages do not include a browser shell. A Vite tree still lives at `crates/fresh-gui-app/ui` and is not built or shipped; a later web UI would be the same GPUI interface via WebAssembly, which is not in this release. Native v1 gaps vs that old browser shell: pane splits, markdown WYSIWYG, minimap, context menus, layout v4 restore, WebGL xterm, find, palettes / theme packs, tab pin/reorder.
+The product host is this GPUI client. The daemon is a headless ADE WebSocket. A later browser host would be this same GPUI UI via WebAssembly, which is not in this release. Native v1 does not yet include pane splits, markdown WYSIWYG, a minimap, context menus, layout restore, mouse selection in the terminal, find, palette packs, or tab pin/reorder.
 
-`Mod` in the browser UI is `Ctrl` on Linux/Windows and `Cmd` on macOS. Disconnect leaves remote sessions and PTYs running so you can reconnect.
+Disconnect leaves remote sessions and PTYs running so you can reconnect.
 
 Sessions keep shells alive across GUI disconnect. Explorer list/create/copy/move/delete and editor open are sandboxed to `--root` (default: current directory), plus directories authorized when a terminal cwd leaves that root.
 
@@ -183,13 +183,12 @@ pixi run gui -- --backend 'http://127.0.0.1:7420/?token=…'   # native host
 
 `pixi run serve` starts the headless daemon. The GPUI host is `pixi run gui`.
 
-Useful tasks: `pixi run check`, `test`, `build`, `gui`, `ui` (Vite hot reload on `:1420`), `package` (write `.conda` under `./dist`), `package-binary` (standalone archive; pass target and version).
+Useful tasks: `pixi run check`, `test`, `build`, `gui`, `package` (write `.conda` under `./dist`), `package-binary` (standalone daemon archive; pass target and version), `package-client` (GPUI host archive).
 
 | Piece | Role |
 |-------|------|
 | `fresh-gui` | Headless daemon (PTY, FS, Fresh editor, ADE WebSocket) — Linux primary, Windows binary also released |
-| `fresh-gui-app` | Native GPUI host (default) + CLI (`ping` / `smoke` / `attach`) |
-| `fresh-gui-app/ui` | Old Vite tree, not built or shipped |
+| `fresh-gui-app` | Native GPUI host (default) + CLI (`ping` / `smoke` / `attach` / `remote`) |
 | `fresh-gui-protocol` / `fresh-gui-client` | Shared wire format + client library |
 
 Deeper design notes (architecture and behavior): [docs/DESIGN.md](./docs/DESIGN.md), [docs/FRESH.md](./docs/FRESH.md) (Fresh embedding), [docs/SECURITY.md](./docs/SECURITY.md), [docs/UI.md](./docs/UI.md), [docs/COPILOT.md](./docs/COPILOT.md) (Copilot CLI / ACP design). Backend flags and packaging: [crates/fresh-gui/README.md](./crates/fresh-gui/README.md).

@@ -1,14 +1,10 @@
 # fresh-gui Host UI
 
-Product UI for the **local host** ADE shell. Architecture and protocol: [DESIGN.md](./DESIGN.md). User overview: [README.md](../README.md).
+Product UI is the **native GPUI host** (`crates/fresh-gui-app`, `pixi run gui`, release asset `fresh-gui-client-*`). Architecture and protocol: [DESIGN.md](./DESIGN.md). User overview: [README.md](../README.md).
 
-**Primary host:** native GPUI + gpui-component (`crates/fresh-gui-app`, default `fresh-gui-app` / `pixi run gui`), published as `fresh-gui-client-*` for Linux and Windows. Zed / VS Code-like chrome: activity bar, collapsible explorer, unified terminal + editor tabs, status bar, command palette. Connection is silent (`--backend` printed Local access URL with `?token=`, or `ws://…/ws` + `FRESH_GUI_TOKEN`).
+Zed / VS Code-like chrome: activity bar, collapsible explorer, unified terminal + editor tabs, status bar, command palette. Connection is silent (`--backend` printed Local access URL with `?token=`, or `ws://…/ws` + `FRESH_GUI_TOKEN`). Download the Linux or Windows client, add an SSH remote, and connect. The daemon does not serve a page.
 
-The sections below that describe the Vite/React shell are leftover notes for `crates/fresh-gui-app/ui`. That tree is not built in Release CI and is not installed with the daemon. A future browser host would be this GPUI UI via WebAssembly, which is out of scope here.
-
-**Vite/React host** (`crates/fresh-gui-app/ui`) is demoted to smoke tests and the daemon’s packaged `GET /`. It still includes a status bar, unified terminal/editor tabs, CodeMirror 6, xterm WebGL, per-tab pane trees, shortcuts + command palette, virtualized explorer, OSC 7 cwd sync, find, activity bar, system/light/dark theme with named palettes, and path/file context menus.
-
-The rest of this document describes the **Vite** information architecture (still the feature-complete reference). Native v1 implements a subset — see §11.
+A later browser host would be this same GPUI UI via WebAssembly. That is not in this tree. Sections 1–9 below are notes from the removed Vite/React shell (CodeMirror, xterm). They are not a supported host and the source is gone. Current behavior is §10.
 
 ## 1. Goals
 
@@ -244,9 +240,9 @@ Agent panels (right rail) may appear later per [COPILOT.md](./COPILOT.md); that 
 | Command palette + Go to File | Yes |
 | PTY I/O (VTE grid, OSC 7 tab title/cwd) | Yes (plain text rows; prompt color/escape sequences may show literally; no WebGL xterm, mouse select, or clipboard chords yet) |
 | Editor open / edit / save (gpui `Editor` view of Fresh snapshots) | Yes |
-| Pane splits, layout v4 restore, markdown WYSIWYG, minimap | **Vite only** |
-| Context menus, find, palettes / typography packs, tab pin/reorder | **Vite only** |
-| Ctrl/Cmd+click path_link | **Vite only** |
+| Pane splits, layout v4 restore, markdown WYSIWYG, minimap | Not in v1 |
+| Context menus, find, palettes / typography packs, tab pin/reorder | Not in v1 |
+| Ctrl/Cmd+click path_link | Not in v1 |
 
 Packaged hosts: `fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` and `fresh-gui-client-*-x86_64-pc-windows-msvc.zip`. Linux still needs X11 or Wayland, fontconfig, FreeType, and wgpu/Vulkan. `pixi.toml` platform for the daemon package is `linux-64`; `pixi run gui` is the from-source host.
 
