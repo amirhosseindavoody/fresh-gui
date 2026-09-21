@@ -40,26 +40,17 @@ pub struct AppState {
 pub async fn serve_listener(
     listener: tokio::net::TcpListener,
     state: Arc<AppState>,
-    ui_dir: Option<std::path::PathBuf>,
     http_url: &str,
     ws_url: &str,
     memory: Option<Arc<MemoryMonitor>>,
 ) -> Result<()> {
     let addr = listener.local_addr()?;
-    let api = Router::new()
+    let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/ws", get(ws_upgrade))
         .with_state(state);
 
-    let app = if let Some(dir) = ui_dir {
-        api.fallback_service(
-            tower_http::services::ServeDir::new(dir).append_index_html_on_directories(true),
-        )
-    } else {
-        api
-    };
-
-    info!(%addr, %http_url, %ws_url, "listening (http UI + ws path /ws)");
+    info!(%addr, %http_url, %ws_url, "listening (ws /ws)");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(memory.clone()))
         .await?;

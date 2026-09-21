@@ -19,7 +19,7 @@ source:
 
 build:
   number: 0
-  # linux-64 only (remote daemon + embedded browser UI).
+  # linux-64 only (headless remote daemon).
   skip: not linux64
   script: build.sh
 
@@ -32,7 +32,6 @@ requirements:
     - rust >=1.97.1,<1.98
     - cargo-auditable
     - cargo-bundle-licenses
-    - bun
     - git
   run:
     - libgcc >=13
@@ -41,22 +40,17 @@ tests:
   - script:
       - fresh-gui --help
       - fresh-gui --version
-      - test -f "${PREFIX}/share/fresh-gui/ui/index.html"
   - package_contents:
       bin:
         - fresh-gui
-      files:
-        exists:
-          - share/fresh-gui/ui/index.html
 
 about:
   homepage: https://github.com/amirhosseindavoody/fresh-gui
   repository: https://github.com/amirhosseindavoody/fresh-gui
-  summary: Linux remote daemon for fresh-gui (browser UI + PTY shells over WebSocket)
+  summary: Linux remote daemon for fresh-gui (headless ADE WebSocket)
   description: |
-    Installable Linux binary equivalent to `pixi run serve` / `pixi run serve-release`:
-    serves the host web UI and WebSocket ADE API so you can open shells from a
-    browser (or any client that can reach the URL).
+    Installable Linux daemon: WebSocket ADE (PTY, files, Fresh editor) for the
+    native GPUI client (`fresh-gui-app`). This package does not include a browser UI.
 
     Platform: linux-64 only. Install on the remote Linux machine.
   license: GPL-3.0-or-later

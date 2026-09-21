@@ -1,11 +1,10 @@
 # fresh-gui
 
-Remote ADE daemon: WebSocket ADE API + detachable sessions + PTY + filesystem + optional Fresh editor + optional embedded Vite UI (the primary host is native `fresh-gui-app`). Runs on **Linux** (documented remote) and **Windows** (standalone release binary).
+Remote ADE daemon: WebSocket ADE API + detachable sessions + PTY + filesystem + optional Fresh editor. The host is native `fresh-gui-app`. Runs on **Linux** (documented remote) and **Windows** (standalone release binary). The daemon does not serve a browser UI.
 
 ## Run
 
 ```bash
-pixi run ui-install   # once (dev)
 cd /path/to/your/project
 fresh-gui             # start background session, print URL, return to shell
 fresh-gui             # already running → print status (URL, token, log, pid)
@@ -30,7 +29,7 @@ Session files (private to the user):
 
 The daemon samples its own RSS about every 30 seconds and, on graceful stop, logs average and peak resident memory (MB). Child PTY processes are excluded.
 
-Open the printed **Local access** URL in `fresh-gui-app` (`pixi run gui -- --backend 'http://127.0.0.1:7420/?token=…'`) or in a browser. A bearer token is always required (auto-generated when unset). Prefer `FRESH_GUI_TOKEN` over `--token` so the secret does not appear in `ps`. The Vite UI caches the token in tab `sessionStorage` so a reload can re-auth and reattach without keeping `?token=` in the URL.
+Open the printed **Local access** URL in `fresh-gui-app` (`pixi run gui -- --backend 'http://127.0.0.1:7420/?token=…'`). A bearer token is always required (auto-generated when unset). Prefer `FRESH_GUI_TOKEN` over `--token` so the secret does not appear in `ps`. The daemon does not serve a browser UI.
 
 ## Install
 
@@ -42,13 +41,13 @@ pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git
 fresh-gui
 ```
 
-The package / archive ships `bin/fresh-gui` and UI assets under `share/fresh-gui/ui`. The native GPUI host is not inside that archive.
+The package / archive ships the headless `bin/fresh-gui` binary. The native GPUI host is a separate release asset (`fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` or the Windows `.zip`).
 
 ## Endpoints
 
 | Route | Role |
 |-------|------|
-| `GET /` | Host UI (`share/fresh-gui/ui` or `ui/dist` in dev) |
+| `GET /` | Not served (headless daemon) |
 | `GET /healthz` | Liveness |
 | `WS /ws` | ADE JSON frames |
 
@@ -64,8 +63,7 @@ Sessions own PTYs; disconnect detaches the subscriber but keeps shells running f
 | `--token` / `FRESH_GUI_TOKEN` | Auth token (prefer env over flag). When unset, a random per-process token is generated |
 | `--allow-no-auth` / `FRESH_GUI_ALLOW_NO_AUTH` | Disable auth (**loopback only**; for local tests — not a normal run mode) |
 | `--root` / `FRESH_GUI_FS_ROOT` | FS + editor sandbox (default: cwd) |
-| `--ui-dir` / `FRESH_GUI_UI_DIR` | Override UI assets directory |
-| `--no-ui` / `FRESH_GUI_NO_UI` | API only |
+| `--no-ui` / `FRESH_GUI_NO_UI` | Accepted for compatibility; the daemon is always headless |
 | `--no-editor` / `FRESH_GUI_NO_EDITOR` | Omit Fresh editor |
 | `--public-host` / `FRESH_GUI_PUBLIC_HOST` | Hostname in startup UI/WS URLs (else FQDN / bind address) |
 | `--config` / `FRESH_GUI_CONFIG` | Path to `config.json` |

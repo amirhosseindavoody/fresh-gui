@@ -220,7 +220,7 @@ pub fn print_session_info(meta: &SessionMeta) {
             "  From another machine (e.g. your laptop) — SSH tunnel, nothing exposed to the network:"
         );
         println!("    ssh -L {port}:127.0.0.1:{port} {user}@your-server");
-        println!("    then open: {local}");
+        println!("    fresh-gui-app --backend '{local}'");
     } else if !meta.require_auth {
         println!();
         println!("  auth: disabled (--allow-no-auth)");
@@ -275,7 +275,6 @@ pub fn serve_args_for_child(
     allow_no_auth: bool,
     root: Option<&Path>,
     no_editor: bool,
-    ui_dir: Option<&Path>,
     no_ui: bool,
     public_host: Option<&str>,
     config: Option<&Path>,
@@ -299,10 +298,6 @@ pub fn serve_args_for_child(
     }
     if no_editor {
         args.push("--no-editor".into());
-    }
-    if let Some(d) = ui_dir {
-        args.push("--ui-dir".into());
-        args.push(d.display().to_string());
     }
     if no_ui {
         args.push("--no-ui".into());

@@ -1,23 +1,19 @@
-//! fresh-gui-app — native GPUI ADE host, plus CLI helpers and optional static UI.
+//! fresh-gui-app — native GPUI ADE host, plus CLI helpers.
 //!
 //! Default (no subcommand): open the native desktop shell.
 //! CLI: `ping` / `smoke` / `attach` talk to a running daemon.
-//! `serve-ui` still serves the Vite `ui/dist` bundle for browser smoke tests.
 
 mod gui;
 mod ssh;
 
 use anyhow::{Context, Result};
-use axum::Router;
 use clap::{Parser, Subcommand};
 use fresh_gui_client::{Client, ConnectOptions, smoke_echo};
 use fresh_gui_protocol::{Message, PROTOCOL_VERSION};
 use ssh::{
     DaemonSource, SshTarget, Toolchain, bootstrap, load_remotes, remotes_config_path, save_remotes,
 };
-use std::net::SocketAddr;
 use std::path::PathBuf;
-use tower_http::services::ServeDir;
 use tracing::info;
 
 #[derive(Debug, Parser)]
@@ -58,14 +54,6 @@ enum Cmd {
     Remote {
         #[command(subcommand)]
         cmd: RemoteCmd,
-    },
-    /// Serve the built Vite UI over HTTP (browser smoke tests; not the primary host).
-    ServeUi {
-        #[arg(long, default_value = "127.0.0.1:1420")]
-        listen: SocketAddr,
-        /// Directory with index.html (defaults to `ui/dist` from a Vite build).
-        #[arg(long)]
-        dir: Option<PathBuf>,
     },
 }
 
@@ -128,7 +116,6 @@ fn main() -> Result<()> {
         Cmd::Smoke => tokio_block_on(cmd_smoke(backend, token)),
         Cmd::Attach { cols, rows } => tokio_block_on(cmd_attach(backend, token, cols, rows)),
         Cmd::Remote { cmd } => cmd_remote(cmd),
-        Cmd::ServeUi { listen, dir } => tokio_block_on(cmd_serve_ui(listen, dir)),
     }
 }
 
@@ -373,23 +360,4 @@ fn cmd_remote_connect(path: &std::path::Path, name: &str) -> Result<()> {
     drop(session);
     eprintln!("Closed SSH tunnel.");
     result
-}
-
-async fn cmd_serve_ui(listen: SocketAddr, dir: Option<PathBuf>) -> Result<()> {
-    let dir = dir.unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("ui")
-            .join("dist")
-    });
-    anyhow::ensure!(
-        dir.join("index.html").is_file(),
-        "missing {} — run `pixi run ui-install && pixi run ui-build` (or `pixi run ui` for Vite dev). The native host is `fresh-gui-app` / `pixi run gui`.",
-        dir.join("index.html").display()
-    );
-
-    let app = Router::new().fallback_service(ServeDir::new(&dir));
-    info!(%listen, dir = %dir.display(), "serving Vite UI (smoke) — open http://{listen}/");
-    let listener = tokio::net::TcpListener::bind(listen).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
 }

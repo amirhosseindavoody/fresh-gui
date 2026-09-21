@@ -4,15 +4,16 @@
 # Usage:
 #   scripts/package-binary.sh <target> <version> [out-dir]
 #
-# Expects:
-#   - release binary at target/<triple>/release/fresh-gui[.exe]
-#     (or target/release/ when target matches host and no triple dir)
-#   - UI assets at crates/fresh-gui-app/ui/dist/index.html
+# Expects a release binary at target/<triple>/release/fresh-gui[.exe]
+# (or target/release/ when target matches host and no triple dir).
 #
 # Writes under out-dir (default: dist/binaries):
 #   fresh-gui-<version>-<target>.tar.gz   (unix)
 #   fresh-gui-<version>-<target>.zip      (windows)
-# and writes ${archive}.sha256 next to the archive
+# and writes ${archive}.sha256 next to the archive.
+#
+# The archive is the headless daemon only. The GPUI host is packaged
+# separately by scripts/package-client.sh.
 
 set -euo pipefail
 
@@ -63,42 +64,26 @@ find_binary() {
 }
 
 BINARY="$(find_binary)"
-UI_DIST="$ROOT/crates/fresh-gui-app/ui/dist"
-if [[ ! -f "$UI_DIST/index.html" ]]; then
-  echo "error: UI not built (missing ${UI_DIST}/index.html). Run: pixi run ui-build" >&2
-  exit 1
-fi
 
 STAGE_NAME="fresh-gui-${VERSION}-${TARGET%%.*}"
 # Prefer the full target string (without glibc suffix) in the archive stem.
 ARCHIVE_STEM="fresh-gui-${VERSION}-${TARGET%%.*}"
 STAGE="$OUT_DIR/.stage/${STAGE_NAME}"
 rm -rf "$STAGE"
-mkdir -p "$STAGE/bin" "$STAGE/share/fresh-gui/ui"
+mkdir -p "$STAGE/bin"
 
 cp -a "$BINARY" "$STAGE/bin/${BIN_NAME}"
 if [[ "$IS_WINDOWS" -eq 0 ]]; then
   chmod +x "$STAGE/bin/${BIN_NAME}"
 fi
 
-if command -v rsync >/dev/null 2>&1; then
-  rsync -a --exclude='*.map' "$UI_DIST"/ "$STAGE/share/fresh-gui/ui/"
-else
-  (cd "$UI_DIST" && tar -cf - --exclude='*.map' .) \
-    | (cd "$STAGE/share/fresh-gui/ui" && tar -xf -)
-fi
-test -f "$STAGE/share/fresh-gui/ui/index.html"
-
 cat >"$STAGE/README.txt" <<EOF
 fresh-gui ${VERSION}
 target: ${TARGET%%.*}
 
-Layout (same as the pixi/conda package):
-  bin/${BIN_NAME}
-  share/fresh-gui/ui/   # embedded browser UI
-
-Run from this directory (or put bin/ on PATH and keep the relative
-share/ layout next to bin/):
+Headless ADE daemon (WebSocket /ws). This archive does not include a
+browser UI. Connect with the native GPUI client
+(fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz or the Windows zip):
 
   ./bin/${BIN_NAME}
   ./bin/${BIN_NAME} --foreground

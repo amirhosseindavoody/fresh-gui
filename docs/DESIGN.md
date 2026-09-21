@@ -12,7 +12,7 @@ Developers often keep a Windows or macOS laptop as the interactive machine and a
 
 ### Goals
 
-- **Split deployment:** native GPUI host (or optional browser ADE UI) ↔ Linux remote backend.
+- **Split deployment:** native GPUI host ↔ Linux remote backend.
 - **Terminal-first UX:** multi-tab / split PTY as the primary surface, with editor and explorer as peers.
 - **Fresh as backend of truth:** reuse Fresh crates for buffer/editor semantics; do not re-implement editor core in the host UI.
 - **Pixi + Cargo workspace** for reproducible Rust development.
@@ -54,7 +54,7 @@ Logistics template: `pixi.toml` + Cargo workspace under `crates/`, CalVer `YYYY.
 │    activity, tabs, chrome   │◄───────►│    sessions, PTY, FS, config     │
 │    VTE view + gpui Editor   │  /ws    │    embeds Fresh Editor (optional)│
 │                             │  JSON   │                                  │
-│  optional Vite UI / CLI     │         │  vendor/fresh (submodule)        │
+│  CLI                        │         │  vendor/fresh (submodule)        │
 └─────────────────────────────┘         └──────────────────────────────────┘
                  ▲                                        ▲
                  └──────── fresh-gui-protocol ────────────┘
@@ -65,21 +65,21 @@ Logistics template: `pixi.toml` + Cargo workspace under `crates/`, CalVer `YYYY.
 | Crate | Binary? | Role |
 |-------|---------|------|
 | `fresh-gui-protocol` | no | Versioned messages, capability constants, errors |
-| `fresh-gui` | yes (`fresh-gui`) | Daemon: HTTP UI + WebSocket ADE, sessions, PTY, FS, Fresh editor (Linux primary; Windows binary also released) |
+| `fresh-gui` | yes (`fresh-gui`) | Headless daemon: WebSocket ADE, sessions, PTY, FS, Fresh editor (Linux primary; Windows binary also released) |
 | `fresh-gui-client` | no | Dial, auth, typed request helpers |
-| `fresh-gui-app` | yes (`fresh-gui-app`) | Native GPUI host (default) + CLI (`ping` / `smoke` / `attach` / `serve-ui`) + optional Vite/TS UI (`ui/`) |
+| `fresh-gui-app` | yes (`fresh-gui-app`) | Native GPUI host (default) + CLI (`ping` / `smoke` / `attach` / `remote`) |
 
 ### Process model
 
 1. Operator starts **`fresh-gui`** on the remote machine (background session by default, or `--foreground` for tests). One daemon process holds the session lock; Fresh Editor runs in-process on a dedicated thread; PTY shells are child processes. Linux is the documented remote; the same daemon binary is also released for Windows.
-2. Operator runs **`fresh-gui-app`** with the printed Local access URL (`?token=`) or `ws://…/ws` plus `FRESH_GUI_TOKEN`. The native host authenticates and creates/attaches a session. (The daemon still serves a Vite UI at `GET /` for browser smoke tests.)
-3. After `hello` + `auth`, the client creates or attaches a **session**. Layout persistence (`layout_set` v4) is implemented for the Vite host; native v1 does not restore it yet.
+2. Operator runs **`fresh-gui-app`** with the printed Local access URL (`?token=`) or `ws://…/ws` plus `FRESH_GUI_TOKEN`. The native host authenticates and creates/attaches a session. The daemon serves `/ws` and `/healthz` only.
+3. After `hello` + `auth`, the client creates or attaches a **session**. The daemon still accepts `layout_set` v4; the GPUI host does not restore that blob yet.
 4. Terminal panes map to remote PTYs in that session. Explorer and editor talk to sandboxed FS / Fresh buffer APIs over the same socket.
 5. Disconnect detaches the WebSocket subscriber; the session and PTYs keep running for reattach + scrollback.
 
 ## 5. Protocol
 
-Wire format: **JSON text frames** over WebSocket at `/ws`. Protocol version is negotiated in `hello` and must match exactly (`PROTOCOL_VERSION`, currently `0.4.0`). PTY payloads use standard base64 in `pty_data`. Message shapes live in `fresh-gui-protocol` (mirrored in the optional Vite UI as `ui/src/protocol.ts`).
+Wire format: **JSON text frames** over WebSocket at `/ws`. Protocol version is negotiated in `hello` and must match exactly (`PROTOCOL_VERSION`, currently `0.4.0`). PTY payloads use standard base64 in `pty_data`. Message shapes live in `fresh-gui-protocol`.
 
 This is a **new ADE protocol**, not Fresh `--web` scene. Fresh Editor is an optional capability on top of PTY / session / FS.
 
@@ -136,28 +136,27 @@ Backend `config.json` (JSONC) holds UI prefs (theme, palette, fonts, explorer vi
 
 ### Packaging
 
-Pixi `[package]` + `recipe/` installs `bin/fresh-gui` and the browser UI under `share/fresh-gui/ui` (linux-64 `.conda`, glibc 2.28+). Recipe fetches the pinned Fresh tree via `vendor/fresh.rev` when submodules are missing.
+Pixi `[package]` + `recipe/` installs the headless `bin/fresh-gui` (linux-64 `.conda`, glibc 2.28+). Recipe fetches the pinned Fresh tree via `vendor/fresh.rev` when submodules are missing. It does not build or install a browser UI.
 
 CI on `main` (and `workflow_dispatch`) bumps CalVer and publishes a GitHub Release with:
 
 | Asset | What it is |
 |-------|------------|
-| `fresh-gui-*-*.conda` | linux-64 daemon + packaged browser UI |
-| `fresh-gui-*-x86_64-unknown-linux-gnu.tar.gz` | same layout, glibc ≥ 2.31 (`scripts/package-binary.sh`) |
-| `fresh-gui-*-x86_64-unknown-linux-musl.tar.gz` | same layout, musl |
-| `fresh-gui-*-x86_64-pc-windows-msvc.zip` | same layout, Windows daemon |
+| `fresh-gui-*-*.conda` | linux-64 headless daemon |
+| `fresh-gui-*-x86_64-unknown-linux-gnu.tar.gz` | headless daemon, glibc ≥ 2.31 (`scripts/package-binary.sh`) |
+| `fresh-gui-*-x86_64-unknown-linux-musl.tar.gz` | headless daemon, musl |
+| `fresh-gui-*-x86_64-pc-windows-msvc.zip` | headless daemon, Windows |
+| `fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` | Linux GPUI host only (`fresh-gui-app`), built on `ubuntu-latest` |
 | `fresh-gui-client-*-x86_64-pc-windows-msvc.zip` | Windows GPUI host only (`fresh-gui-app.exe`) |
 
-`pixi.toml` stays `linux-64`. The client archive is built by `scripts/package-client.sh` (no embedded Vite UI). Linux GPUI builds stay a source checkout (`pixi run gui`).
+`pixi.toml` stays `linux-64`. Client archives are built by `scripts/package-client.sh` (no embedded Vite UI). `pixi run gui` remains the from-source host. The Linux client is built on `ubuntu-latest` and needs glibc ≥ 2.39 (not the daemon's glibc 2.31 zigbuild), a display, fontconfig, and a Vulkan loader.
 
 ## 7. Host surfaces
 
 | Surface | How it connects |
 |---------|-----------------|
-| **Native GPUI host (primary)** | `fresh-gui-app` / `pixi run gui` — gpui-kit 0.6.6 (`gpui-pre` = 0.3.6, same snapshot gpui-component requires). Speaks ADE over `fresh-gui-client`. |
-| **Embedded Vite UI** | Served from the same port as `/ws` (`GET /` → `ui/dist` or packaged `share/fresh-gui/ui`) — smoke / packaged browser path |
-| **Vite dev** | `pixi run ui` on `:1420`, points at the backend WS |
-| **CLI** | `fresh-gui-app ping\|smoke\|attach` via `fresh-gui-client` |
+| **Native GPUI host (only UI)** | `fresh-gui-app` / `pixi run gui` — gpui-kit 0.6.6 (`gpui-pre` = 0.3.6, same snapshot gpui-component requires). Speaks ADE over `fresh-gui-client`. |
+| **CLI** | `fresh-gui-app ping\|smoke\|attach\|remote` via `fresh-gui-client` |
 | **SSH bootstrap** | `fresh-gui-app remote add` / `remote connect` — OpenSSH only |
 
 ### SSH remote bootstrap
@@ -175,9 +174,9 @@ Fresh Orchestrator already models SSH workspaces, but that code is TUI/plugin-on
 
 The ADE protocol did **not** need to change for the native host: only the renderer switched from browser (React/CodeMirror/xterm) to GPUI. Fresh remains on the daemon. Combined license is GPL-3.0-or-later (host, matching Fresh) plus Apache-2.0 (gpui-kit). Apache-2.0 can be combined with GPL-3.0, so the binary is GPL-3.0-or-later.
 
-Native v1 chrome: activity bar, collapsible explorer, unified terminal/editor tabs, status bar, command palette, Go to File. Terminal is a VTE grid of remote PTY bytes (not Fresh `TerminalManager`). Editor tabs use gpui-component `Editor` as a **view** of Fresh snapshots (save is local dirty + `buffer_edit` then `buffer_save`). Full IA for the Vite UI and remaining native gaps: [UI.md](./UI.md).
+Native v1 chrome: activity bar, collapsible explorer, unified terminal/editor tabs, status bar, command palette, Go to File. Terminal is a VTE grid of remote PTY bytes (not Fresh `TerminalManager`). Editor tabs use gpui-component `Editor` as a **view** of Fresh snapshots (save is local dirty + `buffer_edit` then `buffer_save`). Host chrome notes: [UI.md](./UI.md).
 
-Linux GUI needs X11 or Wayland, fontconfig, and a working wgpu/Vulkan (or software) backend. macOS/Windows GPUI builds are not the documented path yet (`pixi.toml` is `linux-64`). Linking `fresh-gui-app` (`cargo run` / `cargo test`) also needs a C++ toolchain (`g++` / `libstdc++`) because gpui-kit pulls native GPU/text stacks.
+Linux GUI needs X11 or Wayland, fontconfig, FreeType, and a working wgpu/Vulkan backend. Release clients cover Linux x86_64 (`ubuntu-latest`) and Windows x86_64; `pixi.toml` stays `linux-64` for the daemon package. Linking `fresh-gui-app` (`cargo run` / `cargo test`) also needs a C++ toolchain (`g++` / `libstdc++`) because gpui-kit pulls native GPU/text stacks. The Linux release job installs those libraries (Wayland, X11/XKB, Vulkan, fontconfig, FreeType) before `cargo build`.
 
 ## 8. Fresh coupling
 
@@ -197,10 +196,9 @@ Bump the pin with `git -C vendor/fresh fetch && git -C vendor/fresh checkout --d
 
 ## 9. Development environment
 
-- **Pixi** (conda-forge): tasks `check`, `test`, `build`, `clippy`, `fmt`, `gui`, `ui` / `ui-install` / `ui-build`, `serve`, `package`, `package-binary`, `package-client`, `update-version`.
+- **Pixi** (conda-forge): tasks `check`, `test`, `build`, `clippy`, `fmt`, `gui`, `serve`, `package`, `package-binary`, `package-client`, `update-version`.
 - **Rust** via Pixi / rust-version `1.97` (edition 2024).
-- **Bun** for the Vite/TS UI (`crates/fresh-gui-app/ui/bun.lock`).
-- **Versioning:** CalVer `YYYY.MMDD.N` (e.g. `2026.921.3`). `scripts/update-version.sh` bumps workspace manifests; CI also bumps and publishes backend Releases (linux-64 `.conda`, standalone linux-gnu / musl / windows daemon archives, and a Windows GPUI client archive).
+- **Versioning:** CalVer `YYYY.MMDD.N` (e.g. `2026.921.4`). `scripts/update-version.sh` bumps workspace manifests; CI also bumps and publishes backend Releases (linux-64 `.conda`, standalone linux-gnu / musl / windows daemon archives, and Linux + Windows GPUI client archives).
 
 ## 10. Security
 
@@ -217,7 +215,7 @@ These are settled product choices, kept here as rationale—not a backlog.
 | ID | Choice | Why |
 |----|--------|-----|
 | **D1** | New ADE protocol (PTY-first); Fresh `--web` scene is not the wire | Terminal-first UX without fighting an editor-centric grid scene |
-| **D2** | Native GPUI host as primary renderer; Vite UI kept for smoke | Desktop ADE chrome (Zed / VS Code feel) without a second editor core; browser stack remains for packaged `GET /` |
+| **D2** | Native GPUI host is the only UI | Desktop ADE chrome (Zed / VS Code feel) without a second editor core. A later web UI would be this GPUI client via WebAssembly |
 | **D3** | Fresh as submodule + git rev pin | Portable, editable, explicit pin; also mirrored in `vendor/fresh.rev` for packaging |
 | **D4** | PTY + FS + editor as layered capabilities | Useful remote shell first; explorer and Fresh editor negotiate as capabilities |
 | **D5** | GPL-3.0-or-later everywhere | Same license as Fresh; no split licensing |
@@ -248,5 +246,5 @@ fresh-gui/
   scripts/
     update-version.sh
     package-binary.sh  # standalone daemon archives (gnu / musl / windows)
-    package-client.sh  # GPUI host archive (Windows client release)
+    package-client.sh  # GPUI host archives (Linux tar.gz, Windows zip)
 ```

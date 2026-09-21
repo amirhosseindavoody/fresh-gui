@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Bump project version in Cargo.toml, pixi.toml, recipe/recipe.yaml (if present),
-# and the browser UI package.json.
+# Bump project version in Cargo.toml, pixi.toml, and recipe/recipe.yaml (if present).
 #
 # Scheme (Cargo-compatible SemVer + date sense):
 #   YYYY.MMDD.N   e.g. 2026.630.1  (2026-06-30, first release that day)
@@ -14,7 +13,6 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CARGO_TOML="$ROOT/Cargo.toml"
 PIXI_TOML="$ROOT/pixi.toml"
 RECIPE_YAML="$ROOT/recipe/recipe.yaml"
-UI_PKG="$ROOT/crates/fresh-gui-app/ui/package.json"
 
 today_prefix() {
   local year month day mmdd
@@ -163,20 +161,6 @@ main() {
     mv "$recipe_tmp" "$RECIPE_YAML"
   fi
   trap - EXIT
-
-  if [[ -f "$UI_PKG" ]]; then
-    local ui_tmp
-    ui_tmp="$(mktemp)"
-    awk -v ver="$new_version" '
-      BEGIN { done = 0 }
-      !done && /"version":/ {
-        sub(/"version": "[^"]*"/, "\"version\": \"" ver "\"")
-        done = 1
-      }
-      { print }
-    ' "$UI_PKG" >"$ui_tmp"
-    mv "$ui_tmp" "$UI_PKG"
-  fi
 
   # Keep Cargo.lock in sync so `cargo build --locked` works (e.g. git source builds).
   if ! cargo update \
