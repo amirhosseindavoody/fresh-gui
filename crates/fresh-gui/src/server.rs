@@ -6,13 +6,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
+use axum::Router;
 use axum::extract::ws::{Message as WsMessage, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
 use base64::Engine;
-use fresh_gui_protocol::{Hello, HelloUi, Message, CAP_EDITOR, CAP_SCENE, PROTOCOL_VERSION};
+use fresh_gui_protocol::{CAP_EDITOR, CAP_SCENE, Hello, HelloUi, Message, PROTOCOL_VERSION};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -98,10 +98,7 @@ async fn shutdown_signal(memory: Option<Arc<MemoryMonitor>>) {
     }
 }
 
-async fn ws_upgrade(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
@@ -130,10 +127,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             editor_line_wrap: cfg.ui.editor_line_wrap,
         }
     };
-    let mut hello = Hello::backend(
-        format!("fresh-gui/{}", env!("CARGO_PKG_VERSION")),
-        caps,
-    );
+    let mut hello = Hello::backend(format!("fresh-gui/{}", env!("CARGO_PKG_VERSION")), caps);
     hello.config_path = Some(state.config_path.display().to_string());
     hello.ui = Some(ui);
     let hello = Message::Hello(hello);
@@ -286,14 +280,15 @@ async fn handle_client_msg(
             if let Some(prev) = session_id.take() {
                 state.sessions.detach_subscriber(&prev).await;
             }
-            let (ptys, layout, replay) = state
-                .sessions
-                .attach(&want_id, out_tx)
-                .await
-                .map_err(|err| Message::Error {
-                    code: "session_attach_failed".into(),
-                    message: err.to_string(),
-                })?;
+            let (ptys, layout, replay) =
+                state
+                    .sessions
+                    .attach(&want_id, out_tx)
+                    .await
+                    .map_err(|err| Message::Error {
+                        code: "session_attach_failed".into(),
+                        message: err.to_string(),
+                    })?;
             *session_id = Some(want_id.clone());
             send_msg(
                 sink,
@@ -384,19 +379,12 @@ async fn handle_client_msg(
                     message: err.to_string(),
                 })?;
 
-            send_msg(
-                sink,
-                &Message::PtyOpened {
-                    id,
-                    cols,
-                    rows,
-                },
-            )
-            .await
-            .map_err(|_| Message::Error {
-                code: "send_failed".into(),
-                message: "failed to send PtyOpened".into(),
-            })?;
+            send_msg(sink, &Message::PtyOpened { id, cols, rows })
+                .await
+                .map_err(|_| Message::Error {
+                    code: "send_failed".into(),
+                    message: "failed to send PtyOpened".into(),
+                })?;
             Ok(())
         }
         Message::PtyData { id, data } => {
@@ -497,15 +485,12 @@ async fn handle_client_msg(
             require_auth(*authed)?;
             match state.fs_root.stat(&path).await {
                 Ok(entry) => {
-                    send_msg(
-                        sink,
-                        &Message::FsStatResult { request_id, entry },
-                    )
-                    .await
-                    .map_err(|_| Message::Error {
-                        code: "send_failed".into(),
-                        message: "failed to send FsStatResult".into(),
-                    })?;
+                    send_msg(sink, &Message::FsStatResult { request_id, entry })
+                        .await
+                        .map_err(|_| Message::Error {
+                            code: "send_failed".into(),
+                            message: "failed to send FsStatResult".into(),
+                        })?;
                     Ok(())
                 }
                 Err(err) => Err(Message::Error {
@@ -523,15 +508,12 @@ async fn handle_client_msg(
             require_auth(*authed)?;
             match state.fs_root.create(&parent, &name, kind).await {
                 Ok(entry) => {
-                    send_msg(
-                        sink,
-                        &Message::FsCreated { request_id, entry },
-                    )
-                    .await
-                    .map_err(|_| Message::Error {
-                        code: "send_failed".into(),
-                        message: "failed to send FsCreated".into(),
-                    })?;
+                    send_msg(sink, &Message::FsCreated { request_id, entry })
+                        .await
+                        .map_err(|_| Message::Error {
+                            code: "send_failed".into(),
+                            message: "failed to send FsCreated".into(),
+                        })?;
                     Ok(())
                 }
                 Err(err) => Err(Message::Error {
@@ -635,8 +617,16 @@ async fn handle_client_msg(
                     code: "editor_open_failed".into(),
                     message: format!("{request_id}: {err:#}"),
                 })?;
-            reply_editor_opened(sink, editor, request_id, resolved.path, preview, resolved.line, resolved.column)
-                .await
+            reply_editor_opened(
+                sink,
+                editor,
+                request_id,
+                resolved.path,
+                preview,
+                resolved.line,
+                resolved.column,
+            )
+            .await
         }
         Message::EditorOpenLink {
             request_id,
@@ -684,10 +674,13 @@ async fn handle_client_msg(
                     message: "editor capability not available".into(),
                 });
             };
-            editor.close(buffer_id).await.map_err(|err| Message::Error {
-                code: "editor_close_failed".into(),
-                message: err.to_string(),
-            })?;
+            editor
+                .close(buffer_id)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "editor_close_failed".into(),
+                    message: err.to_string(),
+                })?;
             Ok(())
         }
         Message::BufferEdit {
@@ -786,10 +779,14 @@ async fn handle_client_msg(
             recursive,
         } => {
             require_auth(*authed)?;
-            let resolved = state.fs_root.resolve(&path).await.map_err(|err| Message::Error {
-                code: "fs_watch_failed".into(),
-                message: format!("{request_id}: {err:#}"),
-            })?;
+            let resolved = state
+                .fs_root
+                .resolve(&path)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "fs_watch_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
             // Install watches off the WebSocket task. A recursive root walk can
             // take seconds on large trees; awaiting it here would stall PTY
             // output on the same connection (felt as slow shell init / lag).
@@ -871,8 +868,7 @@ async fn resolve_editor_open(
     line: Option<u32>,
     column: Option<u32>,
 ) -> anyhow::Result<crate::path_open::ResolvedOpen> {
-    let (path_part, parsed_line, parsed_col) =
-        fresh::input::quick_open::parse_path_line_col(path);
+    let (path_part, parsed_line, parsed_col) = fresh::input::quick_open::parse_path_line_col(path);
     let line = line.or(parsed_line.map(|n| n as u32));
     let column = column.or(parsed_col.map(|n| n as u32));
 
@@ -918,10 +914,13 @@ async fn reply_editor_opened(
     line: Option<u32>,
     column: Option<u32>,
 ) -> Result<(), Message> {
-    let opened = editor.open(path, preview).await.map_err(|err| Message::Error {
-        code: "editor_open_failed".into(),
-        message: format!("{request_id}: {err:#}"),
-    })?;
+    let opened = editor
+        .open(path, preview)
+        .await
+        .map_err(|err| Message::Error {
+            code: "editor_open_failed".into(),
+            message: format!("{request_id}: {err:#}"),
+        })?;
     send_msg(
         sink,
         &Message::EditorOpened {
@@ -990,5 +989,7 @@ async fn send_msg(
     msg: &Message,
 ) -> Result<(), ()> {
     let json = msg.to_json().map_err(|_| ())?;
-    sink.send(WsMessage::Text(json.into())).await.map_err(|_| ())
+    sink.send(WsMessage::Text(json.into()))
+        .await
+        .map_err(|_| ())
 }

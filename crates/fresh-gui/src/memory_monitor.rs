@@ -80,11 +80,7 @@ impl MemoryMonitor {
     /// Safe to call multiple times (signal path + post-serve fallback); only the
     /// first call emits the summary.
     pub fn finish(&self) {
-        if self
-            .inner
-            .finalized
-            .swap(true, Ordering::SeqCst)
-        {
+        if self.inner.finalized.swap(true, Ordering::SeqCst) {
             return;
         }
         if let Some(abort) = &self.abort {
@@ -252,7 +248,10 @@ RssAnon:\t  100000 kB
 
     #[test]
     fn parse_status_kb_line_rejects_garbage() {
-        assert_eq!(parse_status_kb_line("VmRSS: not-a-number kB", "VmRSS:"), None);
+        assert_eq!(
+            parse_status_kb_line("VmRSS: not-a-number kB", "VmRSS:"),
+            None
+        );
         assert_eq!(parse_status_kb_line("VmSize: 1 kB", "VmRSS:"), None);
     }
 

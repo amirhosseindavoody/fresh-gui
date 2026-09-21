@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "Host ADE shell for fresh-gui (CLI + browser UI)"
+description = "Native GPUI ADE host for fresh-gui (CLI + optional Vite UI)"
 readme = "README.md"
 
 [[bin]]
@@ -15,11 +15,23 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+async-channel = "2.3"
 axum = { workspace = true }
 clap = { workspace = true }
 fresh-gui-client = { workspace = true }
 fresh-gui-protocol = { workspace = true }
+# Pin the same gpui-pre snapshot gpui-kit 0.6.6 / gpui-component require
+# (`=0.3.6`) so Cargo does not resolve a second gpui crate instance.
+gpui = { package = "gpui-pre", version = "=0.3.6" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.6", features = [
+    "font-kit",
+    "x11",
+    "wayland",
+    "runtime_shaders",
+] }
+gpui-kit = "0.6.6"
 tokio = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+vte = "0.14"

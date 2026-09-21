@@ -20,19 +20,19 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::daemon::{
-    close_session, live_session, print_session_info, serve_args_for_child, spawn_daemon,
-    wait_until_ready, write_meta, SessionLock, SessionMeta, SessionPaths,
+    SessionLock, SessionMeta, SessionPaths, close_session, live_session, print_session_info,
+    serve_args_for_child, spawn_daemon, wait_until_ready, write_meta,
 };
 use crate::editor_worker::EditorHandle;
 use crate::fs::FsRoot;
 use crate::fs_watch::FsWatchStore;
-use crate::memory_monitor::{MemoryMonitor, DEFAULT_SAMPLE_INTERVAL};
+use crate::memory_monitor::{DEFAULT_SAMPLE_INTERVAL, MemoryMonitor};
 use crate::server::AppState;
 use crate::session::SessionStore;
 
@@ -223,8 +223,10 @@ async fn run_server_foreground(args: ServeArgs, write_session_meta: bool) -> Res
     };
 
     let loopback = args.listen.ip().is_loopback();
-    let AuthSetup { token, require_auth } =
-        resolve_auth(loopback, args.token.as_deref(), args.allow_no_auth)?;
+    let AuthSetup {
+        token,
+        require_auth,
+    } = resolve_auth(loopback, args.token.as_deref(), args.allow_no_auth)?;
 
     if !loopback {
         warn!(
@@ -313,9 +315,15 @@ async fn run_server_foreground(args: ServeArgs, write_session_meta: bool) -> Res
         print_startup_banner(bound, &http_url, &ws_url, token.as_deref());
     }
 
-    let result =
-        server::serve_listener(listener, state, ui_dir, &http_url, &ws_url, Some(memory.clone()))
-            .await;
+    let result = server::serve_listener(
+        listener,
+        state,
+        ui_dir,
+        &http_url,
+        &ws_url,
+        Some(memory.clone()),
+    )
+    .await;
 
     // Fallback if shutdown drained without the signal path finalizing (e.g. serve error).
     memory.finish();
@@ -342,7 +350,9 @@ fn resolve_auth(
 ) -> Result<AuthSetup> {
     if allow_no_auth {
         if !loopback {
-            bail!("--allow-no-auth is only permitted on loopback binds (got a non-loopback listen)");
+            bail!(
+                "--allow-no-auth is only permitted on loopback binds (got a non-loopback listen)"
+            );
         }
         return Ok(AuthSetup {
             token: None,
@@ -360,12 +370,7 @@ fn resolve_auth(
     })
 }
 
-fn print_startup_banner(
-    bound: SocketAddr,
-    http_url: &str,
-    ws_url: &str,
-    token: Option<&str>,
-) {
+fn print_startup_banner(bound: SocketAddr, http_url: &str, ws_url: &str, token: Option<&str>) {
     println!();
     println!("  fresh-gui ready");
     println!("  UI:  {http_url}");
@@ -440,7 +445,9 @@ async fn bind_listen(
         let candidate = SocketAddr::new(preferred.ip(), port);
         match tokio::net::TcpListener::bind(candidate).await {
             Ok(listener) => {
-                let bound = listener.local_addr().context("local_addr after fallback bind")?;
+                let bound = listener
+                    .local_addr()
+                    .context("local_addr after fallback bind")?;
                 warn!(%preferred, %bound, "bound fallback listen address");
                 return Ok((listener, bound));
             }
@@ -538,11 +545,7 @@ fn hostname_command(args: &[&str]) -> Option<String> {
         return None;
     }
     let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
+    if name.is_empty() { None } else { Some(name) }
 }
 
 fn is_assigned_domain(name: &str) -> bool {
@@ -619,9 +622,7 @@ fn ui_dir_candidates() -> Vec<PathBuf> {
         candidates.push(PathBuf::from(prefix).join("share/fresh-gui/ui"));
     }
 
-    candidates.push(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fresh-gui-app/ui/dist"),
-    );
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fresh-gui-app/ui/dist"));
     if let Ok(cwd) = std::env::current_dir() {
         candidates.push(cwd.join("crates/fresh-gui-app/ui/dist"));
         candidates.push(cwd.join("ui/dist"));

@@ -1,12 +1,15 @@
-//! fresh-gui-app — host ADE shell CLI + optional static UI server.
+//! fresh-gui-app — native GPUI ADE host, plus CLI helpers and optional static UI.
 //!
-//! CLI: connect to a backend and run a PTY smoke test, or serve `ui/dist`
-//! for local development (`serve-ui`).
+//! Default (no subcommand): open the native desktop shell.
+//! CLI: `ping` / `smoke` / `attach` talk to a running daemon.
+//! `serve-ui` still serves the Vite `ui/dist` bundle for browser smoke tests.
+
+mod gui;
 
 use anyhow::{Context, Result};
 use axum::Router;
 use clap::{Parser, Subcommand};
-use fresh_gui_client::{smoke_echo, Client, ConnectOptions};
+use fresh_gui_client::{Client, ConnectOptions, smoke_echo};
 use fresh_gui_protocol::{Message, PROTOCOL_VERSION};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -14,34 +17,40 @@ use tower_http::services::ServeDir;
 use tracing::info;
 
 #[derive(Debug, Parser)]
-#[command(name = "fresh-gui-app", version, about = "Terminal-first ADE GUI (host)")]
+#[command(
+    name = "fresh-gui-app",
+    version,
+    about = "Native GPUI ADE host for fresh-gui"
+)]
 struct Args {
     #[command(subcommand)]
     cmd: Option<Cmd>,
 
-    /// Backend WebSocket URL (used by `smoke` / `ping`).
+    /// Backend WebSocket URL or the printed Local access HTTP URL (`?token=`).
     #[arg(long, global = true, default_value = "ws://127.0.0.1:7420/ws")]
     backend: String,
 
-    /// Auth token if the backend requires one.
+    /// Auth token if the backend requires one (also `FRESH_GUI_TOKEN`).
     #[arg(long, global = true, env = "FRESH_GUI_TOKEN")]
     token: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
+    /// Open the native GPUI host (default when no subcommand is given).
+    Gui,
     /// Ping the backend (hello + ping/pong).
     Ping,
     /// Open a PTY, run a printf, print captured output (CI / smoke).
     Smoke,
-    /// Interactive: open a PTY and forward stdin/stdout (no xterm; debug aid).
+    /// Interactive: open a PTY and forward stdin/stdout (no emulator; debug aid).
     Attach {
         #[arg(long, default_value_t = 80)]
         cols: u16,
         #[arg(long, default_value_t = 24)]
         rows: u16,
     },
-    /// Serve the built Vite UI over HTTP (local static server for `ui/dist`).
+    /// Serve the built Vite UI over HTTP (browser smoke tests; not the primary host).
     ServeUi {
         #[arg(long, default_value = "127.0.0.1:1420")]
         listen: SocketAddr,
@@ -51,8 +60,7 @@ enum Cmd {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -65,13 +73,25 @@ async fn main() -> Result<()> {
         backend,
         token,
     } = Args::parse();
-    let args = SharedArgs { backend, token };
-    match cmd.unwrap_or(Cmd::Ping) {
-        Cmd::Ping => cmd_ping(&args).await,
-        Cmd::Smoke => cmd_smoke(&args).await,
-        Cmd::Attach { cols, rows } => cmd_attach(&args, cols, rows).await,
-        Cmd::ServeUi { listen, dir } => cmd_serve_ui(listen, dir).await,
+
+    match cmd.unwrap_or(Cmd::Gui) {
+        Cmd::Gui => gui::run(backend, token),
+        Cmd::Ping => tokio_block_on(cmd_ping(backend, token)),
+        Cmd::Smoke => tokio_block_on(cmd_smoke(backend, token)),
+        Cmd::Attach { cols, rows } => tokio_block_on(cmd_attach(backend, token, cols, rows)),
+        Cmd::ServeUi { listen, dir } => tokio_block_on(cmd_serve_ui(listen, dir)),
     }
+}
+
+fn tokio_block_on<F>(fut: F) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("tokio runtime")?
+        .block_on(fut)
 }
 
 struct SharedArgs {
@@ -89,8 +109,9 @@ async fn connect(args: &SharedArgs) -> Result<Client> {
         .with_context(|| format!("connect to {}", args.backend))
 }
 
-async fn cmd_ping(args: &SharedArgs) -> Result<()> {
-    let mut client = connect(args).await?;
+async fn cmd_ping(backend: String, token: Option<String>) -> Result<()> {
+    let args = SharedArgs { backend, token };
+    let mut client = connect(&args).await?;
     info!(
         protocol = PROTOCOL_VERSION,
         backend = %client.backend_hello.implementation,
@@ -105,7 +126,6 @@ async fn cmd_ping(args: &SharedArgs) -> Result<()> {
                 break;
             }
             Message::Ping { nonce } => {
-                // backend shouldn't ping first in MVP
                 info!(nonce, "unexpected ping");
             }
             other => info!(?other, "skip"),
@@ -114,16 +134,17 @@ async fn cmd_ping(args: &SharedArgs) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_smoke(args: &SharedArgs) -> Result<()> {
-    let out = smoke_echo(&args.backend, args.token.as_deref()).await?;
+async fn cmd_smoke(backend: String, token: Option<String>) -> Result<()> {
+    let out = smoke_echo(&backend, token.as_deref()).await?;
     println!("{out}");
     Ok(())
 }
 
-async fn cmd_attach(args: &SharedArgs, cols: u16, rows: u16) -> Result<()> {
+async fn cmd_attach(backend: String, token: Option<String>, cols: u16, rows: u16) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let mut client = connect(args).await?;
+    let args = SharedArgs { backend, token };
+    let mut client = connect(&args).await?;
     let id = client.open_pty(cols, rows, None, None).await?;
     info!(%id, "pty opened — type to send; Ctrl-C to quit");
 
@@ -170,12 +191,12 @@ async fn cmd_serve_ui(listen: SocketAddr, dir: Option<PathBuf>) -> Result<()> {
     });
     anyhow::ensure!(
         dir.join("index.html").is_file(),
-        "missing {} — run `pixi run ui-install && pixi run ui-build` (or `pixi run ui` for Vite dev)",
+        "missing {} — run `pixi run ui-install && pixi run ui-build` (or `pixi run ui` for Vite dev). The native host is `fresh-gui-app` / `pixi run gui`.",
         dir.join("index.html").display()
     );
 
     let app = Router::new().fallback_service(ServeDir::new(&dir));
-    info!(%listen, dir = %dir.display(), "serving UI — open http://{listen}/");
+    info!(%listen, dir = %dir.display(), "serving Vite UI (smoke) — open http://{listen}/");
     let listener = tokio::net::TcpListener::bind(listen).await?;
     axum::serve(listener, app).await?;
     Ok(())

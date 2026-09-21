@@ -57,18 +57,20 @@ async fn fs_list_root() {
     let mut client = Client::connect(ConnectOptions::new(format!("ws://{addr}/ws")))
         .await
         .expect("connect");
-    assert!(
-        client
-            .backend_hello
-            .capabilities
-            .iter()
-            .any(|c| c == "fs")
-    );
+    assert!(client.backend_hello.capabilities.iter().any(|c| c == "fs"));
 
     let (path, entries) = client.list_dir("").await.expect("list");
     assert!(path.contains("fresh-gui-fs-e2e") || entries.len() >= 2);
-    assert!(entries.iter().any(|e| e.name == "hello.txt" && e.kind == FsKind::File));
-    assert!(entries.iter().any(|e| e.name == "nested" && e.kind == FsKind::Dir));
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.name == "hello.txt" && e.kind == FsKind::File)
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.name == "nested" && e.kind == FsKind::Dir)
+    );
 
     let (_nested_path, nested) = client.list_dir("nested").await.expect("list nested");
     assert!(nested.is_empty());

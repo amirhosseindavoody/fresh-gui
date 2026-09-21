@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{Context, Result};
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -73,10 +73,7 @@ impl PtySession {
             .spawn_command(cmd)
             .with_context(|| format!("spawn shell {shell}"))?;
 
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .context("clone pty reader")?;
+        let mut reader = pair.master.try_clone_reader().context("clone pty reader")?;
         let writer = pair.master.take_writer().context("take pty writer")?;
         let master = Arc::new(Mutex::new(pair.master));
 

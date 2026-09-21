@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 const META_NAME: &str = "session.json";
@@ -237,9 +237,7 @@ pub fn spawn_daemon(serve_args: &[String], paths: &SessionPaths) -> Result<u32> 
         .mode(0o600)
         .open(&paths.log_path)
         .with_context(|| format!("open log for child {}", paths.log_path.display()))?;
-    let log_err = log
-        .try_clone()
-        .context("clone log fd for stderr")?;
+    let log_err = log.try_clone().context("clone log fd for stderr")?;
 
     let mut cmd = Command::new(&exe);
     cmd.arg("--daemon-serve");
@@ -361,7 +359,10 @@ pub fn close_session(paths: &SessionPaths) -> Result<()> {
 
     if !is_process_running(meta.pid) {
         remove_session_files(paths);
-        println!("Cleared stale session metadata (process {} was not running).", meta.pid);
+        println!(
+            "Cleared stale session metadata (process {} was not running).",
+            meta.pid
+        );
         return Ok(());
     }
 

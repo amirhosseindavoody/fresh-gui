@@ -235,8 +235,8 @@ impl Config {
             return Ok(Self::default());
         }
 
-        let text = fs::read_to_string(path)
-            .with_context(|| format!("read config {}", path.display()))?;
+        let text =
+            fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
         Self::parse(&text)
             .with_context(|| format!("parse config {}", path.display()))
             .map(|cfg| {
@@ -281,8 +281,8 @@ impl Config {
             return Ok(true);
         }
 
-        let text = fs::read_to_string(path)
-            .with_context(|| format!("read config {}", path.display()))?;
+        let text =
+            fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
         if text.trim().is_empty() {
             fs::write(path, DEFAULT_CONFIG_TEMPLATE)
                 .with_context(|| format!("write default config {}", path.display()))?;
@@ -290,8 +290,8 @@ impl Config {
             return Ok(true);
         }
 
-        let defaults = parse_jsonc_value(DEFAULT_CONFIG_TEMPLATE)
-            .context("parse default config template")?;
+        let defaults =
+            parse_jsonc_value(DEFAULT_CONFIG_TEMPLATE).context("parse default config template")?;
         let mut existing = match parse_jsonc_value(&text) {
             Ok(v) => v,
             Err(err) => {
@@ -413,10 +413,7 @@ fn parse_jsonc_value(text: &str) -> Result<serde_json::Value> {
 /// Recursively insert keys from `defaults` that are missing in `existing`.
 /// Never replaces an existing key (including `null` / wrong types).
 /// Returns whether any key was inserted.
-pub fn merge_missing_json(
-    existing: &mut serde_json::Value,
-    defaults: &serde_json::Value,
-) -> bool {
+pub fn merge_missing_json(existing: &mut serde_json::Value, defaults: &serde_json::Value) -> bool {
     use serde_json::Value;
     match (existing, defaults) {
         (Value::Object(existing_map), Value::Object(defaults_map)) => {

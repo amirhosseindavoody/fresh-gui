@@ -57,10 +57,8 @@ async fn editor_edit_save_reopen() {
         .await
         .expect("connect");
 
-    let (buffer_id, _path, _lang, rev, text) = client
-        .open_editor("note.txt", false)
-        .await
-        .expect("open");
+    let (buffer_id, _path, _lang, rev, text) =
+        client.open_editor("note.txt", false).await.expect("open");
     assert!(text.contains("version-one"));
     assert_eq!(rev, 0);
 
@@ -81,10 +79,8 @@ async fn editor_edit_save_reopen() {
     assert_eq!(active.as_deref(), Some(buffer_id.as_str()));
 
     // Re-open should see saved content at latest rev.
-    let (_id2, _p2, _l2, rev2, text2) = client
-        .open_editor("note.txt", false)
-        .await
-        .expect("reopen");
+    let (_id2, _p2, _l2, rev2, text2) =
+        client.open_editor("note.txt", false).await.expect("reopen");
     assert!(text2.contains("version-two"));
     assert_eq!(rev2, 2);
 

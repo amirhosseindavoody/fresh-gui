@@ -7,10 +7,10 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use fresh::input::quick_open::parse_path_line_col;
 use fresh::primitives::path_utils::expand_tilde;
-use fresh::services::terminal::path_link::{detect_link_at, DetectedLink};
+use fresh::services::terminal::path_link::{DetectedLink, detect_link_at};
 
 use crate::fs::FsRoot;
 
@@ -56,11 +56,7 @@ pub async fn resolve_link_open(
     })
 }
 
-async fn resolve_existing_file(
-    fs_root: &FsRoot,
-    raw: &str,
-    cwd: Option<&str>,
-) -> Result<PathBuf> {
+async fn resolve_existing_file(fs_root: &FsRoot, raw: &str, cwd: Option<&str>) -> Result<PathBuf> {
     if let Some(cwd) = cwd.filter(|s| !s.is_empty()) {
         // Terax/Fresh: relative paths follow the terminal cwd, which may lie
         // outside `--root` — authorize it like explorer re-root does.
@@ -117,18 +113,21 @@ mod tests {
 
     #[tokio::test]
     async fn resolves_relative_under_cwd() {
-        let tmp = std::env::temp_dir().join(format!(
-            "fresh-gui-path-open-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("fresh-gui-path-open-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(tmp.join("src")).unwrap();
         fs::write(tmp.join("src/main.rs"), b"fn main() {}\n").unwrap();
         let root = FsRoot::new(tmp.clone()).unwrap();
 
-        let got = resolve_path_open(&root, "src/main.rs:2:1", Some(tmp.to_str().unwrap()), None, None)
-            .await
-            .unwrap();
+        let got = resolve_path_open(
+            &root,
+            "src/main.rs:2:1",
+            Some(tmp.to_str().unwrap()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(got.path.ends_with("src/main.rs"));
         assert_eq!(got.line, Some(2));
         assert_eq!(got.column, Some(1));
@@ -138,10 +137,7 @@ mod tests {
 
     #[tokio::test]
     async fn detect_link_in_compiler_line() {
-        let tmp = std::env::temp_dir().join(format!(
-            "fresh-gui-path-link-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("fresh-gui-path-link-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(tmp.join("src")).unwrap();
         fs::write(tmp.join("src/lib.rs"), b"ok\n").unwrap();
