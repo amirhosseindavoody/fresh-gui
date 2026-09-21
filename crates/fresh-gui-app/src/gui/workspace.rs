@@ -30,6 +30,14 @@ use super::terminal::{TermScreen, keystroke_to_bytes};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Dense ribbon sizes. gpui-component medium controls (32px icon buttons,
+/// 32px tabs, `py_2` rails) leave the shell airier than VS Code / Zed.
+const TITLE_BAR_H: f32 = 30.;
+const ACTIVITY_RAIL_W: f32 = 36.;
+const SIDEBAR_HEADER_H: f32 = 26.;
+const TREE_ROW_H: f32 = 22.;
+const STATUS_BAR_H: f32 = 22.;
+
 fn next_id(prefix: &str) -> String {
     format!("{prefix}-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed))
 }
@@ -680,18 +688,19 @@ impl Workspace {
 
     fn render_activity_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
-            .w(px(48.))
+            .w(px(ACTIVITY_RAIL_W))
             .h_full()
             .flex_shrink_0()
             .items_center()
-            .gap_1()
-            .py_2()
+            .gap(px(0.))
+            .py_1()
             .bg(cx.theme().sidebar)
             .border_r_1()
             .border_color(cx.theme().border)
             .child(
                 Button::new("act-explorer")
                     .ghost()
+                    .small()
                     .icon(IconName::Folder)
                     .tooltip("Explorer")
                     .selected(self.activity == Activity::Explorer && !self.sidebar_collapsed)
@@ -708,6 +717,7 @@ impl Workspace {
             .child(
                 Button::new("act-settings")
                     .ghost()
+                    .small()
                     .icon(IconName::Settings)
                     .tooltip("Settings")
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -739,14 +749,15 @@ impl Workspace {
             .child(
                 h_flex()
                     .w_full()
-                    .px_3()
-                    .py_2()
+                    .h(px(SIDEBAR_HEADER_H))
+                    .px_2()
                     .items_center()
                     .justify_between()
-                    .child(div().text_sm().font_bold().child(root_label))
+                    .child(div().text_xs().font_semibold().child(root_label))
                     .child(
                         Button::new("collapse-sidebar")
                             .ghost()
+                            .xsmall()
                             .icon(IconName::PanelLeftClose)
                             .tooltip("Hide Explorer (Ctrl+B)")
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -771,11 +782,19 @@ impl Workspace {
                     let view = view.clone();
                     ListItem::new(ix)
                         .w_full()
+                        .h(px(TREE_ROW_H))
+                        .text_sm()
                         .rounded(cx.theme().radius)
-                        .py_0p5()
-                        .px_2()
-                        .pl(px(12.) * entry.depth() + px(8.))
-                        .child(h_flex().gap_2().child(Icon::new(icon).small()).child(label))
+                        .py_0()
+                        .px_1()
+                        .pl(px(8.) * entry.depth() + px(4.))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .child(Icon::new(icon).small())
+                                .child(label),
+                        )
                         .on_click(move |_, _, cx| {
                             view.update(cx, |this, cx| {
                                 if is_folder {
@@ -793,19 +812,55 @@ impl Workspace {
                         })
                 })
                 .text_sm()
-                .p_1()
+                .p_0()
                 .flex_1()
                 .min_h_0(),
             )
     }
 
+    fn render_new_tab_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        Button::new("new-term")
+            .ghost()
+            .xsmall()
+            .icon(IconName::Plus)
+            .tooltip("New Terminal (Ctrl+T)")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.new_terminal();
+                cx.notify();
+            }))
+    }
+
     fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // `TabBar` paints `last_empty_space` only when a suffix or overflow
+        // menu is set, and that suffix is pinned to the far edge (after a
+        // flex-1 scroller). A zero-width suffix turns the slot on without
+        // adding a second control group, so `+` stays against the last tab.
         let mut bar = TabBar::new("workspace-tabs")
+            .small()
+            .w_full()
+            .flex_shrink_0()
             .selected_index(self.active_tab)
             .on_click(cx.listener(|this, ix: &usize, _, cx| {
                 this.active_tab = *ix;
                 cx.notify();
-            }));
+            }))
+            .last_empty_space(
+                h_flex()
+                    .id("tab-new-slot")
+                    .h_full()
+                    .flex_grow_1()
+                    .flex_shrink_0()
+                    .items_center()
+                    .child(self.render_new_tab_button(cx)),
+            )
+            .suffix(
+                div()
+                    .id("tab-suffix-anchor")
+                    .w(px(0.))
+                    .min_w(px(0.))
+                    .h_full()
+                    .flex_shrink_0(),
+            );
         for tab in &self.tabs {
             let icon = match tab {
                 ShellTab::Terminal { .. } => IconName::SquareTerminal,
@@ -813,22 +868,7 @@ impl Workspace {
             };
             bar = bar.child(Tab::new().label(Self::tab_label(tab)).icon(icon));
         }
-        h_flex()
-            .w_full()
-            .items_center()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(bar.flex_1())
-            .child(
-                Button::new("new-term")
-                    .ghost()
-                    .icon(IconName::Plus)
-                    .tooltip("New Terminal (Ctrl+T)")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.new_terminal();
-                        cx.notify();
-                    })),
-            )
+        bar
     }
 
     fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1066,11 +1106,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_next_tab))
             .on_action(cx.listener(Self::on_prev_tab))
             .child(
-                TitleBar::new().child(
+                TitleBar::new().h(px(TITLE_BAR_H)).child(
                     h_flex()
-                        .gap_2()
+                        .gap_1()
                         .items_center()
-                        .child(div().font_bold().child("fresh-gui"))
+                        .child(div().text_sm().font_semibold().child("fresh-gui"))
                         .child(
                             div()
                                 .text_xs()
@@ -1098,6 +1138,10 @@ impl Render for Workspace {
             )
             .child(
                 StatusBar::new()
+                    .h(px(STATUS_BAR_H))
+                    .py_0()
+                    .px_2()
+                    .gap_1()
                     .left(self.status.clone())
                     .child(self.connection_label())
                     .right(caps)
