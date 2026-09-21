@@ -1,15 +1,30 @@
 # Bump CalVer, build the linux-64 fresh-gui pixi package + standalone
-# binaries (linux-gnu glibc≥2.31, linux-musl, windows-msvc), and publish a
-# GitHub Release.
+# binaries (linux-gnu glibc≥2.31, linux-musl, windows-msvc) and the GPUI
+# hosts (linux-gnu, windows-msvc), and publish a GitHub Release.
 #
-# Triggers on every push to main (merge) and on manual dispatch.
-# Commits/tags pushed with GITHUB_TOKEN do not re-trigger this workflow.
+# Triggers on every push to main (merge), on manual dispatch, and on pull
+# requests that touch the client build. The release job does not run on pull
+# requests: it bumps CalVer, pushes main, and creates the GitHub Release.
+# The Linux GPUI client job still builds and packages on those PRs so the
+# archive steps are verified before merge. Commits/tags pushed with
+# GITHUB_TOKEN do not re-trigger this workflow.
 
 name: Release backend
 
 on:
   push:
     branches: [main]
+  # Full release (version bump + GitHub Release) stays push/dispatch only.
+  # These paths re-run the Linux GPUI client build + package on the PR.
+  pull_request:
+    paths:
+      - ".github/workflows/release-backend.yml"
+      - "scripts/package-client.sh"
+      - "crates/fresh-gui-app/**"
+      - "crates/fresh-gui-client/**"
+      - "crates/fresh-gui-protocol/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
   workflow_dispatch:
     inputs:
       bump:
@@ -23,8 +38,8 @@ on:
         default: ""
 
 concurrency:
-  group: release-backend-main
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'pull_request' && format('release-backend-pr-{0}', github.ref) || 'release-backend-main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: write
@@ -40,6 +55,7 @@ jobs:
     # Avoid publishing releases from forks. Skip bot release commits if they
     # ever re-trigger (e.g. PAT instead of GITHUB_TOKEN).
     if: >-
+      github.event_name != 'pull_request' &&
       github.repository == 'amirhosseindavoody/fresh-gui' &&
       (github.event_name != 'push' ||
        !startsWith(github.event.head_commit.message, 'chore: release'))
@@ -176,9 +192,10 @@ jobs:
             echo "| \`fresh-gui-*-x86_64-unknown-linux-gnu.tar.gz\` | Standalone Linux binary (glibc **≥ 2.31**), same layout |"
             echo "| \`fresh-gui-*-x86_64-unknown-linux-musl.tar.gz\` | Standalone Linux musl binary (Alpine, static-friendly), same layout |"
             echo "| \`fresh-gui-*-x86_64-pc-windows-msvc.zip\` | Standalone Windows daemon, same layout |"
+            echo "| \`fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz\` | Linux GPUI host (\`fresh-gui-app\`) |"
             echo "| \`fresh-gui-client-*-x86_64-pc-windows-msvc.zip\` | Windows GPUI host (\`fresh-gui-app.exe\`) |"
             echo
-            echo "These assets are the **daemon** plus the packaged browser UI. A separate job attaches the Windows GPUI host as \`fresh-gui-client-*-x86_64-pc-windows-msvc.zip\` (\`fresh-gui-app.exe\`). Linux GPUI builds stay a source checkout (\`pixi run gui\`)."
+            echo "These assets are the **daemon** plus the packaged browser UI. Separate jobs attach the GPUI hosts: Linux \`fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz\` (\`fresh-gui-app\`) and Windows \`fresh-gui-client-*-x86_64-pc-windows-msvc.zip\` (\`fresh-gui-app.exe\`). \`pixi run gui\` is still the from-source path."
             echo
             echo "### Install (pixi / conda)"
             echo
@@ -195,6 +212,22 @@ jobs:
             echo "tar -xzf fresh-gui-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
             echo "cd fresh-gui-${VERSION}-x86_64-unknown-linux-gnu"
             echo "./bin/fresh-gui"
+            echo '```'
+            echo
+            echo "### Linux GPUI client"
+            echo
+            echo "Built on \`ubuntu-latest\`. Needs **glibc ≥ 2.39** (Ubuntu 24.04+; a newer runner image can raise this floor) — not the daemon's glibc 2.31 zigbuild. Also needs an X11 or Wayland session, fontconfig, and a Vulkan loader (\`libvulkan.so.1\`, loaded on demand) plus Wayland client libraries."
+            echo
+            echo '```bash'
+            echo "tar -xzf fresh-gui-client-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+            echo "cd fresh-gui-client-${VERSION}-x86_64-unknown-linux-gnu"
+            echo "./fresh-gui-app remote add lab user@server --root /path/to/project"
+            echo "./fresh-gui-app remote connect lab"
+            echo '```'
+            echo
+            echo '```bash'
+            echo "# Debian/Ubuntu runtime libraries:"
+            echo "sudo apt install libvulkan1 libfontconfig1 libfreetype6 libwayland-client0 libxkbcommon0 libxkbcommon-x11-0 libxcb1"
             echo '```'
             echo
             echo "Or install from git at this tag:"
@@ -401,5 +434,140 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           assets=(dist/client/fresh-gui-client-*.zip dist/client/fresh-gui-client-*.zip.sha256)
+          test "${#assets[@]}" -ge 2
+          gh release upload "${TAG}" "${assets[@]}" --clobber
+
+  # Same shape as client-windows. On pull_request, `release` is skipped (it
+  # would bump CalVer and publish); this job still compiles and packages so
+  # the Linux archive is verified before merge. The GitHub Release upload
+  # runs only after `release` succeeds.
+  client-linux:
+    name: GPUI client (linux)
+    needs: release
+    if: >-
+      !cancelled() &&
+      (needs.release.result == 'success' ||
+       (github.event_name == 'pull_request' && needs.release.result == 'skipped'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout release tag
+        if: github.event_name != 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout pull request
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install GPUI system dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          pkgs=(
+            pkg-config
+            build-essential
+            g++
+            clang
+            cmake
+            libssl-dev
+            libzstd-dev
+            libwayland-dev
+            libxkbcommon-dev
+            libxkbcommon-x11-dev
+            libx11-dev
+            libx11-xcb-dev
+            libxcb1-dev
+            libxcb-render0-dev
+            libxcb-shape0-dev
+            libxcb-xfixes0-dev
+            libvulkan-dev
+            libvulkan1
+          )
+          # Package names differ slightly across Ubuntu releases (ubuntu-latest).
+          if apt-cache show libfontconfig1-dev >/dev/null 2>&1; then
+            pkgs+=(libfontconfig1-dev)
+          else
+            pkgs+=(libfontconfig-dev)
+          fi
+          if apt-cache show libfreetype6-dev >/dev/null 2>&1; then
+            pkgs+=(libfreetype6-dev)
+          else
+            pkgs+=(libfreetype-dev)
+          fi
+          if apt-cache show libstdc++-14-dev >/dev/null 2>&1; then
+            pkgs+=(libstdc++-14-dev)
+          fi
+          sudo apt-get install -y --no-install-recommends "${pkgs[@]}"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-client-x86_64-unknown-linux-gnu
+          workspaces: ". -> target"
+
+      - name: Build GPUI host
+        shell: bash
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+          CARGO_PROFILE_RELEASE_LTO: thin
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p fresh-gui-app \
+            --target x86_64-unknown-linux-gnu
+
+      - name: Package client archive
+        shell: bash
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${VERSION}" ]]; then
+            VERSION="$(awk '
+              /^\[workspace\.package\]$/ { in_sec = 1; next }
+              /^\[/ { in_sec = 0 }
+              in_sec && /^version =/ {
+                line = $0
+                sub(/^version = "/, "", line)
+                sub(/"$/, "", line)
+                print line
+                exit
+              }
+            ' Cargo.toml)"
+          fi
+          rm -rf dist/client
+          mkdir -p dist/client
+          bash ./scripts/package-client.sh x86_64-unknown-linux-gnu "${VERSION}" dist/client
+          ls -lah dist/client
+          shopt -s nullglob
+          archives=(dist/client/fresh-gui-client-*.tar.gz)
+          test "${#archives[@]}" -eq 1
+          test -f "${archives[0]}.sha256"
+          tar -tzf "${archives[0]}" | grep -q '/fresh-gui-app$'
+          (cd dist/client && sha256sum -c ./*.tar.gz.sha256)
+
+      - name: Upload to GitHub Release
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/client/fresh-gui-client-*.tar.gz dist/client/fresh-gui-client-*.tar.gz.sha256)
           test "${#assets[@]}" -ge 2
           gh release upload "${TAG}" "${assets[@]}" --clobber

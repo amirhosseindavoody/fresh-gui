@@ -68,6 +68,27 @@ Do not bind publicly by default. Non-loopback listens still require a token and 
 
 The native host can save an SSH target, install the Linux daemon if it is missing, and open a local tunnel to ADE `/ws`. Auth is your normal OpenSSH setup (keys, agent, `~/.ssh/config`). The app does not prompt for a password: `ssh user@host` must already succeed non-interactively (`BatchMode`).
 
+Download the host from a [GitHub Release](https://github.com/amirhosseindavoody/fresh-gui/releases) (or build it with `pixi run gui`):
+
+| Asset | Laptop |
+|-------|--------|
+| `fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 |
+| `fresh-gui-client-*-x86_64-pc-windows-msvc.zip` | Windows x86_64 |
+
+```bash
+# Linux
+tar -xzf fresh-gui-client-YYYY.MMDD.N-x86_64-unknown-linux-gnu.tar.gz
+cd fresh-gui-client-YYYY.MMDD.N-x86_64-unknown-linux-gnu
+./fresh-gui-app remote add lab user@server --root /path/to/project
+./fresh-gui-app remote connect lab
+```
+
+The Linux archive is built on `ubuntu-latest` and needs **glibc ≥ 2.39** (Ubuntu 24.04 or newer; a newer runner image can raise this floor). It is not the daemon's glibc 2.31 zigbuild. It also needs a display (X11 or Wayland), fontconfig, and a Vulkan loader (`libvulkan.so.1`, loaded on demand) plus Wayland client libraries:
+
+```bash
+sudo apt install libvulkan1 libfontconfig1 libfreetype6 libwayland-client0 libxkbcommon0 libxkbcommon-x11-0 libxcb1
+```
+
 ```bash
 # on the laptop (Windows or Linux fresh-gui-app)
 fresh-gui-app remote add lab user@server
@@ -185,9 +206,10 @@ CalVer `YYYY.MMDD.N`. Pushes to `main` (and manual `workflow_dispatch`) bump the
 | `fresh-gui-*-x86_64-unknown-linux-gnu.tar.gz` | Linux standalone (glibc ≥ 2.31) |
 | `fresh-gui-*-x86_64-unknown-linux-musl.tar.gz` | Linux musl (Alpine / static-friendly) |
 | `fresh-gui-*-x86_64-pc-windows-msvc.zip` | Windows standalone daemon |
+| `fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` | Linux GPUI host (`fresh-gui-app`) |
 | `fresh-gui-client-*-x86_64-pc-windows-msvc.zip` | Windows GPUI host (`fresh-gui-app.exe`) |
 
-Daemon archives unpack to `bin/fresh-gui` + `share/fresh-gui/ui` (same layout as the conda package). The **client** archive is only the native GPUI host, for a Windows laptop that talks to a Linux daemon (see [Windows or Linux client](#windows-or-linux-client-auto-install-over-ssh)). The version-bump commit rebases if `main` moved during the build. Manual bump: `pixi run update-version`.
+Daemon archives unpack to `bin/fresh-gui` + `share/fresh-gui/ui` (same layout as the conda package). The **client** archives are only the native GPUI host, for a Linux or Windows laptop that talks to a Linux daemon (see [Windows or Linux client](#windows-or-linux-client-auto-install-over-ssh)). The Linux client is built on `ubuntu-latest` and needs glibc ≥ 2.39, not the glibc 2.31 zigbuild used for the daemon. The version-bump commit rebases if `main` moved during the build. Manual bump: `pixi run update-version`.
 
 ## License
 

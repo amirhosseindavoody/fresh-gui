@@ -146,9 +146,10 @@ CI on `main` (and `workflow_dispatch`) bumps CalVer and publishes a GitHub Relea
 | `fresh-gui-*-x86_64-unknown-linux-gnu.tar.gz` | same layout, glibc ≥ 2.31 (`scripts/package-binary.sh`) |
 | `fresh-gui-*-x86_64-unknown-linux-musl.tar.gz` | same layout, musl |
 | `fresh-gui-*-x86_64-pc-windows-msvc.zip` | same layout, Windows daemon |
+| `fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` | Linux GPUI host only (`fresh-gui-app`), built on `ubuntu-latest` |
 | `fresh-gui-client-*-x86_64-pc-windows-msvc.zip` | Windows GPUI host only (`fresh-gui-app.exe`) |
 
-`pixi.toml` stays `linux-64`. The client archive is built by `scripts/package-client.sh` (no embedded Vite UI). Linux GPUI builds stay a source checkout (`pixi run gui`).
+`pixi.toml` stays `linux-64`. Client archives are built by `scripts/package-client.sh` (no embedded Vite UI). `pixi run gui` remains the from-source host. The Linux client is built on `ubuntu-latest` and needs glibc ≥ 2.39 (not the daemon's glibc 2.31 zigbuild), a display, fontconfig, and a Vulkan loader.
 
 ## 7. Host surfaces
 
@@ -177,7 +178,7 @@ The ADE protocol did **not** need to change for the native host: only the render
 
 Native v1 chrome: activity bar, collapsible explorer, unified terminal/editor tabs, status bar, command palette, Go to File. Terminal is a VTE grid of remote PTY bytes (not Fresh `TerminalManager`). Editor tabs use gpui-component `Editor` as a **view** of Fresh snapshots (save is local dirty + `buffer_edit` then `buffer_save`). Full IA for the Vite UI and remaining native gaps: [UI.md](./UI.md).
 
-Linux GUI needs X11 or Wayland, fontconfig, and a working wgpu/Vulkan (or software) backend. macOS/Windows GPUI builds are not the documented path yet (`pixi.toml` is `linux-64`). Linking `fresh-gui-app` (`cargo run` / `cargo test`) also needs a C++ toolchain (`g++` / `libstdc++`) because gpui-kit pulls native GPU/text stacks.
+Linux GUI needs X11 or Wayland, fontconfig, FreeType, and a working wgpu/Vulkan backend. Release clients cover Linux x86_64 (`ubuntu-latest`) and Windows x86_64; `pixi.toml` stays `linux-64` for the daemon package. Linking `fresh-gui-app` (`cargo run` / `cargo test`) also needs a C++ toolchain (`g++` / `libstdc++`) because gpui-kit pulls native GPU/text stacks. The Linux release job installs those libraries (Wayland, X11/XKB, Vulkan, fontconfig, FreeType) before `cargo build`.
 
 ## 8. Fresh coupling
 
@@ -200,7 +201,7 @@ Bump the pin with `git -C vendor/fresh fetch && git -C vendor/fresh checkout --d
 - **Pixi** (conda-forge): tasks `check`, `test`, `build`, `clippy`, `fmt`, `gui`, `ui` / `ui-install` / `ui-build`, `serve`, `package`, `package-binary`, `package-client`, `update-version`.
 - **Rust** via Pixi / rust-version `1.97` (edition 2024).
 - **Bun** for the Vite/TS UI (`crates/fresh-gui-app/ui/bun.lock`).
-- **Versioning:** CalVer `YYYY.MMDD.N` (e.g. `2026.921.3`). `scripts/update-version.sh` bumps workspace manifests; CI also bumps and publishes backend Releases (linux-64 `.conda`, standalone linux-gnu / musl / windows daemon archives, and a Windows GPUI client archive).
+- **Versioning:** CalVer `YYYY.MMDD.N` (e.g. `2026.921.4`). `scripts/update-version.sh` bumps workspace manifests; CI also bumps and publishes backend Releases (linux-64 `.conda`, standalone linux-gnu / musl / windows daemon archives, and Linux + Windows GPUI client archives).
 
 ## 10. Security
 
@@ -248,5 +249,5 @@ fresh-gui/
   scripts/
     update-version.sh
     package-binary.sh  # standalone daemon archives (gnu / musl / windows)
-    package-client.sh  # GPUI host archive (Windows client release)
+    package-client.sh  # GPUI host archives (Linux tar.gz, Windows zip)
 ```

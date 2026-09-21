@@ -98,6 +98,18 @@ Saved targets: %APPDATA%\\fresh-gui\\remotes.json on Windows,
 See https://github.com/amirhosseindavoody/fresh-gui
 EOF
 
+if [[ "$IS_WINDOWS" -eq 0 ]]; then
+  cat >>"$STAGE/README.txt" <<'EOF'
+
+Linux runtime: glibc >= 2.39 (Ubuntu 24.04 or newer), an X11 or Wayland
+session, fontconfig, and a Vulkan loader (libvulkan.so.1, loaded on demand).
+On Debian/Ubuntu:
+
+  sudo apt install libvulkan1 libfontconfig1 libfreetype6 \
+    libwayland-client0 libxkbcommon0 libxkbcommon-x11-0 libxcb1
+EOF
+fi
+
 mkdir -p "$OUT_DIR"
 ARCHIVE_PATH="$OUT_DIR/${ARCHIVE_STEM}.${ARCHIVE_EXT}"
 rm -f "$ARCHIVE_PATH"

@@ -246,7 +246,7 @@ Agent panels (right rail) may appear later per [COPILOT.md](./COPILOT.md); that 
 | Context menus, find, palettes / typography packs, tab pin/reorder | **Vite only** |
 | Ctrl/Cmd+click path_link | **Vite only** |
 
-Linux-only GUI path in this repo: X11 or Wayland, fontconfig, wgpu/Vulkan. `pixi.toml` platform is `linux-64`.
+Packaged hosts: `fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` and `fresh-gui-client-*-x86_64-pc-windows-msvc.zip`. Linux still needs X11 or Wayland, fontconfig, FreeType, and wgpu/Vulkan. `pixi.toml` platform for the daemon package is `linux-64`; `pixi run gui` is the from-source host.
 
 ## 11. References
 

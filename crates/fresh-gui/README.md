@@ -42,7 +42,7 @@ pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git
 fresh-gui
 ```
 
-The package / archive ships `bin/fresh-gui` and UI assets under `share/fresh-gui/ui`. The native GPUI host is not inside that archive.
+The package / archive ships `bin/fresh-gui` and UI assets under `share/fresh-gui/ui`. The native GPUI host is a separate release asset (`fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` or the Windows `.zip`), not inside the daemon archive.
 
 ## Endpoints
 
