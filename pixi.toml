@@ -5,13 +5,13 @@ description = "Terminal-first ADE GUI (host) with remote Fresh backend"
 name = "fresh-gui"
 platforms = ["linux-64"]
 preview = ["pixi-build"]
-version = "2026.921.6"
+version = "2026.921.7"
 
 # Packaged Linux daemon (`fresh-gui`, headless ADE). Install with:
 #   pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git
 [package]
 name = "fresh-gui"
-version = "2026.921.6"
+version = "2026.921.7"
 description = "Linux remote daemon for fresh-gui (headless ADE WebSocket)"
 authors = ["Amirhossein Davoody <amirhossein.davoody@gmail.com>"]
 license = "GPL-3.0-or-later"
