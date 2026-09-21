@@ -56,7 +56,7 @@ The Rust crate name imported in code is `fresh` (lib name of `fresh-editor`).
 
 Package builds (`recipe/build.sh`) call `ensure_vendor_fresh()`: init the submodule if possible, otherwise shallow-fetch `vendor/fresh.rev`.
 
-**Pin:** `31c311bfa44fbbdb4c8b258357af3c1d7d0e81c6` on fork branch `cursor/sync-upstream-master-ea42` ([fresh#3](https://github.com/amirhosseindavoody/fresh/pull/3), draft). Move the pin to fork `master` when that PR merges. Upstream Fresh is **GPL-3.0-or-later**; `fresh-gui` matches that license.
+**Pin:** `ddfc322bc977fc21c4c837ae79906c04a5717c58` on fork `master` ([fresh#3](https://github.com/amirhosseindavoody/fresh/pull/3) merged). Same tree as the pre-merge trial `31c311bfa44fbbdb4c8b258357af3c1d7d0e81c6`. Upstream Fresh is **GPL-3.0-or-later**; `fresh-gui` matches that license.
 
 ### Bumping Fresh
 

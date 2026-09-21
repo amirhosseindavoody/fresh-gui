@@ -159,7 +159,7 @@ Fresh is a **git submodule** at `vendor/fresh`, pinned by commit SHA (also recor
 
 Full integration detail — vendoring, `EditorHandle`, protocol mapping, path_link, what is *not* from Fresh: **[FRESH.md](./FRESH.md)**.
 
-**Current pin:** `31c311bfa44fbbdb4c8b258357af3c1d7d0e81c6` on the integration fork branch `cursor/sync-upstream-master-ea42` ([fresh#3](https://github.com/amirhosseindavoody/fresh/pull/3), draft). That commit includes upstream through `a0408d30` plus the fork sync. Embedding APIs used by `crates/fresh-gui` (`Config::load_with_layers`, `Editor::with_working_dir`, `open_file` / preview, `replace_content`, `path_link`) compiled unchanged (`cargo check -p fresh-gui`). Re-pin to fork `master` when that PR merges.
+**Current pin:** `ddfc322bc977fc21c4c837ae79906c04a5717c58` on the integration fork `master` ([fresh#3](https://github.com/amirhosseindavoody/fresh/pull/3) merged). Same tree as the pre-merge trial `31c311bfa44fbbdb4c8b258357af3c1d7d0e81c6` (upstream through `a0408d30` plus the fork sync). Embedding APIs used by `crates/fresh-gui` (`Config::load_with_layers`, `Editor::with_working_dir`, `open_file` / preview, `replace_content`, `path_link`) compiled unchanged (`cargo check -p fresh-gui`).
 
 ```bash
 git clone --recurse-submodules https://github.com/amirhosseindavoody/fresh-gui.git
