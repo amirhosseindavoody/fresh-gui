@@ -164,7 +164,7 @@ detect_os() {
   case "$os_name" in
     Linux | linux) printf '%s\n' Linux ;;
     Darwin | darwin | macOS) printf '%s\n' Darwin ;;
-    MINGW* | MSYS* | CYGWIN* | Windows_NT | windows) printf '%s\n' Windows ;;
+    MINGW* | MSYS* | CYGWIN* | Windows_NT | Windows | windows) printf '%s\n' Windows ;;
     *)
       echo "error: unsupported operating system '${os_name}'." >&2
       echo "       fresh-gui publishes Linux x86_64 and Windows x86_64 binaries." >&2
@@ -413,6 +413,18 @@ verify_checksum() {
   echo "Checksum verified."
 }
 
+# Current Windows release assets are GNU tar archives named .zip (the
+# package script falls back to `tar -a` when Info-ZIP is absent, and that
+# produces a tar file). Real PK zips still extract with unzip.
+is_zip_file() {
+  file=$1
+  if ! command -v od >/dev/null 2>&1; then
+    return 1
+  fi
+  sig=$(od -An -N 2 -t x1 "$file" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+  [ "$sig" = "504b" ]
+}
+
 extract_archive() {
   archive=$1
   dest=$2
@@ -427,12 +439,14 @@ extract_archive() {
       tar -xzf "$archive" -C "$dest"
       ;;
     zip)
-      if command -v unzip >/dev/null 2>&1; then
+      if is_zip_file "$archive" && command -v unzip >/dev/null 2>&1; then
         unzip -q -o "$archive" -d "$dest"
       elif command -v tar >/dev/null 2>&1; then
         tar -xf "$archive" -C "$dest"
+      elif command -v unzip >/dev/null 2>&1; then
+        unzip -q -o "$archive" -d "$dest"
       else
-        echo "error: unzip or tar is required to extract the zip archive." >&2
+        echo "error: tar or unzip is required to extract the archive." >&2
         exit 1
       fi
       ;;

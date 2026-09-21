@@ -169,9 +169,11 @@ public static extern IntPtr SendMessageTimeout(
                 return [int] $response.StatusCode
             }
         }
-        $message = [string] $ErrorRecord.Exception.Message
-        if ($message -match '\(404\)') {
-            return 404
+        if ($ErrorRecord.Exception) {
+            $message = [string] $ErrorRecord.Exception.Message
+            if ($message -match '\(404\)') {
+                return 404
+            }
         }
         return 0
     }
@@ -189,6 +191,41 @@ public static extern IntPtr SendMessageTimeout(
             UserAgent       = 'fresh-gui-install'
         }
         Invoke-WebRequest @params
+    }
+
+    function Test-ZipMagic {
+        param([string] $Path)
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        try {
+            $first = $stream.ReadByte()
+            $second = $stream.ReadByte()
+            return ($first -eq 80 -and $second -eq 75)
+        } finally {
+            $stream.Dispose()
+        }
+    }
+
+    function Expand-FreshGuiArchive {
+        param(
+            [string] $Archive,
+            [string] $Destination
+        )
+        if (-not (Test-Path -LiteralPath $Destination)) {
+            New-Item -ItemType Directory -Path $Destination | Out-Null
+        }
+        # Published Windows assets are often GNU tar files with a .zip name.
+        if (Test-ZipMagic $Archive) {
+            Expand-Archive -LiteralPath $Archive -DestinationPath $Destination -Force
+            return
+        }
+        $tar = Get-Command tar -ErrorAction SilentlyContinue
+        if (-not $tar) {
+            throw "Archive is a tar file named .zip (the published Windows release layout). tar is required to extract it. Windows 10 and later include tar.exe."
+        }
+        & $tar.Source -xf $Archive -C $Destination
+        if ($LASTEXITCODE -ne 0) {
+            throw "tar failed to extract $(Mask-Credentials $Archive) (exit $LASTEXITCODE)."
+        }
     }
 
     function Test-Sha256Hex {
@@ -261,7 +298,7 @@ public static extern IntPtr SendMessageTimeout(
         }
 
         $extract = Join-Path $Work 'extract'
-        Expand-Archive -LiteralPath $archive -DestinationPath $extract -Force
+        Expand-FreshGuiArchive -Archive $archive -Destination $extract
         $found = @(Get-ChildItem -LiteralPath $extract -Recurse -File -Filter $BinaryName)
         if ($found.Count -lt 1) {
             throw "Archive does not contain '$BinaryName'."
@@ -338,12 +375,24 @@ public static extern IntPtr SendMessageTimeout(
         $response = $request.GetResponse()
         try {
             $finalUrl = $response.ResponseUri.AbsoluteUri
+            $FreshGuiVersion = $null
+            if ($finalUrl -match '/releases/tag/v([^/?#]+)') {
+                $FreshGuiVersion = $Matches[1]
+            } else {
+                $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
+                try {
+                    $body = $reader.ReadToEnd()
+                } finally {
+                    $reader.Close()
+                }
+                if ($body -match '/releases/tag/v([A-Za-z0-9._+-]+)') {
+                    $FreshGuiVersion = $Matches[1]
+                }
+            }
         } finally {
             $response.Close()
         }
-        if ($finalUrl -match '/releases/tag/v([^/?#]+)$') {
-            $FreshGuiVersion = $Matches[1]
-        } else {
+        if (-not $FreshGuiVersion) {
             throw "Could not resolve the latest release from $latestUrl (landed on $finalUrl). Set FRESH_GUI_VERSION."
         }
     } else {

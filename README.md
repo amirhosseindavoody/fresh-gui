@@ -33,6 +33,8 @@ The script reads the latest [GitHub Release](https://github.com/amirhosseindavoo
 
 into `~/.fresh-gui/bin` (Windows: `%USERPROFILE%\.fresh-gui\bin`) and prepends that directory to `PATH` (shell rc / profile on Unix, the user `PATH` on Windows). Open a new terminal afterward. Published hosts are Linux x86_64 and Windows x86_64. macOS has no release build.
 
+Windows assets are named `.zip`. The ones on current releases are GNU tar archives, and the installer extracts those with `tar` (included with Windows 10 and later). A real PK zip is unpacked with `Expand-Archive` / `unzip`.
+
 The default is **both** archives when the release contains them. Linux uses the gnu builds (`x86_64-unknown-linux-gnu`). Alpine (or `FRESH_GUI_LIBC=musl`) installs the musl daemon; the GPUI client is gnu-only, so that install skips `fresh-gui-app` unless you set `FRESH_GUI_LIBC=gnu`.
 
 | Setting | Shell | PowerShell |

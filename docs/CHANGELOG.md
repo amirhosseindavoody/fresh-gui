@@ -6,6 +6,7 @@
 
 - `scripts/install.sh` (`curl -fsSL …/scripts/install.sh | sh`) and `scripts/install.ps1` (`irm …/scripts/install.ps1 | iex`) download the GitHub Release for this machine, verify the sibling `.sha256` when it is published, and install `fresh-gui-app` plus `fresh-gui` into `~/.fresh-gui/bin` (Windows: `%USERPROFILE%\.fresh-gui\bin`), then update PATH.
 - `latest` follows the Releases redirect (archive names include the CalVer). `FRESH_GUI_VERSION` / `-FreshGuiVersion` pins a tag. `FRESH_GUI_HOME`, `FRESH_GUI_REPOURL`, `FRESH_GUI_COMPONENTS` (`both` / `client` / `daemon`), and `FRESH_GUI_NO_PATH_UPDATE` / `-NoPathUpdate` match the pixi installer shape. Linux prefers the gnu assets; `FRESH_GUI_LIBC=musl` selects the musl daemon (the GPUI client is gnu-only).
+- Windows release assets named `.zip` are GNU tar archives today (`tar -a` when Info-ZIP is absent). The installers extract those with `tar`, and use unzip / `Expand-Archive` when the file is a real PK zip.
 
 ### Denser GPUI chrome
 
