@@ -2,7 +2,7 @@
 
 Product UI is the **native GPUI host** (`crates/fresh-gui-app`, `pixi run gui`, release asset `fresh-gui-client-*`). Architecture and protocol: [DESIGN.md](./DESIGN.md). User overview: [README.md](../README.md).
 
-Zed / VS Code-like chrome: activity bar, collapsible explorer, unified terminal + editor tabs, status bar, command palette. Connection is silent (`--backend` printed Local access URL with `?token=`, or `ws://…/ws` + `FRESH_GUI_TOKEN`). Download the Linux or Windows client, add an SSH remote, and connect. The daemon does not serve a page.
+Zed / VS Code-like chrome: activity bar, collapsible explorer, unified terminal + editor tabs, status bar, command palette. Ribbons are dense (30px title bar, 36px activity rail, 26px explorer header, 24px tab strip, 22px tree rows and status bar). The new-terminal **+** sits immediately after the last tab. Connection is silent (`--backend` printed Local access URL with `?token=`, or `ws://…/ws` + `FRESH_GUI_TOKEN`). Download the Linux or Windows client, add an SSH remote, and connect. The daemon does not serve a page.
 
 A later browser host would be this same GPUI UI via WebAssembly. That is not in this tree. Sections 1–9 below are notes from the removed Vite/React shell (CodeMirror, xterm). They are not a supported host and the source is gone. Current behavior is §10.
 
@@ -229,6 +229,19 @@ Agent panels (right rail) may appear later per [COPILOT.md](./COPILOT.md); that 
 ## 10. Native GPUI host (v1)
 
 `crates/fresh-gui-app/src/gui/` is the primary renderer. It reuses `fresh-gui-client` + ADE; it does **not** link Fresh.
+
+Ribbon metrics live in `workspace.rs` and override gpui-component’s medium defaults (32px icon buttons, 32px tabs, `py_2` rails), which read sparse next to VS Code / Zed:
+
+| Container | Size |
+|-----------|------|
+| Title bar | 30px (`TitleBar` height); label is `text_sm` with a 4px gap |
+| Activity rail | 36px wide, `py_1`, no gap; explorer and settings are small ghost icon buttons |
+| Explorer header | 26px, `text_xs`, xsmall collapse button |
+| Explorer rows | 22px, `text_sm`, 8px indent, no tree padding |
+| Tab strip | `TabBar::small()` (24px). The **+** is an xsmall ghost button in `last_empty_space`, so it follows the rightmost tab |
+| Status bar | 22px, `py_0`, `gap_1` |
+
+`TabBar` only mounts `last_empty_space` when a suffix or overflow menu is set, and a real suffix is pinned after the flex-1 scroller (the far-right **+** in earlier builds). The suffix here is a zero-width anchor; colors stay on the active theme (`tab_bar`, `sidebar`, `status_bar`, `border`).
 
 | Native v1 | Status |
 |-----------|--------|

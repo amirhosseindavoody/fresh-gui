@@ -2,6 +2,11 @@
 
 ## 2026-09-21
 
+### Denser GPUI chrome
+
+- Title bar (30px), activity rail (36px, small icon buttons), explorer header (26px), tree rows (22px), tab strip (`TabBar::small()`, 24px), and status bar (22px) drop the medium gpui-component padding and min heights that made the shell look sparse next to VS Code / Zed.
+- The new-terminal **+** is an xsmall button in the tab bar’s `last_empty_space`, immediately after the last tab. A zero-width suffix only exists so gpui-component mounts that slot; the button is no longer a right-aligned control.
+
 ### Linux GPUI client on GitHub Releases
 
 - The release workflow builds `fresh-gui-app` for `x86_64-unknown-linux-gnu` on `ubuntu-latest` and uploads `fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` plus `.sha256`, using the same `scripts/package-client.sh` layout as the Windows client. Daemon archives stay a separate matrix and are headless `bin/fresh-gui`.

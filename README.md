@@ -128,7 +128,7 @@ After connect you get terminals, an explorer, and editor tabs in one shell:
 
 | Do this | How |
 |---------|-----|
-| New terminal | `Ctrl+T` or **+** |
+| New terminal | `Ctrl+T` or the **+** immediately after the last tab |
 | Open a file | Click in the explorer (or `Ctrl+P` → path `[:line[:col]]`) |
 | Save | `Ctrl+S` |
 | Command palette | `Ctrl+Shift+P` |
