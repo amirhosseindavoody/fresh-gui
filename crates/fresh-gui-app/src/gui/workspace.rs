@@ -16,9 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use fresh_gui_protocol::{
     CAP_WORKSPACE, FsEntry, FsKind, Hello, PtyInfo, WorkspaceInfo, WorkspaceTab, WorkspaceTabKind,
 };
-use gpui_kit::component::dock::{
-    DockArea, DockEvent, DockPlacement, DockSkin, PanelId, PanelStyle, panel_handle,
-};
+use gpui_kit::component::dock::{DockArea, DockEvent, DockPlacement, PanelId, panel_handle};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{
     ActiveTheme, Icon, IconName, Root, Selectable, Sizable, StyledExt, TitleBar,
@@ -42,7 +40,7 @@ use super::actions::{
 use super::ade::AttachedWorkspace;
 use super::ade::{AdeCmd, AdeEvent, AdeHandle};
 use super::connect::{ConnectTarget, parse_goto_spec};
-use super::dock_a11y::A11yDockSkin;
+use super::dock_a11y::install_workspace_dock;
 use super::explorer::{
     absolute_paths_text, apply_selection, build_explorer_tree, copyable_sources, drag_paths,
     entry_kinds, gesture_from_modifiers, is_placeholder, movable_sources, parent_dir,
@@ -201,12 +199,7 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(target: ConnectTarget, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (ade, evt_rx) = super::ade::spawn(target.clone());
-        let dock = cx.new(|cx| {
-            let skin = DockSkin::new(cx);
-            skin.set_panel_style(PanelStyle::TabBar, cx);
-            skin.set_toggle_button_visible(false, cx);
-            DockArea::new("workspace", Some(1), window, cx).with_renderer(A11yDockSkin::wrap(skin))
-        });
+        let (dock, _) = install_workspace_dock(window, cx);
         let explorer = cx.new(|cx| TreeState::new(cx));
         let command_state = cx.new(|cx| CommandState::new(window, cx));
         let goto_input = cx.new(|cx| InputState::new(window, cx).placeholder("path[:line[:col]]"));
