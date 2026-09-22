@@ -115,6 +115,11 @@ pub struct FsEntry {
     pub kind: FsKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    /// For a `symlink`, what it resolves to when the target is inside the FS
+    /// sandbox. `dir` means the host may expand it like a folder. Absent for
+    /// other kinds, dangling links, and links that leave the sandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_kind: Option<FsKind>,
 }
 
 /// Summary of a live PTY inside a session (sent on attach).
@@ -283,6 +288,9 @@ pub enum Message {
         #[serde(default)]
         active_tab: u32,
         ptys: Vec<PtyInfo>,
+        /// Explorer directories the host last had open in this workspace.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        explorer_expanded: Vec<String>,
     },
     /// Client → backend: replace the workspace's tab list (any workspace id,
     /// not only the one attached on this connection).
@@ -291,6 +299,9 @@ pub enum Message {
         tabs: Vec<WorkspaceTab>,
         #[serde(default)]
         active_tab: u32,
+        /// Open explorer directories (absolute paths). Replaces the stored set.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        explorer_expanded: Vec<String>,
     },
     /// Client → backend: open a PTY in the attached session.
     PtyOpen {
@@ -652,6 +663,7 @@ mod tests {
                 cols: 80,
                 rows: 24,
             }],
+            explorer_expanded: vec!["/tmp/alpha/src".into()],
         };
         let json = switched.to_json().unwrap();
         assert!(json.contains("\"workspace_switched\""));
@@ -666,11 +678,18 @@ mod tests {
                 path: Some("/tmp/alpha/lib.rs".into()),
             }],
             active_tab: 0,
+            explorer_expanded: Vec::new(),
         };
-        assert_eq!(
-            Message::from_json(&layout.to_json().unwrap()).unwrap(),
-            layout
-        );
+        let json = layout.to_json().unwrap();
+        assert!(!json.contains("explorer_expanded"));
+        assert_eq!(Message::from_json(&json).unwrap(), layout);
+
+        // A 0.4.0 peer that predates the field still parses.
+        let old = r#"{"type":"workspace_layout_set","workspace_id":"w1","tabs":[],"active_tab":0}"#;
+        assert!(matches!(
+            Message::from_json(old).unwrap(),
+            Message::WorkspaceLayoutSet { explorer_expanded, .. } if explorer_expanded.is_empty()
+        ));
     }
 
     #[test]

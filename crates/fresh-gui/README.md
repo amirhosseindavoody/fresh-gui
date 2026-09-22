@@ -15,7 +15,7 @@ fresh-gui close       # stop the background session
 fresh-gui --foreground --listen 127.0.0.1:7420 --root /path/to/project
 ```
 
-`fresh-gui` keeps **one background session per user**. Starting it again while a session is live prints the access URL / token and log path instead of starting a second process. Closing the shell that launched it does **not** stop the session — use `fresh-gui close`. That one process holds every workspace (each with its own PTYs and tabs). Switching workspaces in the GPUI client does not start another daemon.
+`fresh-gui` keeps **one background session per user**. Starting it again while a session is live prints the access URL / token and log path instead of starting a second process. Closing the shell that launched it does **not** stop the session — use `fresh-gui close`. That one process holds every workspace (each with its own PTYs and tabs). Switching workspaces in the GPUI client does not start another daemon. The workspace list is saved to disk and reloaded on the next start; running shells are not.
 
 Session files (private to the user):
 
@@ -24,6 +24,7 @@ Session files (private to the user):
 | `$XDG_RUNTIME_DIR/fresh-gui/session.lock` (Linux) / `%LOCALAPPDATA%\fresh-gui\session.lock` (Windows) | Exclusive lock (one session) |
 | `…/session.json` | pid, URLs, token, root, log path |
 | `$XDG_STATE_HOME/fresh-gui/fresh-gui.log` (Linux) / `%LOCALAPPDATA%\fresh-gui\fresh-gui.log` (Windows) | Daemon stdout/stderr + tracing |
+| `$XDG_STATE_HOME/fresh-gui/workspaces.json` (Linux) / `%LOCALAPPDATA%\fresh-gui\workspaces.json` (Windows) | Saved workspaces (names, roots, tabs, open explorer folders). Kept across `fresh-gui close` and reboots; delete it to start with none. `FRESH_GUI_WORKSPACES_FILE` overrides the path, and enables saving under `--foreground` |
 
 (Linux fallbacks: `/tmp/fresh-gui-$UID/` and `~/.local/state/fresh-gui/`.)
 

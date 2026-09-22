@@ -71,10 +71,10 @@ async fn pty_close_kills_shell_process() {
     let pid = {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if let Ok(text) = std::fs::read_to_string(&marker) {
-                if let Ok(pid) = text.trim().parse::<u32>() {
-                    break pid;
-                }
+            if let Ok(text) = std::fs::read_to_string(&marker)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                break pid;
             }
             if std::time::Instant::now() > deadline {
                 let _ = child.kill();

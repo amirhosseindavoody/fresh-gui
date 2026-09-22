@@ -3,13 +3,22 @@
 //! One daemon process (one user) holds every workspace. Each workspace owns an
 //! ADE session: PTYs, scrollback, and the tab list the host restores. Switching
 //! moves the WebSocket subscriber; it does not stop the other sessions.
+//!
+//! With a state file, the workspace list (names, roots, tabs, active tab,
+//! explorer open folders, focus) is written after each change and loaded on
+//! the next start. PTYs do not survive a restart: terminal tabs keep their
+//! title and a dead `pty_id`, and the host starts a new shell for them.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use fresh_gui_protocol::{WorkspaceInfo, WorkspaceTab, WorkspaceTabKind};
-use tokio::sync::Mutex;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, Notify};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::session::SessionStore;
@@ -17,6 +26,10 @@ use crate::session::SessionStore;
 const MAX_TABS: usize = 64;
 const MAX_NAME_CHARS: usize = 64;
 const MAX_TITLE_CHARS: usize = 120;
+const MAX_EXPANDED: usize = 512;
+const STATE_VERSION: u32 = 1;
+/// Coalesces bursts (tab activation, folder clicks) into one write.
+const SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 
 struct Record {
     id: String,
@@ -25,6 +38,35 @@ struct Record {
     session_id: String,
     tabs: Vec<WorkspaceTab>,
     active_tab: u32,
+    explorer_expanded: Vec<String>,
+}
+
+/// On-disk shape of the workspace list.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct SavedState {
+    version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    focused_id: Option<String>,
+    #[serde(default)]
+    workspaces: Vec<SavedWorkspace>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SavedWorkspace {
+    id: String,
+    name: String,
+    root: String,
+    #[serde(default)]
+    tabs: Vec<WorkspaceTab>,
+    #[serde(default)]
+    active_tab: u32,
+    #[serde(default)]
+    explorer_expanded: Vec<String>,
+}
+
+struct Persist {
+    path: PathBuf,
+    dirty: Notify,
 }
 
 impl Record {
@@ -40,6 +82,7 @@ impl Record {
     }
 }
 
+#[derive(Default)]
 struct Inner {
     order: Vec<String>,
     by_id: HashMap<String, Record>,
@@ -47,13 +90,24 @@ struct Inner {
     focused_id: Option<String>,
 }
 
-impl Default for Inner {
-    fn default() -> Self {
-        Self {
-            order: Vec::new(),
-            by_id: HashMap::new(),
-            by_session: HashMap::new(),
-            focused_id: None,
+impl Inner {
+    fn snapshot(&self) -> SavedState {
+        SavedState {
+            version: STATE_VERSION,
+            focused_id: self.focused_id.clone(),
+            workspaces: self
+                .order
+                .iter()
+                .filter_map(|id| self.by_id.get(id))
+                .map(|rec| SavedWorkspace {
+                    id: rec.id.clone(),
+                    name: rec.name.clone(),
+                    root: rec.root.clone(),
+                    tabs: rec.tabs.clone(),
+                    active_tab: rec.active_tab,
+                    explorer_expanded: rec.explorer_expanded.clone(),
+                })
+                .collect(),
         }
     }
 }
@@ -65,6 +119,7 @@ pub struct FocusedWorkspace {
     pub session_id: String,
     pub tabs: Vec<WorkspaceTab>,
     pub active_tab: u32,
+    pub explorer_expanded: Vec<String>,
 }
 
 /// What [`WorkspaceStore::close`] returns so the server can destroy the session.
@@ -77,11 +132,125 @@ pub struct ClosedWorkspace {
 #[derive(Clone, Default)]
 pub struct WorkspaceStore {
     inner: Arc<Mutex<Inner>>,
+    persist: Option<Arc<Persist>>,
 }
 
 impl WorkspaceStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A store that saves to `path`. Call [`Self::load`] to restore the
+    /// previous list and [`Self::spawn_saver`] to start writing.
+    pub fn persistent(path: PathBuf) -> Self {
+        Self {
+            inner: Arc::default(),
+            persist: Some(Arc::new(Persist {
+                path,
+                dirty: Notify::new(),
+            })),
+        }
+    }
+
+    pub fn state_path(&self) -> Option<&Path> {
+        self.persist.as_ref().map(|persist| persist.path.as_path())
+    }
+
+    /// Recreate saved workspaces, each with a fresh ADE session. Returns the
+    /// roots so the caller can re-authorize them in the FS sandbox. A missing
+    /// file is an empty list; an unreadable one is logged and set aside so
+    /// the daemon still starts.
+    pub async fn load(&self, sessions: &SessionStore) -> Vec<String> {
+        let Some(persist) = &self.persist else {
+            return Vec::new();
+        };
+        let saved = match read_state(&persist.path) {
+            Ok(Some(saved)) => saved,
+            Ok(None) => return Vec::new(),
+            Err(err) => {
+                let aside = persist.path.with_extension("json.bad");
+                warn!(
+                    path = %persist.path.display(),
+                    moved_to = %aside.display(),
+                    "workspace state unreadable, starting empty: {err:#}"
+                );
+                let _ = std::fs::rename(&persist.path, &aside);
+                return Vec::new();
+            }
+        };
+        let mut roots = Vec::new();
+        let mut guard = self.inner.lock().await;
+        for ws in saved.workspaces {
+            if ws.id.trim().is_empty() || guard.by_id.contains_key(&ws.id) {
+                continue;
+            }
+            let session_id = sessions.create(None).await;
+            let tabs = sanitize_tabs(ws.tabs);
+            let active_tab = clamp_active(ws.active_tab, tabs.len());
+            let json = layout_json(&tabs, active_tab);
+            let _ = sessions.set_layout(&session_id, json).await;
+            roots.push(ws.root.clone());
+            let rec = Record {
+                id: ws.id.clone(),
+                name: normalize_name(Some(ws.name), &ws.root),
+                root: ws.root,
+                session_id: session_id.clone(),
+                tabs,
+                active_tab,
+                explorer_expanded: sanitize_expanded(ws.explorer_expanded),
+            };
+            guard.by_session.insert(session_id, ws.id.clone());
+            guard.order.push(ws.id.clone());
+            guard.by_id.insert(ws.id, rec);
+        }
+        guard.focused_id = saved
+            .focused_id
+            .filter(|id| guard.by_id.contains_key(id))
+            .or_else(|| guard.order.first().cloned());
+        info!(
+            path = %persist.path.display(),
+            workspaces = guard.order.len(),
+            "restored workspaces"
+        );
+        roots
+    }
+
+    /// Background writer: waits for a change, lets a burst settle, then
+    /// writes one snapshot. No-op without a state file.
+    pub fn spawn_saver(&self) {
+        let Some(persist) = self.persist.clone() else {
+            return;
+        };
+        let store = self.clone();
+        tokio::spawn(async move {
+            loop {
+                persist.dirty.notified().await;
+                tokio::time::sleep(SAVE_DEBOUNCE).await;
+                if let Err(err) = store.save_now().await {
+                    warn!(path = %persist.path.display(), "save workspaces: {err:#}");
+                }
+            }
+        });
+    }
+
+    /// Write the current list immediately (shutdown, tests).
+    pub async fn save_now(&self) -> Result<()> {
+        let Some(persist) = &self.persist else {
+            return Ok(());
+        };
+        let snapshot = self.inner.lock().await.snapshot();
+        let path = persist.path.clone();
+        tokio::task::spawn_blocking(move || write_state(&path, &snapshot))
+            .await
+            .context("join workspace save")??;
+        debug!(path = %persist.path.display(), "saved workspaces");
+        Ok(())
+    }
+
+    fn mark_dirty(&self) {
+        if let Some(persist) = &self.persist {
+            persist.dirty.notify_one();
+        }
     }
 
     pub async fn list(&self) -> (Vec<WorkspaceInfo>, Option<String>) {
@@ -113,6 +282,7 @@ impl WorkspaceStore {
             session_id: session_id.clone(),
             tabs: Vec::new(),
             active_tab: 0,
+            explorer_expanded: Vec::new(),
         };
         let info = rec.info(0);
         let mut guard = self.inner.lock().await;
@@ -122,6 +292,8 @@ impl WorkspaceStore {
         guard.by_session.insert(session_id, id.clone());
         guard.order.push(id.clone());
         guard.by_id.insert(id, rec);
+        drop(guard);
+        self.mark_dirty();
         info
     }
 
@@ -137,16 +309,21 @@ impl WorkspaceStore {
             .get_mut(id)
             .with_context(|| format!("unknown workspace {id}"))?;
         rec.name = name;
-        Ok(rec.info(0))
+        let info = rec.info(0);
+        drop(guard);
+        self.mark_dirty();
+        Ok(info)
     }
 
-    /// Replace the tab list. Returns `(session_id, layout_json)` so the server
-    /// can mirror it onto the ADE session blob.
+    /// Replace the tab list and open explorer folders. Returns
+    /// `(session_id, layout_json)` so the server can mirror it onto the ADE
+    /// session blob.
     pub async fn set_layout(
         &self,
         id: &str,
         tabs: Vec<WorkspaceTab>,
         active_tab: u32,
+        explorer_expanded: Vec<String>,
     ) -> Result<(String, String)> {
         let tabs = sanitize_tabs(tabs);
         let active_tab = clamp_active(active_tab, tabs.len());
@@ -157,8 +334,12 @@ impl WorkspaceStore {
             .with_context(|| format!("unknown workspace {id}"))?;
         rec.tabs = tabs;
         rec.active_tab = active_tab;
+        rec.explorer_expanded = sanitize_expanded(explorer_expanded);
         let json = layout_json(&rec.tabs, rec.active_tab);
-        Ok((rec.session_id.clone(), json))
+        let out = (rec.session_id.clone(), json);
+        drop(guard);
+        self.mark_dirty();
+        Ok(out)
     }
 
     pub async fn focus(&self, id: &str) -> Result<FocusedWorkspace> {
@@ -166,14 +347,21 @@ impl WorkspaceStore {
         if !guard.by_id.contains_key(id) {
             bail!("unknown workspace {id}");
         }
+        let changed = guard.focused_id.as_deref() != Some(id);
         guard.focused_id = Some(id.to_owned());
         let rec = guard.by_id.get(id).expect("workspace present");
-        Ok(FocusedWorkspace {
+        let focused = FocusedWorkspace {
             info: rec.info(0),
             session_id: rec.session_id.clone(),
             tabs: rec.tabs.clone(),
             active_tab: rec.active_tab,
-        })
+            explorer_expanded: rec.explorer_expanded.clone(),
+        };
+        drop(guard);
+        if changed {
+            self.mark_dirty();
+        }
+        Ok(focused)
     }
 
     /// Remove the workspace record. Caller destroys the ADE session.
@@ -192,10 +380,13 @@ impl WorkspaceStore {
         if guard.focused_id.as_deref() == Some(id) {
             guard.focused_id = guard.order.first().cloned();
         }
-        Ok(ClosedWorkspace {
+        let closed = ClosedWorkspace {
             session_id: rec.session_id,
             focused_id: guard.focused_id.clone(),
-        })
+        };
+        drop(guard);
+        self.mark_dirty();
+        Ok(closed)
     }
 
     /// Remember a PTY opened in this session, if the session belongs to a workspace.
@@ -228,8 +419,13 @@ impl WorkspaceStore {
             rec.tabs.drain(0..overflow);
             rec.active_tab = clamp_active(rec.active_tab, rec.tabs.len());
         }
-        let session_id = rec.session_id.clone();
-        Some((session_id, layout_json(&rec.tabs, rec.active_tab)))
+        let out = (
+            rec.session_id.clone(),
+            layout_json(&rec.tabs, rec.active_tab),
+        );
+        drop(guard);
+        self.mark_dirty();
+        Some(out)
     }
 
     pub async fn note_terminal_closed(
@@ -248,9 +444,63 @@ impl WorkspaceStore {
             return None;
         }
         rec.active_tab = clamp_active(rec.active_tab, rec.tabs.len());
-        let session_id = rec.session_id.clone();
-        Some((session_id, layout_json(&rec.tabs, rec.active_tab)))
+        let out = (
+            rec.session_id.clone(),
+            layout_json(&rec.tabs, rec.active_tab),
+        );
+        drop(guard);
+        self.mark_dirty();
+        Some(out)
     }
+}
+
+fn read_state(path: &Path) -> Result<Option<SavedState>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+    let saved: SavedState =
+        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    if saved.version > STATE_VERSION {
+        bail!(
+            "state version {} is newer than this daemon ({STATE_VERSION})",
+            saved.version
+        );
+    }
+    Ok(Some(saved))
+}
+
+/// Write to a sibling temp file, then rename, so a crash mid-write leaves the
+/// previous list intact. The file is private (0600 on Unix): it names
+/// project roots and open file paths.
+fn write_state(path: &Path, state: &SavedState) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    let json = serde_json::to_vec_pretty(state)?;
+    let tmp = path.with_extension("json.tmp");
+    {
+        use std::io::Write as _;
+        let mut file = crate::daemon::open_private_write(&tmp)
+            .with_context(|| format!("open {}", tmp.display()))?;
+        file.write_all(&json)?;
+        file.sync_all()?;
+    }
+    crate::daemon::chmod_file_private(&tmp);
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+fn sanitize_expanded(paths: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    paths
+        .into_iter()
+        .map(|path| path.trim().to_owned())
+        .filter(|path| !path.is_empty() && !path.ends_with("/.") && seen.insert(path.clone()))
+        .take(MAX_EXPANDED)
+        .collect()
 }
 
 fn normalize_name(name: Option<String>, root: &str) -> String {
@@ -368,11 +618,12 @@ mod tests {
                 &alpha.id,
                 vec![term("alpha-term", "pty-a"), editor("/work/alpha/a.rs")],
                 0,
+                Vec::new(),
             )
             .await
             .unwrap();
         store
-            .set_layout(&beta.id, vec![editor("/work/beta/b.rs")], 0)
+            .set_layout(&beta.id, vec![editor("/work/beta/b.rs")], 0, Vec::new())
             .await
             .unwrap();
 
@@ -423,5 +674,113 @@ mod tests {
         store.close(&alpha.id).await.unwrap();
         let err = store.close(&beta.id).await.unwrap_err();
         assert!(err.to_string().contains("last workspace"));
+    }
+
+    fn temp_state(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fresh-gui-ws-state-{tag}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+        dir.join(crate::daemon::WORKSPACES_NAME)
+    }
+
+    #[tokio::test]
+    async fn saved_workspaces_come_back_after_restart() {
+        let path = temp_state("roundtrip");
+        let sessions = SessionStore::new();
+        let store = WorkspaceStore::persistent(path.clone());
+        assert!(store.load(&sessions).await.is_empty());
+        let alpha = store
+            .create(&sessions, Some("alpha".into()), "/work/alpha".into())
+            .await;
+        let beta = store
+            .create(&sessions, Some("beta".into()), "/work/beta".into())
+            .await;
+        store
+            .set_layout(
+                &beta.id,
+                vec![term("2", "pty-b"), editor("/work/beta/lib.rs")],
+                1,
+                vec!["/work/beta/src".into(), "/work/beta/src/.".into()],
+            )
+            .await
+            .unwrap();
+        store.focus(&beta.id).await.unwrap();
+        store.rename(&alpha.id, "Alpha").await.unwrap();
+        store.save_now().await.unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "state file must be private");
+        }
+
+        let sessions = SessionStore::new();
+        let restored = WorkspaceStore::persistent(path.clone());
+        let roots = restored.load(&sessions).await;
+        assert_eq!(
+            roots,
+            vec!["/work/alpha".to_string(), "/work/beta".to_string()]
+        );
+        let (listed, focused) = restored.list().await;
+        assert_eq!(
+            listed.iter().map(|ws| ws.name.as_str()).collect::<Vec<_>>(),
+            ["Alpha", "beta"]
+        );
+        assert_eq!(listed[0].id, alpha.id);
+        assert_ne!(listed[0].session_id, alpha.session_id, "sessions are new");
+        assert_eq!(focused.as_deref(), Some(beta.id.as_str()));
+
+        let beta_now = restored.focus(&beta.id).await.unwrap();
+        assert_eq!(beta_now.active_tab, 1);
+        assert_eq!(beta_now.tabs[0].title, "2");
+        assert_eq!(beta_now.tabs[0].pty_id.as_deref(), Some("pty-b"));
+        assert_eq!(beta_now.tabs[1].path.as_deref(), Some("/work/beta/lib.rs"));
+        assert_eq!(
+            beta_now.explorer_expanded,
+            vec!["/work/beta/src".to_string()]
+        );
+
+        // The restored store keeps saving: closing a workspace sticks.
+        restored.close(&alpha.id).await.unwrap();
+        restored.save_now().await.unwrap();
+        let again = WorkspaceStore::persistent(path.clone());
+        again.load(&SessionStore::new()).await;
+        assert_eq!(again.list().await.0.len(), 1);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn corrupt_state_is_set_aside_and_the_daemon_starts_empty() {
+        let path = temp_state("corrupt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{not json").unwrap();
+        let store = WorkspaceStore::persistent(path.clone());
+        assert!(store.load(&SessionStore::new()).await.is_empty());
+        assert!(store.list().await.0.is_empty());
+        assert!(!path.exists());
+        assert!(path.with_extension("json.bad").exists());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn saver_writes_after_a_change() {
+        let path = temp_state("saver");
+        let store = WorkspaceStore::persistent(path.clone());
+        store.spawn_saver();
+        store
+            .create(&SessionStore::new(), Some("one".into()), "/work/one".into())
+            .await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !path.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let saved = read_state(&path).unwrap().expect("saver wrote the file");
+        assert_eq!(saved.workspaces.len(), 1);
+        assert_eq!(saved.workspaces[0].name, "one");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
