@@ -188,8 +188,12 @@ After connect you get terminals, an explorer, and editor tabs in one shell:
 
 | Do this | How |
 |---------|-----|
-| New terminal | `Ctrl+T` or the **+** immediately after the last tab |
+| New terminal | `Ctrl+T` or the **+** on the active tab group (far right of the dock tab bar) |
+| Split / reorder | Drag a tab to a pane edge to split; drop it on a tab to merge; drag along the strip to reorder. A split needs two tabs — the last remaining tab does not drag |
+| Rename a terminal | Right-click the tab title, or **··· → Rename**. New terminals are titled `1`, `2`, `3`, … for this window |
 | Open a file | Click in the explorer (or `Ctrl+P` → path `[:line[:col]]`) |
+| Explorer selection | `Ctrl`/`Cmd`-click toggles; `Shift`-click selects a range. Right-click **Copy Path** copies absolute paths |
+| Move / copy files | Drag a file onto a folder to move it. With the explorer focused, `Ctrl+C` / `Ctrl+V` (`Cmd` on macOS) copies via the daemon into the selected folder |
 | Save | `Ctrl+S` |
 | Command palette | `Ctrl+Shift+P` |
 | Toggle sidebar | `Ctrl+B` |
@@ -197,7 +201,7 @@ After connect you get terminals, an explorer, and editor tabs in one shell:
 | Next / prev tab | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
 | Reconnect | `Ctrl+Shift+R` or command palette |
 
-The product host is this GPUI client. The daemon is a headless ADE WebSocket. A later browser host would be this same GPUI UI via WebAssembly, which is not in this release. Native v1 does not yet include pane splits, markdown WYSIWYG, a minimap, context menus, layout restore, mouse selection in the terminal, find, palette packs, or tab pin/reorder.
+The product host is this GPUI client. The daemon is a headless ADE WebSocket. A later browser host would be this same GPUI UI via WebAssembly, which is not in this release. Splits and tab reorder use the gpui-component dock. Terminal titles and the in-app file clipboard last for the client session. Still absent: markdown WYSIWYG, a minimap, layout restore, mouse selection in the terminal, find, palette packs, tab pin, and editor-tab rename. Copy Path and in-app paste use absolute ADE paths. On this GPUI snapshot, Linux clipboard writes do not offer `text/uri-list`, so pasting into a file manager is not reliable; paste inside the explorer is a real `fs_copy`.
 
 Disconnect leaves remote sessions and PTYs running so you can reconnect.
 

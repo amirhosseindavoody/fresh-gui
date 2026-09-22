@@ -2,7 +2,7 @@
 
 Product UI is the **native GPUI host** (`crates/fresh-gui-app`, `pixi run gui`, release asset `fresh-gui-client-*`). Architecture and protocol: [DESIGN.md](./DESIGN.md). User overview: [README.md](../README.md).
 
-Zed / VS Code-like chrome: activity bar, collapsible explorer, unified terminal + editor tabs, status bar, command palette. Ribbons are dense (30px title bar, 36px activity rail, 26px explorer header, 24px tab strip, 22px tree rows and status bar). The new-terminal **+** sits immediately after the last tab. Connection is silent (`--backend` printed Local access URL with `?token=`, or `ws://…/ws` + `FRESH_GUI_TOKEN`). Download the Linux or Windows client, add an SSH remote, and connect. The daemon does not serve a page.
+Zed / VS Code-like chrome: activity bar, collapsible explorer, docked terminal + editor tabs (splits, reorder, merge), status bar, command palette. Ribbons are dense (30px title bar, 36px activity rail, 26px explorer header, 22px tree rows and status bar). The dock tab strip stays at the skin default (32px); the new-terminal **+** sits in the group suffix at the far right, next to the **···** menu. Connection is silent (`--backend` printed Local access URL with `?token=`, or `ws://…/ws` + `FRESH_GUI_TOKEN`). Download the Linux or Windows client, add an SSH remote, and connect. The daemon does not serve a page.
 
 A later browser host would be this same GPUI UI via WebAssembly. That is not in this tree. Sections 1–9 below are notes from the removed Vite/React shell (CodeMirror, xterm). They are not a supported host and the source is gone. Current behavior is §10.
 
@@ -238,24 +238,26 @@ Ribbon metrics live in `workspace.rs` and override gpui-component’s medium def
 | Activity rail | 36px wide, `py_1`, no gap; explorer and settings are small ghost icon buttons |
 | Explorer header | 26px, `text_xs`, xsmall collapse button |
 | Explorer rows | 22px, `text_sm`, 8px indent, no tree padding |
-| Tab strip | `TabBar::small()` (24px). The **+** is an xsmall ghost button in `last_empty_space`, so it follows the rightmost tab |
+| Tab strip | Dock skin default (`TabBar` medium, 32px). The **+** is in `title_suffix`, pinned at the far right of the active group with the ellipsis menu |
 | Status bar | 22px, `py_0`, `gap_1` |
 
-`TabBar` only mounts `last_empty_space` when a suffix or overflow menu is set, and a real suffix is pinned after the flex-1 scroller (the far-right **+** in earlier builds). The suffix here is a zero-width anchor; colors stay on the active theme (`tab_bar`, `sidebar`, `status_bar`, `border`).
+Dock chrome (tab height, suffix placement, the disabled Zoom item in **···**) is owned by `DockSkin`. Colors stay on the active theme (`tab_bar`, `sidebar`, `status_bar`, `border`).
 
-| Native v1 | Status |
+| Native host | Status |
 |-----------|--------|
 | Connect / auth / session (`?token=` URL or `--token`) | Yes |
 | SSH target add + auto-install + tunnel (`remote connect`) | Yes (CLI before the window; title bar shows the destination) |
 | Activity bar + collapsible explorer (`fs_list`) | Yes |
-| Unified terminal + editor tabs | Yes (one pane per tab; no splits) |
+| Docked terminal + editor tabs | Yes. Drag a tab to the left/right/top/bottom edge to split; drop it on a tab to merge; drag in the strip to reorder. Empty groups collapse. The last remaining tab cannot be dragged |
+| Terminal titles | New PTYs are `1`, `2`, `3`, … (monotonic for the window; closing `2` does not reuse it). Right-click the title or **··· → Rename**. Titles are client-session state; `workspace_id` is reserved and stays unset. OSC 7 updates cwd for the next terminal and does not rename the tab |
+| Explorer multi-select | Ctrl/Cmd-click toggles; Shift-click selects the visible range. Extra rows use an accent background. The tree still expands a folder on mouse-down |
+| Copy path | Right-click **Copy Path**. Absolute ADE paths, newline-separated. Does not arm paste |
+| Move / copy files | Drag onto a folder sends `fs_move`. Explorer-focused `Ctrl+C`/`Cmd+C` (or **Copy**) arms an in-app clipboard and also writes those absolute paths plus GPUI `ExternalPaths`. `Ctrl+V`/`Cmd+V` (or **Paste**) sends `fs_copy` into the selected directory, or the parent of a selected file. Linux clipboard writes in this GPUI snapshot do not offer `text/uri-list`, so a file-manager paste is not reliable |
 | Status bar (connection, session, capabilities) | Yes |
 | Command palette + Go to File | Yes |
-| PTY I/O (VTE grid, OSC 7 tab title/cwd) | Yes (plain text rows; prompt color/escape sequences may show literally; no WebGL xterm, mouse select, or clipboard chords yet) |
-| Editor open / edit / save (gpui `Editor` view of Fresh snapshots) | Yes |
-| Pane splits, layout v4 restore, markdown WYSIWYG, minimap | Not in v1 |
-| Context menus, find, palettes / typography packs, tab pin/reorder | Not in v1 |
-| Ctrl/Cmd+click path_link | Not in v1 |
+| PTY I/O (VTE grid) | Yes (plain text rows; prompt color/escape sequences may show literally; no WebGL xterm or mouse select) |
+| Editor open / edit / save (gpui `Editor` view of Fresh snapshots) | Yes. Editor tabs keep the filename (`•` when dirty) |
+| Layout v4 restore, markdown WYSIWYG, minimap, find, palettes, tab pin, editor rename, Ctrl/Cmd+click path_link | Not in this host |
 
 Packaged hosts: `fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` and `fresh-gui-client-*-x86_64-pc-windows-msvc.zip`. Linux still needs X11 or Wayland, fontconfig, FreeType, and wgpu/Vulkan. `pixi.toml` platform for the daemon package is `linux-64`; `pixi run gui` is the from-source host.
 

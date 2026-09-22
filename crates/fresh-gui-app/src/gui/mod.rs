@@ -7,7 +7,9 @@
 mod actions;
 mod ade;
 mod connect;
+mod explorer;
 mod osc7;
+mod pane;
 mod terminal;
 mod workspace;
 
