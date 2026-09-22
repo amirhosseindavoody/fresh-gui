@@ -76,7 +76,7 @@ define_shell_defaults!(
 #[cfg(windows)]
 define_shell_defaults!(
     "powershell",
-    "  // Default PTY shell when the client does not pass `shell`.\n  // Empty args keep interactive / OSC 7 setup for known shells.\n"
+    "  // Default PTY shell when the client does not pass `shell`.\n  // Empty args start an interactive powershell, pwsh, or cmd (no Unix -l).\n  // bash and zsh still get interactive / OSC 7 setup.\n"
 );
 
 const KNOWN_PALETTES: &[&str] = &[
@@ -224,7 +224,8 @@ pub struct TerminalShellConfig {
     pub command: String,
 
     /// Arguments passed to the shell. When empty, the backend applies its
-    /// interactive / OSC 7 setup for known shells (`zsh`, `bash`, …).
+    /// interactive / OSC 7 setup for known Unix shells (`zsh`, `bash`, …).
+    /// `powershell`, `pwsh`, and `cmd` are started with no extra arguments.
     #[serde(default)]
     pub args: Vec<String>,
 }

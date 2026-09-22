@@ -244,9 +244,97 @@ fn configure_shell_cmd(cmd: &mut CommandBuilder, shell: &str) {
                 cmd.arg("-l");
             }
         }
+        // Windows console shells stay up when they are the ConPTY process.
+        // A bare `-l` is not a login flag: `powershell.exe` runs it as the
+        // command and exits, and `pwsh -l` binds to `-Login`.
+        base if windows_console_shell(base) => {}
         _ => {
             cmd.arg("-l");
         }
+    }
+}
+
+/// `powershell` / `pwsh` / `cmd`, including a `.exe` suffix and any directory prefix.
+fn windows_console_shell(shell: &str) -> bool {
+    matches!(
+        shell_basename(shell).to_ascii_lowercase().as_str(),
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" | "cmd" | "cmd.exe"
+    )
+}
+
+#[cfg(test)]
+mod shell_args_tests {
+    use super::windows_console_shell;
+
+    #[test]
+    fn powershell_cmd_and_pwsh_are_not_unix_login_shells() {
+        assert!(windows_console_shell("powershell"));
+        assert!(windows_console_shell("PowerShell.EXE"));
+        assert!(windows_console_shell(
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        ));
+        assert!(windows_console_shell("pwsh"));
+        assert!(windows_console_shell("cmd.exe"));
+        assert!(!windows_console_shell("bash"));
+        assert!(!windows_console_shell("zsh"));
+        assert!(!windows_console_shell("fish"));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::time::{Duration, Instant};
+
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::config::Config;
+
+    /// Default config starts `powershell` with empty args. That must be an
+    /// interactive console: ConPTY asks for the cursor (`CSI 6 n`) and, once
+    /// answered, prints a `PS` prompt. A Unix `-l` makes PowerShell run `-l`
+    /// as a command and exit before any prompt.
+    #[test]
+    fn default_powershell_prints_a_prompt() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = PtySession::spawn(
+            "powershell-prompt".into(),
+            100,
+            30,
+            None,
+            None,
+            &Config::default(),
+            tx,
+        )
+        .expect("spawn powershell");
+
+        let mut collected = Vec::new();
+        let start = Instant::now();
+        let mut replied = false;
+        let mut saw_prompt = false;
+        while start.elapsed() < Duration::from_secs(8) {
+            match rx.try_recv() {
+                Ok(bytes) => {
+                    if !replied && bytes.windows(4).any(|w| w == *b"\x1b[6n") {
+                        session.write_all(b"\x1b[1;1R").expect("cursor report");
+                        replied = true;
+                    }
+                    collected.extend_from_slice(&bytes);
+                    if collected.windows(3).any(|w| w == *b"PS ") {
+                        saw_prompt = true;
+                        break;
+                    }
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        session.kill();
+        let text = String::from_utf8_lossy(&collected);
+        assert!(saw_prompt, "powershell produced no PS prompt: {text:?}");
+        assert!(
+            !text.contains("The term '-l'"),
+            "powershell was started with a Unix -l flag: {text:?}"
+        );
     }
 }
 

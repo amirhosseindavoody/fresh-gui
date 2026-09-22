@@ -2,6 +2,11 @@
 
 ## 2026-09-22
 
+### Windows terminal shows a PowerShell prompt
+
+- A new terminal on Windows stayed a blank pane. ConPTY asks for the cursor (`CSI 6 n`) before it draws anything and waits for a cursor-position report; the host never answered, so the shell produced no cells. The terminal view now replies (`CSI row ; col R`) and answers a device-attributes query the same way.
+- Empty `terminal.shell.args` also appended a Unix `-l`. Windows PowerShell runs that as the command `-l` and exits, so there is still no prompt after the cursor report. `powershell`, `pwsh`, and `cmd` now start as the interactive console process. bash and zsh still get the OSC 7 setup.
+
 ### GPUI host stays up after the first terminal activates
 
 - Opening the window no longer panics with `cannot read TerminalPanel while it is already being updated` once the dock marks that terminal active. The dock delivers `set_active` inside the panel's own update, and publishing the workspace tab list was reading the panel (its title) before that update returned. The publish now runs after the update releases the entity. Numbered tabs, splits, and workspace layout saves are unchanged.

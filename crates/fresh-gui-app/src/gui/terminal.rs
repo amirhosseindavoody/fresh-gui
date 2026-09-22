@@ -17,6 +17,8 @@ pub struct TermScreen {
     cursor_col: usize,
     cursor_row: usize, // index into rows_data of the current line
     parser: Parser,
+    /// Bytes to write back to the PTY (cursor-position and device-attribute reports).
+    replies: Vec<u8>,
 }
 
 impl Default for TermScreen {
@@ -40,15 +42,19 @@ impl TermScreen {
             cursor_col: 0,
             cursor_row: 0,
             parser: Parser::new(),
+            replies: Vec::new(),
         }
     }
 
-    pub fn feed(&mut self, bytes: &[u8]) {
+    /// Ingest PTY bytes. Returns any replies the terminal must write back
+    /// (ConPTY blocks the shell until a cursor-position report arrives).
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut parser = Parser::new();
         std::mem::swap(&mut self.parser, &mut parser);
         parser.advance(self, bytes);
         self.parser = parser;
         self.trim_scrollback();
+        std::mem::take(&mut self.replies)
     }
 
     pub fn visible_lines(&self) -> Vec<String> {
@@ -213,13 +219,7 @@ impl Perform for TermScreen {
         }
     }
 
-    fn csi_dispatch(
-        &mut self,
-        params: &Params,
-        _intermediates: &[u8],
-        _ignore: bool,
-        action: char,
-    ) {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         let first = |idx: usize, default: u16| {
             params
                 .iter()
@@ -261,6 +261,25 @@ impl Perform for TermScreen {
                 1 => self.erase_line_to_cursor(),
                 _ => self.erase_line(),
             },
+            // Device Status Report. ConPTY sends CSI 6 n before the first
+            // prompt and waits; without CPR the pane stays blank.
+            'n' => {
+                if intermediates.is_empty() && raw_param(params, 0, 0) == 6 {
+                    let row = self.cursor_row.saturating_sub(self.screen_origin()) + 1;
+                    let col = self.cursor_col + 1;
+                    self.replies
+                        .extend(format!("\x1b[{row};{col}R").into_bytes());
+                }
+            }
+            // Primary / secondary device attributes. A short VT100-style
+            // answer keeps the console host from waiting on an identity query.
+            'c' => {
+                if intermediates == b">" {
+                    self.replies.extend_from_slice(b"\x1b[>0;0;0c");
+                } else if intermediates.is_empty() {
+                    self.replies.extend_from_slice(b"\x1b[?6c");
+                }
+            }
             'm' => {}
             _ => {}
         }
@@ -359,6 +378,26 @@ mod tests {
         s.feed(b"\x1b[31mred\x1b[0m");
         assert!(s.visible_text().contains("red"));
         assert!(!s.visible_text().contains("[31"));
+    }
+
+    #[test]
+    fn cursor_position_report_answers_conpty_dsr() {
+        let mut s = TermScreen::new(80, 24);
+        let reply = s.feed(b"\x1b[6n");
+        assert_eq!(reply, b"\x1b[1;1R");
+        assert!(s.visible_text().trim().is_empty());
+
+        s.feed(b"ab");
+        let reply = s.feed(b"\x1b[6n");
+        assert_eq!(reply, b"\x1b[1;3R");
+    }
+
+    #[test]
+    fn device_attributes_get_a_short_reply() {
+        let mut s = TermScreen::new(80, 24);
+        assert_eq!(s.feed(b"\x1b[c"), b"\x1b[?6c");
+        assert_eq!(s.feed(b"\x1b[>c"), b"\x1b[>0;0;0c");
+        assert!(s.visible_text().trim().is_empty());
     }
 
     #[test]
