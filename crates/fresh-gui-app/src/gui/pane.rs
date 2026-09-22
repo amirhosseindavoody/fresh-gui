@@ -25,7 +25,9 @@ use super::osc7::feed_osc7_chunk;
 use super::paths::display_path;
 use super::rail::path_basename;
 use super::tab_chrome::{TabCloseScope, TabStripMetrics};
-use super::terminal::{TermScreen, TermSpan, keystroke_to_bytes};
+use super::terminal::{
+    TermMouseButton, TermMouseKind, TermMouseMods, TermScreen, TermSpan, keystroke_to_bytes,
+};
 
 /// `text_sm` monospace cell, matching [`super::terminal`] pixel reports.
 const TERM_CELL_W: f32 = 8.;
@@ -75,8 +77,12 @@ pub struct TerminalPanel {
     pending_grid: Rc<Cell<Option<(usize, usize)>>>,
     /// Top-left of the cell grid in window coordinates, from the last layout.
     grid_origin: Rc<Cell<Option<Point<Pixels>>>>,
-    /// Left-button drag is in progress.
+    /// Left-button drag is selecting text on the host.
     selecting: bool,
+    /// Button held for a report to the PTY.
+    pressed: Option<TermMouseButton>,
+    /// Last cell written as a move or drag, so a hover does not repeat.
+    last_mouse_cell: Option<(usize, usize)>,
     closed: bool,
 }
 
@@ -103,6 +109,8 @@ impl TerminalPanel {
             pending_grid: Rc::new(Cell::new(None)),
             grid_origin: Rc::new(Cell::new(None)),
             selecting: false,
+            pressed: None,
+            last_mouse_cell: None,
             closed: false,
         }
     }
@@ -164,6 +172,151 @@ impl TerminalPanel {
         let col = col.clamp(0, cols as isize - 1) as usize;
         let row = row.clamp(0, rows as isize - 1) as usize;
         Some((col, row))
+    }
+
+    fn write_pty(&self, data: Vec<u8>) {
+        if data.is_empty() {
+            return;
+        }
+        self.ade.send(AdeCmd::WritePty {
+            id: self.pty_id.clone(),
+            data,
+        });
+    }
+
+    fn mouse_mods(modifiers: &Modifiers) -> TermMouseMods {
+        TermMouseMods {
+            shift: modifiers.shift,
+            alt: modifiers.alt,
+            control: modifiers.control || modifiers.platform,
+        }
+    }
+
+    /// Host selection when the program is not tracking the mouse, or when
+    /// Shift is held (the usual bypass).
+    fn host_selects(&self, button: TermMouseButton, modifiers: &Modifiers) -> bool {
+        button == TermMouseButton::Left
+            && (modifiers.shift || !self.screen.mouse_tracking().active())
+    }
+
+    fn on_mouse_button(
+        &mut self,
+        button: TermMouseButton,
+        down: bool,
+        position: Point<Pixels>,
+        modifiers: &Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        if down {
+            window.focus(&self.focus, cx);
+        }
+        if down && self.host_selects(button, modifiers) {
+            self.pressed = None;
+            self.pointer_select(position, true, cx);
+            return;
+        }
+        if !down {
+            self.release_mouse(button, position, modifiers, cx);
+            return;
+        }
+        let tracking = self.screen.mouse_tracking();
+        if !tracking.active() {
+            return;
+        }
+        self.selecting = false;
+        self.screen.clear_selection();
+        self.pressed = Some(button);
+        self.last_mouse_cell = self.cell_at(position);
+        self.send_mouse(position, TermMouseKind::Down(button), modifiers, false);
+        cx.notify();
+    }
+
+    fn release_mouse(
+        &mut self,
+        button: TermMouseButton,
+        position: Point<Pixels>,
+        modifiers: &Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selecting && button == TermMouseButton::Left {
+            self.finish_select(cx);
+            return;
+        }
+        if self.pressed == Some(button) {
+            self.pressed = None;
+            self.last_mouse_cell = None;
+            self.send_mouse(position, TermMouseKind::Up(button), modifiers, false);
+        }
+    }
+
+    fn on_pointer_move(
+        &mut self,
+        position: Point<Pixels>,
+        modifiers: &Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selecting {
+            self.pointer_select(position, false, cx);
+            return;
+        }
+        let tracking = self.screen.mouse_tracking();
+        let kind = if let Some(button) = self.pressed {
+            if !tracking.reports_drag() {
+                return;
+            }
+            TermMouseKind::Drag(button)
+        } else if tracking.reports_move() {
+            TermMouseKind::Move
+        } else {
+            return;
+        };
+        self.send_mouse(position, kind, modifiers, true);
+    }
+
+    fn send_mouse(
+        &mut self,
+        position: Point<Pixels>,
+        kind: TermMouseKind,
+        modifiers: &Modifiers,
+        dedup: bool,
+    ) {
+        let Some((col, row)) = self.cell_at(position) else {
+            return;
+        };
+        if dedup && self.last_mouse_cell == Some((col, row)) {
+            return;
+        }
+        let Some(bytes) =
+            self.screen
+                .mouse_tracking()
+                .encode(col, row, kind, Self::mouse_mods(modifiers))
+        else {
+            return;
+        };
+        if dedup {
+            self.last_mouse_cell = Some((col, row));
+        }
+        self.write_pty(bytes);
+    }
+
+    fn scroll_host(&mut self, lines: f32, cx: &mut Context<Self>) {
+        if self.screen.alt_screen() {
+            let steps = lines.abs().round().clamp(1., 8.) as usize;
+            let seq: &[u8] = if lines > 0. { b"\x1b[A" } else { b"\x1b[B" };
+            let mut data = Vec::with_capacity(seq.len() * steps);
+            for _ in 0..steps {
+                data.extend_from_slice(seq);
+            }
+            self.write_pty(data);
+            return;
+        }
+        let steps = lines.round() as i32;
+        if steps != 0 {
+            self.screen.scroll_by(-steps);
+            cx.notify();
+        }
     }
 
     fn pointer_select(&mut self, position: Point<Pixels>, start: bool, cx: &mut Context<Self>) {
@@ -362,10 +515,10 @@ impl Render for TerminalPanel {
         let pending_grid = Rc::clone(&self.pending_grid);
         let grid_origin = Rc::clone(&self.grid_origin);
         let entity_id = cx.entity().entity_id();
-        let selecting = self.selecting;
+        let track_outside = self.selecting || self.pressed.is_some();
         let select_entity = cx.entity().downgrade();
-        let menu_entity = cx.entity().downgrade();
-        div()
+        let reporting = self.screen.mouse_tracking().active();
+        let pane = div()
             .id(format!("terminal-pane-{}", self.pty_id))
             .role(Role::Terminal)
             .aria_label("Terminal")
@@ -379,22 +532,82 @@ impl Render for TerminalPanel {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    window.focus(&this.focus, cx);
-                    this.pointer_select(event.position, true, cx);
+                    this.on_mouse_button(
+                        TermMouseButton::Left,
+                        true,
+                        event.position,
+                        &event.modifiers,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.on_mouse_button(
+                        TermMouseButton::Middle,
+                        true,
+                        event.position,
+                        &event.modifiers,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.on_mouse_button(
+                        TermMouseButton::Right,
+                        true,
+                        event.position,
+                        &event.modifiers,
+                        window,
+                        cx,
+                    );
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                if event.pressed_button != Some(MouseButton::Left) || !this.selecting {
-                    return;
-                }
-                cx.stop_propagation();
-                this.pointer_select(event.position, false, cx);
+                this.on_pointer_move(event.position, &event.modifiers, cx);
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                    this.finish_select(cx);
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    this.on_mouse_button(
+                        TermMouseButton::Left,
+                        false,
+                        event.position,
+                        &event.modifiers,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    this.on_mouse_button(
+                        TermMouseButton::Middle,
+                        false,
+                        event.position,
+                        &event.modifiers,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    this.on_mouse_button(
+                        TermMouseButton::Right,
+                        false,
+                        event.position,
+                        &event.modifiers,
+                        window,
+                        cx,
+                    );
                 }),
             )
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
@@ -450,24 +663,33 @@ impl Render for TerminalPanel {
                 if lines == 0. {
                     return;
                 }
-                if this.screen.alt_screen() {
+                // Wheel is a mouse report while tracking is on. Shift keeps
+                // the host's history / alternate-screen arrows.
+                if this.screen.mouse_tracking().active() && !event.modifiers.shift {
                     let steps = lines.abs().round().clamp(1., 8.) as usize;
-                    let seq: &[u8] = if lines > 0. { b"\x1b[A" } else { b"\x1b[B" };
-                    let mut data = Vec::with_capacity(seq.len() * steps);
+                    let kind = if lines > 0. {
+                        TermMouseKind::ScrollUp
+                    } else {
+                        TermMouseKind::ScrollDown
+                    };
+                    let Some((col, row)) = this.cell_at(event.position) else {
+                        return;
+                    };
+                    let mut data = Vec::new();
                     for _ in 0..steps {
-                        data.extend_from_slice(seq);
+                        if let Some(bytes) = this.screen.mouse_tracking().encode(
+                            col,
+                            row,
+                            kind,
+                            Self::mouse_mods(&event.modifiers),
+                        ) {
+                            data.extend(bytes);
+                        }
                     }
-                    this.ade.send(AdeCmd::WritePty {
-                        id: this.pty_id.clone(),
-                        data,
-                    });
+                    this.write_pty(data);
                     return;
                 }
-                let steps = lines.round() as i32;
-                if steps != 0 {
-                    this.screen.scroll_by(-steps);
-                    cx.notify();
-                }
+                this.scroll_host(lines, cx);
             }))
             .child(
                 v_flex()
@@ -481,7 +703,7 @@ impl Render for TerminalPanel {
                             pending_grid.set(Some(next));
                             app.notify(entity_id);
                         }
-                        if !selecting {
+                        if !track_outside {
                             return;
                         }
                         let moved = select_entity.clone();
@@ -491,19 +713,27 @@ impl Render for TerminalPanel {
                             }
                             moved
                                 .update(app, |panel, cx| {
-                                    if panel.selecting {
-                                        panel.pointer_select(event.position, false, cx);
-                                    }
+                                    panel.on_pointer_move(event.position, &event.modifiers, cx);
                                 })
                                 .ok();
                         });
                         let released = select_entity.clone();
                         window.on_mouse_event(move |event: &MouseUpEvent, phase, _, app| {
-                            if phase.capture() || event.button != MouseButton::Left {
+                            if phase.capture() {
                                 return;
                             }
+                            let Some(button) = term_mouse_button(event.button) else {
+                                return;
+                            };
                             released
-                                .update(app, |panel, cx| panel.finish_select(cx))
+                                .update(app, |panel, cx| {
+                                    panel.release_mouse(
+                                        button,
+                                        event.position,
+                                        &event.modifiers,
+                                        cx,
+                                    );
+                                })
                                 .ok();
                         });
                     })
@@ -516,8 +746,15 @@ impl Render for TerminalPanel {
                     }))
                     .when(focused, |this| this.opacity(1.))
                     .when(!focused, |this| this.opacity(0.85)),
-            )
-            .context_menu(move |menu, _, _| {
+            );
+        // Right-click Copy stays available until a program takes the pointer.
+        // While tracking is on, that click belongs to the PTY; Copy remains
+        // on the tab's ··· menu.
+        if reporting {
+            pane.into_any_element()
+        } else {
+            let menu_entity = cx.entity().downgrade();
+            pane.context_menu(move |menu, _, _| {
                 let menu_entity = menu_entity.clone();
                 menu.item(PopupMenuItem::new("Copy").on_click(move |_, _, cx| {
                     menu_entity
@@ -525,6 +762,8 @@ impl Render for TerminalPanel {
                         .ok();
                 }))
             })
+            .into_any_element()
+        }
     }
 }
 
@@ -537,6 +776,15 @@ fn grid_size(size: Size<Pixels>) -> (usize, usize) {
     let cols = ((width / TERM_CELL_W).floor() as usize).clamp(2, 500);
     let rows = ((height / TERM_CELL_H).floor() as usize).clamp(1, 200);
     (cols, rows)
+}
+
+fn term_mouse_button(button: MouseButton) -> Option<TermMouseButton> {
+    match button {
+        MouseButton::Left => Some(TermMouseButton::Left),
+        MouseButton::Middle => Some(TermMouseButton::Middle),
+        MouseButton::Right => Some(TermMouseButton::Right),
+        MouseButton::Navigate(_) => None,
+    }
 }
 
 fn scroll_lines(delta: ScrollDelta) -> f32 {

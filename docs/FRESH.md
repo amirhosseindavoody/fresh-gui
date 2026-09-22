@@ -148,7 +148,7 @@ Line/column from path or link are returned on `editor_opened` for the **host** t
 | PTY | Host `portable-pty` + OSC 7 hooks (`pty.rs`); Fresh’s `TerminalManager` unused |
 | Explorer FS | Sandboxed `fs.rs` / `fs_watch.rs` (list, create, copy, move, watch). Fresh `StdFileSystem` is only used inside the editor for buffer I/O |
 | Host editing UX | gpui-component `Editor` view of Fresh snapshots (save is `buffer_edit` then `buffer_save`). Fresh Compose/Page View is a plugin and plugins are not enabled on the ADE path |
-| Host terminal UX | `alacritty_terminal` grid of remote PTY bytes (cursor, color, alternate screen). Same library Fresh's TUI terminal wraps. `TerminalManager` is not mounted: it is tied to Fresh's own view, not GPUI |
+| Host terminal UX | `alacritty_terminal` grid of remote PTY bytes (cursor, color, alternate screen, DECSET mouse modes 1000/1002/1003). Same library Fresh's TUI terminal wraps. Mouse bytes are encoded in the host the way Fresh's TUI encodes them; those helpers are private to Fresh's editor, not a callable API. `TerminalManager` is not mounted: it is tied to Fresh's own view, not GPUI |
 | Host chrome | GPUI + gpui-component |
 | Plugins / LSP / tree-sitter in the ADE path | Features off; not exposed over the protocol |
 | Orchestrator / coding agents | Fresh plugin not loaded; agent direction for ADE is design-only ([COPILOT.md](./COPILOT.md)) — steal registry/resume patterns, do not embed Orchestrator yet |

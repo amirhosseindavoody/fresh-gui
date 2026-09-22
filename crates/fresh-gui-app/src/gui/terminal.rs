@@ -191,6 +191,18 @@ impl TermScreen {
         self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
+    /// DECSET mouse tracking currently enabled by the program in the PTY.
+    pub fn mouse_tracking(&self) -> MouseTracking {
+        let mode = *self.term.mode();
+        MouseTracking {
+            clicks: mode.contains(TermMode::MOUSE_REPORT_CLICK),
+            drag: mode.contains(TermMode::MOUSE_DRAG),
+            motion: mode.contains(TermMode::MOUSE_MOTION),
+            sgr: mode.contains(TermMode::SGR_MOUSE),
+            utf8: mode.contains(TermMode::UTF8_MOUSE),
+        }
+    }
+
     /// Scroll the viewport into history. Negative is older (page up).
     pub fn scroll_by(&mut self, lines: i32) {
         if lines == 0 {
@@ -321,6 +333,173 @@ impl TermScreen {
         }
         Some((row as usize, content.cursor.point.column.0))
     }
+}
+
+/// Which mouse reports the PTY asked for.
+///
+/// `alacritty_terminal` treats 1000, 1002, and 1003 as mutually exclusive
+/// flags. 1002 and 1003 still include presses and releases. 1006 (SGR) and
+/// 1005 (UTF-8) choose the encoding. Private mode 1015 (urxvt) is not parsed
+/// by that library, so it is not reported here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MouseTracking {
+    clicks: bool,
+    drag: bool,
+    motion: bool,
+    sgr: bool,
+    utf8: bool,
+}
+
+impl MouseTracking {
+    pub fn active(self) -> bool {
+        self.clicks || self.drag || self.motion
+    }
+
+    /// Button-down motion (1002 cell motion, or 1003 any motion).
+    pub fn reports_drag(self) -> bool {
+        self.drag || self.motion
+    }
+
+    /// Motion with no button (1003 only).
+    pub fn reports_move(self) -> bool {
+        self.motion
+    }
+
+    /// Bytes to write to the PTY, or `None` when this mode does not want `kind`.
+    pub fn encode(
+        self,
+        col: usize,
+        row: usize,
+        kind: TermMouseKind,
+        mods: TermMouseMods,
+    ) -> Option<Vec<u8>> {
+        if !self.active() {
+            return None;
+        }
+        match kind {
+            TermMouseKind::Move if !self.reports_move() => return None,
+            TermMouseKind::Drag(_) if !self.reports_drag() => return None,
+            _ => {}
+        }
+        let protocol = if self.sgr {
+            MouseProtocol::Sgr
+        } else if self.utf8 {
+            MouseProtocol::Utf8
+        } else {
+            MouseProtocol::Normal
+        };
+        Some(encode_mouse_bytes(protocol, col, row, kind, mods))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TermMouseButton {
+    Left,
+    Middle,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TermMouseKind {
+    Down(TermMouseButton),
+    Up(TermMouseButton),
+    Drag(TermMouseButton),
+    Move,
+    ScrollUp,
+    ScrollDown,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermMouseMods {
+    pub shift: bool,
+    pub alt: bool,
+    pub control: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MouseProtocol {
+    Sgr,
+    Utf8,
+    Normal,
+}
+
+fn button_base(button: TermMouseButton) -> u32 {
+    match button {
+        TermMouseButton::Left => 0,
+        TermMouseButton::Middle => 1,
+        TermMouseButton::Right => 2,
+    }
+}
+
+fn button_code(kind: TermMouseKind, mods: TermMouseMods) -> (u32, bool) {
+    let (code, release) = match kind {
+        TermMouseKind::Down(button) => (button_base(button), false),
+        TermMouseKind::Up(button) => (button_base(button), true),
+        TermMouseKind::Drag(button) => (button_base(button) + 32, false),
+        TermMouseKind::Move => (3 + 32, false),
+        TermMouseKind::ScrollUp => (64, false),
+        TermMouseKind::ScrollDown => (65, false),
+    };
+    let mut code = code;
+    if mods.shift {
+        code += 4;
+    }
+    if mods.alt {
+        code += 8;
+    }
+    if mods.control {
+        code += 16;
+    }
+    (code, release)
+}
+
+fn encode_mouse_bytes(
+    protocol: MouseProtocol,
+    col: usize,
+    row: usize,
+    kind: TermMouseKind,
+    mods: TermMouseMods,
+) -> Vec<u8> {
+    let (code, release) = button_code(kind, mods);
+    // Protocols report 1-based cells.
+    let cx = col.saturating_add(1);
+    let cy = row.saturating_add(1);
+    match protocol {
+        MouseProtocol::Sgr => {
+            let end = if release { b'm' } else { b'M' };
+            let mut out = format!("\x1b[<{code};{cx};{cy}").into_bytes();
+            out.push(end);
+            out
+        }
+        MouseProtocol::Normal => {
+            // Legacy normal tracking: one byte each, biased by 32. Release is
+            // button 3 and does not name which button went up. Coords cap at 223.
+            let cb = legacy_button(code, release).saturating_add(32);
+            let cx = (cx.min(223) as u32).saturating_add(32);
+            let cy = (cy.min(223) as u32).saturating_add(32);
+            vec![0x1b, b'[', b'M', cb as u8, cx as u8, cy as u8]
+        }
+        MouseProtocol::Utf8 => {
+            let cb = legacy_button(code, release).saturating_add(32);
+            let mut out = vec![0x1b, b'[', b'M'];
+            push_utf8(&mut out, cb);
+            push_utf8(&mut out, cx.saturating_add(32) as u32);
+            push_utf8(&mut out, cy.saturating_add(32) as u32);
+            out
+        }
+    }
+}
+
+/// X10 / UTF-8 button byte before the +32 bias. Drag's motion bit is already
+/// in `code`. Release collapses to button 3 and keeps only the modifier bits.
+fn legacy_button(code: u32, release: bool) -> u32 {
+    if release { 3 + (code & !0b11) } else { code }
+}
+
+fn push_utf8(out: &mut Vec<u8>, value: u32) {
+    let mut buf = [0u8; 4];
+    let ch = char::from_u32(value).unwrap_or('\u{FFFD}');
+    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
 }
 
 fn push_cell(
@@ -680,6 +859,96 @@ mod tests {
         seq.push(0x07);
         s.feed(&seq);
         assert!(s.take_clipboard_stores().is_empty());
+    }
+
+    fn report(screen: &TermScreen, col: usize, row: usize, kind: TermMouseKind) -> Option<Vec<u8>> {
+        screen
+            .mouse_tracking()
+            .encode(col, row, kind, TermMouseMods::default())
+    }
+
+    #[test]
+    fn mouse_modes_encode_press_drag_move_and_wheel() {
+        let mut s = TermScreen::new(80, 24);
+        assert!(!s.mouse_tracking().active());
+        assert!(report(&s, 0, 0, TermMouseKind::Down(TermMouseButton::Left)).is_none());
+
+        // 1000: clicks and wheel, normal encoding, no motion.
+        s.feed(b"\x1b[?1000h");
+        let tracking = s.mouse_tracking();
+        assert!(tracking.active());
+        assert!(!tracking.reports_drag());
+        assert!(!tracking.reports_move());
+        // Cell (0, 0) is 1-based 1;1, button 0, each field biased by 32.
+        assert_eq!(
+            report(&s, 0, 0, TermMouseKind::Down(TermMouseButton::Left)).as_deref(),
+            Some(&b"\x1b[M !!"[..])
+        );
+        assert!(report(&s, 1, 1, TermMouseKind::Drag(TermMouseButton::Left)).is_none());
+        assert!(report(&s, 1, 1, TermMouseKind::Move).is_none());
+        assert_eq!(
+            report(&s, 0, 0, TermMouseKind::ScrollDown).as_deref(),
+            Some(&[0x1b, b'[', b'M', 65 + 32, 33, 33][..])
+        );
+
+        // 1006 SGR, still click-only until 1002/1003.
+        s.feed(b"\x1b[?1006h");
+        assert_eq!(
+            report(&s, 9, 4, TermMouseKind::Down(TermMouseButton::Left)).as_deref(),
+            Some(b"\x1b[<0;10;5M".as_slice())
+        );
+        assert_eq!(
+            report(&s, 9, 4, TermMouseKind::Up(TermMouseButton::Left)).as_deref(),
+            Some(b"\x1b[<0;10;5m".as_slice())
+        );
+        assert_eq!(
+            report(&s, 9, 4, TermMouseKind::ScrollUp).as_deref(),
+            Some(b"\x1b[<64;10;5M".as_slice())
+        );
+
+        // 1002 replaces 1000 and reports drags, not buttonless moves.
+        s.feed(b"\x1b[?1002h");
+        let tracking = s.mouse_tracking();
+        assert!(tracking.reports_drag());
+        assert!(!tracking.reports_move());
+        assert_eq!(
+            report(&s, 9, 4, TermMouseKind::Drag(TermMouseButton::Left)).as_deref(),
+            Some(b"\x1b[<32;10;5M".as_slice())
+        );
+        assert!(report(&s, 9, 4, TermMouseKind::Move).is_none());
+
+        // 1003 reports every move.
+        s.feed(b"\x1b[?1003h");
+        assert!(s.mouse_tracking().reports_move());
+        assert_eq!(
+            report(&s, 9, 4, TermMouseKind::Move).as_deref(),
+            Some(b"\x1b[<35;10;5M".as_slice())
+        );
+
+        let shifted = s.mouse_tracking().encode(
+            9,
+            4,
+            TermMouseKind::Down(TermMouseButton::Right),
+            TermMouseMods {
+                shift: true,
+                alt: false,
+                control: true,
+            },
+        );
+        // 2 + 4 (shift) + 16 (control)
+        assert_eq!(shifted.as_deref(), Some(b"\x1b[<22;10;5M".as_slice()));
+
+        s.feed(b"\x1b[?1003l\x1b[?1006l");
+        assert!(!s.mouse_tracking().active());
+    }
+
+    #[test]
+    fn utf8_mouse_encodes_wide_coordinates() {
+        let mut s = TermScreen::new(250, 30);
+        s.feed(b"\x1b[?1000h\x1b[?1005h");
+        // Column 200 → 1-based 201 + 32 = 233 = U+00E9 = UTF-8 C3 A9.
+        let bytes = report(&s, 200, 0, TermMouseKind::Down(TermMouseButton::Left)).unwrap();
+        assert_eq!(bytes, b"\x1b[M \xc3\xa9!");
     }
 
     fn base64_encode(bytes: &[u8]) -> Vec<u8> {
