@@ -6,15 +6,30 @@
 //! markdown file are distinct the way a VS Code icon theme is.
 
 use fresh_gui_protocol::FsKind;
+use gpui::{Hsla, hsla};
 use gpui_kit::assets::IconName;
 
-/// One explorer glyph: a bundled Lucide icon and an HSL tint (`hsla` hue 0–360).
+/// One explorer glyph: a bundled Lucide icon and an HSL tint. `hue` is in
+/// degrees (0–360); GPUI's `hsla` wants 0–1, so use [`Self::color`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ExplorerGlyph {
     pub icon: IconName,
     pub hue: f32,
     pub saturation: f32,
     pub lightness: f32,
+}
+
+impl ExplorerGlyph {
+    /// Tints are tuned for a dark sidebar. A light sidebar needs them darker,
+    /// or grey and pastel glyphs wash out against the background.
+    pub fn color(&self, dark: bool) -> Hsla {
+        let lightness = if dark {
+            self.lightness
+        } else {
+            (self.lightness - 0.2).max(0.25)
+        };
+        hsla(self.hue / 360.0, self.saturation, lightness, 1.0)
+    }
 }
 
 /// Icon for `name` (a single path segment). Directories use folder glyphs;
@@ -165,6 +180,15 @@ mod tests {
             explorer_glyph("mystery.xyz", FsKind::File, false).icon,
             IconName::File
         );
+    }
+
+    #[test]
+    fn tints_keep_their_hue_and_darken_on_light_themes() {
+        let rust = explorer_glyph("main.rs", FsKind::File, false);
+        let ts = explorer_glyph("app.ts", FsKind::File, false);
+        assert!((rust.color(true).h - 24.0 / 360.0).abs() < 1e-6);
+        assert_ne!(rust.color(true).h, ts.color(true).h);
+        assert!(rust.color(false).l < rust.color(true).l);
     }
 
     #[test]

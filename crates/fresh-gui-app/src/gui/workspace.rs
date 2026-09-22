@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fresh_gui_protocol::{
@@ -165,6 +166,9 @@ pub struct Workspace {
     /// from listings used to reopen every listed folder and close one whose
     /// `fs_list` was still in flight.
     expanded_dirs: HashSet<String>,
+    /// Path → kind for `explorer_cache`, rebuilt with the tree. Rendering runs
+    /// on every PTY chunk, so rows read this instead of walking the cache.
+    explorer_kinds: Rc<HashMap<String, FsKind>>,
     explorer_focus: FocusHandle,
     /// Selected absolute paths. The last entry is the primary row.
     selection: Vec<String>,
@@ -296,6 +300,7 @@ impl Workspace {
             explorer_root: String::new(),
             explorer_cache: HashMap::new(),
             expanded_dirs: HashSet::new(),
+            explorer_kinds: Rc::default(),
             explorer_focus: cx.focus_handle(),
             selection: Vec::new(),
             anchor: None,
@@ -704,6 +709,7 @@ impl Workspace {
     }
 
     fn rebuild_tree(&mut self, cx: &mut Context<Self>) {
+        self.explorer_kinds = Rc::new(entry_kinds(&self.explorer_cache));
         let root = self.explorer_root.clone();
         if root.is_empty() {
             return;
@@ -1343,6 +1349,7 @@ impl Workspace {
         self.create_open = false;
         self.explorer_cache.clear();
         self.expanded_dirs.clear();
+        self.explorer_kinds = Rc::default();
         self.explorer_root.clear();
         self.selection.clear();
         self.anchor = None;
@@ -2165,7 +2172,8 @@ impl Workspace {
         let root_label = explorer_header_label(&self.explorer_root);
         let selected: HashSet<String> = self.selection.iter().cloned().collect();
 
-        let kinds = entry_kinds(&self.explorer_cache);
+        let kinds = self.explorer_kinds.clone();
+        let dark = cx.theme().is_dark();
 
         v_flex()
             .id("explorer-pane")
@@ -2252,12 +2260,9 @@ impl Workspace {
                                         kind.unwrap_or(FsKind::File),
                                         entry.is_expanded(),
                                     );
-                                    this.child(Icon::new(glyph.icon).small().text_color(hsla(
-                                        glyph.hue,
-                                        glyph.saturation,
-                                        glyph.lightness,
-                                        1.,
-                                    )))
+                                    this.child(
+                                        Icon::new(glyph.icon).small().text_color(glyph.color(dark)),
+                                    )
                                 })
                                 .child(label),
                         )
