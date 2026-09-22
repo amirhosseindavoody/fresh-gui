@@ -73,9 +73,9 @@ Logistics template: `pixi.toml` + Cargo workspace under `crates/`, CalVer `YYYY.
 
 1. Operator starts **`fresh-gui`** on the remote machine (background session by default, or `--foreground` for tests). One daemon process holds the session lock; Fresh Editor runs in-process on a dedicated thread; PTY shells are child processes. Linux is the documented remote; the same daemon binary is also released for Windows.
 2. Operator runs **`fresh-gui-app`** with the printed Local access URL (`?token=`) or `ws://…/ws` plus `FRESH_GUI_TOKEN`. The native host authenticates and creates/attaches a session. The daemon serves `/ws` and `/healthz` only.
-3. After `hello` + `auth`, the client creates or attaches a **session**. The daemon still accepts `layout_set` v4; the GPUI host does not restore that blob yet.
-4. Terminal panes map to remote PTYs in that session. Explorer and editor talk to sandboxed FS / Fresh buffer APIs over the same socket.
-5. Disconnect detaches the WebSocket subscriber; the session and PTYs keep running for reattach + scrollback.
+3. After `hello` + `auth`, the client lists **workspaces** (or creates the default one) and switches to the focused workspace. Each workspace owns one ADE session. The daemon still accepts `layout_set` v4; the GPUI host restores workspace tab lists (`workspace_layout_set`, layout JSON v5) instead of that older blob.
+4. Terminal panes map to remote PTYs in the focused workspace’s session. Explorer and editor talk to sandboxed FS / Fresh buffer APIs over the same socket. Other workspaces stay attached on the daemon with their own PTYs.
+5. Disconnect detaches the WebSocket subscriber; every workspace, its session, and its PTYs keep running for reattach. See [WORKSPACES.md](./WORKSPACES.md).
 
 ## 5. Protocol
 
@@ -92,6 +92,7 @@ Default backend capabilities (omit `editor` / `scene` with `--no-editor`):
 | `ping` | Liveness |
 | `pty` | Create / data / resize / close |
 | `session` | Create / attach / list; `layout_set`; PTYs belong to a session |
+| `workspace` | Several named workspaces in the one daemon; each owns a session and a tab list. Switching moves the subscriber |
 | `fs` | List, authorize, stat, watch; create / copy / move under the sandbox |
 | `editor` | Open / edit / save / close via embedded Fresh |
 | `scene` | Thin ADE open-buffer list (`scene_get` / `scene_snapshot`) |
@@ -100,6 +101,7 @@ Default backend capabilities (omit `editor` / `scene` with `--no-editor`):
 
 - **Control** — `hello`, `auth` / `auth_ok` / `auth_error`, `ping` / `pong`, `error`.
 - **Session** — `session_create` / `session_attach` / `session_list`, `layout_set`.
+- **Workspace** — `workspace_list` / `workspace_create` / `workspace_rename` / `workspace_close` / `workspace_switch` / `workspace_layout_set`. Additive on protocol `0.4.0` (new capability + messages; old clients keep using sessions). Model: [WORKSPACES.md](./WORKSPACES.md).
 - **PTY** — `pty_open` (optional `cwd` / `shell`), `pty_data`, `pty_resize`, `pty_close` / `pty_closed`.
 - **FS** — `fs_list` / `fs_stat` / `fs_authorize`; `fs_watch` / `fs_unwatch` / `fs_changed`; `fs_create` / `fs_copy` / `fs_move` / `fs_delete` (and matching result messages). Paths are sandboxed under `--root` / `FRESH_GUI_FS_ROOT`, plus directories authorized via `fs_authorize` (terminal cwd sync outside the primary root). Delete refuses the primary root and authorized cwd roots.
 - **Editor** — `editor_open` / `editor_open_link` / `editor_opened`, `buffer_snapshot`, `buffer_edit` / `buffer_changed`, `buffer_save` / `buffer_saved`, `editor_close` (revision CAS on edit/save).
@@ -115,7 +117,7 @@ While serving, the daemon samples its own resident set from `/proc/self/status` 
 
 ### Sessions and PTYs
 
-`SessionStore` holds multi-PTY sessions. Closing the WebSocket detaches the subscriber; PTYs keep running. Reattach replays ~64KB of scrollback per PTY and restores the session layout blob from Rust (`layout_set` / `session_attached.layout`; host `localStorage` is a fallback cache). Layout **v4** partitions live PTYs across multiple terminal tabs (and split trees) when leaf ids are still present, reopens editor tabs by path, restores leaf cwd stamps, and reapplies per view-root explorer expanded/scroll snapshots. Explicit `fresh-gui close` ends the daemon and clears session state.
+`SessionStore` holds multi-PTY sessions. `WorkspaceStore` groups them: each workspace has an id, display name, root directory, and one session. The GPUI host switches workspaces without restarting the daemon; idle sessions keep their PTYs and tab lists. Closing the WebSocket detaches the subscriber; PTYs keep running. Reattach replays ~64KB of scrollback per PTY and restores the session layout blob from Rust (`layout_set` / `session_attached.layout`; host `localStorage` is a fallback cache). Workspace switches use the structured tab list (`workspace_layout_set` / `workspace_switched.tabs`) and still mirror a v5 JSON blob onto the session. Layout **v4** partitions live PTYs across multiple terminal tabs (and split trees) when leaf ids are still present, reopens editor tabs by path, restores leaf cwd stamps, and reapplies per view-root explorer expanded/scroll snapshots. Explicit `fresh-gui close` ends the daemon and clears session and workspace state.
 
 PTY shell defaults come from `config.json` (`terminal.shell`; Unix default command `zsh`, Windows `powershell`). On Unix, spawn checks that the chosen command exists and is executable before starting it. When it does not, the order is the configured command (or a client `pty_open` shell), then `$SHELL` if that binary is usable, then `bash`, then `sh`. The selected shell and any skips are logged. If every candidate fails, `pty_open_failed` names the attempts and points at `terminal.shell.command` in `config.json`. Windows does not walk that chain. Bash/zsh hooks emit OSC 7 so the host can track cwd for new tabs/splits and explorer re-rooting.
 
@@ -172,11 +174,11 @@ The GPUI host can reach a Linux box without a hand-made tunnel. Saved targets (`
 3. If no session is running, start `fresh-gui --no-ui` (optional `--root`) and read the token from `session.json`.
 4. Open `ssh -N -L 127.0.0.1:<local>:127.0.0.1:<remote>` and hand `ws://127.0.0.1:<local>/ws` plus the token to the GPUI window. Closing the window kills the tunnel; the remote daemon keeps running.
 
-Fresh Orchestrator already models SSH workspaces, but that code is TUI/plugin-only and is not linked into the ADE daemon (`fresh-editor` feature `runtime`). The host does not reimplement an SSH client. There is no multi-workspace registry beyond this flat target list.
+Fresh Orchestrator already models SSH workspaces, but that code is TUI/plugin-only and is not linked into the ADE daemon (`fresh-editor` feature `runtime`). The host does not reimplement an SSH client. Saved SSH targets stay a flat list. Workspaces on the connected daemon are a separate registry (several projects inside the one remote process); see [WORKSPACES.md](./WORKSPACES.md).
 
 The ADE protocol did **not** need to change for the native host: only the renderer switched from browser (React/CodeMirror/xterm) to GPUI. Fresh remains on the daemon. Combined license is GPL-3.0-or-later (host, matching Fresh) plus Apache-2.0 (gpui-kit). Apache-2.0 can be combined with GPL-3.0, so the binary is GPL-3.0-or-later.
 
-Native chrome: activity bar, collapsible explorer, docked terminal/editor tabs, status bar, command palette, Go to File. Ribbons stay tighter than gpui-component medium defaults (30px title, 36px activity rail, 26px explorer header, 22px status and tree rows). The dock tab strip is the skin’s default 32px bar; the new-terminal **+** lives in that group’s far-right suffix. Dragging a tab to a pane edge splits horizontally or vertically; dropping it on a tab merges; dragging in the strip reorders. gpui-component will not drag the last remaining tab. Terminal tabs are numbered `1`, `2`, `3`, … for the client session (`SessionTabTitle.workspace_id` is reserved for a later workspace key) and can be renamed from the tab or the **···** menu. OSC 7 still records cwd for the next PTY and does not retitle the tab. The explorer multi-selects (Ctrl/Cmd-click, Shift-click), copies absolute paths, moves a drag onto a folder (`fs_move`), and copies files for in-app paste (`fs_copy`). Terminal is a VTE grid of remote PTY bytes (not Fresh `TerminalManager`). Editor tabs use gpui-component `Editor` as a **view** of Fresh snapshots (save is local dirty + `buffer_edit` then `buffer_save`). Host chrome notes: [UI.md](./UI.md).
+Native chrome: workspace rail, activity bar, collapsible explorer, docked terminal/editor tabs, status bar, command palette, Go to File. Ribbons stay tighter than gpui-component medium defaults (30px title, 36px activity rail, 26px explorer header, 22px status and tree rows). The dock tab strip is the skin’s default 32px bar; the new-terminal **+** lives in that group’s far-right suffix. Dragging a tab to a pane edge splits horizontally or vertically; dropping it on a tab merges; dragging in the strip reorders. gpui-component will not drag the last remaining tab. Terminal tabs are numbered `1`, `2`, `3`, … inside the focused workspace (`SessionTabTitle.workspace_id` is that workspace) and can be renamed from the tab or the **···** menu. OSC 7 still records cwd for the next PTY and does not retitle the tab. The explorer multi-selects (Ctrl/Cmd-click, Shift-click), copies absolute paths, moves a drag onto a folder (`fs_move`), and copies files for in-app paste (`fs_copy`). The left rail lists daemon workspaces; switching swaps the dock for that workspace’s session. Terminal is a VTE grid of remote PTY bytes (not Fresh `TerminalManager`). Editor tabs use gpui-component `Editor` as a **view** of Fresh snapshots (save is local dirty + `buffer_edit` then `buffer_save`). Host chrome notes: [UI.md](./UI.md).
 
 Linux GUI needs X11 or Wayland, fontconfig, FreeType, and a working wgpu/Vulkan backend. Release clients cover Linux x86_64 (`ubuntu-latest`) and Windows x86_64; `pixi.toml` stays `linux-64` for the daemon package. Linking `fresh-gui-app` (`cargo run` / `cargo test`) also needs a C++ toolchain (`g++` / `libstdc++`) because gpui-kit pulls native GPU/text stacks. The Linux release job installs those libraries (Wayland, X11/XKB, Vulkan, fontconfig, FreeType) before `cargo build`.
 
@@ -232,6 +234,7 @@ fresh-gui/
   LICENSE
   docs/
     DESIGN.md          # this file
+    WORKSPACES.md      # multi-workspace client ↔ daemon model
     FRESH.md           # Fresh editor embedding
     UI.md
     SECURITY.md

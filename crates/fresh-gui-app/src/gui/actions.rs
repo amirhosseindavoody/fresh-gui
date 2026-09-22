@@ -18,6 +18,8 @@ actions!(
         PrevTab,
         CopyExplorer,
         PasteExplorer,
+        NewWorkspace,
+        RenameWorkspace,
     ]
 );
 

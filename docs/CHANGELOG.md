@@ -6,7 +6,14 @@
 
 - Terminal and editor tabs are gpui-component dock panels. Drag a tab to a pane edge for a horizontal or vertical split, drop it on another tab to merge, and drag within the strip to reorder. Empty groups collapse. The last remaining tab cannot be dragged (the dock refuses a drag from a lone group).
 - The dock tab strip is the skin default 32px bar. The new-terminal **+** is in each panel’s `title_suffix`, at the far right of the active group beside the **···** menu. Title, rail, explorer header, tree rows, and status bar stay at the denser sizes from 2026-09-21.
-- New terminal tabs are titled `1`, `2`, `3`, … for the client session (numbers are not reused). Right-click the tab title or **··· → Rename** sets a custom title until disconnect. `SessionTabTitle.workspace_id` is reserved for a later workspace key and stays unset. OSC 7 still records cwd for the next PTY and no longer replaces the tab title.
+- New terminal tabs are titled `1`, `2`, `3`, … inside the focused workspace (numbers are not reused there). Right-click the tab title or **··· → Rename** sets a custom title. `SessionTabTitle.workspace_id` is the workspace that owns the tab. OSC 7 still records cwd for the next PTY and no longer replaces the tab title.
+
+### Multi-workspace manager
+
+- The daemon keeps several named workspaces in the one per-user process. Each workspace has an id, display name, project root, and its own ADE session (PTYs, scrollback, tab list). Switching attaches that session and leaves the others running. Closing the GPUI window does not drop them.
+- Protocol `0.4.0` gains capability `workspace` and messages `workspace_list` / `workspace_create` / `workspace_rename` / `workspace_close` / `workspace_switch` / `workspace_layout_set`. Older `session_*` clients still connect.
+- The GPUI host shows a workspace rail to the left of the activity bar: create (name and optional absolute root), switch, rename, and close. The focused workspace has its own dock (splits, numbered titles, explorer multi-select). A terminal or file opened in one workspace is not added to another workspace’s tab strip. Switching saves a flat tab list, so split geometry is rebuilt as one group.
+- Design: [docs/WORKSPACES.md](./WORKSPACES.md).
 - The explorer multi-selects with Ctrl/Cmd-click and Shift-click. **Copy Path** writes absolute paths (ADE `FsEntry.path`), one per line. Dragging a file onto a folder sends `fs_move`. With the explorer focused, Ctrl/Cmd+C arms an in-app file clipboard (and writes the same paths plus GPUI `ExternalPaths`); Ctrl/Cmd+V pastes with `fs_copy` into the selected folder or the parent of a selected file. This GPUI snapshot does not offer `text/uri-list` on Linux clipboard writes, so pasting into a file manager is not reliable.
 
 ## 2026-09-21

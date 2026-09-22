@@ -33,7 +33,7 @@ Inspired by Terax’s public UI / [TERAX.md](https://github.com/crynta/terax-ai/
 | AI chat rail, agent diffs, composer | **Not shipped** — Terax parity is a non-goal; terminal/ACP agent direction is design-only ([COPILOT.md](./COPILOT.md)); right rail stays reserved |
 | Source control / git graph | Not present |
 | Web preview / markdown tabs | Markdown WYSIWYG helper exists for editor tabs (toggle with `Mod+Shift+V`); not a separate tab kind |
-| Spaces / multi-project switcher | Not present (ADE sessions cover reconnect) |
+| Spaces / multi-project switcher | GPUI workspace rail (several workspaces on the one daemon). The removed React shell had none |
 | React 19 + Tailwind + shadcn | Yes — chrome in `src/app` + `src/components/ui` (Button, Tabs, DropdownMenu, ContextMenu, Separator, … like Terax); ADE controller remains imperative (`src/ade/bootstrap.ts`) |
 | Large trees via React reconciliation | **No** — explorer stays `VirtualTree` (windowed rows) |
 
@@ -235,6 +235,7 @@ Ribbon metrics live in `workspace.rs` and override gpui-component’s medium def
 | Container | Size |
 |-----------|------|
 | Title bar | 30px (`TitleBar` height); label is `text_sm` with a 4px gap |
+| Workspace rail | 168px, left of the activity bar. Header is the explorer header height (26px). Rows are 22px. The active workspace shows Rename and Close |
 | Activity rail | 36px wide, `py_1`, no gap; explorer and settings are small ghost icon buttons |
 | Explorer header | 26px, `text_xs`, xsmall collapse button |
 | Explorer rows | 22px, `text_sm`, 8px indent, no tree padding |
@@ -246,14 +247,15 @@ Dock chrome (tab height, suffix placement, the disabled Zoom item in **···**)
 | Native host | Status |
 |-----------|--------|
 | Connect / auth / session (`?token=` URL or `--token`) | Yes |
+| Workspace rail (create, rename, close, switch) | Yes — each workspace is its own tab set; idle ones stay on the daemon |
 | SSH target add + auto-install + tunnel (`remote connect`) | Yes (CLI before the window; title bar shows the destination) |
 | Activity bar + collapsible explorer (`fs_list`) | Yes |
 | Docked terminal + editor tabs | Yes. Drag a tab to the left/right/top/bottom edge to split; drop it on a tab to merge; drag in the strip to reorder. Empty groups collapse. The last remaining tab cannot be dragged |
-| Terminal titles | New PTYs are `1`, `2`, `3`, … (monotonic for the window; closing `2` does not reuse it). Right-click the title or **··· → Rename**. Titles are client-session state; `workspace_id` is reserved and stays unset. OSC 7 updates cwd for the next terminal and does not rename the tab |
+| Terminal titles | New PTYs are `1`, `2`, `3`, … inside the focused workspace (closing `2` does not reuse it there). Right-click the title or **··· → Rename**. `SessionTabTitle.workspace_id` is that workspace. OSC 7 updates cwd for the next terminal and does not rename the tab |
 | Explorer multi-select | Ctrl/Cmd-click toggles; Shift-click selects the visible range. Extra rows use an accent background. The tree still expands a folder on mouse-down |
 | Copy path | Right-click **Copy Path**. Absolute ADE paths, newline-separated. Does not arm paste |
 | Move / copy files | Drag onto a folder sends `fs_move`. Explorer-focused `Ctrl+C`/`Cmd+C` (or **Copy**) arms an in-app clipboard and also writes those absolute paths plus GPUI `ExternalPaths`. `Ctrl+V`/`Cmd+V` (or **Paste**) sends `fs_copy` into the selected directory, or the parent of a selected file. Linux clipboard writes in this GPUI snapshot do not offer `text/uri-list`, so a file-manager paste is not reliable |
-| Status bar (connection, session, capabilities) | Yes |
+| Status bar (connection, workspace name, session, capabilities) | Yes |
 | Command palette + Go to File | Yes |
 | PTY I/O (VTE grid) | Yes (plain text rows; prompt color/escape sequences may show literally; no WebGL xterm or mouse select) |
 | Editor open / edit / save (gpui `Editor` view of Fresh snapshots) | Yes. Editor tabs keep the filename (`•` when dirty) |
@@ -264,6 +266,7 @@ Packaged hosts: `fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` and `fresh-
 ## 11. References
 
 - [DESIGN.md](./DESIGN.md) — architecture, protocol, Fresh coupling overview.
+- [WORKSPACES.md](./WORKSPACES.md) — multi-workspace model (daemon authority, switch lifecycle).
 - [FRESH.md](./FRESH.md) — how the daemon embeds Fresh editor libraries.
 - [SECURITY.md](./SECURITY.md) — token + SSH tunnel access model.
 - [COPILOT.md](./COPILOT.md) — Copilot CLI / ACP design (issue #49).

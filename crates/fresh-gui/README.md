@@ -15,7 +15,7 @@ fresh-gui close       # stop the background session
 fresh-gui --foreground --listen 127.0.0.1:7420 --root /path/to/project
 ```
 
-`fresh-gui` keeps **one background session per user**. Starting it again while a session is live prints the access URL / token and log path instead of starting a second process. Closing the shell that launched it does **not** stop the session — use `fresh-gui close`.
+`fresh-gui` keeps **one background session per user**. Starting it again while a session is live prints the access URL / token and log path instead of starting a second process. Closing the shell that launched it does **not** stop the session — use `fresh-gui close`. That one process holds every workspace (each with its own PTYs and tabs). Switching workspaces in the GPUI client does not start another daemon.
 
 Session files (private to the user):
 

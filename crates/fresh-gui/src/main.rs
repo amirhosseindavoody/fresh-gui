@@ -15,6 +15,7 @@ mod pty;
 mod server;
 mod session;
 mod shell_resolve;
+mod workspace;
 
 use std::io::ErrorKind;
 use std::net::SocketAddr;
@@ -36,6 +37,7 @@ use crate::fs_watch::FsWatchStore;
 use crate::memory_monitor::{DEFAULT_SAMPLE_INTERVAL, MemoryMonitor};
 use crate::server::AppState;
 use crate::session::SessionStore;
+use crate::workspace::WorkspaceStore;
 
 /// How many ports above the preferred one to try when the preferred bind is busy.
 const LISTEN_PORT_FALLBACK_SPAN: u16 = 64;
@@ -263,6 +265,7 @@ async fn run_server_foreground(args: ServeArgs, write_session_meta: bool) -> Res
         require_auth,
         fs_root,
         sessions: SessionStore::new(),
+        workspaces: WorkspaceStore::new(),
         editor,
         watches: FsWatchStore::new(),
         config,
@@ -306,14 +309,8 @@ async fn run_server_foreground(args: ServeArgs, write_session_meta: bool) -> Res
         print_startup_banner(bound, &http_url, &ws_url, token.as_deref());
     }
 
-    let result = server::serve_listener(
-        listener,
-        state,
-        &http_url,
-        &ws_url,
-        Some(memory.clone()),
-    )
-    .await;
+    let result =
+        server::serve_listener(listener, state, &http_url, &ws_url, Some(memory.clone())).await;
 
     // Fallback if shutdown drained without the signal path finalizing (e.g. serve error).
     memory.finish();
