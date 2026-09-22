@@ -2,6 +2,13 @@
 
 ## 2026-09-22
 
+### Windows client tabs, explorer, and accessibility
+
+- The new-terminal **+** clears the last tab. The shift is measured from the tab chrome (the title row plus the medium tab’s 12px padding and 1px border) with a 4px gap, so the button no longer sits on top of the tab.
+- Explorer expand/collapse follows the folder you click. Open directories are an explicit set. A listing refresh no longer treats “we have this directory’s children” as “it is expanded”, which was reopening cached folders and closing one whose `fs_list` had not returned. A listed empty directory stays a folder.
+- Explorer rows use Lucide file-type icons (code, braces, text, image, terminal, archive, and folder / folder-open, including git and source folders) tinted by kind, plus a chevron on folders the tree can expand. The host asset source adds those glyphs on top of the default gpui-kit bundle.
+- Focused dock chrome and the explorer and terminal panes now have an accessibility role as well as an element id. GPUI was logging `focused element has no accessibility node (it has an id but no role)` on every focus change, and a role only on the panel made the tab-panel frame log again every frame. `window not found` / `Invalid window handle` in a short burst when the window closes come from GPUI’s own window teardown (`ShowWindow` / `DestroyWindow` after the HWND is gone), not from this host.
+
 ### Windows client path, tabs, and Ctrl+W
 
 - Paths that Windows canonicalizes as `\\?\C:\...` or `\\?\UNC\...` show as a normal path (`C:\...`, `\\server\...`) in the explorer header, editor tab titles, workspace-rail root, status text, and copied paths. The extended prefix stays available to Win32 inside the daemon.

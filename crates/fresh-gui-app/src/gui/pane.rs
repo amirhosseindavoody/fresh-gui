@@ -277,6 +277,8 @@ impl Render for TerminalPanel {
         let focused = self.focus.is_focused(window);
         div()
             .id(format!("terminal-pane-{}", self.pty_id))
+            .role(Role::Terminal)
+            .aria_label("Terminal")
             .size_full()
             .p_2()
             .bg(cx.theme().background)

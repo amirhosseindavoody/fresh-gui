@@ -6,8 +6,11 @@
 
 mod actions;
 mod ade;
+mod assets;
 mod connect;
+mod dock_a11y;
 mod explorer;
+mod file_icons;
 mod osc7;
 mod pane;
 mod paths;
@@ -32,7 +35,7 @@ pub fn run(backend: String, token: Option<String>) -> Result<()> {
 
 /// Same as [`run`], with an already-parsed target (used after SSH bootstrap).
 pub fn run_target(target: ConnectTarget) -> Result<()> {
-    let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
+    let app = gpui_kit::application().with_assets(assets::HostAssets);
 
     app.run(move |cx| {
         gpui_kit::init(cx);

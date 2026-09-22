@@ -1,8 +1,14 @@
-//! Explorer selection and path rules.
+//! Explorer selection, path rules, and the file-tree model.
 //!
-//! The gpui tree keeps a single selected row. Multi-select, drag sources, and
-//! move/copy filtering live here so the workspace can apply them on click
-//! without a second tree widget.
+//! The gpui tree keeps a single selected row and toggles a folder on
+//! mouse-down. Multi-select, drag sources, and which directories stay open
+//! live here so a later `fs_list` rebuild does not reopen every cached
+//! directory or close one whose listing has not returned yet.
+
+use std::collections::{HashMap, HashSet};
+
+use fresh_gui_protocol::{FsEntry, FsKind};
+use gpui_kit::component::tree::TreeItem;
 
 /// Why a click changed the selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +137,60 @@ pub fn absolute_paths_text(paths: &[String]) -> String {
     paths.join("\n")
 }
 
+/// Path → kind for every cached entry. Placeholders are absent.
+pub fn entry_kinds(cache: &HashMap<String, Vec<FsEntry>>) -> HashMap<String, FsKind> {
+    cache
+        .values()
+        .flatten()
+        .map(|entry| (entry.path.clone(), entry.kind))
+        .collect()
+}
+
+/// Record the folder the tree just toggled. A listing refresh reads this set
+/// instead of “every directory we have listed”. Placeholders are not folders.
+pub fn record_tree_toggle(expanded: &mut HashSet<String>, path: &str, open: bool) {
+    if is_placeholder(path) {
+        return;
+    }
+    if open {
+        expanded.insert(path.to_string());
+    } else {
+        expanded.remove(path);
+    }
+}
+
+/// Explorer rows. A directory is expanded only when `expanded` says so.
+/// Listing it (so `cache` has its children) does not open it. A directory
+/// that has not been listed yet keeps a `{path}/.` child so the tree treats
+/// the row as a folder and the click can toggle it.
+pub fn build_explorer_tree(
+    root: &str,
+    cache: &HashMap<String, Vec<FsEntry>>,
+    expanded: &HashSet<String>,
+) -> Vec<TreeItem> {
+    let Some(entries) = cache.get(root) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            if entry.kind == FsKind::Dir {
+                let listed = cache.contains_key(&entry.path);
+                let children = if listed {
+                    build_explorer_tree(&entry.path, cache, expanded)
+                } else {
+                    vec![TreeItem::new(format!("{}/.", entry.path), "…")]
+                };
+                TreeItem::new(entry.path.clone(), entry.name.clone())
+                    .children(children)
+                    .expanded(expanded.contains(&entry.path))
+            } else {
+                TreeItem::new(entry.path.clone(), entry.name.clone())
+            }
+        })
+        .collect()
+}
+
 /// Flat visible ids, skipping lazy placeholders.
 pub fn real_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     ids.into_iter()
@@ -255,6 +315,73 @@ mod tests {
     }
 
     #[test]
+    fn cached_directory_stays_collapsed_until_toggled() {
+        let (root, cache) = sample_tree();
+        let items = build_explorer_tree(&root, &cache, &HashSet::new());
+        let src = find(&items, "/proj/src").unwrap();
+        assert!(!src.is_expanded());
+        assert!(src.is_folder());
+        assert_eq!(src.children[0].id.as_ref(), "/proj/src/main.rs");
+        assert!(!find(&items, "/proj/docs").unwrap().is_expanded());
+    }
+
+    #[test]
+    fn only_the_toggled_directory_expands() {
+        let (root, cache) = sample_tree();
+        let mut expanded = HashSet::new();
+        record_tree_toggle(&mut expanded, "/proj/src", true);
+        record_tree_toggle(&mut expanded, "/proj/docs", true);
+        record_tree_toggle(&mut expanded, "/proj/docs", false);
+        record_tree_toggle(&mut expanded, "/proj/src/.", true);
+        let items = build_explorer_tree(&root, &cache, &expanded);
+        assert!(find(&items, "/proj/src").unwrap().is_expanded());
+        assert!(!find(&items, "/proj/docs").unwrap().is_expanded());
+        assert!(!expanded.iter().any(|path| is_placeholder(path)));
+    }
+
+    #[test]
+    fn unlisted_directory_is_still_a_folder() {
+        let root = "/proj";
+        let mut cache = HashMap::new();
+        cache.insert(
+            root.into(),
+            vec![FsEntry {
+                name: "src".into(),
+                path: "/proj/src".into(),
+                kind: FsKind::Dir,
+                size: None,
+            }],
+        );
+        let expanded = HashSet::from(["/proj/src".to_string()]);
+        let items = build_explorer_tree(root, &cache, &expanded);
+        let src = find(&items, "/proj/src").unwrap();
+        assert!(src.is_expanded());
+        assert!(src.is_folder());
+        assert!(is_placeholder(src.children[0].id.as_ref()));
+    }
+
+    #[test]
+    fn listed_empty_directory_is_not_a_tree_folder() {
+        let root = "/proj";
+        let mut cache = HashMap::new();
+        cache.insert(
+            root.into(),
+            vec![FsEntry {
+                name: "empty".into(),
+                path: "/proj/empty".into(),
+                kind: FsKind::Dir,
+                size: None,
+            }],
+        );
+        cache.insert("/proj/empty".into(), Vec::new());
+        let items = build_explorer_tree(root, &cache, &HashSet::new());
+        let empty = find(&items, "/proj/empty").unwrap();
+        assert!(!empty.is_folder());
+        assert!(empty.children.is_empty());
+        assert_eq!(entry_kinds(&cache).get("/proj/empty"), Some(&FsKind::Dir));
+    }
+
+    #[test]
     fn placeholder_rows_are_not_real_ids() {
         assert!(is_placeholder("/proj/src/."));
         assert_eq!(
@@ -268,5 +395,64 @@ mod tests {
             ),
             vec!["/proj/src".to_string(), "/proj/src/main.rs".to_string()]
         );
+    }
+
+    fn sample_tree() -> (String, HashMap<String, Vec<FsEntry>>) {
+        let root = "/proj".to_string();
+        let mut cache = HashMap::new();
+        cache.insert(
+            root.clone(),
+            vec![
+                FsEntry {
+                    name: "src".into(),
+                    path: "/proj/src".into(),
+                    kind: FsKind::Dir,
+                    size: None,
+                },
+                FsEntry {
+                    name: "docs".into(),
+                    path: "/proj/docs".into(),
+                    kind: FsKind::Dir,
+                    size: None,
+                },
+                FsEntry {
+                    name: "README.md".into(),
+                    path: "/proj/README.md".into(),
+                    kind: FsKind::File,
+                    size: Some(12),
+                },
+            ],
+        );
+        cache.insert(
+            "/proj/src".into(),
+            vec![FsEntry {
+                name: "main.rs".into(),
+                path: "/proj/src/main.rs".into(),
+                kind: FsKind::File,
+                size: Some(4),
+            }],
+        );
+        cache.insert(
+            "/proj/docs".into(),
+            vec![FsEntry {
+                name: "guide.md".into(),
+                path: "/proj/docs/guide.md".into(),
+                kind: FsKind::File,
+                size: Some(8),
+            }],
+        );
+        (root, cache)
+    }
+
+    fn find<'a>(items: &'a [TreeItem], id: &str) -> Option<&'a TreeItem> {
+        for item in items {
+            if item.id.as_ref() == id {
+                return Some(item);
+            }
+            if let Some(found) = find(&item.children, id) {
+                return Some(found);
+            }
+        }
+        None
     }
 }

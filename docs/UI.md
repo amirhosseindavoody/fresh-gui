@@ -238,8 +238,8 @@ Ribbon metrics live in `workspace.rs`. Workspace-rail width, row height, and roo
 | Workspace rail | 232px, left of the activity bar, only when `hello` includes `workspace`. Header is the explorer header height (26px), a muted **Workspaces** section title plus **+**. Rows are two lines and at least 40px: display name, then the project root (`~` for home, **Default root** when empty). The active row has an accent fill and a 3px left accent. Hover reveals Rename and Close; right-click has the same menu. The last workspace cannot be closed. One workspace shows a footer hint |
 | Activity rail | 36px wide, `py_1`, no gap; explorer and settings are small ghost icon buttons |
 | Explorer header | 26px, `text_xs`, xsmall collapse button |
-| Explorer rows | 22px, `text_sm`, 8px indent, no tree padding |
-| Tab strip | Dock skin default (`TabBar` medium, 32px). Each tab has an **×**. The **+** is in `title_suffix` and shifts left to the last tab while the bar has free space; it stays at the right edge, beside **···**, when the strip is full |
+| Explorer rows | 22px, `text_sm`, 8px indent, no tree padding. A chevron marks a folder that has (or may have) children. Lucide file-type icons, tinted by kind, distinguish files from folders |
+| Tab strip | Dock skin default (`TabBar` medium, 32px). Each tab has an **×**. The **+** is in `title_suffix` and shifts left to sit a gap past the last tab’s chrome (title edge plus the medium tab’s 12px padding and 1px border). It stays at the right edge, beside **···**, when the strip is full |
 | Status bar | 22px, `py_0`, `gap_1` |
 
 Dock chrome (tab height, suffix placement, the disabled Zoom item in **···**) is owned by `DockSkin`. Colors stay on the active theme (`tab_bar`, `sidebar`, `status_bar`, `border`).
@@ -252,7 +252,7 @@ Dock chrome (tab height, suffix placement, the disabled Zoom item in **···**)
 | Activity bar + collapsible explorer (`fs_list`) | Yes |
 | Docked terminal + editor tabs | Yes. Drag a tab to the left/right/top/bottom edge to split; drop it on a tab to merge; drag in the strip to reorder. Empty groups collapse. The last remaining tab cannot be dragged |
 | Terminal titles | New PTYs are `1`, `2`, `3`, … inside the focused workspace (closing `2` does not reuse it there). Right-click the title or **··· → Rename**. The same menus close that tab, the other tabs, or the tabs to the right. `SessionTabTitle.workspace_id` is that workspace. OSC 7 updates cwd for the next terminal and does not rename the tab |
-| Explorer multi-select | Ctrl/Cmd-click toggles; Shift-click selects the visible range. Extra rows use an accent background. The tree still expands a folder on mouse-down |
+| Explorer multi-select | Ctrl/Cmd-click toggles; Shift-click selects the visible range. Extra rows use an accent background. A folder toggles on mouse-down. That open/closed set is the host’s: a later `fs_list` does not reopen every cached directory or close a folder whose listing is still in flight. Only the clicked folder changes. An empty listed directory stays a folder (it is not opened as a file) |
 | Copy path | Right-click **Copy Path**. Absolute ADE paths, newline-separated. Does not arm paste |
 | Move / copy files | Drag onto a folder sends `fs_move`. Explorer-focused `Ctrl+C`/`Cmd+C` (or **Copy**) arms an in-app clipboard and also writes those absolute paths plus GPUI `ExternalPaths`. `Ctrl+V`/`Cmd+V` (or **Paste**) sends `fs_copy` into the selected directory, or the parent of a selected file. Linux clipboard writes in this GPUI snapshot do not offer `text/uri-list`, so a file-manager paste is not reliable |
 | Status bar (connection, workspace name, session, capabilities) | Yes |

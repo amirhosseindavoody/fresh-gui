@@ -11,8 +11,13 @@ use std::rc::Rc;
 /// and are separated by the button’s anchor instead.
 const TAB_ROW_BAND_PX: f32 = 8.0;
 
-/// Space kept between the last tab and the **+**.
+/// Space kept between the tab chrome and the **+**.
 const PLUS_GAP_PX: f32 = 4.0;
+
+/// Medium dock-tab padding (`px(12)`) plus the 1px tab border. `note_tab_edge`
+/// records the title row, which sits inside that chrome, so the **+** has to
+/// clear it or it overlaps the last tab.
+const TAB_TRAILING_PAD_PX: f32 = 13.0;
 
 /// Tab edges collected during one frame, shared by every panel in the dock.
 #[derive(Clone, Default)]
@@ -36,10 +41,12 @@ impl TabStripMetrics {
 
 /// How far left the **+** should move from its suffix slot.
 ///
-/// `edges` are `(top, right)` of each tab title in window coordinates.
-/// `plus_top` / `plus_anchor_left` are the button’s unshifted position (the
-/// far-right slot). Tabs that end to the right of that slot are scrolled
-/// past it; they do not pull the button into the overflow.
+/// `edges` are `(top, right)` of each tab title in window coordinates. The
+/// title ends inside the tab’s padding, so the visible tab edge is that right
+/// plus [`TAB_TRAILING_PAD_PX`]. `plus_top` / `plus_anchor_left` are the
+/// button’s unshifted position (the far-right slot). Tabs that end to the
+/// right of that slot are scrolled past it; they do not pull the button into
+/// the overflow.
 pub fn plus_shift_px(edges: &[(f32, f32)], plus_top: f32, plus_anchor_left: f32) -> f32 {
     let last_right = edges
         .iter()
@@ -53,7 +60,8 @@ pub fn plus_shift_px(edges: &[(f32, f32)], plus_top: f32, plus_anchor_left: f32)
     let Some(last_right) = last_right else {
         return 0.0;
     };
-    (plus_anchor_left - last_right - PLUS_GAP_PX).max(0.0)
+    let visual_right = last_right + TAB_TRAILING_PAD_PX;
+    (plus_anchor_left - visual_right - PLUS_GAP_PX).max(0.0)
 }
 
 /// Which other tabs a context-menu close removes. `order` is the center dock’s
@@ -91,7 +99,7 @@ mod tests {
     fn plus_sits_beside_the_last_tab_when_the_bar_has_room() {
         let edges = [(0.0, 40.0), (0.0, 120.0), (0.0, 200.0)];
         let shift = plus_shift_px(&edges, 0.0, 640.0);
-        assert_eq!(shift, 640.0 - 200.0 - PLUS_GAP_PX);
+        assert_eq!(shift, 640.0 - 200.0 - TAB_TRAILING_PAD_PX - PLUS_GAP_PX);
     }
 
     #[test]
@@ -110,9 +118,9 @@ mod tests {
     fn side_by_side_groups_use_their_own_anchor() {
         let edges = [(0.0, 180.0), (0.0, 520.0), (0.0, 700.0)];
         let left = plus_shift_px(&edges, 0.0, 300.0);
-        assert_eq!(left, 300.0 - 180.0 - PLUS_GAP_PX);
+        assert_eq!(left, 300.0 - 180.0 - TAB_TRAILING_PAD_PX - PLUS_GAP_PX);
         let right = plus_shift_px(&edges, 0.0, 760.0);
-        assert_eq!(right, 760.0 - 700.0 - PLUS_GAP_PX);
+        assert_eq!(right, 760.0 - 700.0 - TAB_TRAILING_PAD_PX - PLUS_GAP_PX);
     }
 
     #[test]
@@ -120,7 +128,7 @@ mod tests {
         let edges = [(0.0, 200.0), (40.0, 80.0)];
         assert_eq!(
             plus_shift_px(&edges, 40.0, 400.0),
-            400.0 - 80.0 - PLUS_GAP_PX
+            400.0 - 80.0 - TAB_TRAILING_PAD_PX - PLUS_GAP_PX
         );
     }
 

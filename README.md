@@ -228,7 +228,7 @@ After connect you get terminals, an explorer, and editor tabs in one shell:
 | Close a tab | **×** on the tab, right-click → Close, or `Ctrl+W`. Right-click also has Close Others and Close to the Right |
 | New workspace | Left rail **+**, or command palette → New Workspace. The project root starts as the current workspace folder |
 | Switch workspace | Click a name in the left rail. Tabs, terminals, and the explorer root swap; other workspaces keep running on the daemon |
-| Open a file | Click in the explorer (or `Ctrl+P` → path `[:line[:col]]`) |
+| Open a file | Click a file in the explorer (or `Ctrl+P` → path `[:line[:col]]`). Folders use folder icons and a click expands or collapses only that folder; files use a type icon |
 | Explorer selection | `Ctrl`/`Cmd`-click toggles; `Shift`-click selects a range. Right-click **Copy Path** copies absolute paths |
 | Move / copy files | Drag a file onto a folder to move it. With the explorer focused, `Ctrl+C` / `Ctrl+V` (`Cmd` on macOS) copies via the daemon into the selected folder |
 | Save | `Ctrl+S` |
