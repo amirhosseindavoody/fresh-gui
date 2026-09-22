@@ -68,6 +68,7 @@ impl TermScreen {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn visible_text(&self) -> String {
         self.visible_lines().join("\n")
     }

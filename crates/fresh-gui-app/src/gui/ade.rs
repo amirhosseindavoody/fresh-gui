@@ -82,12 +82,16 @@ pub enum AdeCmd {
         from: Option<String>,
         tabs: Vec<WorkspaceTab>,
         active_tab: u32,
+        explorer_expanded: Vec<String>,
     },
     SetWorkspaceLayout {
         id: String,
         tabs: Vec<WorkspaceTab>,
         active_tab: u32,
+        explorer_expanded: Vec<String>,
     },
+    /// Acknowledged once every command queued before it has been written.
+    Flush(std::sync::mpsc::Sender<()>),
     Disconnect,
 }
 
@@ -99,18 +103,21 @@ pub struct AttachedWorkspace {
     pub tabs: Vec<WorkspaceTab>,
     pub active_tab: u32,
     pub ptys: Vec<PtyInfo>,
+    pub explorer_expanded: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum AdeEvent {
     Connecting,
+    // Boxed: every PTY chunk crosses this channel as an `AdeEvent`, so the
+    // rare connect/switch payloads should not set the size of each one.
     Connected {
-        hello: Hello,
+        hello: Box<Hello>,
         session_id: String,
         workspaces: Vec<WorkspaceInfo>,
         /// Present when the daemon advertises `workspace` and a workspace is attached.
-        attached: Option<AttachedWorkspace>,
+        attached: Option<Box<AttachedWorkspace>>,
     },
     WorkspaceCreated {
         workspace: WorkspaceInfo,
@@ -123,7 +130,7 @@ pub enum AdeEvent {
         focused_id: Option<String>,
     },
     WorkspaceSwitched {
-        attached: AttachedWorkspace,
+        attached: Box<AttachedWorkspace>,
     },
     Disconnected {
         reason: String,
@@ -194,6 +201,16 @@ impl AdeHandle {
     pub fn send(&self, cmd: AdeCmd) {
         let _ = self.tx.try_send(cmd);
     }
+
+    /// Block until queued commands reach the socket, or `timeout` passes.
+    /// For window close: the process can exit before the worker thread runs.
+    pub fn flush_blocking(&self, timeout: Duration) -> bool {
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        if self.tx.try_send(AdeCmd::Flush(ack_tx)).is_err() {
+            return false;
+        }
+        ack_rx.recv_timeout(timeout).is_ok()
+    }
 }
 
 pub fn spawn(target: ConnectTarget) -> (AdeHandle, async_channel::Receiver<AdeEvent>) {
@@ -261,10 +278,10 @@ async fn ade_loop(
 
     let _ = evt_tx
         .send(AdeEvent::Connected {
-            hello,
+            hello: Box::new(hello),
             session_id: boot.session_id,
             workspaces: boot.workspaces,
-            attached: boot.attached,
+            attached: boot.attached.map(Box::new),
         })
         .await;
 
@@ -289,11 +306,10 @@ async fn ade_loop(
                         if let Message::WorkspaceSwitched { ref workspace, .. } = message {
                             client.session_id = Some(workspace.session_id.clone());
                         }
-                        if let Some(ev) = event_from_message(message) {
-                            if evt_tx.send(ev).await.is_err() {
+                        if let Some(ev) = event_from_message(message)
+                            && evt_tx.send(ev).await.is_err() {
                                 break;
                             }
-                        }
                     }
                     Err(err) => {
                         let _ = evt_tx.send(AdeEvent::Disconnected {
@@ -437,6 +453,7 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
             from,
             tabs,
             active_tab,
+            explorer_expanded,
         } => {
             if let Some(from) = from {
                 client
@@ -444,6 +461,7 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
                         workspace_id: from,
                         tabs,
                         active_tab,
+                        explorer_expanded,
                     })
                     .await?;
             }
@@ -455,14 +473,19 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
             id,
             tabs,
             active_tab,
+            explorer_expanded,
         } => {
             client
                 .send(Message::WorkspaceLayoutSet {
                     workspace_id: id,
                     tabs,
                     active_tab,
+                    explorer_expanded,
                 })
                 .await?;
+        }
+        AdeCmd::Flush(ack) => {
+            let _ = ack.send(());
         }
         AdeCmd::Disconnect => {}
     }
@@ -566,12 +589,14 @@ async fn recv_workspace_switched(client: &mut Client) -> anyhow::Result<Attached
                 tabs,
                 active_tab,
                 ptys,
+                explorer_expanded,
             } => {
                 return Ok(AttachedWorkspace {
                     info: workspace,
                     tabs,
                     active_tab,
                     ptys,
+                    explorer_expanded,
                 });
             }
             Message::Error { code, message } => {
@@ -682,13 +707,15 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             tabs,
             active_tab,
             ptys,
+            explorer_expanded,
         } => Some(AdeEvent::WorkspaceSwitched {
-            attached: AttachedWorkspace {
+            attached: Box::new(AttachedWorkspace {
                 info: workspace,
                 tabs,
                 active_tab,
                 ptys,
-            },
+                explorer_expanded,
+            }),
         }),
         Message::Pong { .. } | Message::Ping { .. } | Message::AuthOk => None,
         _ => None,

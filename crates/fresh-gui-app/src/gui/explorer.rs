@@ -137,13 +137,56 @@ pub fn absolute_paths_text(paths: &[String]) -> String {
     paths.join("\n")
 }
 
-/// Path → kind for every cached entry. Placeholders are absent.
+/// A row the explorer can expand: a directory, or a symlink the daemon says
+/// resolves to one inside the sandbox.
+pub fn is_dir_entry(entry: &FsEntry) -> bool {
+    entry.kind == FsKind::Dir
+        || (entry.kind == FsKind::Symlink && entry.target_kind == Some(FsKind::Dir))
+}
+
+/// Path → kind for every cached entry, with folder symlinks reported as
+/// `Dir`. Placeholders are absent.
 pub fn entry_kinds(cache: &HashMap<String, Vec<FsEntry>>) -> HashMap<String, FsKind> {
     cache
         .values()
         .flatten()
-        .map(|entry| (entry.path.clone(), entry.kind))
+        .map(|entry| {
+            let kind = if is_dir_entry(entry) {
+                FsKind::Dir
+            } else {
+                entry.kind
+            };
+            (entry.path.clone(), kind)
+        })
         .collect()
+}
+
+/// The daemon answers `fs_list` with the canonical directory, so listing a
+/// folder symlink returns the target's path and children. Key the listing by
+/// the path the tree asked for and re-parent the children under it, or the
+/// row never finds its children and a visible target duplicates tree ids.
+pub fn rebase_listing(
+    requested: &str,
+    returned: &str,
+    entries: Vec<FsEntry>,
+) -> (String, Vec<FsEntry>) {
+    if requested.is_empty() || requested == returned {
+        return (returned.to_string(), entries);
+    }
+    let sep = if requested.contains('\\') && !requested.contains('/') {
+        '\\'
+    } else {
+        '/'
+    };
+    let base = requested.trim_end_matches(sep);
+    let entries = entries
+        .into_iter()
+        .map(|mut entry| {
+            entry.path = format!("{base}{sep}{}", entry.name);
+            entry
+        })
+        .collect();
+    (requested.to_string(), entries)
 }
 
 /// Record the folder the tree just toggled. A listing refresh reads this set
@@ -157,6 +200,21 @@ pub fn record_tree_toggle(expanded: &mut HashSet<String>, path: &str, open: bool
     } else {
         expanded.remove(path);
     }
+}
+
+/// Drop open folders that their (listed) parent no longer contains, so a
+/// deleted or renamed directory does not stay in the saved set forever.
+/// Folders whose parent has not been listed yet are kept.
+pub fn prune_expanded(expanded: &mut HashSet<String>, cache: &HashMap<String, Vec<FsEntry>>) {
+    expanded.retain(|dir| {
+        let Some(parent) = parent_dir(dir) else {
+            return true;
+        };
+        match cache.get(&parent) {
+            Some(entries) => entries.iter().any(|entry| &entry.path == dir),
+            None => true,
+        }
+    });
 }
 
 /// Explorer rows. A directory is expanded only when `expanded` says so.
@@ -174,7 +232,7 @@ pub fn build_explorer_tree(
     entries
         .iter()
         .map(|entry| {
-            if entry.kind == FsKind::Dir {
+            if is_dir_entry(entry) {
                 let listed = cache.contains_key(&entry.path);
                 let children = if listed {
                     build_explorer_tree(&entry.path, cache, expanded)
@@ -350,6 +408,7 @@ mod tests {
                 path: "/proj/src".into(),
                 kind: FsKind::Dir,
                 size: None,
+                target_kind: None,
             }],
         );
         let expanded = HashSet::from(["/proj/src".to_string()]);
@@ -371,6 +430,7 @@ mod tests {
                 path: "/proj/empty".into(),
                 kind: FsKind::Dir,
                 size: None,
+                target_kind: None,
             }],
         );
         cache.insert("/proj/empty".into(), Vec::new());
@@ -382,17 +442,75 @@ mod tests {
     }
 
     #[test]
+    fn folder_symlinks_expand_and_other_links_do_not() {
+        let link = |name: &str, target: Option<FsKind>| FsEntry {
+            name: name.into(),
+            path: format!("/proj/{name}"),
+            kind: FsKind::Symlink,
+            size: None,
+            target_kind: target,
+        };
+        let mut cache = HashMap::new();
+        cache.insert(
+            "/proj".to_string(),
+            vec![
+                link("dirlink", Some(FsKind::Dir)),
+                link("filelink", Some(FsKind::File)),
+                link("escape", None),
+            ],
+        );
+        let items = build_explorer_tree("/proj", &cache, &HashSet::new());
+        assert!(find(&items, "/proj/dirlink").unwrap().is_folder());
+        assert!(!find(&items, "/proj/filelink").unwrap().is_folder());
+        assert!(!find(&items, "/proj/escape").unwrap().is_folder());
+        let kinds = entry_kinds(&cache);
+        assert_eq!(kinds["/proj/dirlink"], FsKind::Dir);
+        assert_eq!(kinds["/proj/escape"], FsKind::Symlink);
+    }
+
+    #[test]
+    fn deleted_folders_leave_the_open_set() {
+        let (_, cache) = sample_tree();
+        let mut expanded: HashSet<String> =
+            ["/proj/src", "/proj/gone", "/elsewhere/unlisted/child"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+        prune_expanded(&mut expanded, &cache);
+        assert!(expanded.contains("/proj/src"));
+        assert!(!expanded.contains("/proj/gone"));
+        assert!(expanded.contains("/elsewhere/unlisted/child"));
+    }
+
+    #[test]
+    fn listing_through_a_symlink_stays_under_the_link() {
+        let child = FsEntry {
+            name: "x.rs".into(),
+            path: "/real/target/x.rs".into(),
+            kind: FsKind::File,
+            size: Some(1),
+            target_kind: None,
+        };
+        let (key, entries) = rebase_listing("/proj/dirlink", "/real/target", vec![child.clone()]);
+        assert_eq!(key, "/proj/dirlink");
+        assert_eq!(entries[0].path, "/proj/dirlink/x.rs");
+
+        let (key, entries) = rebase_listing(r"C:\proj\link", r"C:\real", vec![child.clone()]);
+        assert_eq!(key, r"C:\proj\link");
+        assert_eq!(entries[0].path, r"C:\proj\link\x.rs");
+
+        let (key, entries) = rebase_listing("/real/target", "/real/target", vec![child.clone()]);
+        assert_eq!(key, "/real/target");
+        assert_eq!(entries[0].path, child.path);
+        let (key, _) = rebase_listing("", "/root", vec![]);
+        assert_eq!(key, "/root");
+    }
+
+    #[test]
     fn placeholder_rows_are_not_real_ids() {
         assert!(is_placeholder("/proj/src/."));
         assert_eq!(
-            real_ids(
-                [
-                    "/proj/src".into(),
-                    "/proj/src/.".into(),
-                    "/proj/src/main.rs"
-                ]
-                .into_iter()
-            ),
+            real_ids(["/proj/src", "/proj/src/.", "/proj/src/main.rs"].into_iter()),
             vec!["/proj/src".to_string(), "/proj/src/main.rs".to_string()]
         );
     }
@@ -408,18 +526,21 @@ mod tests {
                     path: "/proj/src".into(),
                     kind: FsKind::Dir,
                     size: None,
+                    target_kind: None,
                 },
                 FsEntry {
                     name: "docs".into(),
                     path: "/proj/docs".into(),
                     kind: FsKind::Dir,
                     size: None,
+                    target_kind: None,
                 },
                 FsEntry {
                     name: "README.md".into(),
                     path: "/proj/README.md".into(),
                     kind: FsKind::File,
                     size: Some(12),
+                    target_kind: None,
                 },
             ],
         );
@@ -430,6 +551,7 @@ mod tests {
                 path: "/proj/src/main.rs".into(),
                 kind: FsKind::File,
                 size: Some(4),
+                target_kind: None,
             }],
         );
         cache.insert(
@@ -439,6 +561,7 @@ mod tests {
                 path: "/proj/docs/guide.md".into(),
                 kind: FsKind::File,
                 size: Some(8),
+                target_kind: None,
             }],
         );
         (root, cache)
