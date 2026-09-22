@@ -14,7 +14,7 @@ How operators reach `fresh-gui` on shared hosts. Architecture overview: [DESIGN.
 2. **Never expose the backend to the network by default.** Keep the loopback bind as the default and the recommended path — remote access goes through an **SSH tunnel**, which is already authenticated (SSH login) and encrypted end to end.
 3. **Zero-friction access instructions.** On startup, the process prints:
    - a **local** URL (same machine) with the token embedded, and
-   - the exact **SSH tunnel command** to run on a laptop, then `fresh-gui-app --backend` with the Local access URL (or `remote connect`, which builds the tunnel itself).
+   - the exact **SSH tunnel command** to run on a laptop, then `fresh-gui --backend` with the Local access URL (or `fresh-gui user@host` / `remote connect`, which builds the tunnel itself).
 4. Keep a narrow, explicit escape hatch for local integration tests (`--allow-no-auth`, loopback-only) so CI doesn't need to thread tokens through every test — never used in the documented user-facing flow.
 
 ## 3. Design
@@ -23,7 +23,7 @@ How operators reach `fresh-gui` on shared hosts. Architecture overview: [DESIGN.
 
 - If `--token` / `FRESH_GUI_TOKEN` is set (and non-empty), use it as-is (lets an operator pin a stable token, e.g. to reuse across restarts).
 - Otherwise, **auto-generate** a random token per process start (`uuid::Uuid::new_v4()`, 122 bits of OS-RNG entropy, formatted as 32 hex chars). It is never written to git/config.
-- The token is **never included in `tracing` structured logs** (only `auth_required: bool` is logged). For the background session, it is stored in the user-private session meta file (`$XDG_RUNTIME_DIR/fresh-gui/session.json` on Unix, mode `0600`; `%LOCALAPPDATA%\fresh-gui\session.json` on Windows) so a later `fresh-gui` / `fresh-gui status` can reprint the Local access URL. The meta file is removed on `fresh-gui close`.
+- The token is **never included in `tracing` structured logs** (only `auth_required: bool` is logged). For the background session, it is stored in the user-private session meta file (`$XDG_RUNTIME_DIR/fresh-gui/session.json` on Unix, mode `0600`; `%LOCALAPPDATA%\fresh-gui\session.json` on Windows) so a later `fresh-gui` / `fresh-gui status` can reprint the Local access URL. The desktop command reads that meta by running the daemon binary with `--json` (stdout of a local pipe). The token is not an argument of the GUI process. The meta file is removed on `fresh-gui close`.
 - Prefer `FRESH_GUI_TOKEN` over `--token` so the secret does not appear in `ps` / process listings.
 
 ### 3.2 Bind stays loopback by default
@@ -47,7 +47,8 @@ Default `fresh-gui` detaches a per-user daemon (exclusive lock), prints status, 
 
   From another machine (e.g. your laptop) — SSH tunnel, nothing exposed to the network:
     ssh -L 7420:127.0.0.1:7420 <user>@<host>
-    fresh-gui-app --backend 'http://127.0.0.1:7420/?token=<token>'
+    fresh-gui user@<host>
+    fresh-gui --backend 'http://127.0.0.1:7420/?token=<token>'
 
   Stop with: fresh-gui close
 ```
@@ -56,11 +57,11 @@ Default `fresh-gui` detaches a per-user daemon (exclusive lock), prints status, 
 
 ### 3.4 Native client
 
-`fresh-gui-app` reads `?token=` from the printed Local access URL passed to `--backend` (or `FRESH_GUI_TOKEN` / `--token`). The token stays in the client process for the WebSocket handshake. It is not written to `remotes.json`. `remote connect` reads it from the remote `session.json` over SSH instead of putting it on the client argv.
+`fresh-gui` on a desktop install reads the local session with `fresh-gui-daemon --json` (or attaches with `--backend`, which still accepts `?token=` / `FRESH_GUI_TOKEN` / `--token`). The token stays in the client process for the WebSocket handshake. It is not written to `remotes.json`. `fresh-gui user@host` and `remote connect` read it from the remote `session.json` over SSH instead of putting it on the client argv.
 
 ### 3.5 SSH bootstrap from the native host
 
-`fresh-gui-app remote connect` is another way to build the same loopback tunnel. It uses the **local OpenSSH client** (`ssh` / `scp`): keys, agent, and `~/.ssh/config`. The host does not collect passwords (`BatchMode=yes`). Host-key checking stays at OpenSSH defaults.
+`fresh-gui user@host` and `fresh-gui remote connect` build the same loopback tunnel. They use the **local OpenSSH client** (`ssh` / `scp`): keys, agent, and `~/.ssh/config`. The host does not collect passwords (`BatchMode=yes`). Host-key checking stays at OpenSSH defaults.
 
 The ADE token is read from the remote user's private `session.json` over that SSH session and kept in the client process for the WebSocket handshake. It is **not** written to `remotes.json`, not passed on the client argv, and not written to tracing logs. If a failed start's banner is shown, `token=` / `?token=` values are redacted. The tunnel binds `127.0.0.1` only. A missing daemon is copied to `~/.local/bin/fresh-gui` on the remote account you SSH as — same Unix user the daemon will run as.
 
@@ -73,7 +74,7 @@ The ADE token is read from the remote user's private `session.json` over that SS
 | Risk | Notes / mitigation |
 |------|---------------------|
 | **Token visible via `ps aux` if passed as `--token` on the CLI** | Other users on a shared host can see full command lines of any process. Prefer `FRESH_GUI_TOKEN` or (best) let it auto-generate — neither appears in `ps` output. Documented in README. |
-| **Token in shell history** | It's printed once to the terminal and appears in the URL if you pass that URL to `--backend`. Treat it like a password: don't paste it into chat/tickets, and restart the process (new random token) if you suspect it leaked. Prefer `remote connect`, which keeps the token off the client argv. |
+| **Token in shell history** | It's printed once to the terminal and appears in the URL if you pass that URL to `--backend`. Treat it like a password: don't paste it into chat/tickets, and restart the process (new random token) if you suspect it leaked. Prefer `fresh-gui` (local) or `fresh-gui user@host` / `remote connect`, which keep the token off the client argv. |
 | **Token in logs/terminal scrollback** | Kept out of `tracing` (which may be centrally aggregated, e.g. journald); it still hits the operator's own terminal scrollback by design (that's the delivery mechanism), so avoid running under a shared/logged terminal multiplexer session. |
 | **Token in private `session.json`** | Needed so re-running `fresh-gui` can reprint the Local access URL. Unix: `$XDG_RUNTIME_DIR/fresh-gui/session.json` (mode `0600`, directory `0700`). Windows: `%LOCALAPPDATA%\fresh-gui\session.json`. Removed on `fresh-gui close` / daemon exit. Same user-private trust as the lock file — other accounts cannot read it. |
 | **Token comparison timing** | Equal-length compares use a byte-wise XOR fold; length mismatches still short-circuit. In practice the token travels only over loopback or an SSH tunnel, and 122 bits of entropy makes brute forcing infeasible. |

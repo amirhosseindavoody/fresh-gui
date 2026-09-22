@@ -65,14 +65,14 @@ Logistics template: `pixi.toml` + Cargo workspace under `crates/`, CalVer `YYYY.
 | Crate | Binary? | Role |
 |-------|---------|------|
 | `fresh-gui-protocol` | no | Versioned messages, capability constants, errors |
-| `fresh-gui` | yes (`fresh-gui`) | Headless daemon: WebSocket ADE, sessions, PTY, FS, Fresh editor (Linux primary; Windows binary also released) |
+| `fresh-gui` | yes (`fresh-gui`) | Headless daemon: WebSocket ADE, sessions, PTY, FS, Fresh editor (Linux primary; Windows binary also released). Cargo and the daemon archive keep this file name. |
 | `fresh-gui-client` | no | Dial, auth, typed request helpers |
-| `fresh-gui-app` | yes (`fresh-gui-app`) | Native GPUI host (default) + CLI (`ping` / `smoke` / `attach` / `remote`) |
+| `fresh-gui-app` | yes (`fresh-gui-app`) | Native GPUI host. Installers put it on `PATH` as `fresh-gui` (and keep `fresh-gui-app` as a second name). CLI: open, `status` / `close`, `ping` / `smoke` / `attach` / `remote` |
 
 ### Process model
 
-1. Operator starts **`fresh-gui`** on the remote machine (background session by default, or `--foreground` for tests). One daemon process holds the session lock; Fresh Editor runs in-process on a dedicated thread; PTY shells are child processes. Linux is the documented remote; the same daemon binary is also released for Windows.
-2. Operator runs **`fresh-gui-app`** with the printed Local access URL (`?token=`) or `ws://…/ws` plus `FRESH_GUI_TOKEN`. The native host authenticates and creates/attaches a session. The daemon serves `/ws` and `/healthz` only.
+1. One daemon process per user holds the session lock (background session by default, or `--foreground` for tests). Fresh Editor runs in-process on a dedicated thread; PTY shells are child processes. Linux is the documented remote; the same daemon binary is also released for Windows. The desktop command starts this process when `fresh-gui status` would report nothing. A daemon-only install (Pixi, musl, the SCP'd `~/.local/bin/fresh-gui`) still starts it by running `fresh-gui`.
+2. The native host authenticates and creates/attaches a session. With the installer, `fresh-gui` (no URL) reads the token from the daemon's private session meta via `fresh-gui-daemon --json` on a local pipe. `--backend` with a Local access URL (`?token=`) or `ws://…/ws` plus `FRESH_GUI_TOKEN` still connects explicitly. The daemon serves `/ws` and `/healthz` only.
 3. After `hello` + `auth`, the client lists **workspaces** (or creates the default one) and switches to the focused workspace. Each workspace owns one ADE session. The daemon still accepts `layout_set` v4; the GPUI host restores workspace tab lists (`workspace_layout_set`, layout JSON v5) instead of that older blob.
 4. Terminal panes map to remote PTYs in the focused workspace’s session. Explorer and editor talk to sandboxed FS / Fresh buffer APIs over the same socket. Other workspaces stay attached on the daemon with their own PTYs.
 5. Disconnect detaches the WebSocket subscriber; every workspace, its session, and its PTYs keep running for reattach. See [WORKSPACES.md](./WORKSPACES.md).
@@ -148,20 +148,20 @@ CI on `main` (and `workflow_dispatch`) bumps CalVer and publishes a GitHub Relea
 | `fresh-gui-*-x86_64-unknown-linux-gnu.tar.gz` | headless daemon, glibc ≥ 2.31 (`scripts/package-binary.sh`) |
 | `fresh-gui-*-x86_64-unknown-linux-musl.tar.gz` | headless daemon, musl |
 | `fresh-gui-*-x86_64-pc-windows-msvc.zip` | headless daemon, Windows |
-| `fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` | Linux GPUI host only (`fresh-gui-app`), built on `ubuntu-latest` |
-| `fresh-gui-client-*-x86_64-pc-windows-msvc.zip` | Windows GPUI host only (`fresh-gui-app.exe`) |
+| `fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` | Linux GPUI host (`fresh-gui` in new archives; `fresh-gui-app` in older ones), built on `ubuntu-latest` |
+| `fresh-gui-client-*-x86_64-pc-windows-msvc.zip` | Windows GPUI host (`fresh-gui.exe`; older archives: `fresh-gui-app.exe`) |
 
 `pixi.toml` stays `linux-64`. Client archives are built by `scripts/package-client.sh` (no embedded Vite UI). `pixi run gui` remains the from-source host. The Linux client is built on `ubuntu-latest` and needs glibc ≥ 2.39 (not the daemon's glibc 2.31 zigbuild), a display, fontconfig, and a Vulkan loader.
 
-`scripts/install.sh` and `scripts/install.ps1` are the one-line installers (`curl | sh`, `irm | iex`). They resolve `latest` from the GitHub Releases redirect (asset names include the CalVer), download the **client and daemon** for the host OS, verify the sibling `.sha256` when that asset exists, and copy `fresh-gui-app` and `fresh-gui` into `~/.fresh-gui/bin` (Windows: `%USERPROFILE%\.fresh-gui\bin`), then update PATH. `FRESH_GUI_COMPONENTS=client|daemon` installs one of them. Linux defaults to the gnu assets; `FRESH_GUI_LIBC=musl` (also auto-detected on Alpine) selects the musl daemon. The GPUI client is published for gnu only, so a musl install skips it. If the default install asks for both and one archive is missing from that tag, the other is still installed. Windows assets use a `.zip` name; current releases are GNU tar files inside that name (Info-ZIP was not on the runner), so the installers sniff the magic and extract with `tar` or with unzip / `Expand-Archive`. See [README.md](../README.md#install).
+`scripts/install.sh` and `scripts/install.ps1` are the one-line installers (`curl | sh`, `irm | iex`). They resolve `latest` from the GitHub Releases redirect (asset names include the CalVer), download the **client and daemon** for the host OS, verify the sibling `.sha256` when that asset exists, and install into `~/.fresh-gui/bin` (Windows: `%USERPROFILE%\.fresh-gui\bin`), then update PATH. When both archives are present the GPUI host is `fresh-gui` (a `fresh-gui-app` hardlink points at the same file) and the headless binary is `fresh-gui-daemon`. A daemon-only install keeps the headless binary named `fresh-gui`. The installers accept either archive member name (`fresh-gui-app` from current releases, `fresh-gui` from `scripts/package-client.sh` after this change). `FRESH_GUI_COMPONENTS=client|daemon` installs one of them. Linux defaults to the gnu assets; `FRESH_GUI_LIBC=musl` (also auto-detected on Alpine) selects the musl daemon. The GPUI client is published for gnu only, so a musl install skips it. If the default install asks for both and one archive is missing from that tag, the other is still installed. Windows assets use a `.zip` name; current releases are GNU tar files inside that name (Info-ZIP was not on the runner), so the installers sniff the magic and extract with `tar` or with unzip / `Expand-Archive`. See [README.md](../README.md#install).
 
 ## 7. Host surfaces
 
 | Surface | How it connects |
 |---------|-----------------|
-| **Native GPUI host (only UI)** | `fresh-gui-app` / `pixi run gui` — gpui-kit 0.6.6 (`gpui-pre` = 0.3.6, same snapshot gpui-component requires). Speaks ADE over `fresh-gui-client`. |
-| **CLI** | `fresh-gui-app ping\|smoke\|attach\|remote` via `fresh-gui-client` |
-| **SSH bootstrap** | `fresh-gui-app remote add` / `remote connect` — OpenSSH only |
+| **Native GPUI host (only UI)** | `fresh-gui` / `pixi run gui` — gpui-kit 0.6.6 (`gpui-pre` = 0.3.6, same snapshot gpui-component requires). Speaks ADE over `fresh-gui-client`. Cargo binary name remains `fresh-gui-app`. |
+| **CLI** | `fresh-gui ping\|smoke\|attach\|status\|close\|remote` via `fresh-gui-client` and the daemon binary |
+| **SSH bootstrap** | `fresh-gui user@host`, `fresh-gui remote add` / `remote connect` — OpenSSH only |
 
 ### SSH remote bootstrap
 
@@ -171,7 +171,7 @@ The GPUI host can reach a Linux box without a hand-made tunnel. Saved targets (`
 
 1. Run a probe over SSH. It checks `~/.local/bin/fresh-gui` (then `PATH`) and the daemon's private `session.json` (`$XDG_RUNTIME_DIR/fresh-gui/` or `/tmp/fresh-gui-$UID`).
 2. If the binary is missing, download or unpack a Linux daemon (saved path, saved release URL, `FRESH_GUI_DAEMON_PATH` / `FRESH_GUI_DAEMON_URL`, or the latest GitHub `x86_64-unknown-linux-gnu` `.tar.gz`) and `scp` it to `~/.local/bin/fresh-gui`.
-3. If no session is running, start `fresh-gui --no-ui` (optional `--root`) and read the token from `session.json`.
+3. If no session is running, start `fresh-gui --no-ui` (optional `--root`) and read the token from `session.json`. On a server that only has the daemon archive, that binary is headless. On a machine where `fresh-gui` is the GPUI host, `--no-ui` starts `fresh-gui-daemon` and returns. The probe still prefers `~/.local/bin/fresh-gui`, which SCP installs as the headless binary.
 4. Open `ssh -N -L 127.0.0.1:<local>:127.0.0.1:<remote>` and hand `ws://127.0.0.1:<local>/ws` plus the token to the GPUI window. Closing the window kills the tunnel; the remote daemon keeps running.
 
 Fresh Orchestrator already models SSH workspaces, but that code is TUI/plugin-only and is not linked into the ADE daemon (`fresh-editor` feature `runtime`). The host does not reimplement an SSH client. Saved SSH targets stay a flat list. Workspaces on the connected daemon are a separate registry (several projects inside the one remote process); see [WORKSPACES.md](./WORKSPACES.md).

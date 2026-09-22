@@ -1,8 +1,8 @@
 # fresh-gui Host UI
 
-Product UI is the **native GPUI host** (`crates/fresh-gui-app`, `pixi run gui`, release asset `fresh-gui-client-*`). Architecture and protocol: [DESIGN.md](./DESIGN.md). User overview: [README.md](../README.md).
+Product UI is the **native GPUI host** (`fresh-gui`, crate `crates/fresh-gui-app`, `pixi run gui`, release asset `fresh-gui-client-*`). Architecture and protocol: [DESIGN.md](./DESIGN.md). User overview: [README.md](../README.md).
 
-Zed / VS Code-like chrome: activity bar, collapsible explorer, docked terminal + editor tabs (splits, reorder, merge), status bar, command palette. Ribbons are dense (30px title bar, 36px activity rail, 26px explorer header, 22px tree rows and status bar). The dock tab strip stays at the skin default (32px); the new-terminal **+** sits in the group suffix at the far right, next to the **···** menu. Connection is silent (`--backend` printed Local access URL with `?token=`, or `ws://…/ws` + `FRESH_GUI_TOKEN`). Download the Linux or Windows client, add an SSH remote, and connect. The daemon does not serve a page.
+Zed / VS Code-like chrome: activity bar, collapsible explorer, docked terminal + editor tabs (splits, reorder, merge), status bar, command palette. Ribbons are dense (30px title bar, 36px activity rail, 26px explorer header, 22px tree rows and status bar). The dock tab strip stays at the skin default (32px); the new-terminal **+** sits in the group suffix at the far right, next to the **···** menu. Connection is silent. `fresh-gui` with no URL reads the local session token from the daemon. `--backend` still accepts a printed Local access URL with `?token=`, or `ws://…/ws` + `FRESH_GUI_TOKEN`. `fresh-gui user@host` opens an SSH remote. The daemon does not serve a page.
 
 A later browser host would be this same GPUI UI via WebAssembly. That is not in this tree. Sections 1–9 below are notes from the removed Vite/React shell (CodeMirror, xterm). They are not a supported host and the source is gone. Current behavior is §10.
 

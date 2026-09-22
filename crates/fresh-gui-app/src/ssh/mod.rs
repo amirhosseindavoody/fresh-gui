@@ -12,3 +12,4 @@ mod probe;
 
 pub use bootstrap::{DaemonSource, Toolchain, bootstrap};
 pub use config::{SshTarget, load_remotes, remotes_config_path, save_remotes};
+pub use probe::validate_destination;

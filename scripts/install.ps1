@@ -21,6 +21,10 @@
 #   FRESH_GUI_NO_PATH_UPDATE  any non-empty value skips the user PATH update
 #   FRESH_GUI_COMPONENTS      both (default) | client | daemon
 #   FRESH_GUI_DRY_RUN         any non-empty value prints the plan and exits
+#
+# Both components: fresh-gui.exe is the GPUI host, fresh-gui-daemon.exe is the
+# headless daemon, fresh-gui-app.exe is another name for the host.
+# Daemon only: fresh-gui.exe is the headless daemon.
 
 # Parse -File arguments here. `irm | iex` has no script-level param block
 # (Invoke-Expression rejects one), and a bare script stores unknown args in $args.
@@ -233,11 +237,31 @@ public static extern IntPtr SendMessageTimeout(
         return $Value -match '^[0-9a-f]{64}$'
     }
 
+    function Install-CompatName {
+        param(
+            [string] $Source,
+            [string] $Dest
+        )
+        if ($Source -eq $Dest -or -not (Test-Path -LiteralPath $Source)) {
+            return
+        }
+        if (Test-Path -LiteralPath $Dest) {
+            Remove-Item -LiteralPath $Dest -Force
+        }
+        try {
+            New-Item -ItemType HardLink -Path $Dest -Target $Source | Out-Null
+        } catch {
+            Copy-Item -LiteralPath $Source -Destination $Dest -Force
+        }
+        Write-Host "Installed $Dest"
+    }
+
     function Install-Component {
         param(
             [string] $Url,
             [string] $Work,
-            [string] $BinaryName,
+            [string[]] $BinaryNames,
+            [string] $DestName,
             [string] $BinDir,
             [switch] $Optional
         )
@@ -299,12 +323,19 @@ public static extern IntPtr SendMessageTimeout(
 
         $extract = Join-Path $Work 'extract'
         Expand-FreshGuiArchive -Archive $archive -Destination $extract
-        $found = @(Get-ChildItem -LiteralPath $extract -Recurse -File -Filter $BinaryName)
-        if ($found.Count -lt 1) {
-            throw "Archive does not contain '$BinaryName'."
+        $found = $null
+        foreach ($name in $BinaryNames) {
+            $hits = @(Get-ChildItem -LiteralPath $extract -Recurse -File -Filter $name)
+            if ($hits.Count -ge 1) {
+                $found = $hits[0]
+                break
+            }
         }
-        $destination = Join-Path $BinDir $BinaryName
-        Copy-Item -LiteralPath $found[0].FullName -Destination $destination -Force
+        if ($null -eq $found) {
+            throw "Archive does not contain: $($BinaryNames -join ', ')."
+        }
+        $destination = Join-Path $BinDir $DestName
+        Copy-Item -LiteralPath $found.FullName -Destination $destination -Force
         Write-Host "Installed $destination"
         return $true
     }
@@ -440,12 +471,16 @@ public static extern IntPtr SendMessageTimeout(
     New-Item -ItemType Directory -Path $work | Out-Null
     try {
         if ($wantClient) {
-            if (Install-Component -Url $clientUrl -Work (Join-Path $work 'client') -BinaryName 'fresh-gui-app.exe' -BinDir $binDir -Optional:$optional) {
+            if (Install-Component -Url $clientUrl -Work (Join-Path $work 'client') -BinaryNames @('fresh-gui-app.exe', 'fresh-gui.exe') -DestName 'fresh-gui.exe' -BinDir $binDir -Optional:$optional) {
                 $gotClient = $true
+                Install-CompatName -Source (Join-Path $binDir 'fresh-gui.exe') -Dest (Join-Path $binDir 'fresh-gui-app.exe')
             }
         }
         if ($wantDaemon) {
-            if (Install-Component -Url $daemonUrl -Work (Join-Path $work 'daemon') -BinaryName 'fresh-gui.exe' -BinDir $binDir -Optional:$optional) {
+            # Beside the desktop command the daemon cannot also be named fresh-gui.exe.
+            # Daemon-only installs keep that historical name.
+            $daemonDest = if ($gotClient) { 'fresh-gui-daemon.exe' } else { 'fresh-gui.exe' }
+            if (Install-Component -Url $daemonUrl -Work (Join-Path $work 'daemon') -BinaryNames @('fresh-gui.exe', 'fresh-gui-daemon.exe') -DestName $daemonDest -BinDir $binDir -Optional:$optional) {
                 $gotDaemon = $true
             }
         }
@@ -462,7 +497,7 @@ public static extern IntPtr SendMessageTimeout(
 
     if ($NoPathUpdate) {
         Write-Host 'No PATH update because -NoPathUpdate / FRESH_GUI_NO_PATH_UPDATE is set.'
-        Write-Host "Add '$binDir' to your user PATH to run fresh-gui-app and fresh-gui."
+        Write-Host "Add '$binDir' to your user PATH to run fresh-gui."
     } else {
         $current = Get-EnvValue -Name 'PATH'
         if ($null -eq $current) {
@@ -485,13 +520,17 @@ public static extern IntPtr SendMessageTimeout(
 
     Write-Host ''
     if ($gotClient) {
-        Write-Host 'Next, open a project on a Linux machine:'
-        Write-Host '  fresh-gui-app remote add lab user@server --root /path/to/project'
-        Write-Host '  fresh-gui-app remote connect lab'
-    }
-    if ($gotDaemon) {
-        Write-Host 'Or start the daemon in a project directory on this machine:'
+        Write-Host 'Run fresh-gui. It starts the local daemon when needed and opens the window:'
+        Write-Host '  fresh-gui'
+        Write-Host '  fresh-gui C:\path\to\project'
+        Write-Host 'Connect to a Linux machine over SSH:'
+        Write-Host '  fresh-gui user@server'
+        Write-Host '  fresh-gui remote add lab user@server --root /path/to/project'
+        Write-Host '  fresh-gui remote connect lab'
+    } elseif ($gotDaemon) {
+        Write-Host 'Daemon-only install. Start a background session in a project directory:'
         Write-Host '  cd C:\path\to\project'
         Write-Host '  fresh-gui'
+        Write-Host '  fresh-gui close'
     }
 } @script:FreshGuiFileArgs

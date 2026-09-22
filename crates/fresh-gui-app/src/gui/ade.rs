@@ -247,7 +247,7 @@ async fn ade_loop(
     };
 
     let hello = client.backend_hello.clone();
-    let boot = match bootstrap_workspaces(&mut client).await {
+    let boot = match bootstrap_workspaces(&mut client, target.preferred_root.as_deref()).await {
         Ok(boot) => boot,
         Err(err) => {
             let _ = evt_tx
@@ -475,7 +475,10 @@ struct Boot {
     attached: Option<AttachedWorkspace>,
 }
 
-async fn bootstrap_workspaces(client: &mut Client) -> anyhow::Result<Boot> {
+async fn bootstrap_workspaces(
+    client: &mut Client,
+    preferred_root: Option<&str>,
+) -> anyhow::Result<Boot> {
     let cap = client
         .backend_hello
         .capabilities
@@ -492,20 +495,20 @@ async fn bootstrap_workspaces(client: &mut Client) -> anyhow::Result<Boot> {
 
     client.send(Message::WorkspaceList).await?;
     let (mut workspaces, focused) = recv_workspace_list(client).await?;
-    if workspaces.is_empty() {
-        client
-            .send(Message::WorkspaceCreate {
-                name: None,
-                root: None,
-            })
-            .await?;
-        let created = recv_workspace_created(client).await?;
-        workspaces.push(created);
-    }
-    let fallback = workspaces[0].id.clone();
-    let id = focused
-        .filter(|id| workspaces.iter().any(|workspace| &workspace.id == id))
-        .unwrap_or(fallback);
+    let action =
+        super::connect::plan_workspace_boot(&workspaces, focused.as_deref(), preferred_root);
+    let id = match action {
+        super::connect::BootAction::Switch { id } => id,
+        super::connect::BootAction::Create { root } => {
+            client
+                .send(Message::WorkspaceCreate { name: None, root })
+                .await?;
+            let created = recv_workspace_created(client).await?;
+            let id = created.id.clone();
+            workspaces.push(created);
+            id
+        }
+    };
     client
         .send(Message::WorkspaceSwitch { workspace_id: id })
         .await?;

@@ -29,7 +29,8 @@ clippy = "cargo clippy --workspace --all-targets -- -D warnings"
 fmt = "cargo fmt --all"
 fmt-check = "cargo fmt --all -- --check"
 backend = "cargo run -p fresh-gui --"
-gui = "cargo run -p fresh-gui-app --"
+# Builds the headless daemon first so the host can find target/debug/fresh-gui.
+gui = "cargo build -p fresh-gui --bins && cargo run -p fresh-gui-app --"
 # Start a detached background session (prints the connect URL, returns).
 # Headless ADE; the native host is `pixi run gui`.
 serve = "cargo run -p fresh-gui --"
@@ -43,7 +44,7 @@ close = "cargo run -p fresh-gui -- close"
 status = "cargo run -p fresh-gui -- status"
 build-release = "cargo build --release -p fresh-gui"
 backend-release = "cargo run --release -p fresh-gui --"
-app = "cargo run -p fresh-gui-app --"
+app = "cargo build -p fresh-gui --bins && cargo run -p fresh-gui-app --"
 package = "pixi build -o dist"
 # Standalone archive: `pixi run package-binary -- <target> <version> [out-dir]`
 package-binary = "scripts/package-binary.sh"

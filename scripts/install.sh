@@ -3,10 +3,13 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/amirhosseindavoody/fresh-gui/main/scripts/install.sh | sh
 #
-# Downloads the GPUI client (fresh-gui-app) and the headless daemon (fresh-gui)
-# for this machine from GitHub Releases, checks the sibling .sha256 asset when
-# it exists, and copies both into ~/.fresh-gui/bin. Adds that directory to the
-# shell rc / profile unless FRESH_GUI_NO_PATH_UPDATE is set.
+# Downloads the GPUI host and the headless daemon for this machine from GitHub
+# Releases, checks the sibling .sha256 asset when it exists, and copies them
+# into ~/.fresh-gui/bin. The command on PATH is `fresh-gui` (the desktop app).
+# When both archives are installed, the headless daemon is `fresh-gui-daemon`
+# beside it. A daemon-only install keeps the headless binary named `fresh-gui`.
+# Adds that directory to the shell rc / profile unless FRESH_GUI_NO_PATH_UPDATE
+# is set.
 # With the default components=both, a release that lacks one of the two
 # archives still installs the other. components=client or daemon fails if
 # that archive is missing.
@@ -73,8 +76,8 @@ main() {
   if [ "$libc" = "musl" ] && [ "$want_client" -eq 1 ]; then
     if [ "$want_daemon" -eq 1 ]; then
       echo "note: the GPUI client is published for x86_64-unknown-linux-gnu only." >&2
-      echo "      Skipping fresh-gui-app. Set FRESH_GUI_LIBC=gnu to download the glibc client." >&2
-      echo "      Installing the musl daemon (fresh-gui)." >&2
+      echo "      Skipping the desktop command. Set FRESH_GUI_LIBC=gnu to download the glibc client." >&2
+      echo "      Installing the musl daemon as fresh-gui." >&2
       want_client=0
     else
       echo "error: the GPUI client is published for x86_64-unknown-linux-gnu only." >&2
@@ -132,13 +135,44 @@ main() {
   fi
   got_client=0
   got_daemon=0
+  # Client archive members are `fresh-gui-app` on current releases and
+  # `fresh-gui` once package-client.sh renames the host. Install that file
+  # as `fresh-gui` either way, and keep a `fresh-gui-app` name for old notes.
   if [ "$want_client" -eq 1 ]; then
-    if install_one "$client_url" "$work/client" "fresh-gui-app" "$bin_dir" "$ext" "$optional"; then
+    if [ "$ext" = "zip" ]; then
+      if install_named "$client_url" "$work/client" "fresh-gui.exe" "$bin_dir" "$ext" "$optional" \
+        fresh-gui-app.exe fresh-gui.exe; then
+        got_client=1
+        link_same "${bin_dir}/fresh-gui.exe" "${bin_dir}/fresh-gui-app.exe"
+      fi
+    elif install_named "$client_url" "$work/client" "fresh-gui" "$bin_dir" "$ext" "$optional" \
+      fresh-gui-app fresh-gui; then
       got_client=1
+      link_same "${bin_dir}/fresh-gui" "${bin_dir}/fresh-gui-app"
     fi
   fi
   if [ "$want_daemon" -eq 1 ]; then
-    if install_one "$daemon_url" "$work/daemon" "fresh-gui" "$bin_dir" "$ext" "$optional"; then
+    # Beside the desktop command the daemon cannot also be named fresh-gui.
+    # Daemon-only (servers, musl) keeps the historical `fresh-gui` name so
+    # `remote connect` and pixi-style headless use still match.
+    if [ "$got_client" -eq 1 ]; then
+      if [ "$ext" = "zip" ]; then
+        daemon_dest="fresh-gui-daemon.exe"
+      else
+        daemon_dest="fresh-gui-daemon"
+      fi
+    elif [ "$ext" = "zip" ]; then
+      daemon_dest="fresh-gui.exe"
+    else
+      daemon_dest="fresh-gui"
+    fi
+    if [ "$ext" = "zip" ]; then
+      if install_named "$daemon_url" "$work/daemon" "$daemon_dest" "$bin_dir" "$ext" "$optional" \
+        fresh-gui.exe fresh-gui-daemon.exe; then
+        got_daemon=1
+      fi
+    elif install_named "$daemon_url" "$work/daemon" "$daemon_dest" "$bin_dir" "$ext" "$optional" \
+      fresh-gui fresh-gui-daemon; then
       got_daemon=1
     fi
   fi
@@ -151,7 +185,7 @@ main() {
 
   if [ -n "${FRESH_GUI_NO_PATH_UPDATE:-}" ]; then
     echo "No PATH update because FRESH_GUI_NO_PATH_UPDATE is set."
-    echo "Add '${bin_dir}' to your PATH to run fresh-gui-app and fresh-gui."
+    echo "Add '${bin_dir}' to your PATH to run fresh-gui."
   else
     update_path "$bin_dir"
   fi
@@ -457,24 +491,16 @@ extract_archive() {
   esac
 }
 
-find_binary() {
-  root=$1
-  name=$2
-  found=$(find "$root" -type f -name "$name" | awk 'NR == 1 { print; exit }')
-  if [ -z "$found" ]; then
-    echo "error: archive does not contain '${name}'." >&2
-    exit 1
-  fi
-  printf '%s\n' "$found"
-}
-
-install_one() {
+# install_named URL STAGE DEST_BASENAME DEST_DIR EXT OPTIONAL CANDIDATE...
+# Copies the first archive member whose file name matches a candidate.
+install_named() {
   url=$1
   stage=$2
-  bin_name=$3
+  dest_base=$3
   dest_dir=$4
   ext_name=$5
   optional=$6
+  shift 6
   mkdir -p "$stage"
   archive="$stage/archive"
   code=$(http_download "$url" "$archive") || exit 1
@@ -499,17 +525,41 @@ install_one() {
   fi
   verify_checksum "$archive" "${url}.sha256" "$stage/archive.sha256"
   extract_archive "$archive" "$stage/extract" "$ext_name"
-  case "$ext_name" in
-    zip) src_name="${bin_name}.exe" ;;
-    *) src_name="$bin_name" ;;
-  esac
-  src=$(find_binary "$stage/extract" "$src_name") || exit 1
+  src=""
+  for name in "$@"; do
+    found=$(find "$stage/extract" -type f -name "$name" | awk 'NR == 1 { print; exit }')
+    if [ -n "$found" ]; then
+      src=$found
+      break
+    fi
+  done
+  if [ -z "$src" ]; then
+    echo "error: archive does not contain any of: $*" >&2
+    exit 1
+  fi
   mkdir -p "$dest_dir"
-  tmp_dest="${dest_dir}/${src_name}.partial"
+  tmp_dest="${dest_dir}/${dest_base}.partial"
   cp "$src" "$tmp_dest"
   chmod 755 "$tmp_dest"
-  mv -f "$tmp_dest" "${dest_dir}/${src_name}"
-  echo "Installed ${dest_dir}/${src_name}"
+  mv -f "$tmp_dest" "${dest_dir}/${dest_base}"
+  echo "Installed ${dest_dir}/${dest_base}"
+}
+
+# Second name for the same bytes (hardlink, or a copy when links are refused).
+link_same() {
+  src=$1
+  dest=$2
+  if [ "$src" = "$dest" ] || [ ! -f "$src" ]; then
+    return 0
+  fi
+  rm -f "$dest"
+  if ln "$src" "$dest" 2>/dev/null; then
+    echo "Installed ${dest}"
+    return 0
+  fi
+  cp "$src" "$dest"
+  chmod 755 "$dest"
+  echo "Installed ${dest}"
 }
 
 update_shell_file() {
@@ -572,14 +622,18 @@ print_next_steps() {
   os_name=$3
   echo
   if [ "$did_client" -eq 1 ]; then
-    echo "Next, open a project on a Linux machine:"
-    echo "  fresh-gui-app remote add lab user@server --root /path/to/project"
-    echo "  fresh-gui-app remote connect lab"
-  fi
-  if [ "$did_daemon" -eq 1 ]; then
-    echo "Or start the daemon in a project directory on this machine:"
+    echo "Run fresh-gui. It starts the local daemon when needed and opens the window:"
+    echo "  fresh-gui"
+    echo "  fresh-gui /path/to/project"
+    echo "Connect to a Linux machine over SSH:"
+    echo "  fresh-gui user@server"
+    echo "  fresh-gui remote add lab user@server --root /path/to/project"
+    echo "  fresh-gui remote connect lab"
+  elif [ "$did_daemon" -eq 1 ]; then
+    echo "Daemon-only install. Start a background session in a project directory:"
     echo "  cd /path/to/project"
     echo "  fresh-gui"
+    echo "  fresh-gui close"
   fi
   if [ "$did_client" -eq 1 ] && [ "$os_name" = "Linux" ]; then
     echo

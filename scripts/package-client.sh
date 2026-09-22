@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Package the native GPUI host (fresh-gui-app) as a client archive.
+# Package the native GPUI host as a client archive.
 #
 # Usage:
 #   scripts/package-client.sh <target> <version> [out-dir]
 #
 # Expects a release binary at target/<triple>/release/fresh-gui-app[.exe]
-# (or target/release/ when that matches the host).
+# (or target/release/ when that matches the host). The archive member is
+# named fresh-gui[.exe] — that is the user-facing command. Cargo keeps the
+# fresh-gui-app file name so it does not collide with the daemon binary.
 #
 # Writes under out-dir (default: dist/client):
 #   fresh-gui-client-<version>-<target>.zip      (windows)
@@ -28,18 +30,22 @@ cd "$ROOT"
 case "$TARGET" in
   *windows* | *msvc* | *gnu*-pc-windows*)
     IS_WINDOWS=1
-    BIN_NAME="fresh-gui-app.exe"
+    CARGO_BIN="fresh-gui-app.exe"
+    BIN_NAME="fresh-gui.exe"
     ARCHIVE_EXT="zip"
     ;;
   *)
     IS_WINDOWS=0
-    BIN_NAME="fresh-gui-app"
+    CARGO_BIN="fresh-gui-app"
+    BIN_NAME="fresh-gui"
     ARCHIVE_EXT="tar.gz"
     ;;
 esac
 
 find_binary() {
   local candidates=(
+    "$ROOT/target/${TARGET}/release/${CARGO_BIN}"
+    "$ROOT/target/release/${CARGO_BIN}"
     "$ROOT/target/${TARGET}/release/${BIN_NAME}"
     "$ROOT/target/release/${BIN_NAME}"
   )
@@ -54,7 +60,7 @@ find_binary() {
       return 0
     fi
   done
-  echo "error: release client binary not found for target=${TARGET} (looked for ${BIN_NAME})" >&2
+  echo "error: release client binary not found for target=${TARGET} (looked for ${CARGO_BIN})" >&2
   printf '  tried: %s\n' "${candidates[@]}" >&2
   exit 1
 }
@@ -76,21 +82,24 @@ fresh-gui client ${VERSION}
 target: ${TARGET%%.*}
 
 This is the native GPUI host (${BIN_NAME}), not the Linux daemon.
-The daemon stays on the Linux machine and is published separately
-(fresh-gui-*-x86_64-unknown-linux-gnu.tar.gz).
+Run it with no arguments on a machine that also has the daemon, or point it
+at SSH. The repo installer names the headless binary fresh-gui-daemon when
+both are installed. The daemon archive stays separate
+(fresh-gui-*-x86_64-unknown-linux-gnu.tar.gz, member bin/fresh-gui).
 
-Add an SSH target and connect (OpenSSH keys / agent; no password prompt):
-
-  ${BIN_NAME} remote add lab user@server --root /path/to/project
-  ${BIN_NAME} remote connect lab
+  ./${BIN_NAME}
+  ./${BIN_NAME} /path/to/project
+  ./${BIN_NAME} user@server
+  ./${BIN_NAME} remote add lab user@server --root /path/to/project
+  ./${BIN_NAME} remote connect lab
 
 If the remote has no fresh-gui binary, the host copies a Linux daemon to
 ~/.local/bin/fresh-gui, starts it headless, and tunnels ADE /ws to this window.
 
 Optional daemon source (default: latest GitHub linux-gnu release):
 
-  ${BIN_NAME} remote daemon --path /path/to/fresh-gui
-  ${BIN_NAME} remote daemon --url https://github.com/amirhosseindavoody/fresh-gui/releases/download/v${VERSION}/fresh-gui-${VERSION}-x86_64-unknown-linux-gnu.tar.gz
+  ./${BIN_NAME} remote daemon --path /path/to/fresh-gui
+  ./${BIN_NAME} remote daemon --url https://github.com/amirhosseindavoody/fresh-gui/releases/download/v${VERSION}/fresh-gui-${VERSION}-x86_64-unknown-linux-gnu.tar.gz
 
 Saved targets: %APPDATA%\\fresh-gui\\remotes.json on Windows,
 ~/.config/fresh-gui/remotes.json on Linux. Tokens are not stored there.
