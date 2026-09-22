@@ -383,7 +383,7 @@ fn materialize_daemon(
     if let Some(path) = &daemon.path {
         if !path.is_file() {
             bail!(
-                "daemon binary path {} is not a file. Set it with `fresh-gui-app remote daemon --path` or FRESH_GUI_DAEMON_PATH.",
+                "daemon binary path {} is not a file. Set it with `fresh-gui remote daemon --path` or FRESH_GUI_DAEMON_PATH.",
                 path.display()
             );
         }

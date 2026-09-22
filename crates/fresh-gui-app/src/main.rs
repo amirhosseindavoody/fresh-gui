@@ -1,9 +1,15 @@
-//! fresh-gui-app — native GPUI ADE host, plus CLI helpers.
+//! fresh-gui — native GPUI ADE host.
 //!
-//! Default (no subcommand): open the native desktop shell.
-//! CLI: `ping` / `smoke` / `attach` talk to a running daemon.
+//! Default: ensure the per-user headless daemon and open the desktop shell.
+//! `user@host` and `remote connect` SSH-bootstrap a Linux daemon and open the
+//! same window. `ping` / `smoke` / `attach` talk to a running daemon.
+//!
+//! The Cargo binary name stays `fresh-gui-app` so it does not collide with the
+//! daemon package in `target/`. Installers place this executable on `PATH` as
+//! `fresh-gui`.
 
 mod gui;
+mod launch;
 mod ssh;
 
 use anyhow::{Context, Result};
@@ -18,19 +24,41 @@ use tracing::info;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "fresh-gui-app",
+    name = "fresh-gui",
+    bin_name = "fresh-gui",
     version,
-    about = "Native GPUI ADE host for fresh-gui"
+    about = "Open the fresh-gui desktop shell",
+    after_help = "\
+With no arguments, fresh-gui starts the local daemon when this user has none \
+and opens the window against that session.\n\
+A project path focuses that directory. user@host installs or reuses a Linux \
+daemon over SSH and opens the window.\n\
+Saved remotes: fresh-gui remote add / remote connect."
 )]
 struct Args {
     #[command(subcommand)]
     cmd: Option<Cmd>,
 
-    /// Backend WebSocket URL or the printed Local access HTTP URL (`?token=`).
-    #[arg(long, global = true, default_value = "ws://127.0.0.1:7420/ws")]
-    backend: String,
+    /// Local project directory, `user@host`, or a saved remote name.
+    #[arg(value_name = "TARGET")]
+    target: Option<String>,
+
+    /// Project directory. With `user@host`, this is the remote `--root`.
+    #[arg(long)]
+    root: Option<String>,
+
+    /// Start the local daemon if needed and return. Does not open a window.
+    /// Remote bootstrap runs this on the Linux host (`fresh-gui --no-ui`).
+    #[arg(long, env = "FRESH_GUI_NO_UI")]
+    no_ui: bool,
+
+    /// Backend WebSocket URL or a Local access HTTP URL (`?token=`).
+    /// When set, fresh-gui does not start a local daemon.
+    #[arg(long, global = true)]
+    backend: Option<String>,
 
     /// Auth token if the backend requires one (also `FRESH_GUI_TOKEN`).
+    /// The usual local and SSH paths read the token from the session file.
     #[arg(long, global = true, env = "FRESH_GUI_TOKEN")]
     token: Option<String>,
 }
@@ -39,6 +67,10 @@ struct Args {
 enum Cmd {
     /// Open the native GPUI host (default when no subcommand is given).
     Gui,
+    /// Print URL / token / log path for the local daemon session.
+    Status,
+    /// Stop the local daemon session.
+    Close,
     /// Ping the backend (hello + ping/pong).
     Ping,
     /// Open a PTY, run a printf, print captured output (CI / smoke).
@@ -97,6 +129,11 @@ enum RemoteCmd {
 }
 
 fn main() -> Result<()> {
+    if std::env::var_os("FRESH_GUI_DAEMON_CHILD").is_some() {
+        eprintln!("fresh-gui: this binary is the desktop app, not the headless daemon");
+        std::process::exit(1);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -104,19 +141,149 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let Args {
-        cmd,
-        backend,
-        token,
-    } = Args::parse();
-
-    match cmd.unwrap_or(Cmd::Gui) {
-        Cmd::Gui => gui::run(backend, token),
-        Cmd::Ping => tokio_block_on(cmd_ping(backend, token)),
-        Cmd::Smoke => tokio_block_on(cmd_smoke(backend, token)),
-        Cmd::Attach { cols, rows } => tokio_block_on(cmd_attach(backend, token, cols, rows)),
-        Cmd::Remote { cmd } => cmd_remote(cmd),
+    let args = Args::parse();
+    match args.cmd {
+        Some(Cmd::Ping) => {
+            let (backend, token) = resolve_backend(args.backend, args.token)?;
+            tokio_block_on(cmd_ping(backend, token))
+        }
+        Some(Cmd::Smoke) => {
+            let (backend, token) = resolve_backend(args.backend, args.token)?;
+            tokio_block_on(cmd_smoke(backend, token))
+        }
+        Some(Cmd::Attach { cols, rows }) => {
+            let (backend, token) = resolve_backend(args.backend, args.token)?;
+            tokio_block_on(cmd_attach(backend, token, cols, rows))
+        }
+        Some(Cmd::Remote { cmd }) => cmd_remote(cmd),
+        Some(Cmd::Status) => delegate_daemon(&["status"]),
+        Some(Cmd::Close) => delegate_daemon(&["close"]),
+        Some(Cmd::Gui) | None => open_default(&args),
     }
+}
+
+fn open_default(args: &Args) -> Result<()> {
+    if args.backend.is_some() && args.target.is_some() {
+        anyhow::bail!("pass either TARGET or --backend");
+    }
+    if args.no_ui && args.backend.is_some() {
+        anyhow::bail!("--no-ui starts the local daemon and does not use --backend");
+    }
+    if let Some(backend) = args.backend.clone() {
+        return gui::run(backend, args.token.clone());
+    }
+
+    let path = ssh::remotes_config_path()?;
+    let file = ssh::load_remotes(&path)?;
+    let saved: Vec<launch::KnownRemote<'_>> = file
+        .targets
+        .iter()
+        .map(|target| launch::KnownRemote {
+            name: &target.name,
+            destination: &target.destination,
+        })
+        .collect();
+    let launch = launch::classify_launch(args.target.as_deref(), args.root.as_deref(), &saved)?;
+    match launch {
+        launch::LaunchTarget::Local { root } => {
+            open_local(root.as_deref(), args.token.clone(), args.no_ui)
+        }
+        launch::LaunchTarget::SavedRemote {
+            name,
+            root_override,
+        } => {
+            if args.no_ui {
+                anyhow::bail!(
+                    "--no-ui is the local daemon. Use `fresh-gui remote connect {name}` to open a remote."
+                );
+            }
+            cmd_remote_connect(&path, &name, root_override)
+        }
+        launch::LaunchTarget::AdHocRemote { destination, root } => {
+            if args.no_ui {
+                anyhow::bail!(
+                    "--no-ui is the local daemon. Use `fresh-gui {destination}` to open that host."
+                );
+            }
+            open_adhoc_remote(&destination, root)
+        }
+    }
+}
+
+fn open_local(root: Option<&std::path::Path>, token: Option<String>, no_ui: bool) -> Result<()> {
+    let session = launch::ensure_local_session(root)?;
+    if session.started {
+        eprintln!("Started the local fresh-gui session (pid {}).", session.pid);
+    } else {
+        eprintln!(
+            "Attaching to the running fresh-gui session (pid {}).",
+            session.pid
+        );
+    }
+    if no_ui {
+        return Ok(());
+    }
+    let mut target = gui::parse_connect_target(&session.ws_url, token.or(session.token));
+    target.preferred_root = session.preferred_root;
+    gui::run_target(target)
+}
+
+fn open_adhoc_remote(destination: &str, root: Option<String>) -> Result<()> {
+    let target = ssh::SshTarget {
+        name: launch::ad_hoc_remote_name(destination),
+        destination: destination.to_string(),
+        port: None,
+        identity: None,
+        remote_root: root,
+        local_port: None,
+    };
+    let path = ssh::remotes_config_path()?;
+    let file = ssh::load_remotes(&path)?;
+    let env_path = std::env::var("FRESH_GUI_DAEMON_PATH").ok();
+    let env_url = std::env::var("FRESH_GUI_DAEMON_URL").ok();
+    let daemon = ssh::DaemonSource::resolve(&file, env_path.as_deref(), env_url.as_deref());
+    open_bootstrapped(&target, &daemon)
+}
+
+fn open_bootstrapped(target: &SshTarget, daemon: &DaemonSource) -> Result<()> {
+    let session = bootstrap(target, daemon, &Toolchain::default(), |line| {
+        eprintln!("{line}");
+    })?;
+    eprintln!(
+        "Tunnel ready. Opening fresh-gui at {} ({})",
+        session.ws_url, session.destination
+    );
+    let gui_target = gui::ConnectTarget {
+        ws_url: session.ws_url.clone(),
+        token: session.token.clone(),
+        label: Some(session.destination.clone()),
+        preferred_root: target.remote_root.clone(),
+    };
+    let result = gui::run_target(gui_target);
+    drop(session);
+    eprintln!("Closed SSH tunnel.");
+    result
+}
+
+fn resolve_backend(
+    backend: Option<String>,
+    token: Option<String>,
+) -> Result<(String, Option<String>)> {
+    if let Some(backend) = backend {
+        return Ok((backend, token));
+    }
+    let session = launch::ensure_local_session(None)?;
+    Ok((session.ws_url, token.or(session.token)))
+}
+
+fn delegate_daemon(args: &[&str]) -> Result<()> {
+    let bin = launch::find_daemon()?;
+    let status = std::process::Command::new(&bin)
+        .args(args)
+        .env("FRESH_GUI_DAEMON_CHILD", "1")
+        .status()
+        .with_context(|| format!("run {} {}", bin.display(), args.join(" ")))?;
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 fn tokio_block_on<F>(fut: F) -> Result<()>
@@ -244,14 +411,14 @@ fn cmd_remote(cmd: RemoteCmd) -> Result<()> {
                 "Saved SSH target '{name}' ({destination}) in {}",
                 path.display()
             );
-            println!("Connect with: fresh-gui-app remote connect {name}");
+            println!("Connect with: fresh-gui remote connect {name}");
             Ok(())
         }
         RemoteCmd::List => {
             let file = load_remotes(&path)?;
             if file.targets.is_empty() {
                 println!("No saved SSH targets ({})", path.display());
-                println!("Add one with: fresh-gui-app remote add <name> <user@host>");
+                println!("Add one with: fresh-gui remote add <name> <user@host>");
                 return Ok(());
             }
             println!("SSH targets ({})", path.display());
@@ -287,7 +454,7 @@ fn cmd_remote(cmd: RemoteCmd) -> Result<()> {
             );
             Ok(())
         }
-        RemoteCmd::Connect { name } => cmd_remote_connect(&path, &name),
+        RemoteCmd::Connect { name } => cmd_remote_connect(&path, &name, None),
         RemoteCmd::Daemon {
             url,
             path: daemon_path,
@@ -338,26 +505,65 @@ fn cmd_remote_daemon(
     Ok(())
 }
 
-fn cmd_remote_connect(path: &std::path::Path, name: &str) -> Result<()> {
+fn cmd_remote_connect(
+    path: &std::path::Path,
+    name: &str,
+    root_override: Option<String>,
+) -> Result<()> {
     let file = load_remotes(path)?;
-    let target = file.get(name)?.clone();
+    let mut target = file.get(name)?.clone();
+    if let Some(root) = root_override {
+        target.remote_root = Some(root);
+    }
     let env_path = std::env::var("FRESH_GUI_DAEMON_PATH").ok();
     let env_url = std::env::var("FRESH_GUI_DAEMON_URL").ok();
     let daemon = DaemonSource::resolve(&file, env_path.as_deref(), env_url.as_deref());
-    let session = bootstrap(&target, &daemon, &Toolchain::default(), |line| {
-        eprintln!("{line}");
-    })?;
-    eprintln!(
-        "Tunnel ready. Opening the GPUI host at {} ({})",
-        session.ws_url, session.destination
-    );
-    let gui_target = gui::ConnectTarget {
-        ws_url: session.ws_url.clone(),
-        token: session.token.clone(),
-        label: Some(session.destination.clone()),
-    };
-    let result = gui::run_target(gui_target);
-    drop(session);
-    eprintln!("Closed SSH tunnel.");
-    result
+    open_bootstrapped(&target, &daemon)
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn bare_invocation_opens_the_local_app() {
+        let args = Args::try_parse_from(["fresh-gui"]).unwrap();
+        assert!(args.cmd.is_none());
+        assert!(args.target.is_none());
+        assert!(args.backend.is_none());
+        assert!(!args.no_ui);
+    }
+
+    #[test]
+    fn project_path_and_ssh_destination_are_positionals() {
+        let path = Args::try_parse_from(["fresh-gui", "/work/app"]).unwrap();
+        assert_eq!(path.target.as_deref(), Some("/work/app"));
+        assert!(path.cmd.is_none());
+
+        let remote = Args::try_parse_from(["fresh-gui", "ada@lab", "--root", "/srv/app"]).unwrap();
+        assert_eq!(remote.target.as_deref(), Some("ada@lab"));
+        assert_eq!(remote.root.as_deref(), Some("/srv/app"));
+    }
+
+    #[test]
+    fn subcommands_stay_subcommands() {
+        let status = Args::try_parse_from(["fresh-gui", "status"]).unwrap();
+        assert!(matches!(status.cmd, Some(Cmd::Status)));
+
+        let connect = Args::try_parse_from(["fresh-gui", "remote", "connect", "lab"]).unwrap();
+        assert!(matches!(connect.cmd, Some(Cmd::Remote { .. })));
+
+        let headless =
+            Args::try_parse_from(["fresh-gui", "--no-ui", "--root", "/work/app"]).unwrap();
+        assert!(headless.no_ui);
+        assert_eq!(headless.root.as_deref(), Some("/work/app"));
+        assert!(headless.cmd.is_none());
+    }
+
+    #[test]
+    fn explicit_backend_skips_the_positional() {
+        let args = Args::try_parse_from(["fresh-gui", "--backend", "ws://127.0.0.1:9/ws"]).unwrap();
+        assert_eq!(args.backend.as_deref(), Some("ws://127.0.0.1:9/ws"));
+        assert!(args.target.is_none());
+    }
 }

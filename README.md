@@ -1,6 +1,6 @@
 # fresh-gui
 
-A **terminal-first IDE shell** for a remote Linux machine. Run the backend on your server; open shells, edit files, and browse the tree from the **native GPUI host** (`fresh-gui-app`, Zed / VS Code feel). Download the Linux or Windows client, add an SSH remote, and connect.
+A **terminal-first IDE shell**. Run **`fresh-gui`**. It opens the native GPUI host (Zed / VS Code feel) and, on this machine, starts the headless daemon when this user does not already have one. A path opens that project. `fresh-gui user@host` installs or reuses the daemon on a Linux machine over SSH and opens the same window.
 
 Inspired by [Terax](https://github.com/crynta/terax-ai) (layout and terminal-first product sense — not Tauri). The remote editor core is [Fresh](https://github.com/sinelaw/fresh). The host is a renderer only: it speaks `fresh-gui-protocol` over WebSocket; Fresh stays buffer authority on the daemon.
 
@@ -24,18 +24,19 @@ Review the Windows script before running it:
 powershell -c "irm https://raw.githubusercontent.com/amirhosseindavoody/fresh-gui/main/scripts/install.ps1 | more"
 ```
 
-The script reads the latest [GitHub Release](https://github.com/amirhosseindavoody/fresh-gui/releases) for this machine, checks the `.sha256` file published next to each archive, and copies:
+The script reads the latest [GitHub Release](https://github.com/amirhosseindavoody/fresh-gui/releases) for this machine, checks the `.sha256` file published next to each archive, and copies binaries into `~/.fresh-gui/bin` (Windows: `%USERPROFILE%\.fresh-gui\bin`). It prepends that directory to `PATH` (shell rc / profile on Unix, the user `PATH` on Windows). Open a new terminal afterward. Published hosts are Linux x86_64 and Windows x86_64. macOS has no release build.
 
-| Binary | Role |
-|--------|------|
-| `fresh-gui-app` | Native GPUI host (primary) |
-| `fresh-gui` | Headless daemon, for this machine or for `remote daemon --path` |
+| On `PATH` | When |
+|-----------|------|
+| `fresh-gui` | Always. With the client installed this is the GPUI host: it starts or reuses the local daemon and opens the window. |
+| `fresh-gui-daemon` | Client and daemon both installed. Headless ADE process the desktop command launches. |
+| `fresh-gui-app` | Same program as `fresh-gui` when the client is installed (older name). |
 
-into `~/.fresh-gui/bin` (Windows: `%USERPROFILE%\.fresh-gui\bin`) and prepends that directory to `PATH` (shell rc / profile on Unix, the user `PATH` on Windows). Open a new terminal afterward. Published hosts are Linux x86_64 and Windows x86_64. macOS has no release build.
+A daemon-only install (`FRESH_GUI_COMPONENTS=daemon`, or musl) names the headless binary `fresh-gui` and does not install a window. That is the server / `remote connect` binary (`~/.local/bin/fresh-gui` after SSH bootstrap). Remote SCP still looks for `bin/fresh-gui` inside the daemon archive.
 
 Windows assets are named `.zip`. The ones on current releases are GNU tar archives, and the installer extracts those with `tar` (included with Windows 10 and later). A real PK zip is unpacked with `Expand-Archive` / `unzip`.
 
-The default is **both** archives when the release contains them. Linux uses the gnu builds (`x86_64-unknown-linux-gnu`). Alpine (or `FRESH_GUI_LIBC=musl`) installs the musl daemon; the GPUI client is gnu-only, so that install skips `fresh-gui-app` unless you set `FRESH_GUI_LIBC=gnu`.
+The default is **both** archives when the release contains them. Linux uses the gnu builds (`x86_64-unknown-linux-gnu`). Alpine (or `FRESH_GUI_LIBC=musl`) installs the musl daemon as `fresh-gui`; the GPUI client is gnu-only, so that install skips the desktop command unless you set `FRESH_GUI_LIBC=gnu`.
 
 | Setting | Shell | PowerShell |
 |---------|-------|------------|
@@ -64,16 +65,35 @@ irm https://raw.githubusercontent.com/amirhosseindavoody/fresh-gui/main/scripts/
 
 The Linux client needs glibc ≥ 2.39, an X11 or Wayland session, fontconfig, and a Vulkan loader (`libvulkan.so.1`). The daemon gnu build needs glibc ≥ 2.31. Pixi remains available for the daemon alone (below).
 
-## Install the backend (Linux)
+## Open the app
 
-On the machine that holds your project:
+After the installer (client + daemon):
+
+```bash
+fresh-gui                      # this directory; starts the daemon if needed, then the window
+fresh-gui /path/to/project     # that project (creates or focuses a workspace if a session exists)
+fresh-gui status               # URL, token, log, pid
+fresh-gui close                # stop the background session
+```
+
+If a session is already running, `fresh-gui` attaches the window to it. It does not start a second daemon. The token comes from the private session file. You do not paste a URL.
+
+Pass an explicit backend when you already have a tunnel or a printed Local access URL:
+
+```bash
+fresh-gui --backend 'http://127.0.0.1:7420/?token=<token>'
+```
+
+## Headless daemon (servers, Pixi)
+
+Pixi and `FRESH_GUI_COMPONENTS=daemon` install only the headless binary, still named `fresh-gui`. On that machine the command starts a background session and returns the shell. It does not open a window.
 
 ```bash
 pixi global install --git https://github.com/amirhosseindavoody/fresh-gui.git
 # or a release tag / .conda from https://github.com/amirhosseindavoody/fresh-gui/releases
 
 cd /path/to/your/project
-fresh-gui          # starts a background session, prints the URL, returns the shell
+fresh-gui          # background session, prints the URL, returns the shell
 fresh-gui          # already running → reprint URL / token / log path
 fresh-gui close    # stop the session
 ```
@@ -93,12 +113,12 @@ The process prints something like:
 
   From another machine (e.g. your laptop) — SSH tunnel, nothing exposed to the network:
     ssh -L 7420:127.0.0.1:7420 user@your-server
-    fresh-gui-app --backend 'http://127.0.0.1:7420/?token=<token>'
+    fresh-gui --backend 'http://127.0.0.1:7420/?token=<token>'
 
   Stop with: fresh-gui close
 ```
 
-Pass the **Local access** URL to the native GPUI host (token is embedded; the app auto-connects). A bearer token is **always required**, including on loopback — on shared hosts every local account can reach `127.0.0.1`. When you do not pass `--token` / `FRESH_GUI_TOKEN`, the process generates a random token and stores it in the private session meta (mode `0600`) so `fresh-gui` can reprint it later. Prefer `FRESH_GUI_TOKEN=…` over `--token` so the secret does not show up in `ps`. The daemon is headless: it does not serve a browser UI.
+On a machine where `fresh-gui` is the desktop command, running it again attaches to this session (the token is read from the session file, not pasted). A bearer token is **always required**, including on loopback — on shared hosts every local account can reach `127.0.0.1`. When you do not pass `--token` / `FRESH_GUI_TOKEN`, the process generates a random token and stores it in the private session meta (mode `0600`) so a later `fresh-gui` / `fresh-gui status` can use it. Prefer `FRESH_GUI_TOKEN=…` over `--token` so the secret does not show up in `ps`. The daemon is headless: it does not serve a browser UI. The desktop command asks the daemon for `--json` session meta on a local pipe, so the token is not placed on the GUI argv.
 
 Only **one background session per user** is allowed (exclusive lock under `$XDG_RUNTIME_DIR/fresh-gui/`). Closing the launching terminal does not stop the session.
 
@@ -108,25 +128,36 @@ Works on older enterprise glibc (2.28+).
 
 ### From your laptop over SSH
 
-Keep the backend on loopback and use the printed SSH tunnel command (or the equivalent):
+```bash
+fresh-gui user@server
+# saved target:
+fresh-gui remote add lab user@server --root /path/to/project
+fresh-gui remote connect lab
+# or the saved name (a directory with that name in the current folder is opened locally instead):
+fresh-gui lab
+```
+
+That opens the local window, copies the Linux daemon to the server if it is missing, starts it headless when no session is running, and tunnels ADE `/ws`. You do not SSH in and start a second binary yourself.
+
+A manual tunnel still works:
 
 ```bash
-# on the server
+# on the server (daemon-only `fresh-gui`, or `fresh-gui --no-ui` where the desktop command is installed)
 cd /path/to/your/project
 fresh-gui
 
-# on your laptop (from the banner)
+# on your laptop
 ssh -L 7420:127.0.0.1:7420 user@server
-fresh-gui-app --backend 'http://127.0.0.1:7420/?token=…'
+fresh-gui --backend 'http://127.0.0.1:7420/?token=…'
 ```
 
 Do not bind publicly by default. Non-loopback listens still require a token and log a warning; SSH tunnel + loopback is the supported remote path.
 
 ### Windows or Linux client (auto-install over SSH)
 
-The native host can save an SSH target, install the Linux daemon if it is missing, and open a local tunnel to ADE `/ws`. Auth is your normal OpenSSH setup (keys, agent, `~/.ssh/config`). The app does not prompt for a password: `ssh user@host` must already succeed non-interactively (`BatchMode`).
+The desktop command can save an SSH target, install the Linux daemon if it is missing, and open a local tunnel to ADE `/ws`. Auth is your normal OpenSSH setup (keys, agent, `~/.ssh/config`). The app does not prompt for a password: `ssh user@host` must already succeed non-interactively (`BatchMode`).
 
-The [installer](#install) places `fresh-gui-app` on `PATH`. You can also download the host from a [GitHub Release](https://github.com/amirhosseindavoody/fresh-gui/releases) (or build it with `pixi run gui`):
+The [installer](#install) places `fresh-gui` on `PATH`. You can also download the host from a [GitHub Release](https://github.com/amirhosseindavoody/fresh-gui/releases) (or build it with `pixi run gui`):
 
 | Asset | Laptop |
 |-------|--------|
@@ -134,11 +165,12 @@ The [installer](#install) places `fresh-gui-app` on `PATH`. You can also downloa
 | `fresh-gui-client-*-x86_64-pc-windows-msvc.zip` | Windows x86_64 |
 
 ```bash
-# Linux
+# Linux (archive member is fresh-gui; older archives used fresh-gui-app)
 tar -xzf fresh-gui-client-YYYY.MMDD.N-x86_64-unknown-linux-gnu.tar.gz
 cd fresh-gui-client-YYYY.MMDD.N-x86_64-unknown-linux-gnu
-./fresh-gui-app remote add lab user@server --root /path/to/project
-./fresh-gui-app remote connect lab
+./fresh-gui user@server
+./fresh-gui remote add lab user@server --root /path/to/project
+./fresh-gui remote connect lab
 ```
 
 The Linux archive is built on `ubuntu-latest` and needs **glibc ≥ 2.39** (Ubuntu 24.04 or newer; a newer runner image can raise this floor). It is not the daemon's glibc 2.31 zigbuild. It also needs a display (X11 or Wayland), fontconfig, and a Vulkan loader (`libvulkan.so.1`, loaded on demand) plus Wayland client libraries:
@@ -148,18 +180,19 @@ sudo apt install libvulkan1 libfontconfig1 libfreetype6 libwayland-client0 libxk
 ```
 
 ```bash
-# on the laptop (Windows or Linux fresh-gui-app)
-fresh-gui-app remote add lab user@server
+# on the laptop (Windows or Linux)
+fresh-gui user@server
+fresh-gui remote add lab user@server
 # or an OpenSSH Host alias from ~/.ssh/config:
-fresh-gui-app remote add lab my-server --root /path/to/project
+fresh-gui remote add lab my-server --root /path/to/project
 
 # optional — pin the Linux daemon (default: latest GitHub linux-gnu release)
-fresh-gui-app remote daemon --path ./fresh-gui-linux
-fresh-gui-app remote daemon --url 'https://github.com/amirhosseindavoody/fresh-gui/releases/download/vYYYY.MMDD.N/fresh-gui-YYYY.MMDD.N-x86_64-unknown-linux-gnu.tar.gz'
+fresh-gui remote daemon --path ./fresh-gui-linux
+fresh-gui remote daemon --url 'https://github.com/amirhosseindavoody/fresh-gui/releases/download/vYYYY.MMDD.N/fresh-gui-YYYY.MMDD.N-x86_64-unknown-linux-gnu.tar.gz'
 # one-shot overrides: FRESH_GUI_DAEMON_PATH, FRESH_GUI_DAEMON_URL
 
-fresh-gui-app remote list
-fresh-gui-app remote connect lab
+fresh-gui remote list
+fresh-gui remote connect lab
 ```
 
 On `remote connect` the host:
@@ -173,16 +206,17 @@ Closing the window closes the tunnel. The remote daemon keeps running; the next 
 
 ## Using the native host
 
-Primary UI is **`fresh-gui-app`** (GPUI + [gpui-component](https://github.com/longbridge/gpui-component) via gpui-kit). Same machine as the daemon, or a laptop after the SSH tunnel:
+The window is GPUI + [gpui-component](https://github.com/longbridge/gpui-component) via gpui-kit. Same machine as the daemon, or a laptop after SSH bootstrap:
 
 ```bash
-# daemon already printed: http://127.0.0.1:7420/?token=…
+fresh-gui
+# from a checkout (builds the daemon, then opens the window):
+pixi run gui
+# explicit URL, when you already have one:
 pixi run gui -- --backend 'http://127.0.0.1:7420/?token=…'
-# or, with token in the environment:
-FRESH_GUI_TOKEN=… pixi run gui -- --backend ws://127.0.0.1:7420/ws
 ```
 
-No subcommand is the same as `gui`. Linux needs an X11 or Wayland display plus fontconfig / Vulkan (or a working wgpu backend).
+No subcommand is the same as opening the window. Linux needs an X11 or Wayland display plus fontconfig / Vulkan (or a working wgpu backend).
 
 After connect you get terminals, an explorer, and editor tabs in one shell:
 
@@ -243,18 +277,19 @@ cd fresh-gui
 git submodule update --init --recursive
 pixi install
 
-pixi run backend -- --foreground   # Linux daemon (prints Local access URL)
-pixi run gui -- --backend 'http://127.0.0.1:7420/?token=…'   # native host
+pixi run gui                 # daemon if needed, then the window
+pixi run backend -- --foreground   # headless daemon in the foreground (prints the URL)
 ```
 
-`pixi run serve` starts the headless daemon. The GPUI host is `pixi run gui`.
+`pixi run serve` starts the headless daemon and returns. `pixi run gui` builds that daemon and runs the GPUI host (`cargo run -p fresh-gui-app`). The Cargo binary is still named `fresh-gui-app` so it does not overwrite `target/debug/fresh-gui`.
 
 Useful tasks: `pixi run check`, `test`, `build`, `gui`, `package` (write `.conda` under `./dist`), `package-binary` (standalone daemon archive; pass target and version), `package-client` (GPUI host archive).
 
 | Piece | Role |
 |-------|------|
-| `fresh-gui` | Headless daemon (PTY, FS, Fresh editor, ADE WebSocket) — Linux primary, Windows binary also released |
-| `fresh-gui-app` | Native GPUI host (default) + CLI (`ping` / `smoke` / `attach` / `remote`) |
+| `fresh-gui` (installer) | GPUI host. Starts or reuses `fresh-gui-daemon`, or SSH-bootstraps a Linux daemon |
+| `fresh-gui` (Cargo / Pixi / daemon archive) | Headless daemon (PTY, FS, Fresh editor, ADE WebSocket) |
+| `fresh-gui-app` | Cargo name of the GPUI host. Installers also keep this name as a second link to `fresh-gui` |
 | `fresh-gui-protocol` / `fresh-gui-client` | Shared wire format + client library |
 
 Deeper design notes (architecture and behavior): [docs/DESIGN.md](./docs/DESIGN.md), [docs/FRESH.md](./docs/FRESH.md) (Fresh embedding), [docs/SECURITY.md](./docs/SECURITY.md), [docs/UI.md](./docs/UI.md), [docs/COPILOT.md](./docs/COPILOT.md) (Copilot CLI / ACP design). Backend flags and packaging: [crates/fresh-gui/README.md](./crates/fresh-gui/README.md).
@@ -269,8 +304,8 @@ CalVer `YYYY.MMDD.N`. Pushes to `main` (and manual `workflow_dispatch`) bump the
 | `fresh-gui-*-x86_64-unknown-linux-gnu.tar.gz` | Linux headless daemon (glibc ≥ 2.31) |
 | `fresh-gui-*-x86_64-unknown-linux-musl.tar.gz` | Linux musl headless daemon (Alpine / static-friendly) |
 | `fresh-gui-*-x86_64-pc-windows-msvc.zip` | Windows headless daemon |
-| `fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` | Linux GPUI host (`fresh-gui-app`) |
-| `fresh-gui-client-*-x86_64-pc-windows-msvc.zip` | Windows GPUI host (`fresh-gui-app.exe`) |
+| `fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` | Linux GPUI host (`fresh-gui`; older archives: `fresh-gui-app`) |
+| `fresh-gui-client-*-x86_64-pc-windows-msvc.zip` | Windows GPUI host (`fresh-gui.exe`; older archives: `fresh-gui-app.exe`) |
 
 Daemon archives are the headless `bin/fresh-gui` binary (same as the conda package). The **client** archives are the native GPUI host, for a Linux or Windows laptop that talks to a Linux daemon (see [Windows or Linux client](#windows-or-linux-client-auto-install-over-ssh)). The Linux client is built on `ubuntu-latest` and needs glibc ≥ 2.39, not the glibc 2.31 zigbuild used for the daemon. The version-bump commit rebases if `main` moved during the build. Manual bump: `pixi run update-version`.
 

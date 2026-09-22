@@ -1,6 +1,6 @@
 # fresh-gui
 
-Remote ADE daemon: WebSocket ADE API + detachable sessions + PTY + filesystem + optional Fresh editor. The host is native `fresh-gui-app`. Runs on **Linux** (documented remote) and **Windows** (standalone release binary). The daemon does not serve a browser UI.
+Remote ADE daemon: WebSocket ADE API + detachable sessions + PTY + filesystem + optional Fresh editor. The desktop command is the GPUI host, installed as `fresh-gui`; this package is the headless process (`fresh-gui` in Cargo, Pixi, and the daemon archive, `fresh-gui-daemon` when the installer places it beside the host). Runs on **Linux** (documented remote) and **Windows** (standalone release binary). The daemon does not serve a browser UI.
 
 ## Run
 
@@ -29,7 +29,7 @@ Session files (private to the user):
 
 The daemon samples its own RSS about every 30 seconds and, on graceful stop, logs average and peak resident memory (MB). Child PTY processes are excluded.
 
-Open the printed **Local access** URL in `fresh-gui-app` (`pixi run gui -- --backend 'http://127.0.0.1:7420/?token=…'`). A bearer token is always required (auto-generated when unset). Prefer `FRESH_GUI_TOKEN` over `--token` so the secret does not appear in `ps`. The daemon does not serve a browser UI.
+On a desktop install, `fresh-gui` in the project directory opens the window against this session (it reads the token from `session.json` via `--json`). From a checkout: `pixi run gui`. A bearer token is always required (auto-generated when unset). Prefer `FRESH_GUI_TOKEN` over `--token` so the secret does not appear in `ps`. The daemon does not serve a browser UI. `--json` (hidden) prints session meta as one JSON object for that launcher.
 
 ## Install
 
@@ -68,7 +68,8 @@ Sessions own PTYs; disconnect detaches the subscriber but keeps shells running f
 | `--token` / `FRESH_GUI_TOKEN` | Auth token (prefer env over flag). When unset, a random per-process token is generated |
 | `--allow-no-auth` / `FRESH_GUI_ALLOW_NO_AUTH` | Disable auth (**loopback only**; for local tests — not a normal run mode) |
 | `--root` / `FRESH_GUI_FS_ROOT` | FS + editor sandbox (default: cwd) |
-| `--no-ui` / `FRESH_GUI_NO_UI` | Accepted for compatibility; the daemon is always headless |
+| `--no-ui` / `FRESH_GUI_NO_UI` | Accepted for compatibility; the daemon is always headless. The desktop `fresh-gui` command uses the same flag to start this process and skip the window |
+| `--json` | Hidden. Print session meta as JSON on stdout (no banner). `status --json` exits 1 when nothing is running |
 | `--no-editor` / `FRESH_GUI_NO_EDITOR` | Omit Fresh editor |
 | `--public-host` / `FRESH_GUI_PUBLIC_HOST` | Hostname in startup UI/WS URLs (else FQDN / bind address) |
 | `--config` / `FRESH_GUI_CONFIG` | Path to `config.json` |

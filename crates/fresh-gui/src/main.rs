@@ -59,6 +59,12 @@ struct Cli {
     #[arg(long = "daemon-serve", hide = true, env = "FRESH_GUI_DAEMON_SERVE")]
     daemon_serve: bool,
 
+    /// Print session meta as one JSON object on stdout (no banner).
+    /// The desktop `fresh-gui` command uses this to read the loopback URL and
+    /// token without putting the secret on the GUI process argv.
+    #[arg(long, hide = true, global = true)]
+    json: bool,
+
     /// Run the server in the foreground (do not detach). For tests / debugging.
     #[arg(long, env = "FRESH_GUI_FOREGROUND")]
     foreground: bool,
@@ -129,6 +135,20 @@ fn main() -> Result<()> {
             let paths = SessionPaths::resolve()?;
             close_session(&paths)
         }
+        Some(Command::Status) if cli.json => {
+            let paths = SessionPaths::resolve()?;
+            match live_session(&paths)? {
+                Some(meta) => {
+                    println!("{}", crate::daemon::session_meta_json(&meta)?);
+                    Ok(())
+                }
+                None => {
+                    // Quiet non-zero so the desktop launcher can tell "not running"
+                    // apart from a JSON session without scraping a banner.
+                    std::process::exit(1);
+                }
+            }
+        }
         Some(Command::Status) => {
             let paths = SessionPaths::resolve()?;
             match live_session(&paths)? {
@@ -161,14 +181,23 @@ fn main() -> Result<()> {
                 .context("tokio runtime")?;
             rt.block_on(run_server_foreground(cli.serve, /*write_meta=*/ false))
         }
-        None => start_or_status(cli.serve),
+        None => start_or_status(cli.serve, cli.json),
     }
 }
 
-fn start_or_status(serve: ServeArgs) -> Result<()> {
+fn emit_session(meta: &crate::daemon::SessionMeta, json: bool) -> Result<()> {
+    if json {
+        println!("{}", crate::daemon::session_meta_json(meta)?);
+    } else {
+        print_session_info(meta);
+    }
+    Ok(())
+}
+
+fn start_or_status(serve: ServeArgs, json: bool) -> Result<()> {
     let paths = SessionPaths::resolve()?;
     if let Some(meta) = live_session(&paths)? {
-        print_session_info(&meta);
+        emit_session(&meta, json)?;
         return Ok(());
     }
 
@@ -185,7 +214,9 @@ fn start_or_status(serve: ServeArgs) -> Result<()> {
     );
 
     let child_pid = spawn_daemon(&child_args, &paths)?;
-    eprintln!("Starting fresh-gui in the background (spawn pid {child_pid})…");
+    if std::env::var_os("FRESH_GUI_QUIET").is_none() {
+        eprintln!("Starting fresh-gui in the background (spawn pid {child_pid})…");
+    }
 
     let meta = wait_until_ready(&paths).with_context(|| {
         format!(
@@ -193,7 +224,7 @@ fn start_or_status(serve: ServeArgs) -> Result<()> {
             paths.log_path.display()
         )
     })?;
-    print_session_info(&meta);
+    emit_session(&meta, json)?;
     Ok(())
 }
 
@@ -383,7 +414,8 @@ fn print_startup_banner(bound: SocketAddr, http_url: &str, ws_url: &str, token: 
             "  From another machine (e.g. your laptop) — SSH tunnel, nothing exposed to the network:"
         );
         println!("    ssh -L {port}:127.0.0.1:{port} {user}@{host}");
-        println!("    fresh-gui-app --backend '{local}'");
+        println!("    fresh-gui user@{host}");
+        println!("    fresh-gui --backend '{local}'");
     }
     println!();
 }

@@ -6,6 +6,9 @@ pub struct ConnectTarget {
     pub token: Option<String>,
     /// Shown in the title bar (SSH destination). The WebSocket URL stays local.
     pub label: Option<String>,
+    /// Absolute project directory to focus or create after connect.
+    /// Set when `fresh-gui /path` attaches to a daemon that is already running.
+    pub preferred_root: Option<String>,
 }
 
 /// Turn a CLI `--backend` plus optional `--token` into a WebSocket URL.
@@ -21,6 +24,7 @@ pub fn parse_connect_target(backend: &str, cli_token: Option<String>) -> Connect
         ws_url,
         token,
         label: None,
+        preferred_root: None,
     }
 }
 
@@ -106,6 +110,70 @@ fn ws_from_http(scheme: &str, rest: &str) -> String {
     }
 }
 
+/// What the host should do with the workspace list before attaching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootAction {
+    /// Switch to an existing workspace (creates nothing).
+    Switch { id: String },
+    /// Create a workspace, then switch to it. `None` root uses the daemon FS root.
+    Create { root: Option<String> },
+}
+
+/// Pick the workspace to show. A preferred root (from `fresh-gui /path` while
+/// a session is already up) switches to a matching workspace or creates one.
+pub fn plan_workspace_boot(
+    workspaces: &[fresh_gui_protocol::WorkspaceInfo],
+    focused_id: Option<&str>,
+    preferred_root: Option<&str>,
+) -> BootAction {
+    let preferred = preferred_root
+        .map(str::trim)
+        .filter(|root| !root.is_empty());
+    if let Some(root) = preferred {
+        if let Some(found) = workspaces
+            .iter()
+            .find(|workspace| roots_equal(&workspace.root, root))
+        {
+            return BootAction::Switch {
+                id: found.id.clone(),
+            };
+        }
+        return BootAction::Create {
+            root: Some(root.to_string()),
+        };
+    }
+    if workspaces.is_empty() {
+        return BootAction::Create { root: None };
+    }
+    let fallback = &workspaces[0].id;
+    let id = focused_id
+        .filter(|id| workspaces.iter().any(|workspace| workspace.id == *id))
+        .unwrap_or(fallback);
+    BootAction::Switch { id: id.to_string() }
+}
+
+fn roots_equal(left: &str, right: &str) -> bool {
+    normalize_root(left) == normalize_root(right)
+}
+
+fn normalize_root(path: &str) -> String {
+    let trimmed = path.trim();
+    let stripped = trimmed.trim_end_matches(['/', '\\']);
+    let stripped = if stripped.is_empty() {
+        trimmed
+    } else {
+        stripped
+    };
+    #[cfg(windows)]
+    {
+        stripped.to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        stripped.to_string()
+    }
+}
+
 fn percent_decode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
@@ -148,6 +216,43 @@ mod tests {
     fn host_port_defaults_to_ws_path() {
         let t = parse_connect_target("127.0.0.1:7420", None);
         assert_eq!(t.ws_url, "ws://127.0.0.1:7420/ws");
+        assert!(t.preferred_root.is_none());
+    }
+
+    #[test]
+    fn preferred_root_switches_or_creates() {
+        use fresh_gui_protocol::WorkspaceInfo;
+        let workspaces = vec![WorkspaceInfo {
+            id: "a".into(),
+            name: "alpha".into(),
+            root: "/work/alpha".into(),
+            session_id: "s".into(),
+            pty_count: 0,
+            tab_count: 0,
+        }];
+        assert_eq!(
+            plan_workspace_boot(&workspaces, Some("missing"), None),
+            BootAction::Switch { id: "a".into() }
+        );
+        assert_eq!(
+            plan_workspace_boot(&workspaces, Some("a"), Some("/work/alpha/")),
+            BootAction::Switch { id: "a".into() }
+        );
+        assert_eq!(
+            plan_workspace_boot(&workspaces, Some("a"), Some("/work/beta")),
+            BootAction::Create {
+                root: Some("/work/beta".into())
+            }
+        );
+        assert_eq!(
+            plan_workspace_boot(&[], None, None),
+            BootAction::Create { root: None }
+        );
+    }
+
+    #[test]
+    fn host_port_has_no_token() {
+        let t = parse_connect_target("127.0.0.1:7420", None);
         assert!(t.token.is_none());
     }
 

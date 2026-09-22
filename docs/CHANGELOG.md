@@ -2,6 +2,14 @@
 
 ## 2026-09-22
 
+### One command: `fresh-gui`
+
+- The GPUI host is the user-facing command. With no arguments it reuses the per-user daemon session or starts `fresh-gui-daemon` (Cargo target dir: the sibling `fresh-gui` binary), then opens the window. The loopback token is read from session meta via the daemon's hidden `--json` output, not pasted onto the GUI argv.
+- `fresh-gui /path/to/project` uses that directory as the daemon root when it starts the session. If a session is already running, the host switches to a workspace with that root or creates one.
+- `fresh-gui user@host` and `fresh-gui <saved-name>` run the existing SSH bootstrap (install or start the remote daemon, tunnel `/ws`, open the window). `fresh-gui remote add|connect|list|remove|daemon` stay. `fresh-gui status` and `fresh-gui close` forward to the daemon binary.
+- `fresh-gui --no-ui` starts or reuses the local daemon and does not open a window, so a remote `fresh-gui --no-ui` still works when PATH points at the desktop command. SCP still installs the headless archive member as `~/.local/bin/fresh-gui`.
+- Installers (`scripts/install.sh`, `scripts/install.ps1`) place the host on `PATH` as `fresh-gui` (and `fresh-gui-app` as another name for the same file). When both archives are installed the daemon is `fresh-gui-daemon`. A daemon-only install keeps the headless binary named `fresh-gui`. `scripts/package-client.sh` now stores the host in the client archive as `fresh-gui` / `fresh-gui.exe`. The ADE protocol is unchanged.
+
 ### Dock splits, numbered terminals, explorer multi-select
 
 - Terminal and editor tabs are gpui-component dock panels. Drag a tab to a pane edge for a horizontal or vertical split, drop it on another tab to merge, and drag within the strip to reorder. Empty groups collapse. The last remaining tab cannot be dragged (the dock refuses a drag from a lone group).

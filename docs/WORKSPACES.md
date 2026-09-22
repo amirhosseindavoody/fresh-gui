@@ -8,7 +8,7 @@ This follows [Herdr](https://herdr.dev/docs/concepts/)’s split — a backgroun
 
 | | Daemon (authority) | GPUI client |
 |--|--|--|
-| Process | One `fresh-gui` per user. `fresh-gui close` stops everything. | Attaches over `/ws`. Closing the window detaches. |
+| Process | One daemon per user (`fresh-gui-daemon` next to the desktop command, or `fresh-gui` on a daemon-only install). `fresh-gui close` stops everything. | `fresh-gui` attaches over `/ws`. Closing the window detaches. |
 | Workspace | `id`, display name, canonical root, ADE `session_id`, tab list, focused id | Left rail. Active row is the workspace on screen. |
 | Session | One ADE session **per workspace**: PTYs, scrollback, layout blob | The connection is subscribed to **one** session at a time |
 | Terminal | PTY child stays running when the subscriber moves or the socket drops | VTE tab bound to that PTY id |

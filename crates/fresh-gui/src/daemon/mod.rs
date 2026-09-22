@@ -193,6 +193,11 @@ fn healthz_ok(bound: &str) -> bool {
     text.contains("200") && text.contains("ok")
 }
 
+/// One JSON object for the desktop launcher (`fresh-gui --json` / `status --json`).
+pub fn session_meta_json(meta: &SessionMeta) -> Result<String> {
+    serde_json::to_string(meta).context("serialize session meta")
+}
+
 /// Print operator-facing session info (URL, token, log, pid).
 pub fn print_session_info(meta: &SessionMeta) {
     println!();
@@ -220,7 +225,8 @@ pub fn print_session_info(meta: &SessionMeta) {
             "  From another machine (e.g. your laptop) — SSH tunnel, nothing exposed to the network:"
         );
         println!("    ssh -L {port}:127.0.0.1:{port} {user}@your-server");
-        println!("    fresh-gui-app --backend '{local}'");
+        println!("    fresh-gui");
+        println!("    fresh-gui --backend '{local}'");
     } else if !meta.require_auth {
         println!();
         println!("  auth: disabled (--allow-no-auth)");
@@ -376,6 +382,10 @@ mod tests {
         write_meta(&paths, &meta).unwrap();
         let loaded = read_meta(&paths).unwrap().unwrap();
         assert_eq!(loaded, meta);
+        let json = session_meta_json(&meta).unwrap();
+        let again: SessionMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(again.ws_url, meta.ws_url);
+        assert_eq!(again.token, meta.token);
         let _ = fs::remove_dir_all(&dir);
     }
 }
