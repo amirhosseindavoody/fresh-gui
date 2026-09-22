@@ -27,7 +27,7 @@ use gpui_kit::component::{
     input::{Input, InputEvent, InputState},
     list::ListItem,
     status_bar::StatusBar,
-    tree::{TreeEvent, TreeItem, TreeState, tree},
+    tree::{TreeEvent, TreeState, tree},
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -41,10 +41,13 @@ use super::actions::{
 use super::ade::AttachedWorkspace;
 use super::ade::{AdeCmd, AdeEvent, AdeHandle};
 use super::connect::{ConnectTarget, parse_goto_spec};
+use super::dock_a11y::A11yDockSkin;
 use super::explorer::{
-    absolute_paths_text, apply_selection, copyable_sources, drag_paths, gesture_from_modifiers,
-    is_placeholder, movable_sources, parent_dir, real_ids,
+    absolute_paths_text, apply_selection, build_explorer_tree, copyable_sources, drag_paths,
+    entry_kinds, gesture_from_modifiers, is_placeholder, movable_sources, parent_dir, real_ids,
+    record_tree_toggle,
 };
+use super::file_icons::explorer_glyph;
 use super::pane::{EditorPanel, TerminalPanel};
 use super::paths::{display_path, strip_verbatim_prefixes};
 use super::rail::{
@@ -158,6 +161,10 @@ pub struct Workspace {
     explorer: Entity<TreeState>,
     explorer_root: String,
     explorer_cache: HashMap<String, Vec<FsEntry>>,
+    /// Directories the user has open. A cache hit is not an expand: rebuilding
+    /// from listings used to reopen every listed folder and close one whose
+    /// `fs_list` was still in flight.
+    expanded_dirs: HashSet<String>,
     explorer_focus: FocusHandle,
     /// Selected absolute paths. The last entry is the primary row.
     selection: Vec<String>,
@@ -181,9 +188,12 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(target: ConnectTarget, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (ade, evt_rx) = super::ade::spawn(target.clone());
-        let (dock, skin) = DockSkin::dock_area("workspace", Some(1), window, cx);
-        skin.set_panel_style(PanelStyle::TabBar, cx);
-        skin.set_toggle_button_visible(false, cx);
+        let dock = cx.new(|cx| {
+            let skin = DockSkin::new(cx);
+            skin.set_panel_style(PanelStyle::TabBar, cx);
+            skin.set_toggle_button_visible(false, cx);
+            DockArea::new("workspace", Some(1), window, cx).with_renderer(A11yDockSkin::wrap(skin))
+        });
         let explorer = cx.new(|cx| TreeState::new(cx));
         let command_state = cx.new(|cx| CommandState::new(window, cx));
         let goto_input = cx.new(|cx| InputState::new(window, cx).placeholder("path[:line[:col]]"));
@@ -193,13 +203,22 @@ impl Workspace {
             cx.new(|cx| InputState::new(window, cx).placeholder("Workspace name"));
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Terminal name"));
         let tree_sub = cx.subscribe(&explorer, |this, _, ev: &TreeEvent, _cx| {
-            if let TreeEvent::Expanded(id) = ev {
-                let path = id.to_string();
-                if !is_placeholder(&path) && !this.explorer_cache.contains_key(&path) {
-                    this.ade.send(AdeCmd::ListDir {
-                        request_id: next_id("ex"),
-                        path,
-                    });
+            // The tree already toggled on mouse-down. Record that and list a
+            // directory we have not seen. Do not rebuild here: this callback
+            // runs inside the tree update, and `set_items` would panic.
+            match ev {
+                TreeEvent::Expanded(id) => {
+                    let path = id.to_string();
+                    record_tree_toggle(&mut this.expanded_dirs, &path, true);
+                    if !is_placeholder(&path) && !this.explorer_cache.contains_key(&path) {
+                        this.ade.send(AdeCmd::ListDir {
+                            request_id: next_id("ex"),
+                            path,
+                        });
+                    }
+                }
+                TreeEvent::Collapsed(id) => {
+                    record_tree_toggle(&mut this.expanded_dirs, id.as_ref(), false);
                 }
             }
         });
@@ -276,6 +295,7 @@ impl Workspace {
             explorer,
             explorer_root: String::new(),
             explorer_cache: HashMap::new(),
+            expanded_dirs: HashSet::new(),
             explorer_focus: cx.focus_handle(),
             selection: Vec::new(),
             anchor: None,
@@ -688,7 +708,7 @@ impl Workspace {
         if root.is_empty() {
             return;
         }
-        let items = build_tree_items(&root, &self.explorer_cache);
+        let items = build_explorer_tree(&root, &self.explorer_cache, &self.expanded_dirs);
         self.explorer.update(cx, |state, cx| {
             state.set_items(items, cx);
         });
@@ -913,6 +933,7 @@ impl Workspace {
         self.session_id = Some(info.session_id.clone());
         self.active_workspace_id = Some(info.id.clone());
         self.explorer_cache.clear();
+        self.expanded_dirs.clear();
         self.selection.clear();
         self.anchor = None;
         self.explorer_root = info.root.clone();
@@ -1321,6 +1342,7 @@ impl Workspace {
         self.rail_hover = None;
         self.create_open = false;
         self.explorer_cache.clear();
+        self.expanded_dirs.clear();
         self.explorer_root.clear();
         self.selection.clear();
         self.anchor = None;
@@ -2143,8 +2165,12 @@ impl Workspace {
         let root_label = explorer_header_label(&self.explorer_root);
         let selected: HashSet<String> = self.selection.iter().cloned().collect();
 
+        let kinds = entry_kinds(&self.explorer_cache);
+
         v_flex()
             .id("explorer-pane")
+            .role(Role::Group)
+            .aria_label("Explorer")
             .key_context("Explorer")
             .track_focus(&self.explorer_focus)
             .w(px(260.))
@@ -2178,17 +2204,15 @@ impl Workspace {
                 let menu_view = view;
                 tree(&self.explorer, move |ix, entry, _selected, _window, cx| {
                     let item = entry.item();
-                    let is_folder = entry.is_folder();
-                    let icon = if !is_folder {
-                        IconName::File
-                    } else if entry.is_expanded() {
-                        IconName::FolderOpen
-                    } else {
-                        IconName::Folder
-                    };
                     let path = item.id.to_string();
                     let label = item.label.clone();
+                    let file_name = label.to_string();
                     let placeholder = is_placeholder(&path);
+                    let kind = kinds.get(&path).copied();
+                    // `FsKind`, not `entry.is_folder()`: a listed empty directory
+                    // has no children, so the tree would otherwise open it as a file.
+                    let is_dir = kind == Some(FsKind::Dir);
+                    let can_expand = entry.is_folder();
                     let in_selection = selected.contains(&path);
                     let view = row_view.clone();
                     let drag_view = view.clone();
@@ -2211,7 +2235,30 @@ impl Workspace {
                                 .when(in_selection, |this| {
                                     this.bg(cx.theme().accent.opacity(0.28))
                                 })
-                                .child(Icon::new(icon).small())
+                                .child(div().w(px(14.)).flex().justify_center().when(
+                                    can_expand,
+                                    |this| {
+                                        let chevron = if entry.is_expanded() {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        };
+                                        this.child(Icon::new(chevron).xsmall())
+                                    },
+                                ))
+                                .when(!placeholder, |this| {
+                                    let glyph = explorer_glyph(
+                                        &file_name,
+                                        kind.unwrap_or(FsKind::File),
+                                        entry.is_expanded(),
+                                    );
+                                    this.child(Icon::new(glyph.icon).small().text_color(hsla(
+                                        glyph.hue,
+                                        glyph.saturation,
+                                        glyph.lightness,
+                                        1.,
+                                    )))
+                                })
                                 .child(label),
                         )
                         .when(!placeholder, |this| {
@@ -2226,7 +2273,7 @@ impl Workspace {
                                 },
                             )
                         })
-                        .when(is_folder && !placeholder, |this| {
+                        .when(is_dir && !placeholder, |this| {
                             let dest = path.clone();
                             let drop_view = drop_view.clone();
                             this.drag_over::<ExplorerDrag>(|style, _, _, cx| {
@@ -2251,7 +2298,7 @@ impl Workspace {
                                     mods.control || mods.platform,
                                 );
                                 let focus = drag_view.update(cx, |this, cx| {
-                                    this.apply_tree_click(&path, is_folder, gesture, cx);
+                                    this.apply_tree_click(&path, is_dir, gesture, cx);
                                     this.explorer_focus.clone()
                                 });
                                 window.focus(&focus, cx);
@@ -2635,31 +2682,4 @@ impl Render for Workspace {
             .children(dialog_layer)
             .children(notification_layer)
     }
-}
-
-fn build_tree_items(root: &str, cache: &HashMap<String, Vec<FsEntry>>) -> Vec<TreeItem> {
-    let Some(entries) = cache.get(root) else {
-        return Vec::new();
-    };
-    entries
-        .iter()
-        .map(|entry| {
-            if entry.kind == FsKind::Dir {
-                let children = if cache.contains_key(&entry.path) {
-                    build_tree_items(&entry.path, cache)
-                } else {
-                    Vec::new()
-                };
-                TreeItem::new(entry.path.clone(), entry.name.clone())
-                    .children(if children.is_empty() && !cache.contains_key(&entry.path) {
-                        vec![TreeItem::new(format!("{}/.", entry.path), "…")]
-                    } else {
-                        children
-                    })
-                    .expanded(cache.contains_key(&entry.path))
-            } else {
-                TreeItem::new(entry.path.clone(), entry.name.clone())
-            }
-        })
-        .collect()
 }
