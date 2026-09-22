@@ -2,6 +2,14 @@
 
 ## 2026-09-22
 
+### Windows client path, tabs, and Ctrl+W
+
+- Paths that Windows canonicalizes as `\\?\C:\...` or `\\?\UNC\...` show as a normal path (`C:\...`, `\\server\...`) in the explorer header, editor tab titles, workspace-rail root, status text, and copied paths. The extended prefix stays available to Win32 inside the daemon.
+- Each dock tab has a close button. Right-click offers Close, Close Others, and Close to the Right, including on the last tab. The **···** menu adds Close Others and Close to the Right; the dock still supplies Close when the group can lose a tab. `Ctrl+W` still closes the active tab.
+- The new-terminal **+** stays in the tab bar’s right-hand slot so it remains visible, and shifts left to sit beside the last tab while the bar has room.
+- **New Workspace** prefills the project root with the open workspace’s folder (or the explorer root when that workspace has none). An empty root still means the daemon project root.
+- Closing a tab with `Ctrl+W` no longer panics with `cannot update Workspace while it is already being updated`. The dock calls `on_removed` from inside the workspace update; that bookkeeping now waits until the update returns.
+
 ### Workspace rail closer to a spaces list
 
 - The GPUI workspace column is 232px, to the left of the activity bar. Each row shows the display name and a shortened project root (`~` for a home prefix, **Default root** when the root is empty). The active row uses an accent fill and a left accent bar. Rename and Close show on hover and on right-click, instead of sitting on the active row. The last workspace still cannot be closed. One open workspace shows a short hint so the rail is not an empty strip.

@@ -61,7 +61,7 @@ The host paints a spaces column to the left of the activity bar when `hello.capa
 
 Each row is two lines: the display name, then the project root (a home prefix folds to `~`, and a long path keeps both ends). An empty root is labeled **Default root**. The active workspace has an accent background and a 3px left accent. Hover lightens the row and reveals Rename and Close; the same actions are on the right-click menu. Close is refused for the last workspace (the daemon already rejects that close). With one workspace, a short footer says that **+** adds another project, so the column is not an empty strip.
 
-**+** opens a panel anchored to the rail: display name and absolute project root, then create and switch. Enter confirms. An empty name still becomes the root basename on the daemon; an empty root still uses the daemon project root. The name field previews that basename while it is blank. Clicking another row saves the current tab list, then switches. The command palette has New Workspace, Rename Workspace, and Close Workspace.
+**+** opens a panel anchored to the rail: display name and absolute project root, then create and switch. The root starts as the open workspace’s folder (or the explorer root when that workspace has none). Enter confirms. An empty name still becomes the root basename on the daemon; a cleared root still uses the daemon project root. The name field previews that basename while it is blank. Windows shows the folder without a `\\?\` prefix. Clicking another row saves the current tab list, then switches. The command palette has New Workspace, Rename Workspace, and Close Workspace.
 
 Dock panels, terminals, and the explorer root are replaced from `workspace_switched`.
 

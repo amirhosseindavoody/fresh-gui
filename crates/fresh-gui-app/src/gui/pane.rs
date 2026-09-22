@@ -5,7 +5,11 @@
 //! Tab titles are per workspace. `SessionTabTitle::workspace_id` is the workspace
 //! that owns the panel.
 
-use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent};
+use std::cell::Cell;
+use std::rc::Rc;
+
+use gpui_kit::base::ElementExt as _;
+use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent, PanelId};
 use gpui_kit::component::input::{Editor, EditorState, InputEvent, Position};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{
@@ -18,6 +22,9 @@ use gpui_kit::*;
 
 use super::ade::{AdeCmd, AdeHandle};
 use super::osc7::feed_osc7_chunk;
+use super::paths::display_path;
+use super::rail::path_basename;
+use super::tab_chrome::{TabCloseScope, TabStripMetrics};
 use super::terminal::{TermScreen, keystroke_to_bytes};
 use super::workspace::Workspace;
 
@@ -56,6 +63,9 @@ pub struct TerminalPanel {
     focus: FocusHandle,
     ade: AdeHandle,
     workspace: WeakEntity<Workspace>,
+    metrics: TabStripMetrics,
+    /// How far left the **+** sits from the suffix slot. Measured last frame.
+    plus_shift: Rc<Cell<f32>>,
     closed: bool,
 }
 
@@ -65,6 +75,7 @@ impl TerminalPanel {
         number: u32,
         ade: AdeHandle,
         workspace: WeakEntity<Workspace>,
+        metrics: TabStripMetrics,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
@@ -76,6 +87,8 @@ impl TerminalPanel {
             focus: cx.focus_handle(),
             ade,
             workspace,
+            metrics,
+            plus_shift: Rc::new(Cell::new(0.0)),
             closed: false,
         }
     }
@@ -122,23 +135,6 @@ impl TerminalPanel {
         cx.notify();
         cwd
     }
-
-    fn new_terminal_button(&self) -> impl IntoElement {
-        let workspace = self.workspace.clone();
-        Button::new(format!("new-term-{}", self.pty_id))
-            .ghost()
-            .xsmall()
-            .icon(IconName::Plus)
-            .tooltip("New Terminal (Ctrl+T)")
-            .on_click(move |_, _, cx| {
-                workspace
-                    .update(cx, |workspace, cx| {
-                        workspace.new_terminal(cx);
-                        cx.notify();
-                    })
-                    .ok();
-            })
-    }
 }
 
 impl EventEmitter<PanelEvent> for TerminalPanel {}
@@ -160,11 +156,17 @@ impl BasePanel for TerminalPanel {
 
     fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
         let pty = self.pty_id.clone();
-        self.workspace
-            .update(cx, |workspace, cx| {
-                workspace.note_terminal_active(&pty, active, cx);
-            })
-            .ok();
+        let workspace = self.workspace.clone();
+        // The dock delivers this from inside the panel update, and Ctrl+W
+        // reaches it while `Workspace` is still on the stack. Defer the
+        // workspace write until that update returns.
+        cx.defer(move |cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.note_terminal_active(&pty, active, cx);
+                })
+                .ok();
+        });
         if active {
             window.focus(&self.focus, cx);
         }
@@ -179,57 +181,84 @@ impl BasePanel for TerminalPanel {
             id: self.pty_id.clone(),
         });
         let pty = self.pty_id.clone();
-        self.workspace
-            .update(cx, |workspace, cx| workspace.forget_terminal(&pty, cx))
-            .ok();
+        let workspace = self.workspace.clone();
+        // `remove_panel` runs inside `Workspace::close_active_tab` (Ctrl+W
+        // and the tab's ×). Updating Workspace here panics:
+        // "cannot update Workspace while it is already being updated".
+        cx.defer(move |cx| {
+            workspace
+                .update(cx, |workspace, cx| workspace.forget_terminal(&pty, cx))
+                .ok();
+        });
     }
 }
 
 impl DockPanel for TerminalPanel {
-    fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let label = self.title.label.clone();
         let pty = self.pty_id.clone();
         let workspace = self.workspace.clone();
+        let panel_id = PanelId::from(cx.entity().entity_id());
+        let metrics = self.metrics.clone();
         h_flex()
             .id(format!("term-title-{}", self.pty_id))
             .gap_1()
             .items_center()
             .min_w_0()
+            .on_prepaint(move |bounds, _, _| note_tab_edge(&metrics, bounds))
             .child(Icon::new(IconName::SquareTerminal).small())
             .child(div().text_ellipsis().child(label))
-            .context_menu(move |menu, _, _| {
+            .child(tab_close_button(
+                format!("close-term-{}", self.pty_id),
+                workspace.clone(),
+                panel_id,
+            ))
+            .context_menu(move |menu, _, cx| {
                 let pty = pty.clone();
-                let workspace = workspace.clone();
-                menu.item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
-                    workspace
-                        .update(cx, |workspace, cx| {
-                            workspace.begin_terminal_rename(&pty, window, cx);
-                        })
-                        .ok();
-                }))
+                let workspace_rename = workspace.clone();
+                let menu = menu
+                    .item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
+                        workspace_rename
+                            .update(cx, |workspace, cx| {
+                                workspace.begin_terminal_rename(&pty, window, cx);
+                            })
+                            .ok();
+                    }))
+                    .separator();
+                with_close_items(menu, workspace.clone(), panel_id, true, cx)
             })
             .into_any_element()
     }
 
     fn title_suffix(&mut self, _: &mut Window, _: &mut Context<Self>) -> Option<impl IntoElement> {
-        Some(self.new_terminal_button())
+        Some(new_terminal_button(
+            format!("new-term-{}", self.pty_id),
+            self.metrics.clone(),
+            self.plus_shift.clone(),
+            self.workspace.clone(),
+        ))
     }
 
     fn dropdown_menu(
         &mut self,
         menu: PopupMenu,
         _: &mut Window,
-        _: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> PopupMenu {
         let pty = self.pty_id.clone();
         let workspace = self.workspace.clone();
-        menu.item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
-            workspace
-                .update(cx, |workspace, cx| {
-                    workspace.begin_terminal_rename(&pty, window, cx);
-                })
-                .ok();
-        }))
+        let panel_id = PanelId::from(cx.entity().entity_id());
+        let menu = menu
+            .item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.begin_terminal_rename(&pty, window, cx);
+                    })
+                    .ok();
+            }))
+            .separator();
+        // The dock already appends Close for a group that can lose a tab.
+        with_close_items(menu, self.workspace.clone(), panel_id, false, cx)
     }
 
     fn zoom_control(&self, _: &App) -> Option<PanelControl> {
@@ -306,6 +335,8 @@ pub struct EditorPanel {
     editor: Entity<EditorState>,
     ade: AdeHandle,
     workspace: WeakEntity<Workspace>,
+    metrics: TabStripMetrics,
+    plus_shift: Rc<Cell<f32>>,
     closed: bool,
     _subscription: Subscription,
 }
@@ -319,6 +350,7 @@ impl EditorPanel {
         column: Option<u32>,
         ade: AdeHandle,
         workspace: WeakEntity<Workspace>,
+        metrics: TabStripMetrics,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -346,6 +378,8 @@ impl EditorPanel {
             editor,
             ade,
             workspace,
+            metrics,
+            plus_shift: Rc::new(Cell::new(0.0)),
             closed: false,
             _subscription: subscription,
         }
@@ -429,29 +463,13 @@ impl EditorPanel {
     }
 
     fn label(&self) -> String {
-        let name = self.path.rsplit('/').next().unwrap_or(self.path.as_str());
+        let shown = display_path(&self.path);
+        let name = path_basename(&shown).unwrap_or(shown.as_str());
         if self.dirty {
             format!("• {name}")
         } else {
             name.to_string()
         }
-    }
-
-    fn new_terminal_button(&self) -> impl IntoElement {
-        let workspace = self.workspace.clone();
-        Button::new(format!("new-term-ed-{}", self.buffer_id))
-            .ghost()
-            .xsmall()
-            .icon(IconName::Plus)
-            .tooltip("New Terminal (Ctrl+T)")
-            .on_click(move |_, _, cx| {
-                workspace
-                    .update(cx, |workspace, cx| {
-                        workspace.new_terminal(cx);
-                        cx.notify();
-                    })
-                    .ok();
-            })
     }
 }
 
@@ -474,13 +492,17 @@ impl BasePanel for EditorPanel {
 
     fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
         let path = self.path.clone();
-        self.workspace
-            .update(cx, |workspace, cx| {
-                workspace.note_editor_active(&path, active, cx);
-            })
-            .ok();
+        let workspace = self.workspace.clone();
+        let focus = self.editor.read(cx).focus_handle(cx);
+        cx.defer(move |cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.note_editor_active(&path, active, cx);
+                })
+                .ok();
+        });
         if active {
-            self.editor.read(cx).focus_handle(cx).focus(window, cx);
+            focus.focus(window, cx);
         }
     }
 
@@ -493,24 +515,55 @@ impl BasePanel for EditorPanel {
             buffer_id: self.buffer_id.clone(),
         });
         let path = self.path.clone();
-        self.workspace
-            .update(cx, |workspace, cx| workspace.forget_editor(&path, cx))
-            .ok();
+        let workspace = self.workspace.clone();
+        cx.defer(move |cx| {
+            workspace
+                .update(cx, |workspace, cx| workspace.forget_editor(&path, cx))
+                .ok();
+        });
     }
 }
 
 impl DockPanel for EditorPanel {
-    fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let workspace = self.workspace.clone();
+        let panel_id = PanelId::from(cx.entity().entity_id());
+        let metrics = self.metrics.clone();
         h_flex()
+            .id(format!("editor-title-{}", self.buffer_id))
             .gap_1()
             .items_center()
             .min_w_0()
+            .on_prepaint(move |bounds, _, _| note_tab_edge(&metrics, bounds))
             .child(Icon::new(IconName::File).small())
             .child(div().text_ellipsis().child(self.label()))
+            .child(tab_close_button(
+                format!("close-ed-{}", self.buffer_id),
+                workspace.clone(),
+                panel_id,
+            ))
+            .context_menu(move |menu, _, cx| {
+                with_close_items(menu, workspace.clone(), panel_id, true, cx)
+            })
     }
 
     fn title_suffix(&mut self, _: &mut Window, _: &mut Context<Self>) -> Option<impl IntoElement> {
-        Some(self.new_terminal_button())
+        Some(new_terminal_button(
+            format!("new-term-ed-{}", self.buffer_id),
+            self.metrics.clone(),
+            self.plus_shift.clone(),
+            self.workspace.clone(),
+        ))
+    }
+
+    fn dropdown_menu(
+        &mut self,
+        menu: PopupMenu,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> PopupMenu {
+        let panel_id = PanelId::from(cx.entity().entity_id());
+        with_close_items(menu, self.workspace.clone(), panel_id, false, cx)
     }
 
     fn zoom_control(&self, _: &App) -> Option<PanelControl> {
@@ -532,6 +585,122 @@ impl Render for EditorPanel {
                 .font_family(cx.theme().mono_font_family.clone()),
         )
     }
+}
+
+fn note_tab_edge(metrics: &TabStripMetrics, bounds: Bounds<Pixels>) {
+    let top = f32::from(bounds.origin.y);
+    let right = f32::from(bounds.origin.x + bounds.size.width);
+    metrics.note_tab(top, right);
+}
+
+fn tab_close_button(
+    id: impl Into<ElementId>,
+    workspace: WeakEntity<Workspace>,
+    panel_id: PanelId,
+) -> impl IntoElement {
+    Button::new(id)
+        .ghost()
+        .xsmall()
+        .icon(IconName::Close)
+        .tooltip("Close (Ctrl+W)")
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(move |_, window, cx| {
+            cx.stop_propagation();
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.close_panel_id(panel_id, window, cx);
+                })
+                .ok();
+        })
+}
+
+fn new_terminal_button(
+    id: impl Into<ElementId>,
+    metrics: TabStripMetrics,
+    plus_shift: Rc<Cell<f32>>,
+    workspace: WeakEntity<Workspace>,
+) -> impl IntoElement {
+    let shift = plus_shift.get();
+    div().relative().w(px(20.)).h(px(20.)).child(
+        div()
+            .absolute()
+            .top_0()
+            .left(px(-shift))
+            .on_prepaint(move |bounds, _, _| {
+                let top = f32::from(bounds.origin.y);
+                let anchor = f32::from(bounds.origin.x) + shift;
+                plus_shift.set(metrics.plus_shift(top, anchor));
+            })
+            .child(
+                Button::new(id)
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Plus)
+                    .tooltip("New Terminal (Ctrl+T)")
+                    .on_click(move |_, _, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.new_terminal(cx);
+                                cx.notify();
+                            })
+                            .ok();
+                    }),
+            ),
+    )
+}
+
+fn with_close_items(
+    menu: PopupMenu,
+    workspace: WeakEntity<Workspace>,
+    panel_id: PanelId,
+    include_this: bool,
+    cx: &App,
+) -> PopupMenu {
+    let (others_ok, right_ok) = workspace
+        .read_with(cx, |workspace, cx| {
+            workspace.tab_close_availability(panel_id, cx)
+        })
+        .unwrap_or((false, false));
+    let mut menu = menu;
+    if include_this {
+        let workspace = workspace.clone();
+        menu = menu.item(PopupMenuItem::new("Close").on_click(move |_, window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.close_panel_id(panel_id, window, cx)
+                })
+                .ok();
+        }));
+    }
+    let workspace_others = workspace.clone();
+    let workspace_right = workspace;
+    menu.item(
+        PopupMenuItem::new("Close Others")
+            .disabled(!others_ok)
+            .on_click(move |_, window, cx| {
+                workspace_others
+                    .update(cx, |workspace, cx| {
+                        workspace.close_panel_scope(panel_id, TabCloseScope::Others, window, cx);
+                    })
+                    .ok();
+            }),
+    )
+    .item(
+        PopupMenuItem::new("Close to the Right")
+            .disabled(!right_ok)
+            .on_click(move |_, window, cx| {
+                workspace_right
+                    .update(cx, |workspace, cx| {
+                        workspace.close_panel_scope(
+                            panel_id,
+                            TabCloseScope::ToTheRight,
+                            window,
+                            cx,
+                        );
+                    })
+                    .ok();
+            }),
+    )
 }
 
 pub(crate) fn language_from_path(path: &str, reported: Option<&str>) -> Option<String> {
