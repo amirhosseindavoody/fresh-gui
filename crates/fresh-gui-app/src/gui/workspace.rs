@@ -591,7 +591,15 @@ impl Workspace {
         if active {
             self.active = Some(ActiveSurface::Terminal(pty_id.to_string()));
             if !self.restoring {
-                self.publish_layout(cx);
+                // The dock calls `Panel::set_active` from inside
+                // `Entity::update` on this terminal. `publish_layout` reads
+                // that same entity for the tab title (`capture_layout`), and
+                // GPUI panics on a read while the update is still on the
+                // stack. Defer until the outermost update has returned it.
+                let this = cx.entity();
+                cx.defer(move |cx| {
+                    this.update(cx, |this, cx| this.publish_layout(cx));
+                });
             }
         } else if matches!(&self.active, Some(ActiveSurface::Terminal(id)) if id == pty_id) {
             self.active = None;
