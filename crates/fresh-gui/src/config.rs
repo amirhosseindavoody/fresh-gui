@@ -91,21 +91,12 @@ const KNOWN_PALETTES: &[&str] = &[
 ];
 
 /// Top-level config file.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Config {
     #[serde(default)]
     pub ui: UiConfig,
     #[serde(default)]
     pub terminal: TerminalConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            ui: UiConfig::default(),
-            terminal: TerminalConfig::default(),
-        }
-    }
 }
 
 /// Host UI settings sent on the ADE hello (GPUI chrome).
@@ -260,7 +251,7 @@ impl Config {
             fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
         Self::parse(&text)
             .with_context(|| format!("parse config {}", path.display()))
-            .map(|cfg| {
+            .inspect(|cfg| {
                 info!(
                     path = %path.display(),
                     shell = %cfg.resolve_shell().0,
@@ -268,7 +259,6 @@ impl Config {
                     palette = %cfg.ui.palette,
                     "loaded config"
                 );
-                cfg
             })
     }
 

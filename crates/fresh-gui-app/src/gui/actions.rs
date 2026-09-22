@@ -42,11 +42,3 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-v", PasteExplorer, Some("Explorer")),
     ]);
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn module_compiles() {
-        assert!(true);
-    }
-}

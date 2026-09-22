@@ -256,6 +256,7 @@ impl Client {
                     tabs,
                     active_tab,
                     ptys,
+                    ..
                 } => {
                     self.session_id = Some(workspace.session_id.clone());
                     return Ok((workspace, tabs, active_tab, ptys));
@@ -281,6 +282,7 @@ impl Client {
                 workspace_id: workspace_id.into(),
                 tabs,
                 active_tab,
+                explorer_expanded: Vec::new(),
             },
         )
         .await
@@ -543,7 +545,9 @@ impl Client {
             },
         )
         .await?;
-        let mut opened: Option<(String, String, Option<String>, Option<u32>, Option<u32>)> = None;
+        // (buffer_id, path, language, line, column) from `editor_opened`.
+        type Opened = (String, String, Option<String>, Option<u32>, Option<u32>);
+        let mut opened: Option<Opened> = None;
         loop {
             match self.recv().await? {
                 Message::EditorOpened {

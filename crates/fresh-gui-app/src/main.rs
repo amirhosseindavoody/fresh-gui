@@ -128,6 +128,11 @@ enum RemoteCmd {
     },
 }
 
+/// Our own logs at info. GPUI and gpui-kit log routine internals at info
+/// (focus and a11y notes, frame details) that flood the launching shell, so
+/// they start at warn. `RUST_LOG` replaces this whole filter.
+const DEFAULT_LOG_FILTER: &str = "info,gpui=warn,gpui_base=warn,gpui_component=warn";
+
 fn main() -> Result<()> {
     if std::env::var_os("FRESH_GUI_DAEMON_CHILD").is_some() {
         eprintln!("fresh-gui: this binary is the desktop app, not the headless daemon");
@@ -137,7 +142,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER)),
         )
         .init();
 
@@ -524,6 +529,14 @@ fn cmd_remote_connect(
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn default_log_filter_quiets_gpui_but_keeps_ours() {
+        let filter = tracing_subscriber::EnvFilter::try_new(DEFAULT_LOG_FILTER).unwrap();
+        let text = filter.to_string();
+        assert!(text.contains("gpui=warn"));
+        assert!(text.starts_with("info") || text.contains(",info") || text.contains("info,"));
+    }
 
     #[test]
     fn bare_invocation_opens_the_local_app() {

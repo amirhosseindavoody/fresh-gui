@@ -238,9 +238,9 @@ After connect you get terminals, an explorer, and editor tabs in one shell:
 | Next / prev tab | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
 | Reconnect | `Ctrl+Shift+R` or command palette |
 
-The product host is this GPUI client. The daemon is a headless ADE WebSocket. A later browser host would be this same GPUI UI via WebAssembly, which is not in this release. Splits and tab reorder use the gpui-component dock. Terminal titles and the in-app file clipboard last for the client session. Still absent: markdown WYSIWYG, a minimap, layout restore, mouse selection in the terminal, find, palette packs, tab pin, and editor-tab rename. Copy Path and in-app paste use absolute ADE paths. On this GPUI snapshot, Linux clipboard writes do not offer `text/uri-list`, so pasting into a file manager is not reliable; paste inside the explorer is a real `fs_copy`.
+The product host is this GPUI client. The daemon is a headless ADE WebSocket. A later browser host would be this same GPUI UI via WebAssembly, which is not in this release. Splits and tab reorder use the gpui-component dock. The in-app file clipboard lasts for the client session. Still absent: markdown WYSIWYG, a minimap, dock split restore, mouse selection in the terminal, find, palette packs, tab pin, and editor-tab rename. Copy Path and in-app paste use absolute ADE paths. On this GPUI snapshot, Linux clipboard writes do not offer `text/uri-list`, so pasting into a file manager is not reliable; paste inside the explorer is a real `fs_copy`.
 
-Disconnect leaves remote workspaces and PTYs running so you can reconnect. Each workspace is its own set of tabs and shells on that daemon; the left rail switches among them. See [docs/WORKSPACES.md](docs/WORKSPACES.md).
+Workspaces, their tabs, and open explorer folders are saved by the daemon and come back after `fresh-gui close` or a reboot. Shells do not survive a daemon restart; each terminal tab reopens as a new shell in the workspace root with its old title. Disconnect leaves remote workspaces and PTYs running so you can reconnect. Each workspace is its own set of tabs and shells on that daemon; the left rail switches among them. See [docs/WORKSPACES.md](docs/WORKSPACES.md).
 
 Sessions keep shells alive across GUI disconnect. Explorer list/create/copy/move/delete and editor open are sandboxed to `--root` (default: current directory), plus directories authorized when a terminal cwd leaves that root.
 
@@ -281,6 +281,16 @@ pixi install
 pixi run gui                 # daemon if needed, then the window
 pixi run backend -- --foreground   # headless daemon in the foreground (prints the URL)
 ```
+
+The `vendor/fresh` submodule is required even to build only the GPUI host: Cargo reads every workspace member's manifest, and the daemon path-depends on Fresh. Plain `cargo` works too (Rust 1.97+). On Linux the host also needs system development packages for fonts and windowing. On Ubuntu / Debian:
+
+```bash
+sudo apt install pkg-config libfontconfig1-dev libfreetype-dev \
+  libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libwayland-dev libvulkan1
+cargo test -p fresh-gui-app -p fresh-gui -p fresh-gui-protocol -p fresh-gui-client
+```
+
+The daemon alone needs no GUI packages. The host logs at `info` but keeps GPUI's own crates at `warn`. Set `RUST_LOG` (for example `RUST_LOG=debug`) to replace that filter.
 
 `pixi run serve` starts the headless daemon and returns. `pixi run gui` builds that daemon and runs the GPUI host (`cargo run -p fresh-gui-app`). The Cargo binary is still named `fresh-gui-app` so it does not overwrite `target/debug/fresh-gui`.
 

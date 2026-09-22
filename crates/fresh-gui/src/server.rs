@@ -976,6 +976,7 @@ async fn handle_client_msg(
                     tabs: focused.tabs,
                     active_tab: focused.active_tab,
                     ptys,
+                    explorer_expanded: focused.explorer_expanded,
                 },
             )
             .await
@@ -995,11 +996,12 @@ async fn handle_client_msg(
             workspace_id,
             tabs,
             active_tab,
+            explorer_expanded,
         } => {
             require_auth(*authed)?;
             let (session_for_layout, layout) = state
                 .workspaces
-                .set_layout(&workspace_id, tabs, active_tab)
+                .set_layout(&workspace_id, tabs, active_tab, explorer_expanded)
                 .await
                 .map_err(|err| Message::Error {
                     code: "workspace_layout_failed".into(),

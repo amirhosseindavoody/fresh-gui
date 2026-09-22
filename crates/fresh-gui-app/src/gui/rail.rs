@@ -126,8 +126,8 @@ mod tests {
     #[test]
     fn rail_width_stays_in_the_dense_sidebar_range() {
         assert!((220.0..=240.0).contains(&WORKSPACE_RAIL_W));
-        assert!(WORKSPACE_ROW_H >= 36.0);
-        assert!(WORKSPACE_ROOT_LABEL_MAX >= 24);
+        const { assert!(WORKSPACE_ROW_H >= 36.0) };
+        const { assert!(WORKSPACE_ROOT_LABEL_MAX >= 24) };
     }
 
     #[test]

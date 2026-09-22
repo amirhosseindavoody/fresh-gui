@@ -16,6 +16,7 @@ mod pane;
 mod paths;
 mod rail;
 mod reentry;
+mod restore;
 mod tab_chrome;
 mod terminal;
 mod workspace;

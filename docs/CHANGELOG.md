@@ -2,6 +2,21 @@
 
 ## 2026-09-22
 
+### Workspaces persist across daemon restarts
+
+- The daemon saves the workspace list to a private `workspaces.json` in its state directory (`~/.local/state/fresh-gui/` or `%LOCALAPPDATA%\fresh-gui\`) and loads it on start. Names, roots, tab titles and order, the active tab, open explorer folders, and the focused workspace survive `fresh-gui close` and a reboot. Writes are debounced and atomic; an unreadable file is moved aside to `workspaces.json.bad`. `--foreground` stays in memory unless `FRESH_GUI_WORKSPACES_FILE` is set.
+- A restored terminal tab whose shell ended with the old daemon opens a new shell in the workspace root and keeps its title. A live one reattaches as before.
+- The host now publishes the layout when an editor tab closes, when tabs are reordered, split, or merged, when a folder is expanded or collapsed, and before Disconnect, Reconnect, and window close (window close waits up to 500ms for the send). Before, those changes could be lost until the next tab activation.
+- Restoring selects the saved active terminal even when editor tabs come before it in the strip.
+- Explorer open folders are kept per workspace instead of reset on every switch. Protocol `0.4.0` gains an optional `explorer_expanded` on `workspace_layout_set` / `workspace_switched`; peers without it still parse.
+
+### Explorer symlinks, terminal redraw, logging
+
+- `FsEntry` gains an optional `target_kind`. A symlink whose canonical target is a folder inside the FS sandbox expands like a folder, with its children listed under the link path. Links out of the sandbox, dangling links, and file links are unchanged.
+- Terminal output no longer redraws the whole window. The terminal panel still repaints itself on each chunk; the rail, explorer, dock, and status bar do not.
+- The host's default log filter keeps GPUI's crates at `warn`, so routine GPUI info lines stay out of the launching shell. `RUST_LOG` still replaces the filter.
+- README documents the Linux development packages the GPUI host needs to build and that the `vendor/fresh` submodule is required for any workspace build. Clippy is clean for the four project crates.
+
 ### Windows client tabs, explorer, and accessibility
 
 - The new-terminal **+** clears the last tab. The shift is measured from the tab chrome (the title row plus the medium tab’s 12px padding and 1px border) with a 4px gap, so the button no longer sits on top of the tab.

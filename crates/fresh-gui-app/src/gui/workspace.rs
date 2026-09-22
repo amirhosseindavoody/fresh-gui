@@ -8,7 +8,7 @@
 //! switching swaps this dock for that workspace's session without closing
 //! its PTYs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,7 +17,7 @@ use fresh_gui_protocol::{
     CAP_WORKSPACE, FsEntry, FsKind, Hello, PtyInfo, WorkspaceInfo, WorkspaceTab, WorkspaceTabKind,
 };
 use gpui_kit::component::dock::{
-    DockArea, DockPlacement, DockSkin, PanelId, PanelStyle, panel_handle,
+    DockArea, DockEvent, DockPlacement, DockSkin, PanelId, PanelStyle, panel_handle,
 };
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{
@@ -45,8 +45,8 @@ use super::connect::{ConnectTarget, parse_goto_spec};
 use super::dock_a11y::A11yDockSkin;
 use super::explorer::{
     absolute_paths_text, apply_selection, build_explorer_tree, copyable_sources, drag_paths,
-    entry_kinds, gesture_from_modifiers, is_placeholder, movable_sources, parent_dir, real_ids,
-    record_tree_toggle,
+    entry_kinds, gesture_from_modifiers, is_placeholder, movable_sources, parent_dir,
+    prune_expanded, real_ids, rebase_listing, record_tree_toggle,
 };
 use super::file_icons::explorer_glyph;
 use super::pane::{EditorPanel, TerminalPanel};
@@ -55,6 +55,7 @@ use super::rail::{
     WORKSPACE_RAIL_W, WORKSPACE_ROW_H, empty_workspace_name_hint, explorer_header_label, user_home,
     workspace_rail_hint, workspace_root_label,
 };
+use super::restore::{RestoreStep, restore_plan};
 use super::tab_chrome::{TabCloseScope, TabStripMetrics, panels_for_close_scope};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -169,6 +170,14 @@ pub struct Workspace {
     /// Path → kind for `explorer_cache`, rebuilt with the tree. Rendering runs
     /// on every PTY chunk, so rows read this instead of walking the cache.
     explorer_kinds: Rc<HashMap<String, FsKind>>,
+    /// `fs_list` request id → the path the explorer asked for.
+    pending_lists: HashMap<String, String>,
+    /// Titles for terminal tabs whose PTY did not survive a daemon restart,
+    /// in tab order. Each `pty_opened` for a respawn takes the next one.
+    respawn_titles: VecDeque<String>,
+    /// Saved active tab when it is a live terminal, selected once the
+    /// restore's editors have opened (they would otherwise take focus).
+    restore_focus: Option<String>,
     explorer_focus: FocusHandle,
     /// Selected absolute paths. The last entry is the primary row.
     selection: Vec<String>,
@@ -206,7 +215,7 @@ impl Workspace {
         let ws_rename_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Workspace name"));
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Terminal name"));
-        let tree_sub = cx.subscribe(&explorer, |this, _, ev: &TreeEvent, _cx| {
+        let tree_sub = cx.subscribe(&explorer, |this, _, ev: &TreeEvent, cx| {
             // The tree already toggled on mouse-down. Record that and list a
             // directory we have not seen. Do not rebuild here: this callback
             // runs inside the tree update, and `set_items` would panic.
@@ -215,15 +224,22 @@ impl Workspace {
                     let path = id.to_string();
                     record_tree_toggle(&mut this.expanded_dirs, &path, true);
                     if !is_placeholder(&path) && !this.explorer_cache.contains_key(&path) {
-                        this.ade.send(AdeCmd::ListDir {
-                            request_id: next_id("ex"),
-                            path,
-                        });
+                        this.list_dir(&path);
                     }
                 }
                 TreeEvent::Collapsed(id) => {
                     record_tree_toggle(&mut this.expanded_dirs, id.as_ref(), false);
                 }
+            }
+            this.publish_layout(cx);
+        });
+        // Reorder, split, and merge change the tab order without changing the
+        // active tab. The dock emits this from inside its own update, and
+        // `capture_layout` reads the dock, so publish after it returns.
+        let dock_sub = cx.subscribe(&dock, |this, _, ev: &DockEvent, cx| {
+            if matches!(ev, DockEvent::LayoutChanged) && !this.restoring {
+                let this = cx.entity();
+                cx.defer(move |cx| this.update(cx, |this, cx| this.publish_layout(cx)));
             }
         });
         let rename_sub = cx.subscribe(&rename_input, |this, _, ev: &InputEvent, cx| {
@@ -270,6 +286,14 @@ impl Workspace {
             }
         });
 
+        let closing = cx.weak_entity();
+        window.on_window_should_close(cx, move |_, cx| {
+            if let Some(this) = closing.upgrade() {
+                this.update(cx, |this, cx| this.save_before_exit(cx));
+            }
+            true
+        });
+
         Self {
             target,
             ade,
@@ -301,6 +325,9 @@ impl Workspace {
             explorer_cache: HashMap::new(),
             expanded_dirs: HashSet::new(),
             explorer_kinds: Rc::default(),
+            pending_lists: HashMap::new(),
+            respawn_titles: VecDeque::new(),
+            restore_focus: None,
             explorer_focus: cx.focus_handle(),
             selection: Vec::new(),
             anchor: None,
@@ -317,6 +344,7 @@ impl Workspace {
             rename_input,
             _subscriptions: vec![
                 tree_sub,
+                dock_sub,
                 rename_sub,
                 ws_rename_sub,
                 create_name_sub,
@@ -347,7 +375,7 @@ impl Workspace {
                 self.pty_opens_pending = 0;
                 self.pending_editors.clear();
                 if let Some(attached) = attached {
-                    self.restore_workspace(attached, window, cx);
+                    self.restore_workspace(*attached, window, cx);
                 } else {
                     self.active_workspace_id = None;
                     self.pty_opens_pending = 1;
@@ -356,10 +384,7 @@ impl Workspace {
                         rows: 24,
                         cwd: None,
                     });
-                    self.ade.send(AdeCmd::ListDir {
-                        request_id: next_id("ex"),
-                        path: String::new(),
-                    });
+                    self.list_dir("");
                 }
             }
             AdeEvent::WorkspaceCreated { workspace } => {
@@ -389,7 +414,7 @@ impl Workspace {
                 }
             }
             AdeEvent::WorkspaceSwitched { attached } => {
-                self.restore_workspace(attached, window, cx);
+                self.restore_workspace(*attached, window, cx);
             }
             AdeEvent::Disconnected { reason } => {
                 self.connection = ConnectionState::Offline {
@@ -400,11 +425,20 @@ impl Workspace {
             AdeEvent::PtyOpened { id, .. } => {
                 if self.pty_opens_pending > 0 {
                     self.pty_opens_pending -= 1;
-                    self.add_terminal_tab(id, window, cx);
+                    if let Some(title) = self.respawn_titles.pop_front() {
+                        self.attach_terminal(id, title, window, cx);
+                    } else {
+                        self.add_terminal_tab(id, window, cx);
+                    }
                     self.publish_layout(cx);
                 }
             }
-            AdeEvent::PtyData { id, bytes } => self.on_pty_data(&id, &bytes, cx),
+            AdeEvent::PtyData { id, bytes } => {
+                // The terminal panel notifies itself. Redrawing the whole
+                // workspace (rail, explorer, dock, status) per chunk is waste.
+                self.on_pty_data(&id, &bytes, cx);
+                return;
+            }
             AdeEvent::PtyClosed { id, reason } => {
                 if let Some(reason) = reason {
                     self.status = format!("PTY closed: {reason}").into();
@@ -415,7 +449,13 @@ impl Workspace {
                     });
                 }
             }
-            AdeEvent::FsListed { path, entries, .. } => {
+            AdeEvent::FsListed {
+                request_id,
+                path,
+                entries,
+            } => {
+                let requested = self.pending_lists.remove(&request_id).unwrap_or_default();
+                let (path, entries) = rebase_listing(&requested, &path, entries);
                 if self.explorer_root.is_empty() {
                     self.explorer_root = path.clone();
                 }
@@ -446,7 +486,7 @@ impl Workspace {
                     self.begin_editor_tab(
                         buffer_id, path, language, line, column, activate, window, cx,
                     );
-                    self.finish_restore_if_idle(cx);
+                    self.finish_restore_if_idle(window, cx);
                 }
             }
             AdeEvent::BufferSnapshot {
@@ -470,8 +510,12 @@ impl Workspace {
                 self.pending_fs.clear();
                 if code == "pty_open_failed" {
                     self.pty_opens_pending = self.pty_opens_pending.saturating_sub(1);
+                    self.respawn_titles.pop_front();
                 }
-                if self.restoring {
+                // A folder saved as open may be gone now; its failed listing
+                // is not a reason to abandon reopening the workspace's tabs.
+                let explorer_only = code.starts_with("fs_list") || code.starts_with("fs_stat");
+                if self.restoring && !explorer_only {
                     self.restoring = false;
                     self.pending_editors.clear();
                 }
@@ -518,6 +562,7 @@ impl Workspace {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn begin_editor_tab(
         &mut self,
         buffer_id: String,
@@ -705,10 +750,14 @@ impl Workspace {
         if matches!(&self.active, Some(ActiveSurface::Editor(current)) if current == path) {
             self.active = None;
         }
+        if !self.restoring {
+            self.publish_layout(cx);
+        }
         cx.notify();
     }
 
     fn rebuild_tree(&mut self, cx: &mut Context<Self>) {
+        prune_expanded(&mut self.expanded_dirs, &self.explorer_cache);
         self.explorer_kinds = Rc::new(entry_kinds(&self.explorer_cache));
         let root = self.explorer_root.clone();
         if root.is_empty() {
@@ -876,13 +925,30 @@ impl Workspace {
             id,
             tabs,
             active_tab,
+            explorer_expanded: self.expanded_list(),
         });
     }
 
-    fn finish_restore_if_idle(&mut self, cx: &App) {
+    fn expanded_list(&self) -> Vec<String> {
+        let mut dirs: Vec<String> = self.expanded_dirs.iter().cloned().collect();
+        dirs.sort();
+        dirs
+    }
+
+    /// Send the current layout and wait (briefly) for it to reach the daemon.
+    /// Window close can end the process before the ADE thread runs.
+    fn save_before_exit(&mut self, cx: &App) {
+        if !matches!(self.connection, ConnectionState::Online) {
+            return;
+        }
+        self.publish_layout(cx);
+        self.ade
+            .flush_blocking(std::time::Duration::from_millis(500));
+    }
+
+    fn finish_restore_if_idle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.restoring && self.pending_editors.is_empty() {
-            self.restoring = false;
-            self.publish_layout(cx);
+            self.finish_restore(window, cx);
         }
     }
 
@@ -903,6 +969,7 @@ impl Workspace {
         } else {
             (Vec::new(), 0)
         };
+        let explorer_expanded = self.expanded_list();
         self.restoring = true;
         self.pty_opens_pending = 0;
         self.pending_editors.clear();
@@ -917,6 +984,7 @@ impl Workspace {
             from,
             tabs,
             active_tab,
+            explorer_expanded,
         });
     }
 
@@ -931,76 +999,86 @@ impl Workspace {
             tabs,
             active_tab,
             ptys,
+            explorer_expanded,
         } = attached;
         self.restoring = true;
         self.pty_opens_pending = 0;
         self.pending_editors.clear();
+        self.respawn_titles.clear();
+        self.restore_focus = None;
         self.release_dock(window, cx);
         self.session_id = Some(info.session_id.clone());
         self.active_workspace_id = Some(info.id.clone());
         self.explorer_cache.clear();
-        self.expanded_dirs.clear();
+        self.pending_lists.clear();
+        self.expanded_dirs = explorer_expanded.into_iter().collect();
         self.selection.clear();
         self.anchor = None;
         self.explorer_root = info.root.clone();
         let root = info.root.clone();
         self.upsert_workspace(info);
         self.rebuild_tree(cx);
-        self.ade.send(AdeCmd::ListDir {
-            request_id: next_id("ex"),
-            path: root,
-        });
+        self.list_dir(&root);
+        // Folders open last time need their listings, or they rebuild as
+        // open rows with only a placeholder child.
+        let mut reopen: Vec<String> = self.expanded_dirs.iter().cloned().collect();
+        reopen.sort();
+        for dir in reopen {
+            self.list_dir(&dir);
+        }
 
-        let live: HashSet<String> = ptys.iter().map(|pty| pty.id.clone()).collect();
-        let mut seen = HashSet::new();
+        let live: Vec<String> = ptys.into_iter().map(|PtyInfo { id, .. }| id).collect();
+        let plan = restore_plan(tabs, active_tab, &live);
         let mut editor_jobs = Vec::new();
-        for (index, tab) in tabs.into_iter().enumerate() {
-            match tab.kind {
-                WorkspaceTabKind::Terminal => {
-                    let Some(pty_id) = tab.pty_id else {
-                        continue;
-                    };
-                    if !live.contains(&pty_id) || !seen.insert(pty_id.clone()) {
-                        continue;
-                    }
-                    self.attach_terminal(pty_id, tab.title, window, cx);
+        for step in plan.steps {
+            match step {
+                RestoreStep::Attach { pty_id, title } => {
+                    self.attach_terminal(pty_id, title, window, cx);
                 }
-                WorkspaceTabKind::Editor => {
-                    if let Some(path) = tab.path {
-                        editor_jobs.push((path, index as u32 == active_tab));
-                    }
+                RestoreStep::Respawn { title } => {
+                    self.respawn_titles.push_back(title);
                 }
+                RestoreStep::Editor { path, activate } => editor_jobs.push((path, activate)),
             }
         }
-        for PtyInfo { id, .. } in ptys {
-            if seen.insert(id.clone()) {
-                let n = self.next_terminal_number;
-                self.attach_terminal(id, n.to_string(), window, cx);
-            }
+        for id in plan.orphans {
+            let n = self.next_terminal_number;
+            self.attach_terminal(id, n.to_string(), window, cx);
+        }
+        for _ in 0..self.respawn_titles.len() {
+            self.pty_opens_pending = self.pty_opens_pending.saturating_add(1);
+            self.ade.send(AdeCmd::OpenPty {
+                cols: 80,
+                rows: 24,
+                cwd: Some(root.clone()),
+            });
         }
 
         let expect_editors = !editor_jobs.is_empty();
-        if self.terminals.is_empty() && !expect_editors {
+        if self.terminals.is_empty() && !expect_editors && self.respawn_titles.is_empty() {
             self.restoring = false;
             self.new_terminal(cx);
-        } else if !self.terminals.is_empty()
-            && (active_tab as usize) < self.terminals.len()
-            && editor_jobs.is_empty()
-        {
-            let order = self.panel_order(cx);
-            if let Some(id) = order.get(active_tab as usize).cloned() {
-                self.dock
-                    .update(cx, |dock, cx| dock.select_panel(id, window, cx));
-            }
         }
+        self.restore_focus = plan.focus_pty;
         for (path, activate) in editor_jobs {
             self.open_editor(path, false, activate);
         }
         if !expect_editors {
-            self.restoring = false;
-            if !self.panes_empty() {
-                self.publish_layout(cx);
-            }
+            self.finish_restore(window, cx);
+        }
+    }
+
+    /// Select the saved active terminal (editors reopened by the restore may
+    /// have taken the selection) and publish the rebuilt tab list.
+    fn finish_restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.restoring = false;
+        if let Some(pty_id) = self.restore_focus.take()
+            && let Some(panel) = self.terminals.get(&pty_id).cloned()
+        {
+            self.select_entity(&panel, window, cx);
+        }
+        if !self.panes_empty() {
+            self.publish_layout(cx);
         }
     }
 
@@ -1332,6 +1410,9 @@ impl Workspace {
     }
 
     fn reconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.connection, ConnectionState::Online) {
+            self.publish_layout(cx);
+        }
         self.ade.send(AdeCmd::Disconnect);
         let (ade, evt_rx) = super::ade::spawn(self.target.clone());
         self.ade = ade;
@@ -1350,6 +1431,9 @@ impl Workspace {
         self.explorer_cache.clear();
         self.expanded_dirs.clear();
         self.explorer_kinds = Rc::default();
+        self.pending_lists.clear();
+        self.respawn_titles.clear();
+        self.restore_focus = None;
         self.explorer_root.clear();
         self.selection.clear();
         self.anchor = None;
@@ -1421,10 +1505,7 @@ impl Workspace {
         self.sync_tree_highlight(highlight, cx);
         if is_folder {
             if !self.explorer_cache.contains_key(path) {
-                self.ade.send(AdeCmd::ListDir {
-                    request_id: next_id("ex"),
-                    path: path.to_string(),
-                });
+                self.list_dir(path);
             }
         } else if gesture == super::explorer::SelectGesture::Replace {
             self.open_path(path.to_string(), true);
@@ -1632,9 +1713,23 @@ impl Workspace {
         let prefix = format!("{dir}/");
         self.explorer_cache
             .retain(|key, _| key != dir && !key.starts_with(&prefix));
+        self.pending_lists.retain(|_, path| path != dir);
+        self.list_dir(dir);
+    }
+
+    /// `fs_list` for `path`, remembered so the reply is keyed by the path the
+    /// tree asked for (see [`rebase_listing`]). A listing already in flight
+    /// for the same path is not sent twice.
+    fn list_dir(&mut self, path: &str) {
+        if self.pending_lists.values().any(|pending| pending == path) {
+            return;
+        }
+        let request_id = next_id("ex");
+        self.pending_lists
+            .insert(request_id.clone(), path.to_string());
         self.ade.send(AdeCmd::ListDir {
-            request_id: next_id("ex"),
-            path: dir.to_string(),
+            request_id,
+            path: path.to_string(),
         });
     }
 
@@ -1703,6 +1798,10 @@ impl Workspace {
     }
 
     fn on_disconnect(&mut self, _: &Disconnect, _: &mut Window, cx: &mut Context<Self>) {
+        // Queued ahead of Disconnect, so the ADE worker sends it first.
+        if matches!(self.connection, ConnectionState::Online) {
+            self.publish_layout(cx);
+        }
         self.ade.send(AdeCmd::Disconnect);
         self.connection = ConnectionState::Offline {
             reason: "Disconnected".into(),
@@ -2605,18 +2704,26 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_rename_workspace))
             .on_action(cx.listener(Self::on_close_workspace))
             .child(
-                TitleBar::new().h(px(TITLE_BAR_H)).child(
-                    h_flex()
-                        .gap_1()
-                        .items_center()
-                        .child(div().text_sm().font_semibold().child("fresh-gui"))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(self.target.chrome_label()),
-                        ),
-                ),
+                TitleBar::new()
+                    .h(px(TITLE_BAR_H))
+                    // Linux draws its own close button, which removes the
+                    // window without the platform should-close hook.
+                    .on_close_window(cx.listener(|this, _, window, cx| {
+                        this.save_before_exit(cx);
+                        window.remove_window();
+                    }))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(div().text_sm().font_semibold().child("fresh-gui"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(self.target.chrome_label()),
+                            ),
+                    ),
             )
             .child(
                 h_flex()

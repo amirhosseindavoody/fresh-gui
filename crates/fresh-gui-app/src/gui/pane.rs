@@ -50,6 +50,7 @@ impl SessionTabTitle {
 }
 
 /// Herdr-style terminal titles: the first terminal is `1`, the next is `2`, …
+#[cfg(test)]
 pub fn terminal_title(n: u32) -> String {
     n.to_string()
 }
@@ -344,6 +345,7 @@ pub struct EditorPanel {
 }
 
 impl EditorPanel {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         buffer_id: String,
         path: String,

@@ -291,12 +291,24 @@ async fn run_server_foreground(args: ServeArgs, write_session_meta: bool) -> Res
         EditorHandle::spawn(fs_root.root_path().to_path_buf())
     };
 
+    let sessions = SessionStore::new();
+    let workspaces = match workspaces_state_path(paths.as_ref()) {
+        Some(path) => WorkspaceStore::persistent(path),
+        None => WorkspaceStore::new(),
+    };
+    for root in workspaces.load(&sessions).await {
+        if let Err(err) = fs_root.authorize(&root).await {
+            warn!(%root, "saved workspace root is not available: {err:#}");
+        }
+    }
+    workspaces.spawn_saver();
+
     let state = Arc::new(AppState {
         token: token.clone(),
         require_auth,
         fs_root,
-        sessions: SessionStore::new(),
-        workspaces: WorkspaceStore::new(),
+        sessions,
+        workspaces,
         editor,
         watches: FsWatchStore::new(),
         config,
@@ -313,6 +325,11 @@ async fn run_server_foreground(args: ServeArgs, write_session_meta: bool) -> Res
         editor = state.editor.is_some(),
         default_shell = %default_shell,
         config = %state.config_path.display(),
+        workspaces_file = %state
+            .workspaces
+            .state_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "(memory only)".into()),
         "starting fresh-gui"
     );
 
@@ -340,8 +357,13 @@ async fn run_server_foreground(args: ServeArgs, write_session_meta: bool) -> Res
         print_startup_banner(bound, &http_url, &ws_url, token.as_deref());
     }
 
+    let workspaces = state.workspaces.clone();
     let result =
         server::serve_listener(listener, state, &http_url, &ws_url, Some(memory.clone())).await;
+
+    if let Err(err) = workspaces.save_now().await {
+        warn!("final workspace save: {err:#}");
+    }
 
     // Fallback if shutdown drained without the signal path finalizing (e.g. serve error).
     memory.finish();
@@ -352,6 +374,20 @@ async fn run_server_foreground(args: ServeArgs, write_session_meta: bool) -> Res
     }
 
     result.context("server exited with error")
+}
+
+/// Where the workspace list is saved. The background daemon always saves to
+/// the per-user state dir. `--foreground` (tests, debugging) stays in memory
+/// unless `FRESH_GUI_WORKSPACES_FILE` names a file; that variable also
+/// overrides the daemon's location.
+fn workspaces_state_path(paths: Option<&SessionPaths>) -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os("FRESH_GUI_WORKSPACES_FILE")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        return Some(explicit);
+    }
+    paths.map(|paths| paths.state_dir.join(crate::daemon::WORKSPACES_NAME))
 }
 
 #[derive(Debug)]

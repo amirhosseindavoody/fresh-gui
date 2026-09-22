@@ -97,6 +97,23 @@ impl FsRoot {
         Ok(canon)
     }
 
+    /// Kind of a symlink's target, only when it resolves inside the sandbox;
+    /// a link out of the root must not look expandable.
+    async fn symlink_target_kind(&self, link: &Path) -> Option<FsKind> {
+        let canon = fs::canonicalize(link).await.ok()?;
+        if !self.is_allowed(&canon) {
+            return None;
+        }
+        let meta = fs::metadata(&canon).await.ok()?;
+        Some(if meta.is_dir() {
+            FsKind::Dir
+        } else if meta.is_file() {
+            FsKind::File
+        } else {
+            FsKind::Other
+        })
+    }
+
     pub async fn list(&self, path: &str) -> Result<(String, Vec<FsEntry>)> {
         let dir = self.resolve(path).await?;
         let meta = fs::metadata(&dir).await?;
@@ -127,11 +144,17 @@ impl FsRoot {
             } else {
                 None
             };
+            let target_kind = if kind == FsKind::Symlink {
+                self.symlink_target_kind(&path).await
+            } else {
+                None
+            };
             entries.push(FsEntry {
                 name,
                 path: path.display().to_string(),
                 kind,
                 size,
+                target_kind,
             });
         }
 
@@ -231,11 +254,12 @@ impl FsRoot {
                 .ok_or_else(|| anyhow::anyhow!("source has no file name: {}", from.display()))?;
             let to = unique_dest_path(&dest_dir, &base).await?;
             ensure_child_of(&dest_dir, &to)?;
-            if let Some(parent) = from.parent() {
-                if paths_equal(parent, &dest_dir) && paths_equal(&from, &to) {
-                    out.push(entry_for_path(&from).await?);
-                    continue;
-                }
+            if let Some(parent) = from.parent()
+                && paths_equal(parent, &dest_dir)
+                && paths_equal(&from, &to)
+            {
+                out.push(entry_for_path(&from).await?);
+                continue;
             }
             fs::rename(&from, &to)
                 .await
@@ -358,6 +382,7 @@ async fn entry_for_path(path: &Path) -> Result<FsEntry> {
         } else {
             None
         },
+        target_kind: None,
     })
 }
 
@@ -466,6 +491,33 @@ mod tests {
         assert!(escape.is_err());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_dirs_report_their_target_only_inside_the_sandbox() {
+        let tmp = tempfile_dir();
+        let outside = tempfile_dir();
+        stdfs::create_dir(tmp.join("real")).unwrap();
+        stdfs::write(tmp.join("real/x.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(tmp.join("real"), tmp.join("link")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("real/x.txt"), tmp.join("file-link")).unwrap();
+        std::os::unix::fs::symlink(&outside, tmp.join("escape")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("missing"), tmp.join("dangling")).unwrap();
+
+        let root = FsRoot::new(tmp.clone()).unwrap();
+        let (_, entries) = root.list("").await.unwrap();
+        let target = |name: &str| {
+            let entry = entries.iter().find(|e| e.name == name).unwrap();
+            assert_eq!(entry.kind, FsKind::Symlink, "{name}");
+            entry.target_kind
+        };
+        assert_eq!(target("link"), Some(FsKind::Dir));
+        assert_eq!(target("file-link"), Some(FsKind::File));
+        assert_eq!(target("escape"), None);
+        assert_eq!(target("dangling"), None);
+        let dir = entries.iter().find(|e| e.name == "real").unwrap();
+        assert_eq!(dir.target_kind, None);
+    }
+
     #[tokio::test]
     async fn authorize_outside_root_allows_list() {
         let a = tempfile_dir();
@@ -494,7 +546,7 @@ mod tests {
         assert_eq!(dir.kind, FsKind::Dir);
 
         let copied = root
-            .copy_into(&[file.path.clone()], &dir.path)
+            .copy_into(std::slice::from_ref(&file.path), &dir.path)
             .await
             .unwrap();
         assert_eq!(copied.len(), 1);
@@ -502,7 +554,7 @@ mod tests {
         assert_eq!(stdfs::read(tmp.join("nested/hello.txt")).unwrap(), b"hi");
 
         let moved = root
-            .move_into(&[file.path.clone()], &dir.path)
+            .move_into(std::slice::from_ref(&file.path), &dir.path)
             .await
             .unwrap();
         assert_eq!(moved.len(), 1);

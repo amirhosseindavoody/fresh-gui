@@ -2,10 +2,12 @@
 //!
 //! Layout (Linux / Unix):
 //! - Runtime (lock + meta): `$XDG_RUNTIME_DIR/fresh-gui/` or `/tmp/fresh-gui-$UID/`
-//! - Log: `$XDG_STATE_HOME/fresh-gui/fresh-gui.log` or `~/.local/state/fresh-gui/…`
+//! - Log + saved workspaces: `$XDG_STATE_HOME/fresh-gui/` (`fresh-gui.log`,
+//!   `workspaces.json`) or `~/.local/state/fresh-gui/…`
 //!
 //! Layout (Windows):
-//! - Runtime + log under `%LOCALAPPDATA%\fresh-gui\` (fallback: `%TEMP%\fresh-gui\`)
+//! - Runtime, log, and `workspaces.json` under `%LOCALAPPDATA%\fresh-gui\`
+//!   (fallback: `%TEMP%\fresh-gui\`)
 //!
 //! Only one background session per user (exclusive lock on the lock file).
 //! Detach/spawn follows Fresh’s daemon pattern (`vendor/fresh` …/server/daemon).
@@ -30,6 +32,10 @@ use unix as platform;
 use windows as platform;
 
 pub use platform::{SessionLock, is_process_running, spawn_daemon};
+pub(crate) use platform::{chmod_file_private, open_private_write};
+
+/// Workspace list the daemon restores on its next start.
+pub const WORKSPACES_NAME: &str = "workspaces.json";
 
 const META_NAME: &str = "session.json";
 const LOCK_NAME: &str = "session.lock";
@@ -57,7 +63,6 @@ pub struct SessionMeta {
 pub struct SessionPaths {
     #[allow(dead_code)]
     pub runtime_dir: PathBuf,
-    #[allow(dead_code)]
     pub state_dir: PathBuf,
     pub lock_path: PathBuf,
     pub meta_path: PathBuf,
@@ -274,6 +279,7 @@ pub fn close_session(paths: &SessionPaths) -> Result<()> {
 }
 
 /// Reconstruct CLI args for the daemon child from parsed serve options.
+#[allow(clippy::too_many_arguments)]
 pub fn serve_args_for_child(
     listen: &str,
     strict_listen: bool,
