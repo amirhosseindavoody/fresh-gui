@@ -8,6 +8,7 @@ mod actions;
 mod ade;
 mod assets;
 mod connect;
+mod diff_view;
 mod dock_a11y;
 mod explorer;
 mod file_icons;
@@ -41,6 +42,7 @@ pub fn run_target(target: ConnectTarget) -> Result<()> {
     app.run(move |cx| {
         gpui_kit::init(cx);
         actions::init(cx);
+        actions::install_menus(cx);
         let mut window_size = size(px(1280.0), px(800.0));
         if let Some(display) = cx.primary_display() {
             let display_size = display.bounds().size;

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use fresh_gui_client::{Client, ConnectOptions};
 use fresh_gui_protocol::{
-    CAP_WORKSPACE, FsEntry, Hello, Message, PtyInfo, WorkspaceInfo, WorkspaceTab,
+    CAP_WORKSPACE, FsEntry, GitFile, Hello, Message, PtyInfo, WorkspaceInfo, WorkspaceTab,
 };
 
 use super::connect::ConnectTarget;
@@ -89,6 +89,38 @@ pub enum AdeCmd {
         tabs: Vec<WorkspaceTab>,
         active_tab: u32,
         explorer_expanded: Vec<String>,
+    },
+    GitStatus {
+        request_id: String,
+        workspace_id: String,
+    },
+    GitDiff {
+        request_id: String,
+        workspace_id: String,
+        path: String,
+    },
+    GitStage {
+        request_id: String,
+        workspace_id: String,
+        paths: Vec<String>,
+        stage: bool,
+    },
+    GitCommit {
+        request_id: String,
+        workspace_id: String,
+        message: String,
+    },
+    GitPull {
+        request_id: String,
+        workspace_id: String,
+    },
+    GitPush {
+        request_id: String,
+        workspace_id: String,
+    },
+    OpenExternal {
+        request_id: String,
+        path: String,
     },
     /// Acknowledged once every command queued before it has been written.
     Flush(std::sync::mpsc::Sender<()>),
@@ -188,6 +220,34 @@ pub enum AdeEvent {
     },
     Error {
         code: String,
+        message: String,
+    },
+    GitStatus {
+        request_id: String,
+        repo: bool,
+        root: String,
+        branch: String,
+        upstream: Option<String>,
+        ahead: u32,
+        behind: u32,
+        files: Vec<GitFile>,
+        detail: Option<String>,
+    },
+    GitDiff {
+        request_id: String,
+        path: String,
+        old_text: String,
+        new_text: String,
+        binary: bool,
+        truncated: bool,
+    },
+    GitOp {
+        request_id: String,
+        ok: bool,
+        output: String,
+    },
+    FsOpened {
+        request_id: String,
         message: String,
     },
 }
@@ -488,6 +548,85 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
             let _ = ack.send(());
         }
         AdeCmd::Disconnect => {}
+        AdeCmd::GitStatus {
+            request_id,
+            workspace_id,
+        } => {
+            client
+                .send(Message::GitStatus {
+                    request_id,
+                    workspace_id,
+                })
+                .await?;
+        }
+        AdeCmd::GitDiff {
+            request_id,
+            workspace_id,
+            path,
+        } => {
+            client
+                .send(Message::GitDiff {
+                    request_id,
+                    workspace_id,
+                    path,
+                })
+                .await?;
+        }
+        AdeCmd::GitStage {
+            request_id,
+            workspace_id,
+            paths,
+            stage,
+        } => {
+            client
+                .send(Message::GitStage {
+                    request_id,
+                    workspace_id,
+                    paths,
+                    stage,
+                })
+                .await?;
+        }
+        AdeCmd::GitCommit {
+            request_id,
+            workspace_id,
+            message,
+        } => {
+            client
+                .send(Message::GitCommit {
+                    request_id,
+                    workspace_id,
+                    message,
+                })
+                .await?;
+        }
+        AdeCmd::GitPull {
+            request_id,
+            workspace_id,
+        } => {
+            client
+                .send(Message::GitPull {
+                    request_id,
+                    workspace_id,
+                })
+                .await?;
+        }
+        AdeCmd::GitPush {
+            request_id,
+            workspace_id,
+        } => {
+            client
+                .send(Message::GitPush {
+                    request_id,
+                    workspace_id,
+                })
+                .await?;
+        }
+        AdeCmd::OpenExternal { request_id, path } => {
+            client
+                .send(Message::FsOpenExternal { request_id, path })
+                .await?;
+        }
     }
     Ok(())
 }
@@ -693,6 +832,58 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             entries,
         }),
         Message::Error { code, message } => Some(AdeEvent::Error { code, message }),
+        Message::GitStatusResult {
+            request_id,
+            repo,
+            root,
+            branch,
+            upstream,
+            ahead,
+            behind,
+            files,
+            detail,
+        } => Some(AdeEvent::GitStatus {
+            request_id,
+            repo,
+            root,
+            branch,
+            upstream,
+            ahead,
+            behind,
+            files,
+            detail,
+        }),
+        Message::GitDiffResult {
+            request_id,
+            path,
+            old_text,
+            new_text,
+            binary,
+            truncated,
+        } => Some(AdeEvent::GitDiff {
+            request_id,
+            path,
+            old_text,
+            new_text,
+            binary,
+            truncated,
+        }),
+        Message::GitOpResult {
+            request_id,
+            ok,
+            output,
+        } => Some(AdeEvent::GitOp {
+            request_id,
+            ok,
+            output,
+        }),
+        Message::FsOpened {
+            request_id,
+            message,
+        } => Some(AdeEvent::FsOpened {
+            request_id,
+            message,
+        }),
         Message::WorkspaceCreated { workspace } => Some(AdeEvent::WorkspaceCreated { workspace }),
         Message::WorkspaceRenamed { workspace } => Some(AdeEvent::WorkspaceRenamed { workspace }),
         Message::WorkspaceClosed {

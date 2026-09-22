@@ -17,6 +17,8 @@ pub const CAP_SESSION: &str = "session";
 pub const CAP_WORKSPACE: &str = "workspace";
 pub const CAP_EDITOR: &str = "editor";
 pub const CAP_SCENE: &str = "scene";
+/// Workspace git status, diff, and stage/commit/pull/push. Absent on older daemons.
+pub const CAP_GIT: &str = "git";
 
 /// First message after WebSocket connect. Client sends; backend replies with its own.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -179,6 +181,16 @@ pub struct SceneBuffer {
     pub dirty: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+}
+
+/// One changed path from `git status --porcelain`.
+///
+/// `path` is relative to the repository root. `xy` is the two-character
+/// porcelain code (` M` unstaged, `M ` staged, `??` untracked, …).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitFile {
+    pub path: String,
+    pub xy: String,
 }
 
 /// Top-level JSON envelope (one WebSocket text frame per message).
@@ -520,6 +532,97 @@ pub enum Message {
     EditorClose {
         buffer_id: String,
     },
+    /// Client → backend: `git status` for a workspace root (capability `git`).
+    GitStatus {
+        request_id: String,
+        /// Daemon workspace id. Empty uses the daemon FS root.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        workspace_id: String,
+    },
+    /// Backend → client.
+    GitStatusResult {
+        request_id: String,
+        repo: bool,
+        root: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        branch: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upstream: Option<String>,
+        #[serde(default)]
+        ahead: u32,
+        #[serde(default)]
+        behind: u32,
+        #[serde(default)]
+        files: Vec<GitFile>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    /// Client → backend: whole-file diff of `path` against `HEAD`.
+    ///
+    /// `path` is relative to the repository root (the `path` from [`GitFile`]).
+    GitDiff {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        workspace_id: String,
+        path: String,
+    },
+    /// Backend → client: both sides of the file, or `binary` when either side
+    /// is not text. `truncated` means a side was cut to the snapshot limit.
+    GitDiffResult {
+        request_id: String,
+        path: String,
+        #[serde(default)]
+        old_text: String,
+        #[serde(default)]
+        new_text: String,
+        #[serde(default)]
+        binary: bool,
+        #[serde(default)]
+        truncated: bool,
+    },
+    /// Client → backend: `git add` (`stage`) or `git restore --staged`.
+    GitStage {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        workspace_id: String,
+        paths: Vec<String>,
+        stage: bool,
+    },
+    /// Client → backend: `git commit -m`.
+    GitCommit {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        workspace_id: String,
+        message: String,
+    },
+    /// Client → backend: `git pull --no-edit`.
+    GitPull {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        workspace_id: String,
+    },
+    /// Client → backend: `git push`.
+    GitPush {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        workspace_id: String,
+    },
+    /// Backend → client: result of stage, commit, pull, or push.
+    GitOpResult {
+        request_id: String,
+        ok: bool,
+        output: String,
+    },
+    /// Client → backend: open a sandboxed path with the OS file handler.
+    FsOpenExternal {
+        request_id: String,
+        path: String,
+    },
+    /// Backend → client after the opener was spawned.
+    FsOpened {
+        request_id: String,
+        message: String,
+    },
     /// Client → backend: thin ADE scene snapshot (capability `scene`).
     SceneGet {
         request_id: String,
@@ -582,6 +685,7 @@ impl Hello {
             CAP_WORKSPACE.to_owned(),
             CAP_EDITOR.to_owned(),
             CAP_SCENE.to_owned(),
+            CAP_GIT.to_owned(),
         ]
     }
 
@@ -594,6 +698,7 @@ impl Hello {
             CAP_WORKSPACE.to_owned(),
             CAP_EDITOR.to_owned(),
             CAP_SCENE.to_owned(),
+            CAP_GIT.to_owned(),
         ]
     }
 }
@@ -817,6 +922,28 @@ mod tests {
         assert_eq!(
             Message::from_json(&opened.to_json().unwrap()).unwrap(),
             opened
+        );
+    }
+
+    #[test]
+    fn git_status_roundtrips() {
+        let status = Message::GitStatusResult {
+            request_id: "g1".into(),
+            repo: true,
+            root: "/tmp/proj".into(),
+            branch: "main".into(),
+            upstream: Some("origin/main".into()),
+            ahead: 1,
+            behind: 0,
+            files: vec![GitFile {
+                path: "src/main.rs".into(),
+                xy: " M".into(),
+            }],
+            detail: None,
+        };
+        assert_eq!(
+            Message::from_json(&status.to_json().unwrap()).unwrap(),
+            status
         );
     }
 }

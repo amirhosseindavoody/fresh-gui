@@ -236,7 +236,7 @@ Ribbon metrics live in `workspace.rs`. Workspace-rail width, row height, and roo
 |-----------|------|
 | Title bar | 30px (`TitleBar` height); label is `text_sm` with a 4px gap |
 | Workspace rail | 232px, left of the activity bar, only when `hello` includes `workspace`. Header is the explorer header height (26px), a muted **Workspaces** section title plus **+**. Rows are two lines and at least 40px: display name, then the project root (`~` for home, **Default root** when empty). The active row has an accent fill and a 3px left accent. Hover reveals Rename and Close; right-click has the same menu. The last workspace cannot be closed. One workspace shows a footer hint |
-| Activity rail | 36px wide, `py_1`, no gap; explorer and settings are small ghost icon buttons |
+| Activity rail | 36px wide, `py_1`, no gap; explorer, source control (when `hello` includes `git`), and settings are small ghost icon buttons |
 | Explorer header | 26px, `text_xs`, xsmall collapse button |
 | Explorer rows | 22px, `text_sm`, 8px indent, no tree padding. A chevron marks a folder that has (or may have) children. Lucide file-type icons, tinted by kind, distinguish files from folders |
 | Tab strip | Dock skin default (`TabBar` medium, 32px). Each tab has an **×**. The **+** is in `title_suffix` and shifts left to sit a gap past the last tab’s chrome (title edge plus the medium tab’s 12px padding and 1px border). It stays at the right edge, beside **···**, when the strip is full |
@@ -249,7 +249,10 @@ Dock chrome (tab height, suffix placement, the disabled Zoom item in **···**)
 | Connect / auth / session (`?token=` URL or `--token`) | Yes |
 | Workspace rail (create, rename, close, switch) | Yes — each workspace is its own tab set; idle ones stay on the daemon. **+** asks for a name and an absolute root, prefilled with the current workspace folder (empty name uses the folder name; a cleared root uses the daemon project root). Rename and close are on hover, the right-click menu, and the command palette |
 | SSH target add + auto-install + tunnel (`remote connect`) | Yes (CLI before the window; title bar shows the destination) |
-| Activity bar + collapsible explorer (`fs_list`) | Yes |
+| Activity bar + collapsible explorer (`fs_list`) | Yes. Source Control replaces the explorer while that activity is selected |
+| File menu | **Stop Server** disconnects and, locally, stops the daemon the same way as `fresh-gui close`. **Quit Client** closes the window and leaves the daemon running. An SSH session's Stop Server only disconnects |
+| Binary files | A binary click opens a placeholder (**Open externally**) instead of a text buffer |
+| Source Control | Status, stage, unstage, commit, pull, push for the workspace root. A changed file opens a whole-file split diff; a second click keeps that diff as a tab. Diff tabs are not restored |
 | Docked terminal + editor tabs | Yes. Drag a tab to the left/right/top/bottom edge to split; drop it on a tab to merge; drag in the strip to reorder. Empty groups collapse. The last remaining tab cannot be dragged |
 | Terminal titles | New PTYs are `1`, `2`, `3`, … inside the focused workspace (closing `2` does not reuse it there). Right-click the title or **··· → Rename**. The same menus close that tab, the other tabs, or the tabs to the right. `SessionTabTitle.workspace_id` is that workspace. OSC 7 updates cwd for the next terminal and does not rename the tab |
 | Explorer state | Open folders are per workspace and saved by the daemon with the tab list, so they come back after a switch, a reconnect, or a daemon restart. A symlink to a folder inside the sandbox expands like a folder; its children are shown under the link path |

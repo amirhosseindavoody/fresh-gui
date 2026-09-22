@@ -1,6 +1,22 @@
 //! Window-level ADE actions (command palette + keybindings).
 
-use gpui_kit::{App, KeyBinding, actions};
+use gpui_kit::component::GlobalState;
+use gpui_kit::{App, KeyBinding, Menu, MenuItem, actions};
+
+/// File menu: stop the local daemon, or leave it running and close the window.
+pub fn install_menus(cx: &mut App) {
+    let menus = vec![file_menu().owned()];
+    GlobalState::global_mut(cx).set_app_menus(menus);
+    cx.set_menus(vec![file_menu()]);
+}
+
+fn file_menu() -> Menu {
+    Menu::new("File").items([
+        MenuItem::action("Stop Server", StopServer),
+        MenuItem::separator(),
+        MenuItem::action("Quit Client", QuitClient),
+    ])
+}
 
 actions!(
     fresh_gui,
@@ -21,6 +37,8 @@ actions!(
         NewWorkspace,
         RenameWorkspace,
         CloseWorkspace,
+        StopServer,
+        QuitClient,
     ]
 );
 

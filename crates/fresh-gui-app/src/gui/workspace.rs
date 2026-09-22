@@ -14,12 +14,13 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fresh_gui_protocol::{
-    CAP_WORKSPACE, FsEntry, FsKind, Hello, PtyInfo, WorkspaceInfo, WorkspaceTab, WorkspaceTabKind,
+    CAP_GIT, CAP_WORKSPACE, FsEntry, FsKind, GitFile, Hello, PtyInfo, WorkspaceInfo, WorkspaceTab,
+    WorkspaceTabKind,
 };
 use gpui_kit::component::dock::{DockArea, DockEvent, DockPlacement, PanelId, panel_handle};
-use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::menu::{AppMenuBar, ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{
-    ActiveTheme, Icon, IconName, Root, Selectable, Sizable, StyledExt, TitleBar,
+    ActiveTheme, Disableable as _, Icon, IconName, Root, Selectable, Sizable, StyledExt, TitleBar,
     button::{Button, ButtonVariants as _},
     command::{Command, CommandGroup, CommandItem, CommandState},
     h_flex,
@@ -34,12 +35,13 @@ use gpui_kit::*;
 
 use super::actions::{
     CloseTab, CloseWorkspace, CopyExplorer, Disconnect, GoToFile, NewTerminal, NewWorkspace,
-    NextTab, OpenSettings, PasteExplorer, PrevTab, Reconnect, RenameWorkspace, SaveBuffer,
-    ToggleCommandPalette, ToggleSidebar,
+    NextTab, OpenSettings, PasteExplorer, PrevTab, QuitClient, Reconnect, RenameWorkspace,
+    SaveBuffer, StopServer, ToggleCommandPalette, ToggleSidebar,
 };
 use super::ade::AttachedWorkspace;
 use super::ade::{AdeCmd, AdeEvent, AdeHandle};
 use super::connect::{ConnectTarget, parse_goto_spec};
+use super::diff_view::{self, BinaryPanel, DiffPanel};
 use super::dock_a11y::install_workspace_dock;
 use super::explorer::{
     absolute_paths_text, apply_selection, build_explorer_tree, copyable_sources, drag_paths,
@@ -72,6 +74,109 @@ fn next_id(prefix: &str) -> String {
     format!("{prefix}-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed))
 }
 
+/// `{request_id}: {path}` or `{request_id}: binary file: {path}`.
+fn split_request_message(message: &str) -> Option<(&str, &str)> {
+    let (request_id, rest) = message.split_once(": ")?;
+    let rest = rest.strip_prefix("binary file: ").unwrap_or(rest).trim();
+    if request_id.is_empty() || rest.is_empty() {
+        None
+    } else {
+        Some((request_id, rest))
+    }
+}
+
+fn git_lookup_key(path: &str) -> String {
+    let shown = display_path(path);
+    if cfg!(windows) {
+        shown.to_ascii_lowercase()
+    } else {
+        shown
+    }
+}
+
+fn git_file_row(
+    ix: usize,
+    file: GitFile,
+    busy: bool,
+    view: Entity<Workspace>,
+    _cx: &App,
+) -> impl IntoElement {
+    let mut chars = file.xy.chars();
+    let index = chars.next().unwrap_or(' ');
+    let work = chars.next().unwrap_or(' ');
+    let unstaged = work != ' ' || index == '?';
+    let staged = index != ' ' && index != '?';
+    let name = file
+        .path
+        .rsplit(['/', '\\'])
+        .find(|seg| !seg.is_empty())
+        .unwrap_or(file.path.as_str())
+        .to_string();
+    let xy = if file.xy.is_empty() {
+        "  ".to_string()
+    } else {
+        file.xy.clone()
+    };
+    let open_rel = file.path.clone();
+    let stage_rel = file.path.clone();
+    let unstage_rel = file.path;
+
+    h_flex()
+        .id(format!("git-file-{ix}"))
+        .w_full()
+        .h(px(TREE_ROW_H))
+        .px_1()
+        .gap_1()
+        .items_center()
+        .cursor_pointer()
+        .on_click({
+            let view = view.clone();
+            move |event, window, cx| {
+                let pin = diff_view::click_count(event) >= 2;
+                let rel = open_rel.clone();
+                view.update(cx, |this, cx| this.open_diff(rel, pin, window, cx));
+            }
+        })
+        .child(div().w(px(20.)).flex_shrink_0().text_xs().child(xy))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_sm()
+                .text_ellipsis()
+                .child(name),
+        )
+        .when(unstaged, |row| {
+            let view = view.clone();
+            row.child(
+                Button::new(format!("git-stage-{ix}"))
+                    .ghost()
+                    .xsmall()
+                    .label("Stage")
+                    .disabled(busy)
+                    .on_click(move |_, _, cx| {
+                        let rel = stage_rel.clone();
+                        view.update(cx, |this, cx| this.git_stage(vec![rel], true, cx));
+                        cx.stop_propagation();
+                    }),
+            )
+        })
+        .when(staged, |row| {
+            row.child(
+                Button::new(format!("git-unstage-{ix}"))
+                    .ghost()
+                    .xsmall()
+                    .label("Unstage")
+                    .disabled(busy)
+                    .on_click(move |_, _, cx| {
+                        let rel = unstage_rel.clone();
+                        view.update(cx, |this, cx| this.git_stage(vec![rel], false, cx));
+                        cx.stop_propagation();
+                    }),
+            )
+        })
+}
+
 fn display_paths(paths: &[String]) -> Vec<String> {
     paths.iter().map(|path| display_path(path)).collect()
 }
@@ -79,6 +184,7 @@ fn display_paths(paths: &[String]) -> Vec<String> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Activity {
     Explorer,
+    Git,
 }
 
 enum ConnectionState {
@@ -90,6 +196,8 @@ enum ConnectionState {
 enum ActiveSurface {
     Terminal(String),
     Editor(String),
+    Diff(String),
+    Binary(String),
 }
 
 struct PendingFs {
@@ -155,8 +263,30 @@ pub struct Workspace {
     tab_metrics: TabStripMetrics,
     terminals: HashMap<String, Entity<TerminalPanel>>,
     editors: HashMap<String, Entity<EditorPanel>>,
+    diffs: HashMap<String, Entity<DiffPanel>>,
+    binaries: HashMap<String, Entity<BinaryPanel>>,
+    /// Unpinned diff tab. The next preview replaces it.
+    diff_preview: Option<String>,
+    /// Last terminal or editor panel, so a diff tab does not rewrite the saved active index.
+    last_saved_panel: Option<PanelId>,
     next_terminal_number: u32,
     active: Option<ActiveSurface>,
+    git_cap: bool,
+    git_repo: bool,
+    git_root: String,
+    git_branch: String,
+    git_upstream: Option<String>,
+    git_ahead: u32,
+    git_behind: u32,
+    git_files: Vec<GitFile>,
+    git_detail: Option<String>,
+    git_busy: bool,
+    git_status_req: Option<String>,
+    /// Display path and repo-relative path → repo-relative path.
+    git_paths: HashMap<String, String>,
+    pending_diffs: HashMap<String, String>,
+    commit_input: Entity<InputState>,
+    menu_bar: Entity<AppMenuBar>,
     last_cwd: Option<String>,
     explorer: Entity<TreeState>,
     explorer_root: String,
@@ -208,6 +338,8 @@ impl Workspace {
         let ws_rename_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Workspace name"));
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Terminal name"));
+        let commit_input = cx.new(|cx| InputState::new(window, cx).placeholder("Commit message"));
+        let menu_bar = AppMenuBar::new(cx);
         let tree_sub = cx.subscribe(&explorer, |this, _, ev: &TreeEvent, cx| {
             // The tree already toggled on mouse-down. Record that and list a
             // directory we have not seen. Do not rebuild here: this callback
@@ -265,6 +397,11 @@ impl Workspace {
                 _ => {}
             }
         });
+        let commit_sub = cx.subscribe(&commit_input, |this, _, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::PressEnter { .. }) {
+                this.git_commit(cx);
+            }
+        });
 
         let recv_task = cx.spawn_in(window, async move |this, cx| {
             while let Ok(ev) = evt_rx.recv().await {
@@ -280,6 +417,11 @@ impl Workspace {
         });
 
         let closing = cx.weak_entity();
+        // The Windows close button asks this hook while the HWND is still
+        // valid. Layout is published here, before GPUI destroys the window.
+        // `window not found` and the invalid-handle errors that follow are
+        // GPUI calling ShowWindow / DestroyWindow after that HWND is gone.
+        // This host does not keep a window handle of its own.
         window.on_window_should_close(cx, move |_, cx| {
             if let Some(this) = closing.upgrade() {
                 this.update(cx, |this, cx| this.save_before_exit(cx));
@@ -310,8 +452,27 @@ impl Workspace {
             tab_metrics: TabStripMetrics::default(),
             terminals: HashMap::new(),
             editors: HashMap::new(),
+            diffs: HashMap::new(),
+            binaries: HashMap::new(),
+            diff_preview: None,
+            last_saved_panel: None,
             next_terminal_number: 1,
             active: None,
+            git_cap: false,
+            git_repo: false,
+            git_root: String::new(),
+            git_branch: String::new(),
+            git_upstream: None,
+            git_ahead: 0,
+            git_behind: 0,
+            git_files: Vec::new(),
+            git_detail: None,
+            git_busy: false,
+            git_status_req: None,
+            git_paths: HashMap::new(),
+            pending_diffs: HashMap::new(),
+            commit_input,
+            menu_bar,
             last_cwd: None,
             explorer,
             explorer_root: String::new(),
@@ -342,6 +503,7 @@ impl Workspace {
                 ws_rename_sub,
                 create_name_sub,
                 create_root_sub,
+                commit_sub,
             ],
             _recv_task: recv_task,
         }
@@ -378,6 +540,7 @@ impl Workspace {
                         cwd: None,
                     });
                     self.list_dir("");
+                    self.refresh_git();
                 }
             }
             AdeEvent::WorkspaceCreated { workspace } => {
@@ -505,14 +668,90 @@ impl Workspace {
                     self.pty_opens_pending = self.pty_opens_pending.saturating_sub(1);
                     self.respawn_titles.pop_front();
                 }
-                // A folder saved as open may be gone now; its failed listing
-                // is not a reason to abandon reopening the workspace's tabs.
-                let explorer_only = code.starts_with("fs_list") || code.starts_with("fs_stat");
-                if self.restoring && !explorer_only {
-                    self.restoring = false;
-                    self.pending_editors.clear();
+                if code == "binary_file" {
+                    if let Some((request_id, path)) = split_request_message(&message) {
+                        let activate = self.pending_editors.remove(request_id).unwrap_or(true);
+                        if !path.is_empty() {
+                            self.open_binary(path.to_string(), activate, window, cx);
+                        }
+                        self.finish_restore_if_idle(window, cx);
+                    }
+                    self.status = "Binary file — not opened in the editor".into();
+                } else if code == "git_failed" {
+                    self.git_busy = false;
+                    self.status = format!("Git: {message}").into();
+                } else {
+                    // A folder saved as open may be gone now; its failed listing
+                    // is not a reason to abandon reopening the workspace's tabs.
+                    let side = code.starts_with("fs_list")
+                        || code.starts_with("fs_stat")
+                        || code == "fs_open_failed";
+                    if self.restoring && !side {
+                        self.restoring = false;
+                        self.pending_editors.clear();
+                    }
+                    self.status = format!("{code}: {message}").into();
                 }
-                self.status = format!("{code}: {message}").into();
+            }
+            AdeEvent::GitStatus {
+                request_id,
+                repo,
+                root,
+                branch,
+                upstream,
+                ahead,
+                behind,
+                files,
+                detail,
+            } => {
+                if self.git_status_req.as_deref() == Some(request_id.as_str()) {
+                    self.git_status_req = None;
+                    self.apply_git_status(
+                        repo, root, branch, upstream, ahead, behind, files, detail,
+                    );
+                }
+            }
+            AdeEvent::GitDiff {
+                request_id,
+                path,
+                old_text,
+                new_text,
+                binary,
+                truncated,
+            } => {
+                self.pending_diffs.remove(&request_id);
+                if let Some(panel) = self.diffs.get(&path).cloned() {
+                    panel.update(cx, |panel, cx| {
+                        panel.show_sides(old_text, new_text, binary, truncated, cx);
+                    });
+                }
+            }
+            AdeEvent::GitOp {
+                request_id: _,
+                ok,
+                output,
+            } => {
+                self.git_busy = false;
+                let line = output
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or(if ok {
+                        "Git command finished"
+                    } else {
+                        "Git command failed"
+                    });
+                let line = line.trim();
+                self.status = if line.chars().count() > 180 {
+                    format!("{}…", line.chars().take(180).collect::<String>()).into()
+                } else {
+                    line.to_string().into()
+                };
+                if ok {
+                    self.refresh_git();
+                }
+            }
+            AdeEvent::FsOpened { message, .. } => {
+                self.status = message.into();
             }
         }
         cx.notify();
@@ -521,6 +760,7 @@ impl Workspace {
     fn apply_hello(&mut self, hello: &Hello) {
         self.capabilities = hello.capabilities.clone();
         self.config_path = hello.config_path.clone();
+        self.git_cap = hello.capabilities.iter().any(|cap| cap == CAP_GIT);
     }
 
     fn add_terminal_tab(&mut self, pty_id: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -686,8 +926,26 @@ impl Workspace {
                 .editors
                 .get(path)
                 .map(|panel| PanelId::from(panel.entity_id())),
+            Some(ActiveSurface::Diff(rel)) => self
+                .diffs
+                .get(rel)
+                .map(|panel| PanelId::from(panel.entity_id())),
+            Some(ActiveSurface::Binary(path)) => self
+                .binaries
+                .get(path)
+                .map(|panel| PanelId::from(panel.entity_id())),
             None => None,
         }
+    }
+
+    fn is_saved_tab(&self, id: PanelId) -> bool {
+        self.terminals
+            .values()
+            .any(|panel| PanelId::from(panel.entity_id()) == id)
+            || self
+                .editors
+                .values()
+                .any(|panel| PanelId::from(panel.entity_id()) == id)
     }
 
     pub(crate) fn note_terminal_active(
@@ -698,6 +956,9 @@ impl Workspace {
     ) {
         if active {
             self.active = Some(ActiveSurface::Terminal(pty_id.to_string()));
+            if let Some(id) = self.active_panel_id() {
+                self.last_saved_panel = Some(id);
+            }
             if !self.restoring {
                 // The dock calls `Panel::set_active` from inside
                 // `Entity::update` on this terminal. `publish_layout` reads
@@ -718,6 +979,9 @@ impl Workspace {
     pub(crate) fn note_editor_active(&mut self, path: &str, active: bool, cx: &mut Context<Self>) {
         if active {
             self.active = Some(ActiveSurface::Editor(path.to_string()));
+            if let Some(id) = self.active_panel_id() {
+                self.last_saved_panel = Some(id);
+            }
             if !self.restoring {
                 self.publish_layout(cx);
             }
@@ -806,6 +1070,8 @@ impl Workspace {
     fn release_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let terminals: Vec<_> = self.terminals.values().cloned().collect();
         let editors: Vec<_> = self.editors.values().cloned().collect();
+        let diffs: Vec<_> = self.diffs.values().cloned().collect();
+        let binaries: Vec<_> = self.binaries.values().cloned().collect();
         for panel in terminals {
             panel.update(cx, |panel, _| panel.release());
             self.dock
@@ -816,10 +1082,26 @@ impl Workspace {
             self.dock
                 .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
         }
+        for panel in diffs {
+            panel.update(cx, |panel, _| panel.release());
+            self.dock
+                .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
+        }
+        for panel in binaries {
+            panel.update(cx, |panel, _| panel.release());
+            self.dock
+                .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
+        }
         self.terminals.clear();
         self.editors.clear();
+        self.diffs.clear();
+        self.binaries.clear();
+        self.diff_preview = None;
+        self.pending_diffs.clear();
         self.active = None;
+        self.last_saved_panel = None;
         self.next_terminal_number = 1;
+        self.clear_git_view();
     }
 
     fn capture_layout(&self, cx: &App) -> (Vec<WorkspaceTab>, u32) {
@@ -883,11 +1165,15 @@ impl Workspace {
                 });
             }
         }
-        let active_id = self.active_panel_id();
+        let active_id = match &self.active {
+            Some(ActiveSurface::Diff(_)) | Some(ActiveSurface::Binary(_)) => self.last_saved_panel,
+            _ => self.active_panel_id(),
+        };
         let active_tab = active_id
             .and_then(|id| {
                 self.panel_order(cx)
                     .iter()
+                    .filter(|item| self.is_saved_tab(**item))
                     .position(|item| *item == id)
                     .map(|ix| ix as u32)
             })
@@ -1059,6 +1345,7 @@ impl Workspace {
         if !expect_editors {
             self.finish_restore(window, cx);
         }
+        self.refresh_git();
     }
 
     /// Select the saved active terminal (editors reopened by the restore may
@@ -1270,6 +1557,8 @@ impl Workspace {
     fn remove_dock_ids(&mut self, ids: &[PanelId], window: &mut Window, cx: &mut Context<Self>) {
         let mut terminals = Vec::new();
         let mut editors = Vec::new();
+        let mut diffs = Vec::new();
+        let mut binaries = Vec::new();
         for id in ids {
             if let Some(panel) = self
                 .terminals
@@ -1285,6 +1574,20 @@ impl Workspace {
                 .cloned()
             {
                 editors.push(panel);
+            } else if let Some(panel) = self
+                .diffs
+                .values()
+                .find(|panel| PanelId::from(panel.entity_id()) == *id)
+                .cloned()
+            {
+                diffs.push(panel);
+            } else if let Some(panel) = self
+                .binaries
+                .values()
+                .find(|panel| PanelId::from(panel.entity_id()) == *id)
+                .cloned()
+            {
+                binaries.push(panel);
             }
         }
         for panel in terminals {
@@ -1292,6 +1595,14 @@ impl Workspace {
                 .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
         }
         for panel in editors {
+            self.dock
+                .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
+        }
+        for panel in diffs {
+            self.dock
+                .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
+        }
+        for panel in binaries {
             self.dock
                 .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
         }
@@ -1430,6 +1741,8 @@ impl Workspace {
         self.explorer_root.clear();
         self.selection.clear();
         self.anchor = None;
+        self.git_status_req = None;
+        self.git_busy = false;
         self._recv_task = cx.spawn_in(window, async move |this, cx| {
             while let Ok(ev) = evt_rx.recv().await {
                 if cx
@@ -1473,15 +1786,94 @@ impl Workspace {
         });
     }
 
+    fn clear_git_view(&mut self) {
+        self.git_repo = false;
+        self.git_root.clear();
+        self.git_branch.clear();
+        self.git_upstream = None;
+        self.git_ahead = 0;
+        self.git_behind = 0;
+        self.git_files.clear();
+        self.git_detail = None;
+        self.git_paths.clear();
+    }
+
+    fn workspace_id_or_empty(&self) -> String {
+        self.active_workspace_id.clone().unwrap_or_default()
+    }
+
+    fn refresh_git(&mut self) {
+        if !self.git_cap || !matches!(self.connection, ConnectionState::Online) {
+            return;
+        }
+        let request_id = next_id("git");
+        self.git_status_req = Some(request_id.clone());
+        self.ade.send(AdeCmd::GitStatus {
+            request_id,
+            workspace_id: self.workspace_id_or_empty(),
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_git_status(
+        &mut self,
+        repo: bool,
+        root: String,
+        branch: String,
+        upstream: Option<String>,
+        ahead: u32,
+        behind: u32,
+        files: Vec<GitFile>,
+        detail: Option<String>,
+    ) {
+        self.git_repo = repo;
+        self.git_root = root;
+        self.git_branch = branch;
+        self.git_upstream = upstream;
+        self.git_ahead = ahead;
+        self.git_behind = behind;
+        self.git_detail = detail;
+        self.git_paths.clear();
+        let root = if self.git_root.is_empty() {
+            self.explorer_root.clone()
+        } else {
+            self.git_root.clone()
+        };
+        for file in &files {
+            self.git_paths
+                .insert(git_lookup_key(&file.path), file.path.clone());
+            let abs = diff_view::join_repo(&root, &file.path);
+            self.git_paths
+                .insert(git_lookup_key(&abs), file.path.clone());
+            self.git_paths
+                .insert(git_lookup_key(&display_path(&abs)), file.path.clone());
+        }
+        self.git_files = files;
+    }
+
+    fn git_rel_for(&self, path: &str) -> Option<String> {
+        if let Some(rel) = self.git_paths.get(&git_lookup_key(path)) {
+            return Some(rel.clone());
+        }
+        let root = if self.git_root.is_empty() {
+            self.explorer_root.as_str()
+        } else {
+            self.git_root.as_str()
+        };
+        let rel = diff_view::git_relative(root, path)?;
+        self.git_paths.get(&git_lookup_key(&rel)).cloned()
+    }
+
     fn apply_tree_click(
         &mut self,
         path: &str,
         is_folder: bool,
         gesture: super::explorer::SelectGesture,
+        click_count: usize,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<(String, bool)> {
         if is_placeholder(path) {
-            return;
+            return None;
         }
         let visible = self.visible_tree_ids(cx);
         let (next, anchor) = apply_selection(
@@ -1501,8 +1893,247 @@ impl Workspace {
                 self.list_dir(path);
             }
         } else if gesture == super::explorer::SelectGesture::Replace {
+            if let Some(rel) = self.git_rel_for(path) {
+                return Some((rel, click_count >= 2));
+            }
             self.open_path(path.to_string(), true);
         }
+        None
+    }
+
+    fn open_diff(&mut self, rel: String, pin: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(panel) = self.diffs.get(&rel).cloned() {
+            if pin {
+                panel.update(cx, |panel, cx| panel.pin(cx));
+                if self.diff_preview.as_deref() == Some(rel.as_str()) {
+                    self.diff_preview = None;
+                }
+            }
+            self.select_entity(&panel, window, cx);
+            self.request_git_diff(&rel);
+            return;
+        }
+        if !pin
+            && let Some(prev) = self.diff_preview.clone()
+            && prev != rel
+        {
+            self.close_diff(&prev, window, cx);
+        }
+        let root = if self.git_root.is_empty() {
+            self.explorer_root.clone()
+        } else {
+            self.git_root.clone()
+        };
+        let title = diff_view::join_repo(&root, &rel);
+        let workspace = cx.weak_entity();
+        let panel = cx.new(|cx| DiffPanel::new(rel.clone(), title, pin, workspace, cx));
+        self.dock.update(cx, |dock, cx| {
+            dock.add_panel_view(
+                panel_handle(panel.clone()),
+                DockPlacement::Center,
+                None,
+                window,
+                cx,
+            );
+        });
+        self.diffs.insert(rel.clone(), panel.clone());
+        if !pin {
+            self.diff_preview = Some(rel.clone());
+        }
+        self.select_entity(&panel, window, cx);
+        self.request_git_diff(&rel);
+    }
+
+    fn close_diff(&mut self, rel: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.diffs.get(rel).cloned() else {
+            return;
+        };
+        panel.update(cx, |panel, _| panel.release());
+        self.diffs.remove(rel);
+        if self.diff_preview.as_deref() == Some(rel) {
+            self.diff_preview = None;
+        }
+        self.dock
+            .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
+    }
+
+    fn request_git_diff(&mut self, rel: &str) {
+        if !self.git_cap {
+            return;
+        }
+        let request_id = next_id("git");
+        self.pending_diffs
+            .insert(request_id.clone(), rel.to_string());
+        self.ade.send(AdeCmd::GitDiff {
+            request_id,
+            workspace_id: self.workspace_id_or_empty(),
+            path: rel.to_string(),
+        });
+    }
+
+    pub(crate) fn note_diff_active(&mut self, rel: &str, active: bool, cx: &mut Context<Self>) {
+        if active {
+            self.active = Some(ActiveSurface::Diff(rel.to_string()));
+        } else if matches!(&self.active, Some(ActiveSurface::Diff(current)) if current == rel) {
+            self.active = None;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn forget_diff(&mut self, rel: &str, cx: &mut Context<Self>) {
+        self.diffs.remove(rel);
+        if self.diff_preview.as_deref() == Some(rel) {
+            self.diff_preview = None;
+        }
+        if matches!(&self.active, Some(ActiveSurface::Diff(current)) if current == rel) {
+            self.active = None;
+        }
+        if !self.restoring {
+            let this = cx.entity();
+            cx.defer(move |cx| {
+                this.update(cx, |this, cx| this.publish_layout(cx));
+            });
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn pin_diff(&mut self, rel: &str, cx: &mut Context<Self>) {
+        if let Some(panel) = self.diffs.get(rel).cloned() {
+            panel.update(cx, |panel, cx| panel.pin(cx));
+        }
+        if self.diff_preview.as_deref() == Some(rel) {
+            self.diff_preview = None;
+        }
+        cx.notify();
+    }
+
+    fn open_binary(
+        &mut self,
+        path: String,
+        activate: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(panel) = self.binaries.get(&path).cloned() {
+            if activate {
+                self.select_entity(&panel, window, cx);
+            }
+            return;
+        }
+        let workspace = cx.weak_entity();
+        let panel = cx.new(|cx| BinaryPanel::new(path.clone(), workspace, cx));
+        self.dock.update(cx, |dock, cx| {
+            dock.add_panel_view(
+                panel_handle(panel.clone()),
+                DockPlacement::Center,
+                None,
+                window,
+                cx,
+            );
+        });
+        self.binaries.insert(path, panel.clone());
+        if activate {
+            self.select_entity(&panel, window, cx);
+        }
+    }
+
+    pub(crate) fn note_binary_active(&mut self, path: &str, active: bool, cx: &mut Context<Self>) {
+        if active {
+            self.active = Some(ActiveSurface::Binary(path.to_string()));
+        } else if matches!(&self.active, Some(ActiveSurface::Binary(current)) if current == path) {
+            self.active = None;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn forget_binary(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.binaries.remove(path);
+        if matches!(&self.active, Some(ActiveSurface::Binary(current)) if current == path) {
+            self.active = None;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn open_external(&mut self, path: String, cx: &mut Context<Self>) {
+        self.ade.send(AdeCmd::OpenExternal {
+            request_id: next_id("ext"),
+            path,
+        });
+        self.status = "Opening externally…".into();
+        cx.notify();
+    }
+
+    fn git_stage(&mut self, paths: Vec<String>, stage: bool, cx: &mut Context<Self>) {
+        if paths.is_empty() || !self.git_cap || self.git_busy {
+            return;
+        }
+        self.git_busy = true;
+        self.status = if stage {
+            "Staging…".into()
+        } else {
+            "Unstaging…".into()
+        };
+        self.ade.send(AdeCmd::GitStage {
+            request_id: next_id("git"),
+            workspace_id: self.workspace_id_or_empty(),
+            paths,
+            stage,
+        });
+        cx.notify();
+    }
+
+    fn git_commit(&mut self, cx: &mut Context<Self>) {
+        if !self.git_cap || self.git_busy || !self.git_repo {
+            return;
+        }
+        let message = self.commit_input.read(cx).value().to_string();
+        if message.trim().is_empty() {
+            self.status = "Commit message is empty".into();
+            cx.notify();
+            return;
+        }
+        self.git_busy = true;
+        self.status = "Committing…".into();
+        self.ade.send(AdeCmd::GitCommit {
+            request_id: next_id("git"),
+            workspace_id: self.workspace_id_or_empty(),
+            message,
+        });
+        cx.notify();
+    }
+
+    fn git_pull(&mut self, cx: &mut Context<Self>) {
+        self.git_simple(true, cx);
+    }
+
+    fn git_push(&mut self, cx: &mut Context<Self>) {
+        self.git_simple(false, cx);
+    }
+
+    fn git_simple(&mut self, pull: bool, cx: &mut Context<Self>) {
+        if !self.git_cap || self.git_busy || !self.git_repo {
+            return;
+        }
+        self.git_busy = true;
+        self.status = if pull {
+            "Pulling…".into()
+        } else {
+            "Pushing…".into()
+        };
+        let request_id = next_id("git");
+        let workspace_id = self.workspace_id_or_empty();
+        if pull {
+            self.ade.send(AdeCmd::GitPull {
+                request_id,
+                workspace_id,
+            });
+        } else {
+            self.ade.send(AdeCmd::GitPush {
+                request_id,
+                workspace_id,
+            });
+        }
+        cx.notify();
     }
 
     fn ensure_context_selection(&mut self, path: &str, cx: &mut Context<Self>) {
@@ -1832,6 +2463,58 @@ impl Workspace {
     ) {
         self.begin_workspace_rename(window, cx);
         cx.notify();
+    }
+
+    fn on_stop_server(&mut self, _: &StopServer, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.connection, ConnectionState::Online) {
+            self.save_before_exit(cx);
+        }
+        let remote = self
+            .target
+            .label
+            .as_ref()
+            .is_some_and(|label| !label.is_empty());
+        self.ade.send(AdeCmd::Disconnect);
+        if remote {
+            self.connection = ConnectionState::Offline {
+                reason: "Disconnected".into(),
+            };
+            self.status = "Disconnected. The remote daemon keeps running; stop it with fresh-gui close on that machine.".into();
+            cx.notify();
+            return;
+        }
+        self.connection = ConnectionState::Offline {
+            reason: "Stopping daemon".into(),
+        };
+        self.status = "Stopping the local daemon…".into();
+        cx.notify();
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(crate::launch::close_local_daemon());
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(result) = rx.recv().await else {
+                return;
+            };
+            let _ = cx.update(|_window, app| {
+                let _ = this.update(app, |this, cx| {
+                    this.connection = ConnectionState::Offline {
+                        reason: "Daemon stopped".into(),
+                    };
+                    this.status = match result {
+                        Ok(text) => text.into(),
+                        Err(err) => format!("{err:#}").into(),
+                    };
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn on_quit_client(&mut self, _: &QuitClient, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_before_exit(cx);
+        window.remove_window();
     }
 
     fn on_close_workspace(&mut self, _: &CloseWorkspace, _: &mut Window, cx: &mut Context<Self>) {
@@ -2246,6 +2929,26 @@ impl Workspace {
                         cx.notify();
                     })),
             )
+            .when(self.git_cap, |rail| {
+                rail.child(
+                    Button::new("act-git")
+                        .ghost()
+                        .small()
+                        .icon(gpui_kit::assets::IconName::FolderGit)
+                        .tooltip("Source Control")
+                        .selected(self.activity == Activity::Git && !self.sidebar_collapsed)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.activity == Activity::Git {
+                                this.sidebar_collapsed = !this.sidebar_collapsed;
+                            } else {
+                                this.activity = Activity::Git;
+                                this.sidebar_collapsed = false;
+                                this.refresh_git();
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
             .child(
                 Button::new("act-settings")
                     .ghost()
@@ -2394,10 +3097,17 @@ impl Workspace {
                                     mods.shift,
                                     mods.control || mods.platform,
                                 );
-                                let focus = drag_view.update(cx, |this, cx| {
-                                    this.apply_tree_click(&path, is_dir, gesture, cx);
-                                    this.explorer_focus.clone()
+                                let count = super::diff_view::click_count(event);
+                                let (focus, diff) = drag_view.update(cx, |this, cx| {
+                                    let diff =
+                                        this.apply_tree_click(&path, is_dir, gesture, count, cx);
+                                    (this.explorer_focus.clone(), diff)
                                 });
+                                if let Some((rel, pin)) = diff {
+                                    drag_view.update(cx, |this, cx| {
+                                        this.open_diff(rel, pin, window, cx);
+                                    });
+                                }
                                 window.focus(&focus, cx);
                             }
                         })
@@ -2414,9 +3124,23 @@ impl Workspace {
                             this.selection.clone()
                         });
                         let can_paste = view.read(cx).file_clipboard.is_some();
+                        let is_file = !entry.is_folder();
                         let copy_paths = paths.clone();
                         let file_paths = paths;
-                        menu.item(PopupMenuItem::new("Copy Path").on_click({
+                        let open_path = path.clone();
+                        menu.when(is_file, |menu| {
+                            let view = view.clone();
+                            menu.item(PopupMenuItem::new("Open Editor").on_click(
+                                move |_, _, cx| {
+                                    let path = open_path.clone();
+                                    view.update(cx, |this, cx| {
+                                        this.open_path(path, false);
+                                        cx.notify();
+                                    });
+                                },
+                            ))
+                        })
+                        .item(PopupMenuItem::new("Copy Path").on_click({
                             let view = view.clone();
                             move |_, _, cx| {
                                 view.update(cx, |this, cx| this.copy_path_text(&copy_paths, cx));
@@ -2446,6 +3170,135 @@ impl Workspace {
                 .flex_1()
                 .min_h_0()
             })
+    }
+
+    fn render_git(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+        let branch = if !self.git_repo {
+            "Not a Git repository".to_string()
+        } else if self.git_branch.is_empty() {
+            "HEAD".to_string()
+        } else {
+            let mut label = self.git_branch.clone();
+            if self.git_ahead > 0 {
+                label.push_str(&format!(" ↑{}", self.git_ahead));
+            }
+            if self.git_behind > 0 {
+                label.push_str(&format!(" ↓{}", self.git_behind));
+            }
+            label
+        };
+        let files = self.git_files.clone();
+        let busy = self.git_busy;
+        let repo = self.git_repo;
+
+        v_flex()
+            .id("git-pane")
+            .role(Role::Group)
+            .aria_label("Source Control")
+            .w(px(260.))
+            .h_full()
+            .flex_shrink_0()
+            .bg(cx.theme().sidebar)
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .w_full()
+                    .h(px(SIDEBAR_HEADER_H))
+                    .px_2()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_xs().font_semibold().child("Source Control"))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new("git-refresh")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Refresh")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.refresh_git();
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("collapse-git")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::PanelLeftClose)
+                                    .tooltip("Hide Source Control (Ctrl+B)")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.sidebar_collapsed = true;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(branch),
+                    )
+                    .when_some(self.git_detail.clone(), |column, detail| {
+                        column.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(detail),
+                        )
+                    })
+                    .child(Input::new(&self.commit_input).small())
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new("git-commit")
+                                    .xsmall()
+                                    .primary()
+                                    .label("Commit")
+                                    .disabled(busy || !repo)
+                                    .on_click(cx.listener(|this, _, _, cx| this.git_commit(cx))),
+                            )
+                            .child(
+                                Button::new("git-pull")
+                                    .xsmall()
+                                    .label("Pull")
+                                    .disabled(busy || !repo)
+                                    .on_click(cx.listener(|this, _, _, cx| this.git_pull(cx))),
+                            )
+                            .child(
+                                Button::new("git-push")
+                                    .xsmall()
+                                    .label("Push")
+                                    .disabled(busy || !repo)
+                                    .on_click(cx.listener(|this, _, _, cx| this.git_push(cx))),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("git-file-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(
+                        files
+                            .into_iter()
+                            .enumerate()
+                            .map(|(ix, file)| git_file_row(ix, file, busy, view.clone(), cx)),
+                    ),
+            )
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2507,6 +3360,8 @@ impl Workspace {
             ("Open Settings", Box::new(OpenSettings)),
             ("Reconnect", Box::new(Reconnect)),
             ("Disconnect", Box::new(Disconnect)),
+            ("Stop Server", Box::new(StopServer)),
+            ("Quit Client", Box::new(QuitClient)),
         ];
         Command::new(&self.command_state)
             .placeholder("Type a command…")
@@ -2639,7 +3494,10 @@ impl Workspace {
     }
 
     fn panes_empty(&self) -> bool {
-        self.terminals.is_empty() && self.editors.is_empty()
+        self.terminals.is_empty()
+            && self.editors.is_empty()
+            && self.diffs.is_empty()
+            && self.binaries.is_empty()
     }
 }
 
@@ -2696,6 +3554,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_new_workspace))
             .on_action(cx.listener(Self::on_rename_workspace))
             .on_action(cx.listener(Self::on_close_workspace))
+            .on_action(cx.listener(Self::on_stop_server))
+            .on_action(cx.listener(Self::on_quit_client))
             .child(
                 TitleBar::new()
                     .h(px(TITLE_BAR_H))
@@ -2707,12 +3567,27 @@ impl Render for Workspace {
                     }))
                     .child(
                         h_flex()
-                            .gap_1()
+                            .flex_1()
+                            .h_full()
+                            .gap_2()
                             .items_center()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .id("app-menu-host")
+                                    .h_full()
+                                    .w(px(72.))
+                                    .flex_shrink_0()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .child(self.menu_bar.clone()),
+                            )
                             .child(div().text_sm().font_semibold().child("fresh-gui"))
                             .child(
                                 div()
                                     .text_xs()
+                                    .text_ellipsis()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(self.target.chrome_label()),
                             ),
@@ -2727,7 +3602,10 @@ impl Render for Workspace {
                     })
                     .child(self.render_activity_bar(cx))
                     .when(!self.sidebar_collapsed, |this| {
-                        this.child(self.render_explorer(cx))
+                        this.child(match self.activity {
+                            Activity::Explorer => self.render_explorer(cx).into_any_element(),
+                            Activity::Git => self.render_git(cx).into_any_element(),
+                        })
                     })
                     .child(
                         div()

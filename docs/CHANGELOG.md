@@ -2,6 +2,14 @@
 
 ## 2026-09-22
 
+### Windows client menu, binary files, and Git
+
+- Clicking the title bar no longer warns `a11y: set_focus called more than once in a single frame`. The dock tab frame tracks the focused panel's focus handle. Giving that frame a group role (so GPUI would stop noting a role-less id) made both nodes call `set_focus` on every redraw, including a title-bar click that does not move focus. The tab frame stays role-less and the panel is the only focus owner. GPUI still notes the role-less frame at info; the host filter (`gpui=warn`) hides that.
+- Clicking a binary file no longer feeds those bytes to the editor. On Windows that showed up as `The data area passed to a system call is too small (0x8007007A)`. The daemon samples the first 8KB and refuses a file with a NUL or a run of control bytes (`binary_file`). The host opens a Binary file placeholder with **Open externally**. The daemon resolves that path inside the FS sandbox, then hands it to the OS opener.
+- Closing the window with the Windows **X** can still log `window not found` and invalid window handles (`0x80040102`, `0x80070578`). Those come from GPUI calling `ShowWindow` / `DestroyWindow` after the HWND is already gone. The host publishes the layout inside the platform should-close hook, while the handle is still valid, and does not keep an HWND of its own.
+- The title bar has a **File** menu (gpui-component `AppMenuBar`). **Stop Server** disconnects and, for a local daemon, runs the same stop as `fresh-gui close`. An SSH session only disconnects; the remote daemon keeps running. **Quit Client** closes the window and leaves the daemon running. Both are also in the command palette.
+- **Source Control** on the activity bar (when `hello` includes `git`) replaces the explorer. It lists `git status` for the workspace root: stage, unstage, commit, pull, and push. Those run `git` on the daemon, with prompts disabled. Clicking a changed file opens a whole-file split diff; a second click pins it as a tab until closed. Diff tabs are not saved with the workspace. Right-click **Open Editor** still opens the text buffer. Protocol stays `0.4.0`; the new git and `fs_open_external` messages are additive.
+
 ### Windows client starts again
 
 - v2026.922.10 panicked on launch with `cannot update DockArea while it is already being updated` and the window never appeared. The workspace dock applied tab-bar skin settings inside `cx.new`, before GPUI inserted the area, so the skin's notify leased a missing entity. Those settings run after the area exists. Tab bar, hidden dock-collapse button, and accessibility roles are unchanged.

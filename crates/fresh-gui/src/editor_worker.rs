@@ -283,6 +283,11 @@ fn open_buffer(
     if !path.is_file() {
         bail!("not a file: {}", path.display());
     }
+    if crate::binary::is_binary_file(path)? {
+        return Err(anyhow::Error::new(crate::binary::BinaryFile {
+            path: path.to_path_buf(),
+        }));
+    }
     let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
     if meta.len() as usize > MAX_SNAPSHOT_BYTES {
         bail!(

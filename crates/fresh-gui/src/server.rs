@@ -828,6 +828,100 @@ async fn handle_client_msg(
             }
             Ok(())
         }
+        Message::GitStatus {
+            request_id,
+            workspace_id,
+        } => {
+            require_auth(*authed)?;
+            git_status(state, sink, request_id, workspace_id).await
+        }
+        Message::GitDiff {
+            request_id,
+            workspace_id,
+            path,
+        } => {
+            require_auth(*authed)?;
+            git_diff(state, sink, request_id, workspace_id, path).await
+        }
+        Message::GitStage {
+            request_id,
+            workspace_id,
+            paths,
+            stage,
+        } => {
+            require_auth(*authed)?;
+            git_op(state, sink, request_id, workspace_id, move |dir| {
+                crate::git::stage(&dir, &paths, stage)
+            })
+            .await
+        }
+        Message::GitCommit {
+            request_id,
+            workspace_id,
+            message,
+        } => {
+            require_auth(*authed)?;
+            git_op(state, sink, request_id, workspace_id, move |dir| {
+                crate::git::commit(&dir, &message)
+            })
+            .await
+        }
+        Message::GitPull {
+            request_id,
+            workspace_id,
+        } => {
+            require_auth(*authed)?;
+            git_op(state, sink, request_id, workspace_id, |dir| {
+                crate::git::pull(&dir)
+            })
+            .await
+        }
+        Message::GitPush {
+            request_id,
+            workspace_id,
+        } => {
+            require_auth(*authed)?;
+            git_op(state, sink, request_id, workspace_id, |dir| {
+                crate::git::push(&dir)
+            })
+            .await
+        }
+        Message::FsOpenExternal { request_id, path } => {
+            require_auth(*authed)?;
+            let resolved = state
+                .fs_root
+                .resolve(&path)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "fs_open_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
+            let join_id = request_id.clone();
+            let open_id = request_id.clone();
+            tokio::task::spawn_blocking(move || crate::open_external::open_with_os(&resolved))
+                .await
+                .map_err(|err| Message::Error {
+                    code: "fs_open_failed".into(),
+                    message: format!("{join_id}: {err}"),
+                })?
+                .map_err(|err| Message::Error {
+                    code: "fs_open_failed".into(),
+                    message: format!("{open_id}: {err:#}"),
+                })?;
+            send_msg(
+                sink,
+                &Message::FsOpened {
+                    request_id,
+                    message: format!("Opened {path}"),
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send FsOpened".into(),
+            })?;
+            Ok(())
+        }
         Message::SceneGet { request_id } => {
             require_auth(*authed)?;
             let Some(editor) = state.editor.as_ref() else {
@@ -1124,13 +1218,25 @@ async fn reply_editor_opened(
     line: Option<u32>,
     column: Option<u32>,
 ) -> Result<(), Message> {
-    let opened = editor
-        .open(path, preview)
-        .await
-        .map_err(|err| Message::Error {
-            code: "editor_open_failed".into(),
+    if crate::binary::is_binary_file(&path).unwrap_or(false) {
+        return Err(Message::Error {
+            code: "binary_file".into(),
+            message: format!("{request_id}: {}", path.display()),
+        });
+    }
+    let opened = editor.open(path, preview).await.map_err(|err| {
+        let binary = err
+            .chain()
+            .any(|cause| cause.is::<crate::binary::BinaryFile>());
+        Message::Error {
+            code: if binary {
+                "binary_file".into()
+            } else {
+                "editor_open_failed".into()
+            },
             message: format!("{request_id}: {err:#}"),
-        })?;
+        }
+    })?;
     send_msg(
         sink,
         &Message::EditorOpened {
@@ -1160,6 +1266,147 @@ async fn reply_editor_opened(
     .map_err(|_| Message::Error {
         code: "send_failed".into(),
         message: "failed to send BufferSnapshot".into(),
+    })?;
+    Ok(())
+}
+
+async fn workspace_dir(state: &AppState, workspace_id: &str) -> Result<PathBuf, Message> {
+    let stored = if workspace_id.is_empty() {
+        String::new()
+    } else {
+        state
+            .workspaces
+            .root_of(workspace_id)
+            .await
+            .ok_or_else(|| Message::Error {
+                code: "git_failed".into(),
+                message: format!("unknown workspace {workspace_id}"),
+            })?
+    };
+    if stored.is_empty() {
+        return Ok(state.fs_root.root_path().to_path_buf());
+    }
+    let path = PathBuf::from(&stored);
+    if !path.is_dir() {
+        return Err(Message::Error {
+            code: "git_failed".into(),
+            message: format!("{} is not a directory", path.display()),
+        });
+    }
+    Ok(path)
+}
+
+fn git_err(request_id: &str, err: impl std::fmt::Display) -> Message {
+    Message::Error {
+        code: "git_failed".into(),
+        message: format!("{request_id}: {err}"),
+    }
+}
+
+async fn git_status(
+    state: &AppState,
+    sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
+    request_id: String,
+    workspace_id: String,
+) -> Result<(), Message> {
+    let dir = workspace_dir(state, &workspace_id).await?;
+    let request = request_id.clone();
+    let status = tokio::task::spawn_blocking(move || crate::git::status(&dir))
+        .await
+        .map_err(|err| git_err(&request, err))?
+        .unwrap_or_else(|err| crate::git::Status {
+            repo: false,
+            root: String::new(),
+            branch: String::new(),
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+            files: Vec::new(),
+            detail: Some(err.to_string()),
+        });
+    send_msg(
+        sink,
+        &Message::GitStatusResult {
+            request_id,
+            repo: status.repo,
+            root: status.root,
+            branch: status.branch,
+            upstream: status.upstream,
+            ahead: status.ahead,
+            behind: status.behind,
+            files: status.files,
+            detail: status.detail,
+        },
+    )
+    .await
+    .map_err(|_| Message::Error {
+        code: "send_failed".into(),
+        message: "failed to send GitStatusResult".into(),
+    })?;
+    Ok(())
+}
+
+async fn git_diff(
+    state: &AppState,
+    sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
+    request_id: String,
+    workspace_id: String,
+    path: String,
+) -> Result<(), Message> {
+    let dir = workspace_dir(state, &workspace_id).await?;
+    let request = request_id.clone();
+    let rel = path.clone();
+    let sides = tokio::task::spawn_blocking(move || crate::git::diff(&dir, &rel))
+        .await
+        .map_err(|err| git_err(&request, err))?
+        .map_err(|err| git_err(&request_id, err))?;
+    send_msg(
+        sink,
+        &Message::GitDiffResult {
+            request_id,
+            path,
+            old_text: sides.old_text,
+            new_text: sides.new_text,
+            binary: sides.binary,
+            truncated: sides.truncated,
+        },
+    )
+    .await
+    .map_err(|_| Message::Error {
+        code: "send_failed".into(),
+        message: "failed to send GitDiffResult".into(),
+    })?;
+    Ok(())
+}
+
+async fn git_op<F>(
+    state: &AppState,
+    sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
+    request_id: String,
+    workspace_id: String,
+    op: F,
+) -> Result<(), Message>
+where
+    F: FnOnce(PathBuf) -> anyhow::Result<crate::git::Op> + Send + 'static,
+{
+    let dir = workspace_dir(state, &workspace_id).await?;
+    let request = request_id.clone();
+    let result = tokio::task::spawn_blocking(move || op(dir))
+        .await
+        .map_err(|err| git_err(&request, err))?
+        .map_err(|err| git_err(&request_id, err))?;
+    send_msg(
+        sink,
+        &Message::GitOpResult {
+            request_id,
+            ok: result.ok,
+            output: result.output,
+        },
+    )
+    .await
+    .map_err(|_| Message::Error {
+        code: "send_failed".into(),
+        message: "failed to send GitOpResult".into(),
     })?;
     Ok(())
 }
