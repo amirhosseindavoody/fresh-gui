@@ -10,6 +10,7 @@ mod connect;
 mod explorer;
 mod osc7;
 mod pane;
+mod rail;
 mod terminal;
 mod workspace;
 

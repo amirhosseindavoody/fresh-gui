@@ -2,6 +2,12 @@
 
 ## 2026-09-22
 
+### Workspace rail closer to a spaces list
+
+- The GPUI workspace column is 232px, to the left of the activity bar. Each row shows the display name and a shortened project root (`~` for a home prefix, **Default root** when the root is empty). The active row uses an accent fill and a left accent bar. Rename and Close show on hover and on right-click, instead of sitting on the active row. The last workspace still cannot be closed. One open workspace shows a short hint so the rail is not an empty strip.
+- **+** opens a panel for the display name and an absolute project root. An empty name still becomes the folder name on the daemon. The command palette can create, rename, and close the focused workspace.
+- Protocol `0.4.0` and capability `workspace` are unchanged.
+
 ### Windows terminal shows a PowerShell prompt
 
 - A new terminal on Windows stayed a blank pane. ConPTY asks for the cursor (`CSI 6 n`) before it draws anything and waits for a cursor-position report; the host never answered, so the shell produced no cells. The terminal view now replies (`CSI row ; col R`) and answers a device-attributes query the same way.

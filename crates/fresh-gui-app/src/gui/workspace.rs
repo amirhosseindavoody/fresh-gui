@@ -4,8 +4,9 @@
 //! splits; dropping it on a tab merges; dropping it in the strip reorders.
 //! gpui-component refuses to drag the last remaining tab, so a split needs two
 //! tabs. Terminal titles are herdr-style numbers inside the focused workspace.
-//! A left rail lists daemon workspaces; switching swaps this dock for that
-//! workspace's session without closing its PTYs.
+//! A left spaces rail lists daemon workspaces (name and project root);
+//! switching swaps this dock for that workspace's session without closing
+//! its PTYs.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -17,7 +18,7 @@ use fresh_gui_protocol::{
 use gpui_kit::component::dock::{
     DockArea, DockPlacement, DockSkin, PanelId, PanelStyle, panel_handle,
 };
-use gpui_kit::component::menu::PopupMenuItem;
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{
     ActiveTheme, Icon, IconName, Root, Selectable, Sizable, StyledExt, TitleBar,
     button::{Button, ButtonVariants as _},
@@ -33,9 +34,9 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::actions::{
-    CloseTab, CopyExplorer, Disconnect, GoToFile, NewTerminal, NewWorkspace, NextTab, OpenSettings,
-    PasteExplorer, PrevTab, Reconnect, RenameWorkspace, SaveBuffer, ToggleCommandPalette,
-    ToggleSidebar,
+    CloseTab, CloseWorkspace, CopyExplorer, Disconnect, GoToFile, NewTerminal, NewWorkspace,
+    NextTab, OpenSettings, PasteExplorer, PrevTab, Reconnect, RenameWorkspace, SaveBuffer,
+    ToggleCommandPalette, ToggleSidebar,
 };
 use super::ade::AttachedWorkspace;
 use super::ade::{AdeCmd, AdeEvent, AdeHandle};
@@ -45,6 +46,10 @@ use super::explorer::{
     is_placeholder, movable_sources, parent_dir, real_ids,
 };
 use super::pane::{EditorPanel, TerminalPanel};
+use super::rail::{
+    WORKSPACE_RAIL_W, WORKSPACE_ROW_H, empty_workspace_name_hint, user_home, workspace_rail_hint,
+    workspace_root_label,
+};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -53,7 +58,6 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// The dock tab strip itself stays at the skin's default 32px; that chrome
 /// is owned by `DockSkin`, not this host.
 const TITLE_BAR_H: f32 = 30.;
-const WORKSPACE_RAIL_W: f32 = 168.;
 const ACTIVITY_RAIL_W: f32 = 36.;
 const SIDEBAR_HEADER_H: f32 = 26.;
 const TREE_ROW_H: f32 = 22.;
@@ -127,7 +131,11 @@ pub struct Workspace {
     /// add a tab.
     pending_editors: HashMap<String, bool>,
     restoring: bool,
-    renaming: bool,
+    /// Workspace whose name is being edited in the rail. Any row, not only the
+    /// active one. `None` when the inline field is closed.
+    renaming_id: Option<String>,
+    /// Row under the pointer, so Rename / Close stay off the resting layout.
+    rail_hover: Option<String>,
     create_open: bool,
     capabilities: Vec<String>,
     config_path: Option<String>,
@@ -172,9 +180,8 @@ impl Workspace {
         let explorer = cx.new(|cx| TreeState::new(cx));
         let command_state = cx.new(|cx| CommandState::new(window, cx));
         let goto_input = cx.new(|cx| InputState::new(window, cx).placeholder("path[:line[:col]]"));
-        let create_name = cx.new(|cx| InputState::new(window, cx).placeholder("Name"));
-        let create_root =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Absolute root (optional)"));
+        let create_name = cx.new(|cx| InputState::new(window, cx).placeholder("Folder name"));
+        let create_root = cx.new(|cx| InputState::new(window, cx).placeholder("/absolute/path"));
         let ws_rename_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Workspace name"));
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Terminal name"));
@@ -195,8 +202,28 @@ impl Workspace {
             }
         });
         let ws_rename_sub = cx.subscribe(&ws_rename_input, |this, _, ev: &InputEvent, cx| {
-            if matches!(ev, InputEvent::PressEnter { .. }) && this.renaming {
+            if matches!(ev, InputEvent::PressEnter { .. }) && this.renaming_id.is_some() {
                 this.confirm_workspace_rename(cx);
+            }
+        });
+        let create_name_sub = cx.subscribe(&create_name, |this, _, ev: &InputEvent, cx| {
+            if !this.create_open {
+                return;
+            }
+            match ev {
+                InputEvent::PressEnter { .. } => this.confirm_create(cx),
+                InputEvent::Change => cx.notify(),
+                _ => {}
+            }
+        });
+        let create_root_sub = cx.subscribe(&create_root, |this, _, ev: &InputEvent, cx| {
+            if !this.create_open {
+                return;
+            }
+            match ev {
+                InputEvent::PressEnter { .. } => this.confirm_create(cx),
+                InputEvent::Change => cx.notify(),
+                _ => {}
             }
         });
 
@@ -224,7 +251,8 @@ impl Workspace {
             pty_opens_pending: 0,
             pending_editors: HashMap::new(),
             restoring: false,
-            renaming: false,
+            renaming_id: None,
+            rail_hover: None,
             create_open: false,
             capabilities: Vec::new(),
             config_path: None,
@@ -254,7 +282,13 @@ impl Workspace {
             ws_rename_input,
             rename_pty: None,
             rename_input,
-            _subscriptions: vec![tree_sub, rename_sub, ws_rename_sub],
+            _subscriptions: vec![
+                tree_sub,
+                rename_sub,
+                ws_rename_sub,
+                create_name_sub,
+                create_root_sub,
+            ],
             _recv_task: recv_task,
         }
     }
@@ -835,7 +869,7 @@ impl Workspace {
         self.restoring = true;
         self.pty_opens_pending = 0;
         self.pending_editors.clear();
-        self.renaming = false;
+        self.renaming_id = None;
         self.rename_pty = None;
         // The window is only available from event handlers. `switch_to` is
         // called from those, but `Context` does not hand us a window here.
@@ -992,6 +1026,7 @@ impl Workspace {
         self.palette_open = false;
         self.goto_open = false;
         self.rename_pty = None;
+        self.renaming_id = None;
         self.create_name.update(cx, |state, cx| {
             state.set_value("", window, cx);
             state.focus(window, cx);
@@ -1012,15 +1047,28 @@ impl Workspace {
             self.status = "No workspace to rename".into();
             return;
         };
+        self.begin_workspace_rename_for(&id, window, cx);
+    }
+
+    fn begin_workspace_rename_for(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let name = self
             .workspaces
             .iter()
             .find(|workspace| workspace.id == id)
-            .map(|workspace| workspace.name.clone())
-            .unwrap_or_default();
-        self.renaming = true;
+            .map(|workspace| workspace.name.clone());
+        let Some(name) = name else {
+            self.status = "No workspace to rename".into();
+            return;
+        };
+        self.renaming_id = Some(id.to_string());
         self.rename_pty = None;
         self.palette_open = false;
+        self.create_open = false;
         self.ws_rename_input.update(cx, |state, cx| {
             state.set_value(name, window, cx);
             state.focus(window, cx);
@@ -1028,12 +1076,10 @@ impl Workspace {
     }
 
     fn confirm_workspace_rename(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.active_workspace_id.clone() else {
-            self.renaming = false;
+        let Some(id) = self.renaming_id.take() else {
             return;
         };
         let name = self.ws_rename_input.read(cx).value().to_string();
-        self.renaming = false;
         if name.trim().is_empty() {
             self.status = "Workspace name is empty".into();
             return;
@@ -1043,6 +1089,10 @@ impl Workspace {
 
     fn close_workspace(&mut self, id: String) {
         if !self.workspace_cap {
+            return;
+        }
+        if self.workspaces.len() <= 1 {
+            self.status = "Cannot close the last workspace".into();
             return;
         }
         self.ade.send(AdeCmd::CloseWorkspace { id });
@@ -1140,7 +1190,7 @@ impl Workspace {
             return;
         };
         let current = panel.read(cx).label().to_string();
-        self.renaming = false;
+        self.renaming_id = None;
         self.rename_pty = Some(pty_id.to_string());
         self.palette_open = false;
         self.goto_open = false;
@@ -1184,7 +1234,9 @@ impl Workspace {
         self.pty_opens_pending = 0;
         self.pending_editors.clear();
         self.restoring = false;
-        self.renaming = false;
+        self.renaming_id = None;
+        self.rail_hover = None;
+        self.create_open = false;
         self.explorer_cache.clear();
         self.explorer_root.clear();
         self.selection.clear();
@@ -1576,12 +1628,40 @@ impl Workspace {
         cx.notify();
     }
 
+    fn on_close_workspace(&mut self, _: &CloseWorkspace, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.active_workspace_id.clone() {
+            self.close_workspace(id);
+        } else {
+            self.status = "No workspace to close".into();
+        }
+        cx.notify();
+    }
+
+    fn note_rail_hover(&mut self, id: &str, hovered: bool, cx: &mut Context<Self>) {
+        if hovered {
+            if self.rail_hover.as_deref() != Some(id) {
+                self.rail_hover = Some(id.to_string());
+                cx.notify();
+            }
+        } else if self.rail_hover.as_deref() == Some(id) {
+            self.rail_hover = None;
+            cx.notify();
+        }
+    }
+
     fn render_workspace_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let home = user_home();
+        let hint = if matches!(self.connection, ConnectionState::Online) {
+            workspace_rail_hint(self.workspaces.len())
+        } else {
+            None
+        };
         let rows = self
             .workspaces
             .iter()
-            .map(|workspace| self.render_workspace_row(workspace, cx))
+            .map(|workspace| self.render_workspace_row(workspace, home.as_deref(), cx))
             .collect::<Vec<_>>();
+        let muted = cx.theme().muted_foreground;
 
         v_flex()
             .id("workspace-rail")
@@ -1598,7 +1678,13 @@ impl Workspace {
                     .px_2()
                     .items_center()
                     .justify_between()
-                    .child(div().text_xs().font_semibold().child("Workspaces"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(muted)
+                            .child("Workspaces"),
+                    )
                     .child(
                         Button::new("workspace-create")
                             .ghost()
@@ -1619,109 +1705,256 @@ impl Workspace {
                     .overflow_y_scroll()
                     .children(rows),
             )
+            .when_some(hint, |rail, hint| {
+                rail.child(
+                    div()
+                        .id("workspace-rail-hint")
+                        .w_full()
+                        .flex_shrink_0()
+                        .px_2()
+                        .py_2()
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .text_xs()
+                        .text_color(muted)
+                        .child(hint),
+                )
+            })
     }
 
     fn render_workspace_row(
         &self,
         workspace: &WorkspaceInfo,
+        home: Option<&str>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = workspace.id.clone();
         let active = self.active_workspace_id.as_deref() == Some(workspace.id.as_str());
+        let hovered = self.rail_hover.as_deref() == Some(workspace.id.as_str());
+        let renaming = self.renaming_id.as_deref() == Some(workspace.id.as_str());
+        let can_close = self.workspaces.len() > 1;
         let name = workspace.name.clone();
-        let renaming = active && self.renaming;
+        let root_label = workspace_root_label(&workspace.root, home);
         let row_id = format!("ws-row-{}", workspace.id);
-        let name_id = format!("ws-name-{}", workspace.id);
+        let fill = if active && hovered {
+            Some(cx.theme().accent.opacity(0.28))
+        } else if active {
+            Some(cx.theme().accent.opacity(0.20))
+        } else if hovered {
+            Some(cx.theme().foreground.opacity(0.06))
+        } else {
+            None
+        };
+        let accent = cx.theme().accent.opacity(if active { 1. } else { 0. });
+        let view = cx.entity();
+        let menu_id = id.clone();
+        let hover_id = id.clone();
 
-        v_flex()
+        h_flex()
             .id(row_id)
             .w_full()
-            .px_1()
-            .py(px(2.))
-            .gap(px(2.))
-            .when(active, |row| row.bg(cx.theme().accent.opacity(0.16)))
-            .child(if renaming {
-                h_flex()
-                    .w_full()
-                    .gap_1()
+            .min_h(px(WORKSPACE_ROW_H))
+            .items_stretch()
+            .cursor_pointer()
+            .when_some(fill, |row, color| row.bg(color))
+            .on_hover(cx.listener(move |this, hovered, _, cx| {
+                this.note_rail_hover(&hover_id, *hovered, cx);
+            }))
+            .on_click({
+                let id = id.clone();
+                cx.listener(move |this, _, _, cx| {
+                    this.switch_to(id.clone(), cx);
+                    cx.notify();
+                })
+            })
+            .child(
+                div()
+                    .w(px(3.))
+                    .min_h(px(WORKSPACE_ROW_H))
+                    .flex_shrink_0()
+                    .bg(accent),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .py(px(4.))
+                    .pl(px(8.))
+                    .pr_1()
+                    .justify_center()
+                    .gap(px(1.))
+                    .child(if renaming {
+                        self.render_workspace_rename(&id, cx).into_any_element()
+                    } else {
+                        self.render_workspace_name_line(
+                            &id,
+                            &name,
+                            active,
+                            hovered && !renaming,
+                            can_close,
+                            cx,
+                        )
+                        .into_any_element()
+                    })
                     .child(
                         div()
-                            .flex_1()
+                            .w_full()
                             .min_w_0()
-                            .child(Input::new(&self.ws_rename_input)),
-                    )
-                    .child(
-                        Button::new(format!("ws-rename-ok-{id}"))
-                            .ghost()
-                            .xsmall()
-                            .label("OK")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.confirm_workspace_rename(cx);
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(root_label),
+                    ),
+            )
+            .context_menu(move |menu, _, _| {
+                let rename_id = menu_id.clone();
+                let close_id = menu_id.clone();
+                let rename_view = view.clone();
+                let close_view = view.clone();
+                menu.item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
+                    rename_view.update(cx, |this, cx| {
+                        this.begin_workspace_rename_for(&rename_id, window, cx);
+                        cx.notify();
+                    });
+                }))
+                .item(
+                    PopupMenuItem::new("Close")
+                        .disabled(!can_close)
+                        .on_click(move |_, _, cx| {
+                            close_view.update(cx, |this, cx| {
+                                this.close_workspace(close_id.clone());
                                 cx.notify();
-                            })),
-                    )
-                    .into_any_element()
-            } else {
-                div()
-                    .id(name_id)
-                    .w_full()
-                    .h(px(TREE_ROW_H))
-                    .px_1()
-                    .flex()
-                    .items_center()
-                    .text_sm()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .child(name)
-                    .on_click({
-                        let id = id.clone();
-                        cx.listener(move |this, _, _, cx| {
-                            this.switch_to(id.clone(), cx);
-                            cx.notify();
-                        })
-                    })
-                    .into_any_element()
-            })
-            .when(active && !renaming, |row| {
-                let close_id = id.clone();
-                row.child(
-                    h_flex()
-                        .gap_1()
-                        .px_1()
-                        .child(
-                            Button::new(format!("ws-rename-{id}"))
-                                .ghost()
-                                .xsmall()
-                                .label("Rename")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.begin_workspace_rename(window, cx);
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            Button::new(format!("ws-close-{close_id}"))
-                                .ghost()
-                                .xsmall()
-                                .label("Close")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.close_workspace(close_id.clone());
-                                    cx.notify();
-                                })),
-                        ),
+                            });
+                        }),
                 )
             })
             .into_any_element()
     }
 
+    fn render_workspace_name_line(
+        &self,
+        id: &str,
+        name: &str,
+        active: bool,
+        show_actions: bool,
+        can_close: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .id(format!("ws-name-{id}"))
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .when(active, |label| label.font_semibold())
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(name.to_string()),
+            )
+            .when(show_actions, |line| {
+                line.child(self.render_workspace_actions(id, can_close, cx))
+            })
+    }
+
+    fn render_workspace_actions(
+        &self,
+        id: &str,
+        can_close: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let rename_id = id.to_string();
+        let close_id = id.to_string();
+        h_flex()
+            .flex_shrink_0()
+            .items_center()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                Button::new(format!("ws-rename-{id}"))
+                    .ghost()
+                    .xsmall()
+                    .label("Rename")
+                    .tooltip("Rename workspace")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.begin_workspace_rename_for(&rename_id, window, cx);
+                        cx.notify();
+                    })),
+            )
+            .when(can_close, |line| {
+                line.child(
+                    Button::new(format!("ws-close-{close_id}"))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close)
+                        .tooltip("Close workspace")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_workspace(close_id.clone());
+                            cx.notify();
+                        })),
+                )
+            })
+    }
+
+    fn render_workspace_rename(&self, id: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .w_full()
+            .gap_1()
+            .items_center()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&self.ws_rename_input)),
+            )
+            .child(
+                Button::new(format!("ws-rename-ok-{id}"))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Check)
+                    .tooltip("Rename")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.confirm_workspace_rename(cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new(format!("ws-rename-cancel-{id}"))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Close)
+                    .tooltip("Cancel")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.renaming_id = None;
+                        cx.notify();
+                    })),
+            )
+    }
+
     fn render_create_workspace(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let name_value = self.create_name.read(cx).value().to_string();
+        let root_value = self.create_root.read(cx).value().to_string();
+        let name_hint = if name_value.trim().is_empty() {
+            empty_workspace_name_hint(&root_value)
+        } else {
+            "Display name in the spaces list.".to_string()
+        };
+        let muted = cx.theme().muted_foreground;
+
         div()
             .id("workspace-create-overlay")
             .absolute()
             .inset_0()
-            .flex()
-            .justify_center()
-            .pt(px(80.))
-            .bg(cx.theme().background.opacity(0.45))
+            .bg(cx.theme().background.opacity(0.35))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -1731,7 +1964,10 @@ impl Workspace {
             )
             .child(
                 v_flex()
-                    .w(px(420.))
+                    .absolute()
+                    .left(px(8.))
+                    .top(px(TITLE_BAR_H + SIDEBAR_HEADER_H + 4.))
+                    .w(px(320.))
                     .gap_2()
                     .p_3()
                     .rounded(cx.theme().radius)
@@ -1739,16 +1975,17 @@ impl Workspace {
                     .border_1()
                     .border_color(cx.theme().border)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(div().text_sm().font_bold().child("New Workspace"))
-                    .child(div().text_xs().child("Name"))
+                    .child(div().text_sm().font_semibold().child("New Workspace"))
+                    .child(div().text_xs().font_semibold().child("Name"))
                     .child(Input::new(&self.create_name))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Root directory on the daemon. Leave empty to use the daemon project root."),
-                    )
+                    .child(div().text_xs().text_color(muted).child(name_hint))
+                    .child(div().text_xs().font_semibold().child("Project root"))
                     .child(Input::new(&self.create_root))
+                    .child(
+                        div().text_xs().text_color(muted).child(
+                            "Absolute path on the daemon. Empty uses the daemon project root.",
+                        ),
+                    )
                     .child(
                         h_flex()
                             .justify_end()
@@ -2041,6 +2278,7 @@ impl Workspace {
             ("New Terminal", Box::new(NewTerminal) as Box<dyn Action>),
             ("New Workspace", Box::new(NewWorkspace)),
             ("Rename Workspace", Box::new(RenameWorkspace)),
+            ("Close Workspace", Box::new(CloseWorkspace)),
             ("Close Tab", Box::new(CloseTab)),
             ("Save", Box::new(SaveBuffer)),
             ("Toggle Sidebar", Box::new(ToggleSidebar)),
@@ -2235,6 +2473,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_paste_explorer))
             .on_action(cx.listener(Self::on_new_workspace))
             .on_action(cx.listener(Self::on_rename_workspace))
+            .on_action(cx.listener(Self::on_close_workspace))
             .child(
                 TitleBar::new().h(px(TITLE_BAR_H)).child(
                     h_flex()
