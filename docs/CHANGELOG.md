@@ -9,6 +9,7 @@
 - `fresh-gui user@host` and `fresh-gui <saved-name>` run the existing SSH bootstrap (install or start the remote daemon, tunnel `/ws`, open the window). `fresh-gui remote add|connect|list|remove|daemon` stay. `fresh-gui status` and `fresh-gui close` forward to the daemon binary.
 - `fresh-gui --no-ui` starts or reuses the local daemon and does not open a window, so a remote `fresh-gui --no-ui` still works when PATH points at the desktop command. SCP still installs the headless archive member as `~/.local/bin/fresh-gui`.
 - Installers (`scripts/install.sh`, `scripts/install.ps1`) place the host on `PATH` as `fresh-gui` (and `fresh-gui-app` as another name for the same file). When both archives are installed the daemon is `fresh-gui-daemon`. A daemon-only install keeps the headless binary named `fresh-gui`. `scripts/package-client.sh` now stores the host in the client archive as `fresh-gui` / `fresh-gui.exe`. The ADE protocol is unchanged.
+- The Linux GPUI client release job checks the packaged tarball for a `fresh-gui` member (the name `scripts/package-client.sh` writes). The Windows job has no member-name check. Release notes from that workflow use `./fresh-gui` and `fresh-gui.exe`.
 
 ### Dock splits, numbered terminals, explorer multi-select
 
