@@ -2,6 +2,10 @@
 
 ## 2026-09-22
 
+### Windows client starts again
+
+- v2026.922.10 panicked on launch with `cannot update DockArea while it is already being updated` and the window never appeared. The workspace dock applied tab-bar skin settings inside `cx.new`, before GPUI inserted the area, so the skin's notify leased a missing entity. Those settings run after the area exists. Tab bar, hidden dock-collapse button, and accessibility roles are unchanged.
+
 ### Workspaces persist across daemon restarts
 
 - The daemon saves the workspace list to a private `workspaces.json` in its state directory (`~/.local/state/fresh-gui/` or `%LOCALAPPDATA%\fresh-gui\`) and loads it on start. Names, roots, tab titles and order, the active tab, open explorer folders, and the focused workspace survive `fresh-gui close` and a reboot. Writes are debounced and atomic; an unreadable file is moved aside to `workspaces.json.bad`. `--foreground` stays in memory unless `FRESH_GUI_WORKSPACES_FILE` is set.

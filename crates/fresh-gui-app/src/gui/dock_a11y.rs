@@ -10,13 +10,37 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, AnyView, App, Axis, Div, Stateful, StatefulInteractiveElement as _, Window,
+    AnyElement, AnyView, App, AppContext as _, Axis, Div, Entity, Stateful,
+    StatefulInteractiveElement as _, Window,
 };
 use gpui_kit::Role;
 use gpui_kit::component::dock::{
-    BasePanelView, DockAreaRenderer, DockContext, DockSkin, DropIndicator, NodeId, PanelState,
-    TabGroupContext, TabGroupRenderer,
+    BasePanelView, DockArea, DockAreaRenderer, DockContext, DockSkin, DropIndicator, NodeId,
+    PanelState, PanelStyle, TabGroupContext, TabGroupRenderer,
 };
+
+/// Workspace dock: tab bar, no dock-collapse button, accessibility roles on
+/// the frames that track focus.
+///
+/// Skin setters notify the area. That update has to wait until `cx.new` has
+/// inserted the entity. Calling them inside the constructor leases an id that
+/// is not in the map yet, and GPUI panics with `cannot update DockArea while
+/// it is already being updated` before the window is shown.
+pub(crate) fn install_workspace_dock(
+    window: &mut Window,
+    cx: &mut App,
+) -> (Entity<DockArea>, Rc<DockSkin>) {
+    let mut installed = None;
+    let dock = cx.new(|cx| {
+        let skin = DockSkin::new(cx);
+        installed = Some(skin.clone());
+        DockArea::new("workspace", Some(1), window, cx).with_renderer(A11yDockSkin::wrap(skin))
+    });
+    let skin = installed.expect("DockSkin::new ran inside the constructor");
+    skin.set_panel_style(PanelStyle::TabBar, cx);
+    skin.set_toggle_button_visible(false, cx);
+    (dock, skin)
+}
 
 /// [`DockSkin`] with a group role on every frame that carries an element id.
 pub struct A11yDockSkin {
@@ -125,5 +149,52 @@ impl TabGroupRenderer for RoleTabGroup {
         cx: &mut App,
     ) -> Option<AnyElement> {
         self.inner.render_drop_indicator(indicator, window, cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Empty, Render, TestAppContext};
+
+    struct DockHost {
+        _dock: Entity<DockArea>,
+    }
+
+    impl Render for DockHost {
+        fn render(
+            &mut self,
+            _: &mut Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            Empty
+        }
+    }
+
+    /// The v2026.922.10 startup panic: skin setters inside `cx.new` update the
+    /// area before it is inserted.
+    #[gpui::test]
+    #[should_panic(expected = "cannot update")]
+    fn skin_settings_inside_the_constructor_panic(cx: &mut TestAppContext) {
+        let _ = cx.add_window_view(|window, cx| {
+            let dock = cx.new(|cx| {
+                let skin = DockSkin::new(cx);
+                skin.set_panel_style(PanelStyle::TabBar, cx);
+                skin.set_toggle_button_visible(false, cx);
+                DockArea::new("workspace", Some(1), window, cx)
+                    .with_renderer(A11yDockSkin::wrap(skin))
+            });
+            DockHost { _dock: dock }
+        });
+    }
+
+    #[gpui::test]
+    fn workspace_dock_applies_the_tab_bar_after_insert(cx: &mut TestAppContext) {
+        let _ = cx.add_window_view(|window, cx| {
+            let (dock, skin) = install_workspace_dock(window, cx);
+            assert_eq!(skin.panel_style(), PanelStyle::TabBar);
+            assert!(!skin.is_toggle_button_visible());
+            DockHost { _dock: dock }
+        });
     }
 }
