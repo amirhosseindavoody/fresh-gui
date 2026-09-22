@@ -2,6 +2,10 @@
 
 ## 2026-09-22
 
+### GPUI host stays up after the first terminal activates
+
+- Opening the window no longer panics with `cannot read TerminalPanel while it is already being updated` once the dock marks that terminal active. The dock delivers `set_active` inside the panel's own update, and publishing the workspace tab list was reading the panel (its title) before that update returned. The publish now runs after the update releases the entity. Numbered tabs, splits, and workspace layout saves are unchanged.
+
 ### One command: `fresh-gui`
 
 - The GPUI host is the user-facing command. With no arguments it reuses the per-user daemon session or starts `fresh-gui-daemon` (Cargo target dir: the sibling `fresh-gui` binary), then opens the window. The loopback token is read from session meta via the daemon's hidden `--json` output, not pasted onto the GUI argv.
