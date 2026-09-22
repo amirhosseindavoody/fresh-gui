@@ -227,7 +227,7 @@ All prefs live in one JSONC file on the **backend** host:
 }
 ```
 
-Open it from the UI (**Settings** / `Mod+,`), edit, save with `Mod+S`. Theme follows the OS by default; terminal chrome tracks the same theme. Empty shell `args` keep interactive / OSC 7 setup for known shells. Dotfiles and `.git` directories are hidden in the explorer by default; enable them independently via `showDotfiles` / `showGitDirs`. Editor soft wrap follows Fresh `editor.line_wrap` (on by default); toggle with `Alt+Z` or the command palette.
+Open it from the UI (**Settings** / `Mod+,`), edit, save with `Mod+S`. Theme follows the OS by default; terminal chrome tracks the same theme. Empty shell `args` keep interactive / OSC 7 setup for known shells. On Unix the default shell command is `zsh`. If that binary is missing or not executable, a new terminal tries `$SHELL` when it is usable, then `bash`, then `sh`, and logs which one it started. If none of those can run, the status bar names the shells that were tried and points at `terminal.shell.command`. Windows keeps `powershell`. Dotfiles and `.git` directories are hidden in the explorer by default; enable them independently via `showDotfiles` / `showGitDirs`. Editor soft wrap follows Fresh `editor.line_wrap` (on by default); toggle with `Alt+Z` or the command palette.
 
 ## Develop from source
 

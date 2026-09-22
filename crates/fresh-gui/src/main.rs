@@ -14,6 +14,7 @@ mod path_open;
 mod pty;
 mod server;
 mod session;
+mod shell_resolve;
 
 use std::io::ErrorKind;
 use std::net::SocketAddr;
@@ -111,7 +112,9 @@ struct ServeArgs {
 
     /// Path to JSON config (default: `$XDG_CONFIG_HOME/fresh-gui/config.json`
     /// or `~/.config/fresh-gui/config.json`; Windows: `%APPDATA%\fresh-gui\config.json`).
-    /// Missing file → built-in defaults (shell: `zsh` on Unix, `powershell` on Windows).
+    /// Missing file → built-in defaults (shell: `zsh` on Unix, with fallback to
+    /// `$SHELL`, then `bash`, then `sh` when that binary is missing;
+    /// `powershell` on Windows).
     #[arg(long, env = "FRESH_GUI_CONFIG")]
     config: Option<PathBuf>,
 }

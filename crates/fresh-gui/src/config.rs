@@ -20,7 +20,7 @@ use tracing::{info, warn};
 pub const FILENAME: &str = "config.json";
 
 macro_rules! define_shell_defaults {
-    ($shell:literal) => {
+    ($shell:literal, $terminal_comment:literal) => {
         /// Default shell when config omits `terminal.shell` or leaves it empty.
         pub const DEFAULT_SHELL_COMMAND: &str = $shell;
 
@@ -52,9 +52,9 @@ macro_rules! define_shell_defaults {
     // Soft-wrap long lines (Fresh editor.line_wrap). Default on.
     "editorLineWrap": true
   },
-  // Default PTY shell when the client does not pass `shell`.
-  // Empty args keep interactive / OSC 7 setup for known shells.
-  "terminal": {
+"#,
+            $terminal_comment,
+            r#"  "terminal": {
     "shell": {
       "command": ""#,
             $shell,
@@ -69,9 +69,15 @@ macro_rules! define_shell_defaults {
 }
 
 #[cfg(unix)]
-define_shell_defaults!("zsh");
+define_shell_defaults!(
+    "zsh",
+    "  // Default PTY shell when the client does not pass `shell`.\n  // Unix default is zsh. If that command is missing or not executable, a new terminal falls back to $SHELL (when usable), then bash, then sh.\n  // Empty args keep interactive / OSC 7 setup for known shells.\n"
+);
 #[cfg(windows)]
-define_shell_defaults!("powershell");
+define_shell_defaults!(
+    "powershell",
+    "  // Default PTY shell when the client does not pass `shell`.\n  // Empty args keep interactive / OSC 7 setup for known shells.\n"
+);
 
 const KNOWN_PALETTES: &[&str] = &[
     "primer",
@@ -373,7 +379,10 @@ impl Config {
         }
     }
 
-    /// `(command, args)` for a new PTY when the client did not override `shell`.
+    /// `(command, args)` configured for a new PTY when the client did not override `shell`.
+    ///
+    /// Does not check that the executable exists. Spawn probes the command and,
+    /// on Unix, falls back when it is missing ([`crate::shell_resolve`]).
     pub fn resolve_shell(&self) -> (String, Vec<String>) {
         match &self.terminal.shell {
             Some(s) if !s.command.is_empty() => (s.command.clone(), s.args.clone()),
@@ -745,6 +754,14 @@ mod tests {
         assert_eq!(cfg.ui.font_weight, 400);
         assert_eq!(cfg.ui.mono_font_weight, 400);
         assert_eq!(cfg.resolve_shell().0, DEFAULT_SHELL_COMMAND);
+        #[cfg(unix)]
+        {
+            assert!(
+                DEFAULT_CONFIG_TEMPLATE.contains("falls back"),
+                "template should document the Unix shell fallback"
+            );
+            assert!(DEFAULT_CONFIG_TEMPLATE.contains("$SHELL"));
+        }
         assert!(!cfg.ui.show_dotfiles);
         assert!(!cfg.ui.show_git_dirs);
         assert!(!cfg.ui.editor_minimap);

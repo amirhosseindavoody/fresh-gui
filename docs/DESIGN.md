@@ -117,7 +117,7 @@ While serving, the daemon samples its own resident set from `/proc/self/status` 
 
 `SessionStore` holds multi-PTY sessions. Closing the WebSocket detaches the subscriber; PTYs keep running. Reattach replays ~64KB of scrollback per PTY and restores the session layout blob from Rust (`layout_set` / `session_attached.layout`; host `localStorage` is a fallback cache). Layout **v4** partitions live PTYs across multiple terminal tabs (and split trees) when leaf ids are still present, reopens editor tabs by path, restores leaf cwd stamps, and reapplies per view-root explorer expanded/scroll snapshots. Explicit `fresh-gui close` ends the daemon and clears session state.
 
-PTY shell defaults come from `config.json` (`terminal.shell`). Bash/zsh hooks emit OSC 7 so the host can track cwd for new tabs/splits and explorer re-rooting.
+PTY shell defaults come from `config.json` (`terminal.shell`; Unix default command `zsh`, Windows `powershell`). On Unix, spawn checks that the chosen command exists and is executable before starting it. When it does not, the order is the configured command (or a client `pty_open` shell), then `$SHELL` if that binary is usable, then `bash`, then `sh`. The selected shell and any skips are logged. If every candidate fails, `pty_open_failed` names the attempts and points at `terminal.shell.command` in `config.json`. Windows does not walk that chain. Bash/zsh hooks emit OSC 7 so the host can track cwd for new tabs/splits and explorer re-rooting.
 
 ### Filesystem
 
