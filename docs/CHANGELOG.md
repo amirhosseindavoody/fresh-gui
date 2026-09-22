@@ -6,6 +6,7 @@
 
 - A new terminal on Windows stayed a blank pane. ConPTY asks for the cursor (`CSI 6 n`) before it draws anything and waits for a cursor-position report; the host never answered, so the shell produced no cells. The terminal view now replies (`CSI row ; col R`) and answers a device-attributes query the same way.
 - Empty `terminal.shell.args` also appended a Unix `-l`. Windows PowerShell runs that as the command `-l` and exits, so there is still no prompt after the cursor report. `powershell`, `pwsh`, and `cmd` now start as the interactive console process. bash and zsh still get the OSC 7 setup.
+- The first Windows launch could also sit with no window. `fresh-gui --json` detaches the daemon with inherited standard handles, so the daemon kept the launcher's stdout pipe and the desktop app waited forever for that process to exit. A later launch attached to the daemon and showed the blank pane. The daemon spawn now clears the inherit flag on the launcher's standard handles before `CreateProcess`.
 
 ### GPUI host stays up after the first terminal activates
 
