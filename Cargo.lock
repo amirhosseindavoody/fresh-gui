@@ -2420,7 +2420,7 @@ dependencies = [
 
 [[package]]
 name = "fresh-gui"
-version = "2026.921.7"
+version = "2026.922.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2445,7 +2445,7 @@ dependencies = [
 
 [[package]]
 name = "fresh-gui-app"
-version = "2026.921.7"
+version = "2026.922.1"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2465,7 +2465,7 @@ dependencies = [
 
 [[package]]
 name = "fresh-gui-client"
-version = "2026.921.7"
+version = "2026.922.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -2480,7 +2480,7 @@ dependencies = [
 
 [[package]]
 name = "fresh-gui-protocol"
-version = "2026.921.7"
+version = "2026.922.1"
 dependencies = [
  "serde",
  "serde_json",
