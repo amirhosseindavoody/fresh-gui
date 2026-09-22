@@ -2,8 +2,8 @@
 //!
 //! Splits, tab reorder, and merging tabs back into one group are gpui-component's
 //! dock (`DockArea` / `TabGroup`). These panels are the surfaces that dock hosts.
-//! Tab titles are session-local. `SessionTabTitle::workspace_id` is unused until
-//! a multi-workspace host can key the same label.
+//! Tab titles are per workspace. `SessionTabTitle::workspace_id` is the workspace
+//! that owns the panel.
 
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent};
 use gpui_kit::component::input::{Editor, EditorState, InputEvent, Position};
@@ -23,8 +23,8 @@ use super::workspace::Workspace;
 
 /// Label shown on a tab for this client session.
 ///
-/// `workspace_id` stays `None` until multi-workspace state exists. A later host
-/// can store the same label under that id without changing the dock panel.
+/// `workspace_id` is the daemon workspace that owns this tab. Numbers restart
+/// inside each workspace.
 #[derive(Clone, Debug)]
 pub struct SessionTabTitle {
     pub label: String,
@@ -92,6 +92,16 @@ impl TerminalPanel {
         self.title.label = title;
         self.title.custom = true;
         cx.notify();
+    }
+
+    pub fn bind_workspace(&mut self, workspace_id: Option<String>) {
+        self.title.workspace_id = workspace_id;
+    }
+
+    /// Drop the panel without sending `pty_close`. Used when the host swaps
+    /// workspaces and the PTY must keep running on the daemon.
+    pub fn release(&mut self) {
+        self.closed = true;
     }
 
     /// Feed PTY bytes. Returns a new OSC 7 cwd when one was parsed.
@@ -337,6 +347,12 @@ impl EditorPanel {
 
     pub fn buffer_id(&self) -> &str {
         &self.buffer_id
+    }
+
+    /// Drop the panel without sending `editor_close`. The Fresh buffer stays
+    /// in the daemon worker so another workspace can reopen the same path.
+    pub fn release(&mut self) {
+        self.closed = true;
     }
 
     pub fn is_dirty(&self) -> bool {

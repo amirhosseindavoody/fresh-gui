@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
-use fresh_gui_protocol::{Hello, Message, PROTOCOL_VERSION, PtyInfo, SceneBuffer, SessionInfo};
+use fresh_gui_protocol::{
+    Hello, Message, PROTOCOL_VERSION, PtyInfo, SceneBuffer, SessionInfo, WorkspaceInfo,
+    WorkspaceTab,
+};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -155,6 +158,134 @@ impl Client {
         }
     }
 
+    pub async fn list_workspaces(&mut self) -> Result<(Vec<WorkspaceInfo>, Option<String>)> {
+        send_msg(&mut self.sink, &Message::WorkspaceList).await?;
+        loop {
+            match self.recv().await? {
+                Message::WorkspaceListed {
+                    workspaces,
+                    focused_id,
+                } => return Ok((workspaces, focused_id)),
+                Message::Error { code, message } => {
+                    bail!("workspace list failed: {code}: {message}")
+                }
+                other if ignorable_while_waiting(&other) => continue,
+                other => bail!("unexpected while listing workspaces: {other:?}"),
+            }
+        }
+    }
+
+    pub async fn create_workspace(
+        &mut self,
+        name: Option<String>,
+        root: Option<String>,
+    ) -> Result<WorkspaceInfo> {
+        send_msg(&mut self.sink, &Message::WorkspaceCreate { name, root }).await?;
+        loop {
+            match self.recv().await? {
+                Message::WorkspaceCreated { workspace } => return Ok(workspace),
+                Message::Error { code, message } => {
+                    bail!("workspace create failed: {code}: {message}")
+                }
+                other if ignorable_while_waiting(&other) => continue,
+                other => bail!("unexpected while creating workspace: {other:?}"),
+            }
+        }
+    }
+
+    pub async fn rename_workspace(
+        &mut self,
+        workspace_id: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Result<WorkspaceInfo> {
+        send_msg(
+            &mut self.sink,
+            &Message::WorkspaceRename {
+                workspace_id: workspace_id.into(),
+                name: name.into(),
+            },
+        )
+        .await?;
+        loop {
+            match self.recv().await? {
+                Message::WorkspaceRenamed { workspace } => return Ok(workspace),
+                Message::Error { code, message } => {
+                    bail!("workspace rename failed: {code}: {message}")
+                }
+                other if ignorable_while_waiting(&other) => continue,
+                other => bail!("unexpected while renaming workspace: {other:?}"),
+            }
+        }
+    }
+
+    pub async fn close_workspace(
+        &mut self,
+        workspace_id: impl Into<String>,
+    ) -> Result<Option<String>> {
+        send_msg(
+            &mut self.sink,
+            &Message::WorkspaceClose {
+                workspace_id: workspace_id.into(),
+            },
+        )
+        .await?;
+        loop {
+            match self.recv().await? {
+                Message::WorkspaceClosed { focused_id, .. } => return Ok(focused_id),
+                Message::Error { code, message } => {
+                    bail!("workspace close failed: {code}: {message}")
+                }
+                other if ignorable_while_waiting(&other) => continue,
+                other => bail!("unexpected while closing workspace: {other:?}"),
+            }
+        }
+    }
+
+    /// Attach this connection to `workspace_id`. Returns the workspace, its tab
+    /// list, the active tab index, and live PTYs. Scrollback follows on [`Self::recv`].
+    pub async fn switch_workspace(
+        &mut self,
+        workspace_id: impl Into<String>,
+    ) -> Result<(WorkspaceInfo, Vec<WorkspaceTab>, u32, Vec<PtyInfo>)> {
+        let workspace_id = workspace_id.into();
+        send_msg(&mut self.sink, &Message::WorkspaceSwitch { workspace_id }).await?;
+        loop {
+            match self.recv().await? {
+                Message::WorkspaceSwitched {
+                    workspace,
+                    tabs,
+                    active_tab,
+                    ptys,
+                } => {
+                    self.session_id = Some(workspace.session_id.clone());
+                    return Ok((workspace, tabs, active_tab, ptys));
+                }
+                Message::Error { code, message } => {
+                    bail!("workspace switch failed: {code}: {message}")
+                }
+                other if ignorable_while_waiting(&other) => continue,
+                other => bail!("unexpected while switching workspace: {other:?}"),
+            }
+        }
+    }
+
+    pub async fn set_workspace_layout(
+        &mut self,
+        workspace_id: impl Into<String>,
+        tabs: Vec<WorkspaceTab>,
+        active_tab: u32,
+    ) -> Result<()> {
+        send_msg(
+            &mut self.sink,
+            &Message::WorkspaceLayoutSet {
+                workspace_id: workspace_id.into(),
+                tabs,
+                active_tab,
+            },
+        )
+        .await
+    }
+
     pub async fn set_layout(&mut self, layout: impl Into<String>) -> Result<()> {
         send_msg(
             &mut self.sink,
@@ -195,7 +326,10 @@ impl Client {
                 | Message::Ping { .. }
                 | Message::AuthOk
                 | Message::FsListed { .. }
-                | Message::FsStatResult { .. } => continue,
+                | Message::FsStatResult { .. }
+                | Message::PtyData { .. }
+                | Message::PtyClosed { .. }
+                | Message::FsChanged { .. } => continue,
                 other => bail!("unexpected while opening pty: {other:?}"),
             }
         }
@@ -617,6 +751,19 @@ fn uuid_simple() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{t:x}")
+}
+
+fn ignorable_while_waiting(msg: &Message) -> bool {
+    matches!(
+        msg,
+        Message::PtyData { .. }
+            | Message::PtyClosed { .. }
+            | Message::Pong { .. }
+            | Message::Ping { .. }
+            | Message::AuthOk
+            | Message::FsChanged { .. }
+            | Message::FsWatchStarted { .. }
+    )
 }
 
 async fn send_msg(

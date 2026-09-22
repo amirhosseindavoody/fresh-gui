@@ -190,7 +190,9 @@ After connect you get terminals, an explorer, and editor tabs in one shell:
 |---------|-----|
 | New terminal | `Ctrl+T` or the **+** on the active tab group (far right of the dock tab bar) |
 | Split / reorder | Drag a tab to a pane edge to split; drop it on a tab to merge; drag along the strip to reorder. A split needs two tabs — the last remaining tab does not drag |
-| Rename a terminal | Right-click the tab title, or **··· → Rename**. New terminals are titled `1`, `2`, `3`, … for this window |
+| Rename a terminal | Right-click the tab title, or **··· → Rename**. New terminals are titled `1`, `2`, `3`, … inside the focused workspace |
+| New workspace | Left rail **+**, or command palette → New Workspace |
+| Switch workspace | Click a name in the left rail. Tabs, terminals, and the explorer root swap; other workspaces keep running on the daemon |
 | Open a file | Click in the explorer (or `Ctrl+P` → path `[:line[:col]]`) |
 | Explorer selection | `Ctrl`/`Cmd`-click toggles; `Shift`-click selects a range. Right-click **Copy Path** copies absolute paths |
 | Move / copy files | Drag a file onto a folder to move it. With the explorer focused, `Ctrl+C` / `Ctrl+V` (`Cmd` on macOS) copies via the daemon into the selected folder |
@@ -203,7 +205,7 @@ After connect you get terminals, an explorer, and editor tabs in one shell:
 
 The product host is this GPUI client. The daemon is a headless ADE WebSocket. A later browser host would be this same GPUI UI via WebAssembly, which is not in this release. Splits and tab reorder use the gpui-component dock. Terminal titles and the in-app file clipboard last for the client session. Still absent: markdown WYSIWYG, a minimap, layout restore, mouse selection in the terminal, find, palette packs, tab pin, and editor-tab rename. Copy Path and in-app paste use absolute ADE paths. On this GPUI snapshot, Linux clipboard writes do not offer `text/uri-list`, so pasting into a file manager is not reliable; paste inside the explorer is a real `fs_copy`.
 
-Disconnect leaves remote sessions and PTYs running so you can reconnect.
+Disconnect leaves remote workspaces and PTYs running so you can reconnect. Each workspace is its own set of tabs and shells on that daemon; the left rail switches among them. See [docs/WORKSPACES.md](docs/WORKSPACES.md).
 
 Sessions keep shells alive across GUI disconnect. Explorer list/create/copy/move/delete and editor open are sandboxed to `--root` (default: current directory), plus directories authorized when a terminal cwd leaves that root.
 

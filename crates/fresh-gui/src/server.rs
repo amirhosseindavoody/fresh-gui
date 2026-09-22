@@ -15,7 +15,7 @@ use base64::Engine;
 use fresh_gui_protocol::{CAP_EDITOR, CAP_SCENE, Hello, HelloUi, Message, PROTOCOL_VERSION};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::editor_worker::EditorHandle;
@@ -23,12 +23,14 @@ use crate::fs::FsRoot;
 use crate::fs_watch::FsWatchStore;
 use crate::memory_monitor::MemoryMonitor;
 use crate::session::SessionStore;
+use crate::workspace::WorkspaceStore;
 
 pub struct AppState {
     pub token: Option<String>,
     pub require_auth: bool,
     pub fs_root: FsRoot,
     pub sessions: SessionStore,
+    pub workspaces: WorkspaceStore,
     pub editor: Option<EditorHandle>,
     pub watches: FsWatchStore,
     /// Live config (reloaded when the settings file is saved).
@@ -370,12 +372,20 @@ async fn handle_client_msg(
                     message: err.to_string(),
                 })?;
 
-            send_msg(sink, &Message::PtyOpened { id, cols, rows })
-                .await
-                .map_err(|_| Message::Error {
-                    code: "send_failed".into(),
-                    message: "failed to send PtyOpened".into(),
-                })?;
+            send_msg(
+                sink,
+                &Message::PtyOpened {
+                    id: id.clone(),
+                    cols,
+                    rows,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send PtyOpened".into(),
+            })?;
+            mirror_workspace_layout(state, state.workspaces.note_terminal(&sid, &id).await).await;
             Ok(())
         }
         Message::PtyData { id, data } => {
@@ -421,6 +431,11 @@ async fn handle_client_msg(
                     code: "pty_close_failed".into(),
                     message: err.to_string(),
                 })?;
+            mirror_workspace_layout(
+                state,
+                state.workspaces.note_terminal_closed(&sid, &id).await,
+            )
+            .await;
             Ok(())
         }
         Message::FsList { request_id, path } => {
@@ -841,10 +856,212 @@ async fn handle_client_msg(
             })?;
             Ok(())
         }
+        Message::WorkspaceList => {
+            require_auth(*authed)?;
+            let (workspaces, focused_id) = workspace_list(state).await;
+            send_msg(
+                sink,
+                &Message::WorkspaceListed {
+                    workspaces,
+                    focused_id,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send WorkspaceListed".into(),
+            })?;
+            Ok(())
+        }
+        Message::WorkspaceCreate { name, root } => {
+            require_auth(*authed)?;
+            let root = resolve_workspace_root(state, root).await?;
+            let mut workspace = state.workspaces.create(&state.sessions, name, root).await;
+            workspace.pty_count = state.sessions.pty_count(&workspace.session_id).await;
+            debug!(id = %workspace.id, name = %workspace.name, "workspace created");
+            send_msg(sink, &Message::WorkspaceCreated { workspace })
+                .await
+                .map_err(|_| Message::Error {
+                    code: "send_failed".into(),
+                    message: "failed to send WorkspaceCreated".into(),
+                })?;
+            Ok(())
+        }
+        Message::WorkspaceRename { workspace_id, name } => {
+            require_auth(*authed)?;
+            let mut workspace = state
+                .workspaces
+                .rename(&workspace_id, &name)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "workspace_rename_failed".into(),
+                    message: err.to_string(),
+                })?;
+            workspace.pty_count = state.sessions.pty_count(&workspace.session_id).await;
+            send_msg(sink, &Message::WorkspaceRenamed { workspace })
+                .await
+                .map_err(|_| Message::Error {
+                    code: "send_failed".into(),
+                    message: "failed to send WorkspaceRenamed".into(),
+                })?;
+            Ok(())
+        }
+        Message::WorkspaceClose { workspace_id } => {
+            require_auth(*authed)?;
+            let closed =
+                state
+                    .workspaces
+                    .close(&workspace_id)
+                    .await
+                    .map_err(|err| Message::Error {
+                        code: "workspace_close_failed".into(),
+                        message: err.to_string(),
+                    })?;
+            if session_id.as_deref() == Some(closed.session_id.as_str()) {
+                *session_id = None;
+            }
+            state.sessions.detach_subscriber(&closed.session_id).await;
+            state
+                .sessions
+                .destroy(&closed.session_id)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "workspace_close_failed".into(),
+                    message: err.to_string(),
+                })?;
+            debug!(%workspace_id, "workspace closed");
+            send_msg(
+                sink,
+                &Message::WorkspaceClosed {
+                    workspace_id,
+                    focused_id: closed.focused_id,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send WorkspaceClosed".into(),
+            })?;
+            Ok(())
+        }
+        Message::WorkspaceSwitch { workspace_id } => {
+            require_auth(*authed)?;
+            let focused =
+                state
+                    .workspaces
+                    .focus(&workspace_id)
+                    .await
+                    .map_err(|err| Message::Error {
+                        code: "workspace_switch_failed".into(),
+                        message: err.to_string(),
+                    })?;
+            if let Some(prev) = session_id.take() {
+                state.sessions.detach_subscriber(&prev).await;
+            }
+            let (ptys, _layout, replay) = state
+                .sessions
+                .attach(&focused.session_id, out_tx)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "workspace_switch_failed".into(),
+                    message: err.to_string(),
+                })?;
+            *session_id = Some(focused.session_id.clone());
+            let mut workspace = focused.info;
+            workspace.pty_count = ptys.len() as u32;
+            send_msg(
+                sink,
+                &Message::WorkspaceSwitched {
+                    workspace,
+                    tabs: focused.tabs,
+                    active_tab: focused.active_tab,
+                    ptys,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send WorkspaceSwitched".into(),
+            })?;
+            for msg in replay {
+                send_msg(sink, &msg).await.map_err(|_| Message::Error {
+                    code: "send_failed".into(),
+                    message: "failed to replay scrollback".into(),
+                })?;
+            }
+            Ok(())
+        }
+        Message::WorkspaceLayoutSet {
+            workspace_id,
+            tabs,
+            active_tab,
+        } => {
+            require_auth(*authed)?;
+            let (session_for_layout, layout) = state
+                .workspaces
+                .set_layout(&workspace_id, tabs, active_tab)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "workspace_layout_failed".into(),
+                    message: err.to_string(),
+                })?;
+            state
+                .sessions
+                .set_layout(&session_for_layout, layout)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "workspace_layout_failed".into(),
+                    message: err.to_string(),
+                })?;
+            Ok(())
+        }
         other => {
             warn!(?other, "unexpected client message");
             Ok(())
         }
+    }
+}
+
+async fn workspace_list(
+    state: &AppState,
+) -> (Vec<fresh_gui_protocol::WorkspaceInfo>, Option<String>) {
+    let (mut workspaces, focused) = state.workspaces.list().await;
+    for workspace in &mut workspaces {
+        workspace.pty_count = state.sessions.pty_count(&workspace.session_id).await;
+    }
+    (workspaces, focused)
+}
+
+async fn resolve_workspace_root(state: &AppState, root: Option<String>) -> Result<String, Message> {
+    let Some(raw) = root
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(state.fs_root.root_display());
+    };
+    if !std::path::Path::new(&raw).is_absolute() {
+        return Err(Message::Error {
+            code: "workspace_create_failed".into(),
+            message: format!("workspace root must be an absolute path, got {raw}"),
+        });
+    }
+    let canon = state
+        .fs_root
+        .authorize(&raw)
+        .await
+        .map_err(|err| Message::Error {
+            code: "workspace_create_failed".into(),
+            message: err.to_string(),
+        })?;
+    Ok(canon.display().to_string())
+}
+
+async fn mirror_workspace_layout(state: &AppState, update: Option<(String, String)>) {
+    let Some((session_id, layout)) = update else {
+        return;
+    };
+    if let Err(err) = state.sessions.set_layout(&session_id, layout).await {
+        debug!(%err, "workspace layout mirror failed");
     }
 }
 

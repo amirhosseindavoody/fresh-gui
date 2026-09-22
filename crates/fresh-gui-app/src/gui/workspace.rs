@@ -3,13 +3,17 @@
 //! Editor and terminal surfaces are dock panels. Dragging a tab to a pane edge
 //! splits; dropping it on a tab merges; dropping it in the strip reorders.
 //! gpui-component refuses to drag the last remaining tab, so a split needs two
-//! tabs. Terminal titles are herdr-style numbers for this client session.
+//! tabs. Terminal titles are herdr-style numbers inside the focused workspace.
+//! A left rail lists daemon workspaces; switching swaps this dock for that
+//! workspace's session without closing its PTYs.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fresh_gui_protocol::{FsEntry, FsKind, Hello};
+use fresh_gui_protocol::{
+    CAP_WORKSPACE, FsEntry, FsKind, Hello, PtyInfo, WorkspaceInfo, WorkspaceTab, WorkspaceTabKind,
+};
 use gpui_kit::component::dock::{
     DockArea, DockPlacement, DockSkin, PanelId, PanelStyle, panel_handle,
 };
@@ -29,9 +33,11 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::actions::{
-    CloseTab, CopyExplorer, Disconnect, GoToFile, NewTerminal, NextTab, OpenSettings,
-    PasteExplorer, PrevTab, Reconnect, SaveBuffer, ToggleCommandPalette, ToggleSidebar,
+    CloseTab, CopyExplorer, Disconnect, GoToFile, NewTerminal, NewWorkspace, NextTab, OpenSettings,
+    PasteExplorer, PrevTab, Reconnect, RenameWorkspace, SaveBuffer, ToggleCommandPalette,
+    ToggleSidebar,
 };
+use super::ade::AttachedWorkspace;
 use super::ade::{AdeCmd, AdeEvent, AdeHandle};
 use super::connect::{ConnectTarget, parse_goto_spec};
 use super::explorer::{
@@ -47,6 +53,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// The dock tab strip itself stays at the skin's default 32px; that chrome
 /// is owned by `DockSkin`, not this host.
 const TITLE_BAR_H: f32 = 30.;
+const WORKSPACE_RAIL_W: f32 = 168.;
 const ACTIVITY_RAIL_W: f32 = 36.;
 const SIDEBAR_HEADER_H: f32 = 26.;
 const TREE_ROW_H: f32 = 22.;
@@ -110,6 +117,18 @@ pub struct Workspace {
     ade: AdeHandle,
     connection: ConnectionState,
     session_id: Option<String>,
+    workspace_cap: bool,
+    workspaces: Vec<WorkspaceInfo>,
+    active_workspace_id: Option<String>,
+    /// `pty_open` requests this view is still waiting on. `pty_opened` for any
+    /// other id is ignored so a late open from workspace A cannot appear in B.
+    pty_opens_pending: u32,
+    /// Editor opens issued by this view. Unsolicited `editor_opened` does not
+    /// add a tab.
+    pending_editors: HashMap<String, bool>,
+    restoring: bool,
+    renaming: bool,
+    create_open: bool,
     capabilities: Vec<String>,
     config_path: Option<String>,
     status: SharedString,
@@ -135,6 +154,9 @@ pub struct Workspace {
     palette_open: bool,
     goto_open: bool,
     goto_input: Entity<InputState>,
+    create_name: Entity<InputState>,
+    create_root: Entity<InputState>,
+    ws_rename_input: Entity<InputState>,
     rename_pty: Option<String>,
     rename_input: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
@@ -150,6 +172,11 @@ impl Workspace {
         let explorer = cx.new(|cx| TreeState::new(cx));
         let command_state = cx.new(|cx| CommandState::new(window, cx));
         let goto_input = cx.new(|cx| InputState::new(window, cx).placeholder("path[:line[:col]]"));
+        let create_name = cx.new(|cx| InputState::new(window, cx).placeholder("Name"));
+        let create_root =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Absolute root (optional)"));
+        let ws_rename_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Workspace name"));
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Terminal name"));
         let tree_sub = cx.subscribe(&explorer, |this, _, ev: &TreeEvent, _cx| {
             if let TreeEvent::Expanded(id) = ev {
@@ -165,6 +192,11 @@ impl Workspace {
         let rename_sub = cx.subscribe(&rename_input, |this, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::PressEnter { .. }) && this.rename_pty.is_some() {
                 this.confirm_rename(cx);
+            }
+        });
+        let ws_rename_sub = cx.subscribe(&ws_rename_input, |this, _, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::PressEnter { .. }) && this.renaming {
+                this.confirm_workspace_rename(cx);
             }
         });
 
@@ -186,6 +218,14 @@ impl Workspace {
             ade,
             connection: ConnectionState::Connecting,
             session_id: None,
+            workspace_cap: false,
+            workspaces: Vec::new(),
+            active_workspace_id: None,
+            pty_opens_pending: 0,
+            pending_editors: HashMap::new(),
+            restoring: false,
+            renaming: false,
+            create_open: false,
             capabilities: Vec::new(),
             config_path: None,
             status: "Connecting…".into(),
@@ -209,9 +249,12 @@ impl Workspace {
             palette_open: false,
             goto_open: false,
             goto_input,
+            create_name,
+            create_root,
+            ws_rename_input,
             rename_pty: None,
             rename_input,
-            _subscriptions: vec![tree_sub, rename_sub],
+            _subscriptions: vec![tree_sub, rename_sub, ws_rename_sub],
             _recv_task: recv_task,
         }
     }
@@ -222,20 +265,64 @@ impl Workspace {
                 self.connection = ConnectionState::Connecting;
                 self.status = "Connecting…".into();
             }
-            AdeEvent::Connected { hello, session_id } => {
+            AdeEvent::Connected {
+                hello,
+                session_id,
+                workspaces,
+                attached,
+            } => {
                 self.apply_hello(&hello);
+                self.workspace_cap = hello.capabilities.iter().any(|cap| cap == CAP_WORKSPACE);
+                self.workspaces = workspaces;
                 self.session_id = Some(session_id);
                 self.connection = ConnectionState::Online;
                 self.status = "Online".into();
-                self.ade.send(AdeCmd::OpenPty {
-                    cols: 80,
-                    rows: 24,
-                    cwd: None,
-                });
-                self.ade.send(AdeCmd::ListDir {
-                    request_id: next_id("ex"),
-                    path: String::new(),
-                });
+                self.pty_opens_pending = 0;
+                self.pending_editors.clear();
+                if let Some(attached) = attached {
+                    self.restore_workspace(attached, window, cx);
+                } else {
+                    self.active_workspace_id = None;
+                    self.pty_opens_pending = 1;
+                    self.ade.send(AdeCmd::OpenPty {
+                        cols: 80,
+                        rows: 24,
+                        cwd: None,
+                    });
+                    self.ade.send(AdeCmd::ListDir {
+                        request_id: next_id("ex"),
+                        path: String::new(),
+                    });
+                }
+            }
+            AdeEvent::WorkspaceCreated { workspace } => {
+                let id = workspace.id.clone();
+                self.upsert_workspace(workspace);
+                self.switch_to(id, cx);
+            }
+            AdeEvent::WorkspaceRenamed { workspace } => {
+                self.status = format!("Renamed to {}", workspace.name).into();
+                self.upsert_workspace(workspace);
+            }
+            AdeEvent::WorkspaceClosed { id, focused_id } => {
+                let was_active = self.active_workspace_id.as_deref() == Some(id.as_str());
+                self.workspaces.retain(|workspace| workspace.id != id);
+                if was_active {
+                    self.release_dock(window, cx);
+                    self.active_workspace_id = None;
+                    self.session_id = None;
+                    self.pty_opens_pending = 0;
+                    self.pending_editors.clear();
+                    self.restoring = false;
+                    if let Some(next) =
+                        focused_id.or_else(|| self.workspaces.first().map(|w| w.id.clone()))
+                    {
+                        self.switch_to(next, cx);
+                    }
+                }
+            }
+            AdeEvent::WorkspaceSwitched { attached } => {
+                self.restore_workspace(attached, window, cx);
             }
             AdeEvent::Disconnected { reason } => {
                 self.connection = ConnectionState::Offline {
@@ -243,7 +330,13 @@ impl Workspace {
                 };
                 self.status = format!("Disconnected: {reason}").into();
             }
-            AdeEvent::PtyOpened { id, .. } => self.add_terminal_tab(id, window, cx),
+            AdeEvent::PtyOpened { id, .. } => {
+                if self.pty_opens_pending > 0 {
+                    self.pty_opens_pending -= 1;
+                    self.add_terminal_tab(id, window, cx);
+                    self.publish_layout(cx);
+                }
+            }
             AdeEvent::PtyData { id, bytes } => self.on_pty_data(&id, &bytes, cx),
             AdeEvent::PtyClosed { id, reason } => {
                 if let Some(reason) = reason {
@@ -275,14 +368,19 @@ impl Workspace {
                 self.finish_fs(&request_id, entries, false, cx);
             }
             AdeEvent::EditorOpened {
+                request_id,
                 buffer_id,
                 path,
                 language,
                 line,
                 column,
-                ..
             } => {
-                self.begin_editor_tab(buffer_id, path, language, line, column, window, cx);
+                if let Some(activate) = self.pending_editors.remove(&request_id) {
+                    self.begin_editor_tab(
+                        buffer_id, path, language, line, column, activate, window, cx,
+                    );
+                    self.finish_restore_if_idle(cx);
+                }
             }
             AdeEvent::BufferSnapshot {
                 buffer_id,
@@ -303,6 +401,13 @@ impl Workspace {
             } => self.on_buffer_saved(&buffer_id, path, rev, cx),
             AdeEvent::Error { code, message } => {
                 self.pending_fs.clear();
+                if code == "pty_open_failed" {
+                    self.pty_opens_pending = self.pty_opens_pending.saturating_sub(1);
+                }
+                if self.restoring {
+                    self.restoring = false;
+                    self.pending_editors.clear();
+                }
                 self.status = format!("{code}: {message}").into();
             }
         }
@@ -320,6 +425,8 @@ impl Workspace {
         let workspace = cx.weak_entity();
         let ade = self.ade.clone();
         let panel = cx.new(|cx| TerminalPanel::new(pty_id.clone(), number, ade, workspace, cx));
+        let workspace_id = self.active_workspace_id.clone();
+        panel.update(cx, |panel, _| panel.bind_workspace(workspace_id));
         self.dock.update(cx, |dock, cx| {
             dock.add_panel_view(
                 panel_handle(panel.clone()),
@@ -349,6 +456,7 @@ impl Workspace {
         language: Option<String>,
         line: Option<u32>,
         column: Option<u32>,
+        activate: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -356,7 +464,9 @@ impl Workspace {
             panel.update(cx, |panel, cx| {
                 panel.note_reopen(buffer_id, line, column, cx);
             });
-            self.select_entity(&panel, window, cx);
+            if activate {
+                self.select_entity(&panel, window, cx);
+            }
             return;
         }
         let workspace = cx.weak_entity();
@@ -383,7 +493,10 @@ impl Workspace {
                 cx,
             );
         });
-        self.editors.insert(path, panel);
+        self.editors.insert(path, panel.clone());
+        if activate {
+            self.select_entity(&panel, window, cx);
+        }
     }
 
     fn apply_snapshot(
@@ -395,26 +508,20 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
-            panel.update(cx, |panel, cx| {
-                panel.apply_snapshot(rev, text, path, window, cx);
-            });
-            self.select_entity(&panel, window, cx);
+        let panel = self
+            .editor_by_buffer(&buffer_id, cx)
+            .or_else(|| self.editors.get(&path).cloned());
+        let Some(panel) = panel else {
             return;
-        }
-        if let Some(panel) = self.editors.get(&path).cloned() {
-            panel.update(cx, |panel, cx| {
-                panel.note_reopen(buffer_id.clone(), None, None, cx);
-                panel.apply_snapshot(rev, text, path, window, cx);
-            });
+        };
+        panel.update(cx, |panel, cx| {
+            if panel.buffer_id() != buffer_id {
+                panel.note_reopen(buffer_id, None, None, cx);
+            }
+            panel.apply_snapshot(rev, text, path, window, cx);
+        });
+        if !self.restoring {
             self.select_entity(&panel, window, cx);
-            return;
-        }
-        self.begin_editor_tab(buffer_id, path.clone(), None, None, None, window, cx);
-        if let Some(panel) = self.editors.get(&path).cloned() {
-            panel.update(cx, |panel, cx| {
-                panel.apply_snapshot(rev, text, path, window, cx);
-            });
         }
     }
 
@@ -483,6 +590,9 @@ impl Workspace {
     ) {
         if active {
             self.active = Some(ActiveSurface::Terminal(pty_id.to_string()));
+            if !self.restoring {
+                self.publish_layout(cx);
+            }
         } else if matches!(&self.active, Some(ActiveSurface::Terminal(id)) if id == pty_id) {
             self.active = None;
         }
@@ -492,6 +602,9 @@ impl Workspace {
     pub(crate) fn note_editor_active(&mut self, path: &str, active: bool, cx: &mut Context<Self>) {
         if active {
             self.active = Some(ActiveSurface::Editor(path.to_string()));
+            if !self.restoring {
+                self.publish_layout(cx);
+            }
         } else if matches!(&self.active, Some(ActiveSurface::Editor(current)) if current == path) {
             self.active = None;
         }
@@ -502,6 +615,9 @@ impl Workspace {
         self.terminals.remove(pty_id);
         if matches!(&self.active, Some(ActiveSurface::Terminal(id)) if id == pty_id) {
             self.active = None;
+        }
+        if !self.restoring {
+            self.publish_layout(cx);
         }
         cx.notify();
     }
@@ -532,6 +648,7 @@ impl Workspace {
             return;
         }
         let cwd = self.active_cwd(cx);
+        self.pty_opens_pending = self.pty_opens_pending.saturating_add(1);
         self.ade.send(AdeCmd::OpenPty {
             cols: 80,
             rows: 24,
@@ -549,6 +666,378 @@ impl Workspace {
             return Some(cwd);
         }
         self.last_cwd.clone()
+    }
+
+    fn upsert_workspace(&mut self, info: WorkspaceInfo) {
+        if let Some(slot) = self
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == info.id)
+        {
+            *slot = info;
+        } else {
+            self.workspaces.push(info);
+        }
+    }
+
+    /// Remove dock panels without `pty_close` / `editor_close`. Idle sessions
+    /// stay on the daemon.
+    fn release_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let terminals: Vec<_> = self.terminals.values().cloned().collect();
+        let editors: Vec<_> = self.editors.values().cloned().collect();
+        for panel in terminals {
+            panel.update(cx, |panel, _| panel.release());
+            self.dock
+                .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
+        }
+        for panel in editors {
+            panel.update(cx, |panel, _| panel.release());
+            self.dock
+                .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
+        }
+        self.terminals.clear();
+        self.editors.clear();
+        self.active = None;
+        self.next_terminal_number = 1;
+    }
+
+    fn capture_layout(&self, cx: &App) -> (Vec<WorkspaceTab>, u32) {
+        let mut tabs = Vec::new();
+        let mut seen_pty = HashSet::new();
+        let mut seen_path = HashSet::new();
+        for id in self.panel_order(cx) {
+            if let Some((pty_id, panel)) = self
+                .terminals
+                .iter()
+                .find(|(_, panel)| PanelId::from(panel.entity_id()) == id)
+            {
+                seen_pty.insert(pty_id.clone());
+                tabs.push(WorkspaceTab {
+                    kind: WorkspaceTabKind::Terminal,
+                    title: panel.read(cx).label().to_string(),
+                    pty_id: Some(pty_id.clone()),
+                    path: None,
+                });
+            } else if let Some((path, _)) = self
+                .editors
+                .iter()
+                .find(|(_, panel)| PanelId::from(panel.entity_id()) == id)
+            {
+                seen_path.insert(path.clone());
+                let title = path
+                    .rsplit(['/', '\\'])
+                    .find(|seg| !seg.is_empty())
+                    .unwrap_or(path)
+                    .to_owned();
+                tabs.push(WorkspaceTab {
+                    kind: WorkspaceTabKind::Editor,
+                    title,
+                    pty_id: None,
+                    path: Some(path.clone()),
+                });
+            }
+        }
+        for (pty_id, panel) in &self.terminals {
+            if seen_pty.insert(pty_id.clone()) {
+                tabs.push(WorkspaceTab {
+                    kind: WorkspaceTabKind::Terminal,
+                    title: panel.read(cx).label().to_string(),
+                    pty_id: Some(pty_id.clone()),
+                    path: None,
+                });
+            }
+        }
+        for path in self.editors.keys() {
+            if seen_path.insert(path.clone()) {
+                let title = path
+                    .rsplit(['/', '\\'])
+                    .find(|seg| !seg.is_empty())
+                    .unwrap_or(path)
+                    .to_owned();
+                tabs.push(WorkspaceTab {
+                    kind: WorkspaceTabKind::Editor,
+                    title,
+                    pty_id: None,
+                    path: Some(path.clone()),
+                });
+            }
+        }
+        let active_id = self.active_panel_id();
+        let active_tab = active_id
+            .and_then(|id| {
+                self.panel_order(cx)
+                    .iter()
+                    .position(|item| *item == id)
+                    .map(|ix| ix as u32)
+            })
+            .unwrap_or(0);
+        (tabs, active_tab)
+    }
+
+    fn publish_layout(&mut self, cx: &App) {
+        if self.restoring || !self.workspace_cap {
+            return;
+        }
+        let Some(id) = self.active_workspace_id.clone() else {
+            return;
+        };
+        let (tabs, active_tab) = self.capture_layout(cx);
+        if let Some(workspace) = self
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == id)
+        {
+            workspace.tab_count = tabs.len() as u32;
+            workspace.pty_count = tabs
+                .iter()
+                .filter(|tab| tab.kind == WorkspaceTabKind::Terminal)
+                .count() as u32;
+        }
+        self.ade.send(AdeCmd::SetWorkspaceLayout {
+            id,
+            tabs,
+            active_tab,
+        });
+    }
+
+    fn finish_restore_if_idle(&mut self, cx: &App) {
+        if self.restoring && self.pending_editors.is_empty() {
+            self.restoring = false;
+            self.publish_layout(cx);
+        }
+    }
+
+    fn switch_to(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.workspace_cap || !matches!(self.connection, ConnectionState::Online) {
+            return;
+        }
+        if self.active_workspace_id.as_deref() == Some(id.as_str()) {
+            return;
+        }
+        let from = if self.restoring {
+            None
+        } else {
+            self.active_workspace_id.clone()
+        };
+        let (tabs, active_tab) = if from.is_some() {
+            self.capture_layout(cx)
+        } else {
+            (Vec::new(), 0)
+        };
+        self.restoring = true;
+        self.pty_opens_pending = 0;
+        self.pending_editors.clear();
+        self.renaming = false;
+        self.rename_pty = None;
+        // The window is only available from event handlers. `switch_to` is
+        // called from those, but `Context` does not hand us a window here.
+        // Panels are released when `workspace_switched` restores. Until then
+        // the old dock stays on screen and is replaced in `restore_workspace`.
+        self.ade.send(AdeCmd::SwitchWorkspace {
+            id,
+            from,
+            tabs,
+            active_tab,
+        });
+    }
+
+    fn restore_workspace(
+        &mut self,
+        attached: AttachedWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let AttachedWorkspace {
+            info,
+            tabs,
+            active_tab,
+            ptys,
+        } = attached;
+        self.restoring = true;
+        self.pty_opens_pending = 0;
+        self.pending_editors.clear();
+        self.release_dock(window, cx);
+        self.session_id = Some(info.session_id.clone());
+        self.active_workspace_id = Some(info.id.clone());
+        self.explorer_cache.clear();
+        self.selection.clear();
+        self.anchor = None;
+        self.explorer_root = info.root.clone();
+        let root = info.root.clone();
+        self.upsert_workspace(info);
+        self.rebuild_tree(cx);
+        self.ade.send(AdeCmd::ListDir {
+            request_id: next_id("ex"),
+            path: root,
+        });
+
+        let live: HashSet<String> = ptys.iter().map(|pty| pty.id.clone()).collect();
+        let mut seen = HashSet::new();
+        let mut editor_jobs = Vec::new();
+        for (index, tab) in tabs.into_iter().enumerate() {
+            match tab.kind {
+                WorkspaceTabKind::Terminal => {
+                    let Some(pty_id) = tab.pty_id else {
+                        continue;
+                    };
+                    if !live.contains(&pty_id) || !seen.insert(pty_id.clone()) {
+                        continue;
+                    }
+                    self.attach_terminal(pty_id, tab.title, window, cx);
+                }
+                WorkspaceTabKind::Editor => {
+                    if let Some(path) = tab.path {
+                        editor_jobs.push((path, index as u32 == active_tab));
+                    }
+                }
+            }
+        }
+        for PtyInfo { id, .. } in ptys {
+            if seen.insert(id.clone()) {
+                let n = self.next_terminal_number;
+                self.attach_terminal(id, n.to_string(), window, cx);
+            }
+        }
+
+        let expect_editors = !editor_jobs.is_empty();
+        if self.terminals.is_empty() && !expect_editors {
+            self.restoring = false;
+            self.new_terminal(cx);
+        } else if !self.terminals.is_empty()
+            && (active_tab as usize) < self.terminals.len()
+            && editor_jobs.is_empty()
+        {
+            let order = self.panel_order(cx);
+            if let Some(id) = order.get(active_tab as usize).cloned() {
+                self.dock
+                    .update(cx, |dock, cx| dock.select_panel(id, window, cx));
+            }
+        }
+        for (path, activate) in editor_jobs {
+            self.open_editor(path, false, activate);
+        }
+        if !expect_editors {
+            self.restoring = false;
+            if !self.panes_empty() {
+                self.publish_layout(cx);
+            }
+        }
+    }
+
+    fn attach_terminal(
+        &mut self,
+        pty_id: String,
+        title: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let parsed = title.parse::<u32>().ok().filter(|n| *n > 0);
+        let number = parsed.unwrap_or(self.next_terminal_number.max(1));
+        if number >= self.next_terminal_number {
+            self.next_terminal_number = number.saturating_add(1);
+        }
+        let workspace = cx.weak_entity();
+        let ade = self.ade.clone();
+        let panel = cx.new(|cx| TerminalPanel::new(pty_id.clone(), number, ade, workspace, cx));
+        let workspace_id = self.active_workspace_id.clone();
+        let custom = parsed.is_none() && !title.is_empty() && title != number.to_string();
+        panel.update(cx, |panel, cx| {
+            panel.bind_workspace(workspace_id);
+            if custom {
+                panel.set_custom_title(title, cx);
+            }
+        });
+        self.dock.update(cx, |dock, cx| {
+            dock.add_panel_view(
+                panel_handle(panel.clone()),
+                DockPlacement::Center,
+                None,
+                window,
+                cx,
+            );
+        });
+        self.terminals.insert(pty_id, panel);
+    }
+
+    fn open_editor(&mut self, path: String, preview: bool, activate: bool) {
+        let (path, line, column) = parse_goto_spec(&path);
+        if path.is_empty() {
+            return;
+        }
+        let request_id = next_id("ed");
+        self.pending_editors.insert(request_id.clone(), activate);
+        self.ade.send(AdeCmd::OpenEditor {
+            request_id,
+            path,
+            preview,
+            line,
+            column,
+        });
+    }
+
+    fn open_create_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.workspace_cap {
+            self.status = "This daemon has no workspace capability".into();
+            return;
+        }
+        self.create_open = true;
+        self.palette_open = false;
+        self.goto_open = false;
+        self.rename_pty = None;
+        self.create_name.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.focus(window, cx);
+        });
+        self.create_root
+            .update(cx, |state, cx| state.set_value("", window, cx));
+    }
+
+    fn confirm_create(&mut self, cx: &mut Context<Self>) {
+        let name = self.create_name.read(cx).value().to_string();
+        let root = self.create_root.read(cx).value().to_string();
+        self.create_open = false;
+        self.ade.send(AdeCmd::CreateWorkspace { name, root });
+    }
+
+    fn begin_workspace_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.active_workspace_id.clone() else {
+            self.status = "No workspace to rename".into();
+            return;
+        };
+        let name = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == id)
+            .map(|workspace| workspace.name.clone())
+            .unwrap_or_default();
+        self.renaming = true;
+        self.rename_pty = None;
+        self.palette_open = false;
+        self.ws_rename_input.update(cx, |state, cx| {
+            state.set_value(name, window, cx);
+            state.focus(window, cx);
+        });
+    }
+
+    fn confirm_workspace_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.active_workspace_id.clone() else {
+            self.renaming = false;
+            return;
+        };
+        let name = self.ws_rename_input.read(cx).value().to_string();
+        self.renaming = false;
+        if name.trim().is_empty() {
+            self.status = "Workspace name is empty".into();
+            return;
+        }
+        self.ade.send(AdeCmd::RenameWorkspace { id, name });
+    }
+
+    fn close_workspace(&mut self, id: String) {
+        if !self.workspace_cap {
+            return;
+        }
+        self.ade.send(AdeCmd::CloseWorkspace { id });
     }
 
     fn close_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -622,17 +1111,7 @@ impl Workspace {
     }
 
     fn open_path(&mut self, path: String, preview: bool) {
-        let (path, line, column) = parse_goto_spec(&path);
-        if path.is_empty() {
-            return;
-        }
-        self.ade.send(AdeCmd::OpenEditor {
-            request_id: next_id("ed"),
-            path,
-            preview,
-            line,
-            column,
-        });
+        self.open_editor(path, preview, true);
     }
 
     fn open_settings(&mut self) {
@@ -653,6 +1132,7 @@ impl Workspace {
             return;
         };
         let current = panel.read(cx).label().to_string();
+        self.renaming = false;
         self.rename_pty = Some(pty_id.to_string());
         self.palette_open = false;
         self.goto_open = false;
@@ -678,6 +1158,7 @@ impl Workspace {
         if let Some(panel) = self.terminals.get(&pty).cloned() {
             panel.update(cx, |panel, cx| panel.set_custom_title(title, cx));
             self.status = "Renamed terminal".into();
+            self.publish_layout(cx);
         }
         cx.notify();
     }
@@ -688,6 +1169,18 @@ impl Workspace {
         self.ade = ade;
         self.connection = ConnectionState::Connecting;
         self.status = "Reconnecting…".into();
+        self.release_dock(window, cx);
+        self.workspaces.clear();
+        self.active_workspace_id = None;
+        self.session_id = None;
+        self.pty_opens_pending = 0;
+        self.pending_editors.clear();
+        self.restoring = false;
+        self.renaming = false;
+        self.explorer_cache.clear();
+        self.explorer_root.clear();
+        self.selection.clear();
+        self.anchor = None;
         self._recv_task = cx.spawn_in(window, async move |this, cx| {
             while let Ok(ev) = evt_rx.recv().await {
                 if cx
@@ -1060,6 +1553,220 @@ impl Workspace {
         self.paste_explorer(cx);
     }
 
+    fn on_new_workspace(&mut self, _: &NewWorkspace, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_create_dialog(window, cx);
+        cx.notify();
+    }
+
+    fn on_rename_workspace(
+        &mut self,
+        _: &RenameWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.begin_workspace_rename(window, cx);
+        cx.notify();
+    }
+
+    fn render_workspace_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = self
+            .workspaces
+            .iter()
+            .map(|workspace| self.render_workspace_row(workspace, cx))
+            .collect::<Vec<_>>();
+
+        v_flex()
+            .id("workspace-rail")
+            .w(px(WORKSPACE_RAIL_W))
+            .h_full()
+            .flex_shrink_0()
+            .bg(cx.theme().sidebar)
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .w_full()
+                    .h(px(SIDEBAR_HEADER_H))
+                    .px_2()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_xs().font_semibold().child("Workspaces"))
+                    .child(
+                        Button::new("workspace-create")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Plus)
+                            .tooltip("New Workspace")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_create_dialog(window, cx);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("workspace-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
+    }
+
+    fn render_workspace_row(
+        &self,
+        workspace: &WorkspaceInfo,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = workspace.id.clone();
+        let active = self.active_workspace_id.as_deref() == Some(workspace.id.as_str());
+        let name = workspace.name.clone();
+        let renaming = active && self.renaming;
+        let row_id = format!("ws-row-{}", workspace.id);
+        let name_id = format!("ws-name-{}", workspace.id);
+
+        v_flex()
+            .id(row_id)
+            .w_full()
+            .px_1()
+            .py(px(2.))
+            .gap(px(2.))
+            .when(active, |row| row.bg(cx.theme().accent.opacity(0.16)))
+            .child(if renaming {
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&self.ws_rename_input)),
+                    )
+                    .child(
+                        Button::new(format!("ws-rename-ok-{id}"))
+                            .ghost()
+                            .xsmall()
+                            .label("OK")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_workspace_rename(cx);
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element()
+            } else {
+                div()
+                    .id(name_id)
+                    .w_full()
+                    .h(px(TREE_ROW_H))
+                    .px_1()
+                    .flex()
+                    .items_center()
+                    .text_sm()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(name)
+                    .on_click({
+                        let id = id.clone();
+                        cx.listener(move |this, _, _, cx| {
+                            this.switch_to(id.clone(), cx);
+                            cx.notify();
+                        })
+                    })
+                    .into_any_element()
+            })
+            .when(active && !renaming, |row| {
+                let close_id = id.clone();
+                row.child(
+                    h_flex()
+                        .gap_1()
+                        .px_1()
+                        .child(
+                            Button::new(format!("ws-rename-{id}"))
+                                .ghost()
+                                .xsmall()
+                                .label("Rename")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.begin_workspace_rename(window, cx);
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new(format!("ws-close-{close_id}"))
+                                .ghost()
+                                .xsmall()
+                                .label("Close")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_workspace(close_id.clone());
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_create_workspace(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("workspace-create-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .justify_center()
+            .pt(px(80.))
+            .bg(cx.theme().background.opacity(0.45))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.create_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                v_flex()
+                    .w(px(420.))
+                    .gap_2()
+                    .p_3()
+                    .rounded(cx.theme().radius)
+                    .bg(cx.theme().background)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(div().text_sm().font_bold().child("New Workspace"))
+                    .child(div().text_xs().child("Name"))
+                    .child(Input::new(&self.create_name))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Root directory on the daemon. Leave empty to use the daemon project root."),
+                    )
+                    .child(Input::new(&self.create_root))
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("ws-create-cancel")
+                                    .ghost()
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.create_open = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("ws-create-confirm")
+                                    .primary()
+                                    .label("Create")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.confirm_create(cx);
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
     fn render_activity_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .w(px(ACTIVITY_RAIL_W))
@@ -1324,6 +2031,8 @@ impl Workspace {
         let cancel = cx.entity();
         let items = vec![
             ("New Terminal", Box::new(NewTerminal) as Box<dyn Action>),
+            ("New Workspace", Box::new(NewWorkspace)),
+            ("Rename Workspace", Box::new(RenameWorkspace)),
             ("Close Tab", Box::new(CloseTab)),
             ("Save", Box::new(SaveBuffer)),
             ("Toggle Sidebar", Box::new(ToggleSidebar)),
@@ -1482,6 +2191,12 @@ impl Render for Workspace {
                 }
             })
             .unwrap_or_else(|| "no session".into());
+        let workspace_label = self
+            .workspaces
+            .iter()
+            .find(|workspace| Some(&workspace.id) == self.active_workspace_id.as_ref())
+            .map(|workspace| workspace.name.clone())
+            .unwrap_or_else(|| "no workspace".into());
         let caps = if self.capabilities.is_empty() {
             "—".into()
         } else {
@@ -1510,6 +2225,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_prev_tab))
             .on_action(cx.listener(Self::on_copy_explorer))
             .on_action(cx.listener(Self::on_paste_explorer))
+            .on_action(cx.listener(Self::on_new_workspace))
+            .on_action(cx.listener(Self::on_rename_workspace))
             .child(
                 TitleBar::new().h(px(TITLE_BAR_H)).child(
                     h_flex()
@@ -1528,6 +2245,9 @@ impl Render for Workspace {
                 h_flex()
                     .flex_1()
                     .min_h_0()
+                    .when(self.workspace_cap, |this| {
+                        this.child(self.render_workspace_rail(cx))
+                    })
                     .child(self.render_activity_bar(cx))
                     .when(!self.sidebar_collapsed, |this| {
                         this.child(self.render_explorer(cx))
@@ -1551,6 +2271,7 @@ impl Render for Workspace {
                     .left(self.status.clone())
                     .child(self.connection_label())
                     .right(caps)
+                    .right(workspace_label)
                     .right(session),
             )
             .when(self.palette_open, |this| {
@@ -1580,6 +2301,9 @@ impl Render for Workspace {
                 )
             })
             .when(self.goto_open, |this| this.child(self.render_goto(cx)))
+            .when(self.create_open, |this| {
+                this.child(self.render_create_workspace(cx))
+            })
             .when(self.rename_pty.is_some(), |this| {
                 this.child(self.render_rename(cx))
             })

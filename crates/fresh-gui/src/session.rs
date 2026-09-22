@@ -97,6 +97,28 @@ impl SessionStore {
         v
     }
 
+    pub async fn pty_count(&self, session_id: &str) -> u32 {
+        let guard = self.inner.lock().await;
+        guard
+            .get(session_id)
+            .map(|s| s.ptys.len() as u32)
+            .unwrap_or(0)
+    }
+
+    /// Kill every PTY and drop the session. Used when a workspace is closed.
+    pub async fn destroy(&self, session_id: &str) -> Result<()> {
+        let session = {
+            let mut guard = self.inner.lock().await;
+            guard
+                .remove(session_id)
+                .with_context(|| format!("unknown session {session_id}"))?
+        };
+        for slot in session.ptys.into_values() {
+            slot.session.kill();
+        }
+        Ok(())
+    }
+
     /// Attach `out_tx` as the sole subscriber. Returns pty infos + layout, and
     /// queued scrollback replay messages (caller should deliver after SessionAttached).
     pub async fn attach(

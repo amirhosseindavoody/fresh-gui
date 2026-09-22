@@ -14,6 +14,7 @@ pub const CAP_PING: &str = "ping";
 pub const CAP_PTY: &str = "pty";
 pub const CAP_FS: &str = "fs";
 pub const CAP_SESSION: &str = "session";
+pub const CAP_WORKSPACE: &str = "workspace";
 pub const CAP_EDITOR: &str = "editor";
 pub const CAP_SCENE: &str = "scene";
 
@@ -124,6 +125,40 @@ pub struct PtyInfo {
     pub rows: u16,
 }
 
+/// One open tab inside a workspace. The daemon stores this list; the host
+/// restores its tab strip from it when the workspace is focused.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceTab {
+    pub kind: WorkspaceTabKind,
+    pub title: String,
+    /// Live PTY id when `kind` is `terminal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pty_id: Option<String>,
+    /// Absolute file path when `kind` is `editor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceTabKind {
+    Terminal,
+    Editor,
+}
+
+/// Workspace summary. Tab contents travel on switch / layout, not on every list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceInfo {
+    pub id: String,
+    pub name: String,
+    /// Canonical project directory. Explorer re-roots here on switch.
+    pub root: String,
+    /// ADE session that owns this workspace's PTYs and layout blob.
+    pub session_id: String,
+    pub pty_count: u32,
+    pub tab_count: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionInfo {
     pub id: String,
@@ -189,6 +224,73 @@ pub enum Message {
     /// Client → backend: persist UI layout JSON with the session.
     LayoutSet {
         layout: String,
+    },
+    /// Client → backend: list workspaces owned by this daemon.
+    WorkspaceList,
+    /// Backend → client.
+    WorkspaceListed {
+        workspaces: Vec<WorkspaceInfo>,
+        /// Last workspace a client focused. Absent when none exist yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focused_id: Option<String>,
+    },
+    /// Client → backend: create a workspace and its ADE session.
+    ///
+    /// Empty `name` uses the root directory's basename. Empty `root` uses the
+    /// daemon FS root. Creating does not steal the connection's attached session.
+    WorkspaceCreate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        root: Option<String>,
+    },
+    /// Backend → client.
+    WorkspaceCreated {
+        workspace: WorkspaceInfo,
+    },
+    /// Client → backend.
+    WorkspaceRename {
+        workspace_id: String,
+        name: String,
+    },
+    /// Backend → client.
+    WorkspaceRenamed {
+        workspace: WorkspaceInfo,
+    },
+    /// Client → backend: drop a workspace and kill its PTYs.
+    ///
+    /// The last workspace cannot be closed.
+    WorkspaceClose {
+        workspace_id: String,
+    },
+    /// Backend → client. `focused_id` is the workspace the daemon suggests next
+    /// when the closed one was focused.
+    WorkspaceClosed {
+        workspace_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focused_id: Option<String>,
+    },
+    /// Client → backend: attach this connection to the workspace's session.
+    ///
+    /// Idle workspaces stay in the daemon; only the subscriber moves.
+    WorkspaceSwitch {
+        workspace_id: String,
+    },
+    /// Backend → client. Scrollback follows as `pty_data`, same as session attach.
+    WorkspaceSwitched {
+        workspace: WorkspaceInfo,
+        tabs: Vec<WorkspaceTab>,
+        #[serde(default)]
+        active_tab: u32,
+        ptys: Vec<PtyInfo>,
+    },
+    /// Client → backend: replace the workspace's tab list (any workspace id,
+    /// not only the one attached on this connection).
+    WorkspaceLayoutSet {
+        workspace_id: String,
+        tabs: Vec<WorkspaceTab>,
+        #[serde(default)]
+        active_tab: u32,
     },
     /// Client → backend: open a PTY in the attached session.
     PtyOpen {
@@ -466,6 +568,7 @@ impl Hello {
             CAP_PTY.to_owned(),
             CAP_FS.to_owned(),
             CAP_SESSION.to_owned(),
+            CAP_WORKSPACE.to_owned(),
             CAP_EDITOR.to_owned(),
             CAP_SCENE.to_owned(),
         ]
@@ -477,6 +580,7 @@ impl Hello {
             CAP_PTY.to_owned(),
             CAP_FS.to_owned(),
             CAP_SESSION.to_owned(),
+            CAP_WORKSPACE.to_owned(),
             CAP_EDITOR.to_owned(),
             CAP_SCENE.to_owned(),
         ]
@@ -503,7 +607,70 @@ mod tests {
         let json = Message::Hello(hello).to_json().unwrap();
         assert!(json.contains("\"editor\""));
         assert!(json.contains("\"scene\""));
+        assert!(json.contains("\"workspace\""));
         assert!(json.contains("0.4.0"));
+    }
+
+    #[test]
+    fn workspace_messages_roundtrip() {
+        let info = WorkspaceInfo {
+            id: "w1".into(),
+            name: "alpha".into(),
+            root: "/tmp/alpha".into(),
+            session_id: "s1".into(),
+            pty_count: 1,
+            tab_count: 2,
+        };
+        let listed = Message::WorkspaceListed {
+            workspaces: vec![info.clone()],
+            focused_id: Some("w1".into()),
+        };
+        assert_eq!(
+            Message::from_json(&listed.to_json().unwrap()).unwrap(),
+            listed
+        );
+
+        let switched = Message::WorkspaceSwitched {
+            workspace: info,
+            tabs: vec![
+                WorkspaceTab {
+                    kind: WorkspaceTabKind::Terminal,
+                    title: "Terminal 1".into(),
+                    pty_id: Some("p1".into()),
+                    path: None,
+                },
+                WorkspaceTab {
+                    kind: WorkspaceTabKind::Editor,
+                    title: "main.rs".into(),
+                    pty_id: None,
+                    path: Some("/tmp/alpha/main.rs".into()),
+                },
+            ],
+            active_tab: 1,
+            ptys: vec![PtyInfo {
+                id: "p1".into(),
+                cols: 80,
+                rows: 24,
+            }],
+        };
+        let json = switched.to_json().unwrap();
+        assert!(json.contains("\"workspace_switched\""));
+        assert_eq!(Message::from_json(&json).unwrap(), switched);
+
+        let layout = Message::WorkspaceLayoutSet {
+            workspace_id: "w1".into(),
+            tabs: vec![WorkspaceTab {
+                kind: WorkspaceTabKind::Editor,
+                title: "lib.rs".into(),
+                pty_id: None,
+                path: Some("/tmp/alpha/lib.rs".into()),
+            }],
+            active_tab: 0,
+        };
+        assert_eq!(
+            Message::from_json(&layout.to_json().unwrap()).unwrap(),
+            layout
+        );
     }
 
     #[test]

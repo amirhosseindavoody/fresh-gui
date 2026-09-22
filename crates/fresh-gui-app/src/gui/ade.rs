@@ -4,7 +4,9 @@ use std::thread;
 use std::time::Duration;
 
 use fresh_gui_client::{Client, ConnectOptions};
-use fresh_gui_protocol::{FsEntry, Hello, Message};
+use fresh_gui_protocol::{
+    CAP_WORKSPACE, FsEntry, Hello, Message, PtyInfo, WorkspaceInfo, WorkspaceTab,
+};
 
 use super::connect::ConnectTarget;
 
@@ -63,7 +65,40 @@ pub enum AdeCmd {
         sources: Vec<String>,
         destination: String,
     },
+    CreateWorkspace {
+        name: String,
+        root: String,
+    },
+    RenameWorkspace {
+        id: String,
+        name: String,
+    },
+    CloseWorkspace {
+        id: String,
+    },
+    SwitchWorkspace {
+        id: String,
+        /// Workspace whose tab list should be saved before the subscriber moves.
+        from: Option<String>,
+        tabs: Vec<WorkspaceTab>,
+        active_tab: u32,
+    },
+    SetWorkspaceLayout {
+        id: String,
+        tabs: Vec<WorkspaceTab>,
+        active_tab: u32,
+    },
     Disconnect,
+}
+
+/// Workspace the connection is attached to, plus the tab metadata needed to
+/// rebuild the host strip before scrollback arrives.
+#[derive(Debug, Clone)]
+pub struct AttachedWorkspace {
+    pub info: WorkspaceInfo,
+    pub tabs: Vec<WorkspaceTab>,
+    pub active_tab: u32,
+    pub ptys: Vec<PtyInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +108,22 @@ pub enum AdeEvent {
     Connected {
         hello: Hello,
         session_id: String,
+        workspaces: Vec<WorkspaceInfo>,
+        /// Present when the daemon advertises `workspace` and a workspace is attached.
+        attached: Option<AttachedWorkspace>,
+    },
+    WorkspaceCreated {
+        workspace: WorkspaceInfo,
+    },
+    WorkspaceRenamed {
+        workspace: WorkspaceInfo,
+    },
+    WorkspaceClosed {
+        id: String,
+        focused_id: Option<String>,
+    },
+    WorkspaceSwitched {
+        attached: AttachedWorkspace,
     },
     Disconnected {
         reason: String,
@@ -196,19 +247,26 @@ async fn ade_loop(
     };
 
     let hello = client.backend_hello.clone();
-    let session_id = match client.create_session(None).await {
-        Ok(id) => id,
+    let boot = match bootstrap_workspaces(&mut client).await {
+        Ok(boot) => boot,
         Err(err) => {
             let _ = evt_tx
                 .send(AdeEvent::Disconnected {
-                    reason: format!("session: {err:#}"),
+                    reason: format!("workspace: {err:#}"),
                 })
                 .await;
             return;
         }
     };
 
-    let _ = evt_tx.send(AdeEvent::Connected { hello, session_id }).await;
+    let _ = evt_tx
+        .send(AdeEvent::Connected {
+            hello,
+            session_id: boot.session_id,
+            workspaces: boot.workspaces,
+            attached: boot.attached,
+        })
+        .await;
 
     loop {
         tokio::select! {
@@ -228,6 +286,9 @@ async fn ade_loop(
             msg = client.recv() => {
                 match msg {
                     Ok(message) => {
+                        if let Message::WorkspaceSwitched { ref workspace, .. } = message {
+                            client.session_id = Some(workspace.session_id.clone());
+                        }
                         if let Some(ev) = event_from_message(message) {
                             if evt_tx.send(ev).await.is_err() {
                                 break;
@@ -345,9 +406,185 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
                 })
                 .await?;
         }
+        AdeCmd::CreateWorkspace { name, root } => {
+            let name = if name.trim().is_empty() {
+                None
+            } else {
+                Some(name)
+            };
+            let root = if root.trim().is_empty() {
+                None
+            } else {
+                Some(root)
+            };
+            client.send(Message::WorkspaceCreate { name, root }).await?;
+        }
+        AdeCmd::RenameWorkspace { id, name } => {
+            client
+                .send(Message::WorkspaceRename {
+                    workspace_id: id,
+                    name,
+                })
+                .await?;
+        }
+        AdeCmd::CloseWorkspace { id } => {
+            client
+                .send(Message::WorkspaceClose { workspace_id: id })
+                .await?;
+        }
+        AdeCmd::SwitchWorkspace {
+            id,
+            from,
+            tabs,
+            active_tab,
+        } => {
+            if let Some(from) = from {
+                client
+                    .send(Message::WorkspaceLayoutSet {
+                        workspace_id: from,
+                        tabs,
+                        active_tab,
+                    })
+                    .await?;
+            }
+            client
+                .send(Message::WorkspaceSwitch { workspace_id: id })
+                .await?;
+        }
+        AdeCmd::SetWorkspaceLayout {
+            id,
+            tabs,
+            active_tab,
+        } => {
+            client
+                .send(Message::WorkspaceLayoutSet {
+                    workspace_id: id,
+                    tabs,
+                    active_tab,
+                })
+                .await?;
+        }
         AdeCmd::Disconnect => {}
     }
     Ok(())
+}
+
+struct Boot {
+    session_id: String,
+    workspaces: Vec<WorkspaceInfo>,
+    attached: Option<AttachedWorkspace>,
+}
+
+async fn bootstrap_workspaces(client: &mut Client) -> anyhow::Result<Boot> {
+    let cap = client
+        .backend_hello
+        .capabilities
+        .iter()
+        .any(|c| c == CAP_WORKSPACE);
+    if !cap {
+        let session_id = client.create_session(None).await?;
+        return Ok(Boot {
+            session_id,
+            workspaces: Vec::new(),
+            attached: None,
+        });
+    }
+
+    client.send(Message::WorkspaceList).await?;
+    let (mut workspaces, focused) = recv_workspace_list(client).await?;
+    if workspaces.is_empty() {
+        client
+            .send(Message::WorkspaceCreate {
+                name: None,
+                root: None,
+            })
+            .await?;
+        let created = recv_workspace_created(client).await?;
+        workspaces.push(created);
+    }
+    let fallback = workspaces[0].id.clone();
+    let id = focused
+        .filter(|id| workspaces.iter().any(|workspace| &workspace.id == id))
+        .unwrap_or(fallback);
+    client
+        .send(Message::WorkspaceSwitch { workspace_id: id })
+        .await?;
+    let attached = recv_workspace_switched(client).await?;
+    client.session_id = Some(attached.info.session_id.clone());
+    if let Some(slot) = workspaces
+        .iter_mut()
+        .find(|workspace| workspace.id == attached.info.id)
+    {
+        *slot = attached.info.clone();
+    }
+    Ok(Boot {
+        session_id: attached.info.session_id.clone(),
+        workspaces,
+        attached: Some(attached),
+    })
+}
+
+async fn recv_workspace_list(
+    client: &mut Client,
+) -> anyhow::Result<(Vec<WorkspaceInfo>, Option<String>)> {
+    loop {
+        match client.recv().await? {
+            Message::WorkspaceListed {
+                workspaces,
+                focused_id,
+            } => return Ok((workspaces, focused_id)),
+            Message::Error { code, message } => {
+                anyhow::bail!("workspace list failed: {code}: {message}")
+            }
+            other if bootstrap_skip(&other) => continue,
+            other => anyhow::bail!("unexpected while listing workspaces: {other:?}"),
+        }
+    }
+}
+
+async fn recv_workspace_created(client: &mut Client) -> anyhow::Result<WorkspaceInfo> {
+    loop {
+        match client.recv().await? {
+            Message::WorkspaceCreated { workspace } => return Ok(workspace),
+            Message::Error { code, message } => {
+                anyhow::bail!("workspace create failed: {code}: {message}")
+            }
+            other if bootstrap_skip(&other) => continue,
+            other => anyhow::bail!("unexpected while creating workspace: {other:?}"),
+        }
+    }
+}
+
+async fn recv_workspace_switched(client: &mut Client) -> anyhow::Result<AttachedWorkspace> {
+    loop {
+        match client.recv().await? {
+            Message::WorkspaceSwitched {
+                workspace,
+                tabs,
+                active_tab,
+                ptys,
+            } => {
+                return Ok(AttachedWorkspace {
+                    info: workspace,
+                    tabs,
+                    active_tab,
+                    ptys,
+                });
+            }
+            Message::Error { code, message } => {
+                anyhow::bail!("workspace switch failed: {code}: {message}")
+            }
+            other if bootstrap_skip(&other) => continue,
+            other => anyhow::bail!("unexpected while switching workspace: {other:?}"),
+        }
+    }
+}
+
+fn bootstrap_skip(msg: &Message) -> bool {
+    matches!(
+        msg,
+        Message::Pong { .. } | Message::Ping { .. } | Message::AuthOk
+    )
 }
 
 fn event_from_message(msg: Message) -> Option<AdeEvent> {
@@ -428,6 +665,28 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             entries,
         }),
         Message::Error { code, message } => Some(AdeEvent::Error { code, message }),
+        Message::WorkspaceCreated { workspace } => Some(AdeEvent::WorkspaceCreated { workspace }),
+        Message::WorkspaceRenamed { workspace } => Some(AdeEvent::WorkspaceRenamed { workspace }),
+        Message::WorkspaceClosed {
+            workspace_id,
+            focused_id,
+        } => Some(AdeEvent::WorkspaceClosed {
+            id: workspace_id,
+            focused_id,
+        }),
+        Message::WorkspaceSwitched {
+            workspace,
+            tabs,
+            active_tab,
+            ptys,
+        } => Some(AdeEvent::WorkspaceSwitched {
+            attached: AttachedWorkspace {
+                info: workspace,
+                tabs,
+                active_tab,
+                ptys,
+            },
+        }),
         Message::Pong { .. } | Message::Ping { .. } | Message::AuthOk => None,
         _ => None,
     }
