@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{Context, Result};
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -25,10 +25,11 @@ impl PtySession {
         &self.id
     }
 
-    /// Spawn a PTY. When `shell` is set (client override), that executable is
-    /// used with interactive / OSC 7 setup. Otherwise [`Config::resolve_shell`]
-    /// supplies the command; empty `args` still get OSC 7 setup, non-empty
-    /// `args` are passed through as-is (Fresh-compatible).
+    /// Spawn a PTY. The shell is the client override when set, otherwise
+    /// [`Config::resolve_shell`]. On Unix a command that is missing or not
+    /// executable falls back to `$SHELL`, then `bash`, then `sh`
+    /// ([`crate::shell_resolve`]). Empty `args` still get OSC 7 setup;
+    /// non-empty `args` are passed through (Fresh-compatible).
     pub fn spawn(
         id: String,
         cols: u16,
@@ -38,6 +39,9 @@ impl PtySession {
         config: &Config,
         output_tx: mpsc::UnboundedSender<Vec<u8>>,
     ) -> Result<Self> {
+        let resolved = crate::shell_resolve::resolve_for_spawn(shell.as_deref(), config)?;
+        crate::shell_resolve::log_resolved(&resolved);
+
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -48,30 +52,29 @@ impl PtySession {
             })
             .context("openpty")?;
 
-        let (shell, args, apply_osc7) = match shell {
-            Some(s) => (s, Vec::new(), true),
-            None => {
-                let (cmd, args) = config.resolve_shell();
-                let apply = args.is_empty();
-                (cmd, args, apply)
-            }
-        };
-        let mut cmd = CommandBuilder::new(&shell);
+        let mut cmd = CommandBuilder::new(&resolved.command);
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
         }
-        if apply_osc7 {
-            configure_shell_cmd(&mut cmd, &shell);
+        if resolved.apply_osc7 {
+            configure_shell_cmd(&mut cmd, &resolved.command);
         } else {
-            for arg in &args {
+            for arg in &resolved.args {
                 cmd.arg(arg);
             }
         }
 
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .with_context(|| format!("spawn shell {shell}"))?;
+        let child = pair.slave.spawn_command(cmd).map_err(|err| {
+            anyhow::anyhow!(
+                "{}",
+                crate::shell_resolve::spawn_failure_message(
+                    &resolved.command,
+                    &resolved.reason,
+                    &resolved.skipped,
+                    &err,
+                )
+            )
+        })?;
 
         let mut reader = pair.master.try_clone_reader().context("clone pty reader")?;
         let writer = pair.master.take_writer().context("take pty writer")?;
@@ -244,5 +247,54 @@ fn configure_shell_cmd(cmd: &mut CommandBuilder, shell: &str) {
         _ => {
             cmd.arg("-l");
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::config::Config;
+
+    /// Default config asks for `zsh`. On a host where that binary is missing,
+    /// spawn must still start a later candidate (`$SHELL`, `bash`, or `sh`).
+    #[test]
+    fn default_config_starts_a_shell_when_zsh_is_absent() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        assert_eq!(config.resolve_shell().0, "zsh");
+
+        let session = PtySession::spawn(
+            "fallback".into(),
+            80,
+            24,
+            None,
+            Some("not-a-real-shell-fresh-gui".into()),
+            &config,
+            tx,
+        )
+        .expect("missing client shell and missing zsh should fall back");
+
+        session
+            .write_all(b"printf 'fresh-gui-fallback-ok\\n'\n")
+            .expect("write");
+
+        let mut collected = String::new();
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            match rx.try_recv() {
+                Ok(bytes) => {
+                    collected.push_str(&String::from_utf8_lossy(&bytes));
+                    if collected.contains("fresh-gui-fallback-ok") {
+                        session.kill();
+                        return;
+                    }
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        session.kill();
+        panic!("fallback shell did not print the marker: {collected:?}");
     }
 }

@@ -2,6 +2,10 @@
 
 ## 2026-09-21
 
+### PTY shell fallback when the default is missing
+
+- On Unix, opening a terminal no longer stops at `pty_open_failed: spawn shell zsh` when `zsh` is not installed. Spawn tries the configured command (default `zsh`, or the client `shell` override), then `$SHELL` when that binary is usable, then `bash`, then `sh`. The choice is logged, including which candidates were skipped. If every candidate is missing or not executable, the error names the attempts and tells you to set `terminal.shell.command` in `config.json`. A spawn that still fails uses the same hint. Windows keeps `powershell` and does not walk the Unix chain.
+
 ### One-line installers
 
 - `scripts/install.sh` (`curl -fsSL …/scripts/install.sh | sh`) and `scripts/install.ps1` (`irm …/scripts/install.ps1 | iex`) download the GitHub Release for this machine, verify the sibling `.sha256` when it is published, and install `fresh-gui-app` plus `fresh-gui` into `~/.fresh-gui/bin` (Windows: `%USERPROFILE%\.fresh-gui\bin`), then update PATH.
