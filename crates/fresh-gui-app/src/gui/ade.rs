@@ -53,6 +53,16 @@ pub enum AdeCmd {
     CloseEditor {
         buffer_id: String,
     },
+    CopyPaths {
+        request_id: String,
+        sources: Vec<String>,
+        destination: String,
+    },
+    MovePaths {
+        request_id: String,
+        sources: Vec<String>,
+        destination: String,
+    },
     Disconnect,
 }
 
@@ -109,6 +119,14 @@ pub enum AdeEvent {
         buffer_id: String,
         path: String,
         rev: u64,
+    },
+    FsCopied {
+        request_id: String,
+        entries: Vec<FsEntry>,
+    },
+    FsMoved {
+        request_id: String,
+        entries: Vec<FsEntry>,
     },
     Error {
         code: String,
@@ -301,6 +319,32 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
         AdeCmd::CloseEditor { buffer_id } => {
             client.send(Message::EditorClose { buffer_id }).await?;
         }
+        AdeCmd::CopyPaths {
+            request_id,
+            sources,
+            destination,
+        } => {
+            client
+                .send(Message::FsCopy {
+                    request_id,
+                    sources,
+                    destination,
+                })
+                .await?;
+        }
+        AdeCmd::MovePaths {
+            request_id,
+            sources,
+            destination,
+        } => {
+            client
+                .send(Message::FsMove {
+                    request_id,
+                    sources,
+                    destination,
+                })
+                .await?;
+        }
         AdeCmd::Disconnect => {}
     }
     Ok(())
@@ -368,6 +412,20 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             buffer_id,
             path,
             rev,
+        }),
+        Message::FsCopied {
+            request_id,
+            entries,
+        } => Some(AdeEvent::FsCopied {
+            request_id,
+            entries,
+        }),
+        Message::FsMoved {
+            request_id,
+            entries,
+        } => Some(AdeEvent::FsMoved {
+            request_id,
+            entries,
         }),
         Message::Error { code, message } => Some(AdeEvent::Error { code, message }),
         Message::Pong { .. } | Message::Ping { .. } | Message::AuthOk => None,

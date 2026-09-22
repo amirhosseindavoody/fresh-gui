@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-09-22
+
+### Dock splits, numbered terminals, explorer multi-select
+
+- Terminal and editor tabs are gpui-component dock panels. Drag a tab to a pane edge for a horizontal or vertical split, drop it on another tab to merge, and drag within the strip to reorder. Empty groups collapse. The last remaining tab cannot be dragged (the dock refuses a drag from a lone group).
+- The dock tab strip is the skin default 32px bar. The new-terminal **+** is in each panel’s `title_suffix`, at the far right of the active group beside the **···** menu. Title, rail, explorer header, tree rows, and status bar stay at the denser sizes from 2026-09-21.
+- New terminal tabs are titled `1`, `2`, `3`, … for the client session (numbers are not reused). Right-click the tab title or **··· → Rename** sets a custom title until disconnect. `SessionTabTitle.workspace_id` is reserved for a later workspace key and stays unset. OSC 7 still records cwd for the next PTY and no longer replaces the tab title.
+- The explorer multi-selects with Ctrl/Cmd-click and Shift-click. **Copy Path** writes absolute paths (ADE `FsEntry.path`), one per line. Dragging a file onto a folder sends `fs_move`. With the explorer focused, Ctrl/Cmd+C arms an in-app file clipboard (and writes the same paths plus GPUI `ExternalPaths`); Ctrl/Cmd+V pastes with `fs_copy` into the selected folder or the parent of a selected file. This GPUI snapshot does not offer `text/uri-list` on Linux clipboard writes, so pasting into a file manager is not reliable.
+
 ## 2026-09-21
 
 ### PTY shell fallback when the default is missing

@@ -16,6 +16,8 @@ actions!(
         Disconnect,
         NextTab,
         PrevTab,
+        CopyExplorer,
+        PasteExplorer,
     ]
 );
 
@@ -31,6 +33,10 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-tab", NextTab, None),
         KeyBinding::new("ctrl-shift-tab", PrevTab, None),
         KeyBinding::new("ctrl-shift-r", Reconnect, None),
+        KeyBinding::new("ctrl-c", CopyExplorer, Some("Explorer")),
+        KeyBinding::new("cmd-c", CopyExplorer, Some("Explorer")),
+        KeyBinding::new("ctrl-v", PasteExplorer, Some("Explorer")),
+        KeyBinding::new("cmd-v", PasteExplorer, Some("Explorer")),
     ]);
 }
 

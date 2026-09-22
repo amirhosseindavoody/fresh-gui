@@ -1,18 +1,27 @@
-//! Zed/VS Code-like ADE workspace: activity bar, explorer, tabs, status, palette.
+//! Zed/VS Code-like ADE workspace: activity bar, explorer, docked tabs, status, palette.
+//!
+//! Editor and terminal surfaces are dock panels. Dragging a tab to a pane edge
+//! splits; dropping it on a tab merges; dropping it in the strip reorders.
+//! gpui-component refuses to drag the last remaining tab, so a split needs two
+//! tabs. Terminal titles are herdr-style numbers for this client session.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fresh_gui_protocol::{FsEntry, FsKind, Hello};
+use gpui_kit::component::dock::{
+    DockArea, DockPlacement, DockSkin, PanelId, PanelStyle, panel_handle,
+};
+use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::component::{
     ActiveTheme, Icon, IconName, Root, Selectable, Sizable, StyledExt, TitleBar,
     button::{Button, ButtonVariants as _},
     command::{Command, CommandGroup, CommandItem, CommandState},
     h_flex,
-    input::{Editor, EditorState, Input, InputEvent, InputState},
+    input::{Input, InputEvent, InputState},
     list::ListItem,
     status_bar::StatusBar,
-    tab::{Tab, TabBar},
     tree::{TreeEvent, TreeItem, TreeState, tree},
     v_flex,
 };
@@ -20,18 +29,23 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::actions::{
-    CloseTab, Disconnect, GoToFile, NewTerminal, NextTab, OpenSettings, PrevTab, Reconnect,
-    SaveBuffer, ToggleCommandPalette, ToggleSidebar,
+    CloseTab, CopyExplorer, Disconnect, GoToFile, NewTerminal, NextTab, OpenSettings,
+    PasteExplorer, PrevTab, Reconnect, SaveBuffer, ToggleCommandPalette, ToggleSidebar,
 };
 use super::ade::{AdeCmd, AdeEvent, AdeHandle};
 use super::connect::{ConnectTarget, parse_goto_spec};
-use super::osc7::feed_osc7_chunk;
-use super::terminal::{TermScreen, keystroke_to_bytes};
+use super::explorer::{
+    absolute_paths_text, apply_selection, copyable_sources, drag_paths, gesture_from_modifiers,
+    is_placeholder, movable_sources, parent_dir, real_ids,
+};
+use super::pane::{EditorPanel, TerminalPanel};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Dense ribbon sizes. gpui-component medium controls (32px icon buttons,
 /// 32px tabs, `py_2` rails) leave the shell airier than VS Code / Zed.
+/// The dock tab strip itself stays at the skin's default 32px; that chrome
+/// is owned by `DockSkin`, not this host.
 const TITLE_BAR_H: f32 = 30.;
 const ACTIVITY_RAIL_W: f32 = 36.;
 const SIDEBAR_HEADER_H: f32 = 26.;
@@ -47,43 +61,48 @@ enum Activity {
     Explorer,
 }
 
-enum ShellTab {
-    Terminal {
-        #[allow(dead_code)]
-        id: String,
-        pty_id: String,
-        title: String,
-        cwd: Option<String>,
-        osc_carry: String,
-        screen: TermScreen,
-        focus: FocusHandle,
-    },
-    Editor {
-        #[allow(dead_code)]
-        id: String,
-        buffer_id: String,
-        path: String,
-        dirty: bool,
-        rev: u64,
-        pending: Option<EditorPending>,
-        editor: Entity<EditorState>,
-    },
-}
-
-#[derive(Clone)]
-struct EditorPending {
-    #[allow(dead_code)]
-    path: String,
-    #[allow(dead_code)]
-    language: Option<String>,
-    line: Option<u32>,
-    column: Option<u32>,
-}
-
 enum ConnectionState {
     Connecting,
     Online,
     Offline { reason: String },
+}
+
+enum ActiveSurface {
+    Terminal(String),
+    Editor(String),
+}
+
+struct PendingFs {
+    sources: Vec<String>,
+    destination: String,
+}
+
+#[derive(Clone)]
+struct ExplorerDrag {
+    paths: Vec<String>,
+}
+
+struct ExplorerDragPreview {
+    count: usize,
+}
+
+impl Render for ExplorerDragPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = if self.count == 1 {
+            "Move".to_string()
+        } else {
+            format!("Move {}", self.count)
+        };
+        div()
+            .px_2()
+            .py_1()
+            .text_sm()
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().background)
+            .border_1()
+            .border_color(cx.theme().border)
+            .child(label)
+    }
 }
 
 pub struct Workspace {
@@ -96,15 +115,28 @@ pub struct Workspace {
     status: SharedString,
     sidebar_collapsed: bool,
     activity: Activity,
-    tabs: Vec<ShellTab>,
-    active_tab: usize,
+    dock: Entity<DockArea>,
+    terminals: HashMap<String, Entity<TerminalPanel>>,
+    editors: HashMap<String, Entity<EditorPanel>>,
+    next_terminal_number: u32,
+    active: Option<ActiveSurface>,
+    last_cwd: Option<String>,
     explorer: Entity<TreeState>,
     explorer_root: String,
     explorer_cache: HashMap<String, Vec<FsEntry>>,
+    explorer_focus: FocusHandle,
+    /// Selected absolute paths. The last entry is the primary row.
+    selection: Vec<String>,
+    anchor: Option<String>,
+    /// In-app file clipboard for explorer paste (`fs_copy`). Absolute paths.
+    file_clipboard: Option<Vec<String>>,
+    pending_fs: HashMap<String, PendingFs>,
     command_state: Entity<CommandState>,
     palette_open: bool,
     goto_open: bool,
     goto_input: Entity<InputState>,
+    rename_pty: Option<String>,
+    rename_input: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
     _recv_task: Task<()>,
 }
@@ -112,18 +144,27 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(target: ConnectTarget, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (ade, evt_rx) = super::ade::spawn(target.clone());
+        let (dock, skin) = DockSkin::dock_area("workspace", Some(1), window, cx);
+        skin.set_panel_style(PanelStyle::TabBar, cx);
+        skin.set_toggle_button_visible(false, cx);
         let explorer = cx.new(|cx| TreeState::new(cx));
         let command_state = cx.new(|cx| CommandState::new(window, cx));
         let goto_input = cx.new(|cx| InputState::new(window, cx).placeholder("path[:line[:col]]"));
+        let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Terminal name"));
         let tree_sub = cx.subscribe(&explorer, |this, _, ev: &TreeEvent, _cx| {
             if let TreeEvent::Expanded(id) = ev {
                 let path = id.to_string();
-                if !this.explorer_cache.contains_key(&path) {
+                if !is_placeholder(&path) && !this.explorer_cache.contains_key(&path) {
                     this.ade.send(AdeCmd::ListDir {
                         request_id: next_id("ex"),
                         path,
                     });
                 }
+            }
+        });
+        let rename_sub = cx.subscribe(&rename_input, |this, _, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::PressEnter { .. }) && this.rename_pty.is_some() {
+                this.confirm_rename(cx);
             }
         });
 
@@ -150,16 +191,27 @@ impl Workspace {
             status: "Connecting…".into(),
             sidebar_collapsed: false,
             activity: Activity::Explorer,
-            tabs: Vec::new(),
-            active_tab: 0,
+            dock,
+            terminals: HashMap::new(),
+            editors: HashMap::new(),
+            next_terminal_number: 1,
+            active: None,
+            last_cwd: None,
             explorer,
             explorer_root: String::new(),
             explorer_cache: HashMap::new(),
+            explorer_focus: cx.focus_handle(),
+            selection: Vec::new(),
+            anchor: None,
+            file_clipboard: None,
+            pending_fs: HashMap::new(),
             command_state,
             palette_open: false,
             goto_open: false,
             goto_input,
-            _subscriptions: vec![tree_sub],
+            rename_pty: None,
+            rename_input,
+            _subscriptions: vec![tree_sub, rename_sub],
             _recv_task: recv_task,
         }
     }
@@ -197,14 +249,10 @@ impl Workspace {
                 if let Some(reason) = reason {
                     self.status = format!("PTY closed: {reason}").into();
                 }
-                if let Some(ix) = self.tabs.iter().position(|t| match t {
-                    ShellTab::Terminal { pty_id, .. } => pty_id == &id,
-                    _ => false,
-                }) {
-                    self.tabs.remove(ix);
-                    if self.active_tab >= self.tabs.len() {
-                        self.active_tab = self.tabs.len().saturating_sub(1);
-                    }
+                if let Some(panel) = self.terminals.get(&id).cloned() {
+                    self.dock.update(cx, |dock, cx| {
+                        dock.remove_panel(panel, window, cx);
+                    });
                 }
             }
             AdeEvent::FsListed { path, entries, .. } => {
@@ -214,6 +262,18 @@ impl Workspace {
                 self.explorer_cache.insert(path, entries);
                 self.rebuild_tree(cx);
             }
+            AdeEvent::FsMoved {
+                request_id,
+                entries,
+            } => {
+                self.finish_fs(&request_id, entries, true, cx);
+            }
+            AdeEvent::FsCopied {
+                request_id,
+                entries,
+            } => {
+                self.finish_fs(&request_id, entries, false, cx);
+            }
             AdeEvent::EditorOpened {
                 buffer_id,
                 path,
@@ -222,21 +282,7 @@ impl Workspace {
                 column,
                 ..
             } => {
-                if let Some(ShellTab::Editor { pending, .. }) =
-                    self.tabs.iter_mut().find(|t| match t {
-                        ShellTab::Editor { buffer_id: bid, .. } => bid == &buffer_id,
-                        _ => false,
-                    })
-                {
-                    *pending = Some(EditorPending {
-                        path,
-                        language,
-                        line,
-                        column,
-                    });
-                } else {
-                    self.begin_editor_tab(buffer_id, path, language, line, column, window, cx);
-                }
+                self.begin_editor_tab(buffer_id, path, language, line, column, window, cx);
             }
             AdeEvent::BufferSnapshot {
                 buffer_id,
@@ -245,15 +291,8 @@ impl Workspace {
                 path,
             } => self.apply_snapshot(buffer_id, rev, text, path, window, cx),
             AdeEvent::BufferChanged { buffer_id, rev, .. } => {
-                if let Some(ShellTab::Editor {
-                    buffer_id: bid,
-                    rev: r,
-                    ..
-                }) = self.find_editor_mut(&buffer_id)
-                {
-                    if bid == &buffer_id {
-                        *r = rev;
-                    }
+                if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
+                    panel.update(cx, |panel, cx| panel.set_rev(rev, cx));
                 }
             }
             AdeEvent::BufferSaved {
@@ -261,21 +300,9 @@ impl Workspace {
                 path,
                 rev,
                 ..
-            } => {
-                if let Some(ShellTab::Editor {
-                    dirty,
-                    rev: r,
-                    path: p,
-                    ..
-                }) = self.find_editor_mut(&buffer_id)
-                {
-                    *dirty = false;
-                    *r = rev;
-                    *p = path;
-                    self.status = "Saved".into();
-                }
-            }
+            } => self.on_buffer_saved(&buffer_id, path, rev, cx),
             AdeEvent::Error { code, message } => {
+                self.pending_fs.clear();
                 self.status = format!("{code}: {message}").into();
             }
         }
@@ -288,48 +315,30 @@ impl Workspace {
     }
 
     fn add_terminal_tab(&mut self, pty_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        let n = self
-            .tabs
-            .iter()
-            .filter(|t| matches!(t, ShellTab::Terminal { .. }))
-            .count()
-            + 1;
-        let focus = cx.focus_handle();
-        let tab = ShellTab::Terminal {
-            id: next_id("tab"),
-            pty_id,
-            title: format!("Terminal {n}"),
-            cwd: None,
-            osc_carry: String::new(),
-            screen: TermScreen::default(),
-            focus: focus.clone(),
-        };
-        self.tabs.push(tab);
-        self.active_tab = self.tabs.len() - 1;
-        window.focus(&focus, cx);
+        let number = self.next_terminal_number;
+        self.next_terminal_number = self.next_terminal_number.saturating_add(1);
+        let workspace = cx.weak_entity();
+        let ade = self.ade.clone();
+        let panel = cx.new(|cx| TerminalPanel::new(pty_id.clone(), number, ade, workspace, cx));
+        self.dock.update(cx, |dock, cx| {
+            dock.add_panel_view(
+                panel_handle(panel.clone()),
+                DockPlacement::Center,
+                None,
+                window,
+                cx,
+            );
+        });
+        self.terminals.insert(pty_id, panel);
     }
 
-    fn on_pty_data(&mut self, pty_id: &str, bytes: &[u8], _cx: &mut Context<Self>) {
-        if let Some(ShellTab::Terminal {
-            screen,
-            cwd,
-            osc_carry,
-            title,
-            ..
-        }) = self.tabs.iter_mut().find(|t| match t {
-            ShellTab::Terminal { pty_id: id, .. } => id == pty_id,
-            _ => false,
-        }) {
-            screen.feed(bytes);
-            let chunk = String::from_utf8_lossy(bytes);
-            if let Some(new_cwd) = feed_osc7_chunk(osc_carry, &chunk) {
-                *cwd = Some(new_cwd.clone());
-                if let Some(name) = new_cwd.rsplit('/').next() {
-                    if !name.is_empty() {
-                        *title = name.to_string();
-                    }
-                }
-            }
+    fn on_pty_data(&mut self, pty_id: &str, bytes: &[u8], cx: &mut Context<Self>) {
+        let Some(panel) = self.terminals.get(pty_id).cloned() else {
+            return;
+        };
+        let cwd = panel.update(cx, |panel, cx| panel.push_bytes(bytes, cx));
+        if let Some(cwd) = cwd {
+            self.last_cwd = Some(cwd);
         }
     }
 
@@ -343,53 +352,38 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(ix) = self.tabs.iter().position(|t| match t {
-            ShellTab::Editor { path: p, .. } => p == &path,
-            _ => false,
-        }) {
-            self.active_tab = ix;
+        if let Some(panel) = self.editors.get(&path).cloned() {
+            panel.update(cx, |panel, cx| {
+                panel.note_reopen(buffer_id, line, column, cx);
+            });
+            self.select_entity(&panel, window, cx);
             return;
         }
-        let editor = cx.new(|cx| {
-            let mut state = EditorState::new(window, cx)
-                .line_number(true)
-                .placeholder("Loading…");
-            if let Some(lang) = language_from_path(&path, language.as_deref()) {
-                state = state.language(lang);
-            }
-            state
-        });
-        let sub = cx.subscribe(&editor, |this, editor, ev: &InputEvent, cx| {
-            if matches!(ev, InputEvent::Change) {
-                if let Some(ShellTab::Editor {
-                    editor: e, dirty, ..
-                }) = this.tabs.iter_mut().find(|t| match t {
-                    ShellTab::Editor { editor: ent, .. } => ent == &editor,
-                    _ => false,
-                }) {
-                    if e == &editor {
-                        *dirty = true;
-                    }
-                }
-                cx.notify();
-            }
-        });
-        self._subscriptions.push(sub);
-        self.tabs.push(ShellTab::Editor {
-            id: next_id("tab"),
-            buffer_id,
-            path,
-            dirty: false,
-            rev: 0,
-            pending: Some(EditorPending {
-                path: String::new(),
+        let workspace = cx.weak_entity();
+        let ade = self.ade.clone();
+        let panel = cx.new(|cx| {
+            EditorPanel::new(
+                buffer_id,
+                path.clone(),
                 language,
                 line,
                 column,
-            }),
-            editor,
+                ade,
+                workspace,
+                window,
+                cx,
+            )
         });
-        self.active_tab = self.tabs.len() - 1;
+        self.dock.update(cx, |dock, cx| {
+            dock.add_panel_view(
+                panel_handle(panel.clone()),
+                DockPlacement::Center,
+                None,
+                window,
+                cx,
+            );
+        });
+        self.editors.insert(path, panel);
     }
 
     fn apply_snapshot(
@@ -401,61 +395,123 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(ix) = self.tabs.iter().position(|t| match t {
-            ShellTab::Editor { buffer_id: bid, .. } => bid == &buffer_id,
-            _ => false,
-        }) {
-            if let ShellTab::Editor {
-                editor,
-                rev: r,
-                path: p,
-                pending,
-                dirty,
-                ..
-            } = &mut self.tabs[ix]
-            {
-                *r = rev;
-                *p = path;
-                *dirty = false;
-                let jump = pending.take();
-                editor.update(cx, |state, cx| {
-                    state.set_value(&text, window, cx);
-                    if let Some(j) = jump {
-                        if let Some(line) = j.line {
-                            let pos = gpui_kit::component::input::Position::new(
-                                line.saturating_sub(1),
-                                j.column.unwrap_or(1).saturating_sub(1),
-                            );
-                            state.set_cursor_position(pos, window, cx);
-                        }
-                    }
-                });
-            }
-            self.active_tab = ix;
+        if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
+            panel.update(cx, |panel, cx| {
+                panel.apply_snapshot(rev, text, path, window, cx);
+            });
+            self.select_entity(&panel, window, cx);
             return;
         }
-        self.begin_editor_tab(
-            buffer_id.clone(),
-            path.clone(),
-            None,
-            None,
-            None,
-            window,
-            cx,
-        );
-        if let Some(ShellTab::Editor { editor, rev: r, .. }) = self.tabs.last_mut() {
-            *r = rev;
-            editor.update(cx, |state, cx| {
-                state.set_value(&text, window, cx);
+        if let Some(panel) = self.editors.get(&path).cloned() {
+            panel.update(cx, |panel, cx| {
+                panel.note_reopen(buffer_id.clone(), None, None, cx);
+                panel.apply_snapshot(rev, text, path, window, cx);
+            });
+            self.select_entity(&panel, window, cx);
+            return;
+        }
+        self.begin_editor_tab(buffer_id, path.clone(), None, None, None, window, cx);
+        if let Some(panel) = self.editors.get(&path).cloned() {
+            panel.update(cx, |panel, cx| {
+                panel.apply_snapshot(rev, text, path, window, cx);
             });
         }
     }
 
-    fn find_editor_mut(&mut self, buffer_id: &str) -> Option<&mut ShellTab> {
-        self.tabs.iter_mut().find(|t| match t {
-            ShellTab::Editor { buffer_id: bid, .. } => bid == buffer_id,
-            _ => false,
-        })
+    fn on_buffer_saved(&mut self, buffer_id: &str, path: String, rev: u64, cx: &mut Context<Self>) {
+        let Some(panel) = self.editor_by_buffer(buffer_id, cx) else {
+            return;
+        };
+        let previous = panel.update(cx, |panel, cx| panel.mark_saved(path.clone(), rev, cx));
+        if let Some(previous) = previous
+            && let Some(entity) = self.editors.remove(&previous)
+        {
+            self.editors.insert(path.clone(), entity);
+            if matches!(&self.active, Some(ActiveSurface::Editor(current)) if current == &previous)
+            {
+                self.active = Some(ActiveSurface::Editor(path));
+            }
+        }
+        self.status = "Saved".into();
+    }
+
+    fn editor_by_buffer(&self, buffer_id: &str, cx: &App) -> Option<Entity<EditorPanel>> {
+        self.editors
+            .values()
+            .find(|panel| panel.read(cx).buffer_id() == buffer_id)
+            .cloned()
+    }
+
+    fn select_entity<P: 'static>(
+        &mut self,
+        panel: &Entity<P>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = PanelId::from(panel.entity_id());
+        self.dock
+            .update(cx, |dock, cx| dock.select_panel(id, window, cx));
+    }
+
+    fn panel_order(&self, cx: &App) -> Vec<PanelId> {
+        self.dock
+            .read(cx)
+            .layout(DockPlacement::Center)
+            .map(|tree| tree.panels().collect())
+            .unwrap_or_default()
+    }
+
+    fn active_panel_id(&self) -> Option<PanelId> {
+        match &self.active {
+            Some(ActiveSurface::Terminal(id)) => self
+                .terminals
+                .get(id)
+                .map(|panel| PanelId::from(panel.entity_id())),
+            Some(ActiveSurface::Editor(path)) => self
+                .editors
+                .get(path)
+                .map(|panel| PanelId::from(panel.entity_id())),
+            None => None,
+        }
+    }
+
+    pub(crate) fn note_terminal_active(
+        &mut self,
+        pty_id: &str,
+        active: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if active {
+            self.active = Some(ActiveSurface::Terminal(pty_id.to_string()));
+        } else if matches!(&self.active, Some(ActiveSurface::Terminal(id)) if id == pty_id) {
+            self.active = None;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn note_editor_active(&mut self, path: &str, active: bool, cx: &mut Context<Self>) {
+        if active {
+            self.active = Some(ActiveSurface::Editor(path.to_string()));
+        } else if matches!(&self.active, Some(ActiveSurface::Editor(current)) if current == path) {
+            self.active = None;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn forget_terminal(&mut self, pty_id: &str, cx: &mut Context<Self>) {
+        self.terminals.remove(pty_id);
+        if matches!(&self.active, Some(ActiveSurface::Terminal(id)) if id == pty_id) {
+            self.active = None;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn forget_editor(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.editors.remove(path);
+        if matches!(&self.active, Some(ActiveSurface::Editor(current)) if current == path) {
+            self.active = None;
+        }
+        cx.notify();
     }
 
     fn rebuild_tree(&mut self, cx: &mut Context<Self>) {
@@ -467,14 +523,15 @@ impl Workspace {
         self.explorer.update(cx, |state, cx| {
             state.set_items(items, cx);
         });
+        self.sync_tree_highlight(None, cx);
     }
 
-    fn new_terminal(&mut self) {
+    pub(crate) fn new_terminal(&mut self, cx: &App) {
         if !matches!(self.connection, ConnectionState::Online) {
             self.status = "Not connected".into();
             return;
         }
-        let cwd = self.active_cwd();
+        let cwd = self.active_cwd(cx);
         self.ade.send(AdeCmd::OpenPty {
             cols: 80,
             rows: 24,
@@ -482,54 +539,73 @@ impl Workspace {
         });
     }
 
-    fn active_cwd(&self) -> Option<String> {
-        self.tabs.iter().rev().find_map(|t| match t {
-            ShellTab::Terminal { cwd, .. } => cwd.clone(),
-            _ => None,
-        })
+    fn active_cwd(&self, cx: &App) -> Option<String> {
+        if let Some(ActiveSurface::Terminal(id)) = &self.active
+            && let Some(cwd) = self
+                .terminals
+                .get(id)
+                .and_then(|panel| panel.read(cx).cwd())
+        {
+            return Some(cwd);
+        }
+        self.last_cwd.clone()
     }
 
-    fn close_active_tab(&mut self, cx: &mut Context<Self>) {
-        if self.tabs.is_empty() {
+    fn close_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.active {
+            Some(ActiveSurface::Terminal(id)) => {
+                if let Some(panel) = self.terminals.get(id).cloned() {
+                    self.dock
+                        .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
+                }
+            }
+            Some(ActiveSurface::Editor(path)) => {
+                if let Some(panel) = self.editors.get(path).cloned() {
+                    self.dock
+                        .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn cycle_tab(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let order = self.panel_order(cx);
+        if order.is_empty() {
             return;
         }
-        let ix = self.active_tab.min(self.tabs.len() - 1);
-        match &self.tabs[ix] {
-            ShellTab::Terminal { pty_id, .. } => {
-                self.ade.send(AdeCmd::ClosePty { id: pty_id.clone() });
-            }
-            ShellTab::Editor { buffer_id, .. } => {
-                self.ade.send(AdeCmd::CloseEditor {
-                    buffer_id: buffer_id.clone(),
-                });
-            }
-        }
-        self.tabs.remove(ix);
-        if self.active_tab >= self.tabs.len() {
-            self.active_tab = self.tabs.len().saturating_sub(1);
-        }
-        cx.notify();
+        let current = self.active_panel_id();
+        let ix = current
+            .and_then(|id| order.iter().position(|item| *item == id))
+            .unwrap_or(0);
+        let len = order.len() as isize;
+        let next = (ix as isize + delta).rem_euclid(len) as usize;
+        let id = order[next];
+        self.dock
+            .update(cx, |dock, cx| dock.select_panel(id, window, cx));
     }
 
     fn save_active(&mut self, cx: &mut Context<Self>) {
-        let Some(ShellTab::Editor {
-            buffer_id,
-            rev,
-            editor,
-            dirty,
-            ..
-        }) = self.tabs.get(self.active_tab)
-        else {
+        let Some(ActiveSurface::Editor(path)) = &self.active else {
             return;
         };
-        if !*dirty {
+        let Some(panel) = self.editors.get(path).cloned() else {
+            return;
+        };
+        let (buffer_id, rev, text, dirty) = {
+            let panel = panel.read(cx);
+            (
+                panel.buffer_id().to_string(),
+                panel.rev(),
+                panel.editor().read(cx).value().to_string(),
+                panel.is_dirty(),
+            )
+        };
+        if !dirty {
             self.status = "No changes".into();
             cx.notify();
             return;
         }
-        let text = editor.read(cx).value().to_string();
-        let buffer_id = buffer_id.clone();
-        let rev = *rev;
         self.ade.send(AdeCmd::EditBuffer {
             request_id: next_id("ed"),
             buffer_id: buffer_id.clone(),
@@ -567,6 +643,45 @@ impl Workspace {
         }
     }
 
+    pub(crate) fn begin_terminal_rename(
+        &mut self,
+        pty_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.terminals.get(pty_id).cloned() else {
+            return;
+        };
+        let current = panel.read(cx).label().to_string();
+        self.rename_pty = Some(pty_id.to_string());
+        self.palette_open = false;
+        self.goto_open = false;
+        self.rename_input.update(cx, |state, cx| {
+            state.set_value(current, window, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn confirm_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(pty) = self.rename_pty.clone() else {
+            return;
+        };
+        let title = self.rename_input.read(cx).value().to_string();
+        let title = title.trim().to_string();
+        if title.is_empty() {
+            self.status = "Title cannot be empty".into();
+            cx.notify();
+            return;
+        }
+        self.rename_pty = None;
+        if let Some(panel) = self.terminals.get(&pty).cloned() {
+            panel.update(cx, |panel, cx| panel.set_custom_title(title, cx));
+            self.status = "Renamed terminal".into();
+        }
+        cx.notify();
+    }
+
     fn reconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.ade.send(AdeCmd::Disconnect);
         let (ade, evt_rx) = super::ade::spawn(self.target.clone());
@@ -587,13 +702,282 @@ impl Workspace {
         });
     }
 
-    fn on_new_terminal(&mut self, _: &NewTerminal, _: &mut Window, cx: &mut Context<Self>) {
-        self.new_terminal();
+    fn visible_tree_ids(&self, cx: &App) -> Vec<String> {
+        let state = self.explorer.read(cx);
+        let mut raw = Vec::new();
+        let mut ix = 0;
+        while let Some(entry) = state.entry(ix) {
+            raw.push(entry.item().id.to_string());
+            ix += 1;
+        }
+        real_ids(raw.iter().map(String::as_str))
+    }
+
+    /// Highlight `highlight` when set, otherwise the last selected path.
+    ///
+    /// Deferred so a context menu — invoked while the tree entity is already
+    /// updating — can still move the built-in row highlight.
+    fn sync_tree_highlight(&mut self, highlight: Option<String>, cx: &mut Context<Self>) {
+        let primary = highlight.or_else(|| self.selection.last().cloned());
+        let explorer = self.explorer.clone();
+        cx.defer(move |app| {
+            explorer.update(app, |state, cx| {
+                let ix = primary.as_ref().and_then(|path| {
+                    let id = SharedString::from(path.clone());
+                    state.index_of(&id)
+                });
+                state.set_selected_index(ix, cx);
+            });
+        });
+    }
+
+    fn apply_tree_click(
+        &mut self,
+        path: &str,
+        is_folder: bool,
+        gesture: super::explorer::SelectGesture,
+        cx: &mut Context<Self>,
+    ) {
+        if is_placeholder(path) {
+            return;
+        }
+        let visible = self.visible_tree_ids(cx);
+        let (next, anchor) = apply_selection(
+            &self.selection,
+            self.anchor.as_deref(),
+            &visible,
+            path,
+            gesture,
+        );
+        self.selection = next;
+        self.anchor = anchor;
+        let highlight =
+            (gesture == super::explorer::SelectGesture::Range).then(|| path.to_string());
+        self.sync_tree_highlight(highlight, cx);
+        if is_folder {
+            if !self.explorer_cache.contains_key(path) {
+                self.ade.send(AdeCmd::ListDir {
+                    request_id: next_id("ex"),
+                    path: path.to_string(),
+                });
+            }
+        } else if gesture == super::explorer::SelectGesture::Replace {
+            self.open_path(path.to_string(), true);
+        }
+    }
+
+    fn ensure_context_selection(&mut self, path: &str, cx: &mut Context<Self>) {
+        if is_placeholder(path) || self.selection.iter().any(|item| item == path) {
+            return;
+        }
+        self.selection = vec![path.to_string()];
+        self.anchor = Some(path.to_string());
+        self.sync_tree_highlight(None, cx);
+    }
+
+    fn copy_path_text(&mut self, paths: &[String], cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            self.status = "No selection".into();
+            cx.notify();
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(absolute_paths_text(paths)));
+        self.status = if paths.len() == 1 {
+            "Copied path".into()
+        } else {
+            format!("Copied {} paths", paths.len()).into()
+        };
         cx.notify();
     }
 
-    fn on_close_tab(&mut self, _: &CloseTab, _: &mut Window, cx: &mut Context<Self>) {
-        self.close_active_tab(cx);
+    fn arm_file_copy(&mut self, paths: Vec<String>, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            self.status = "No selection".into();
+            cx.notify();
+            return;
+        }
+        let text = absolute_paths_text(&paths);
+        let path_bufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+        cx.write_to_clipboard(ClipboardItem {
+            entries: vec![
+                ClipboardEntry::String(ClipboardString::new(text)),
+                ClipboardEntry::ExternalPaths(ExternalPaths(path_bufs.into())),
+            ],
+        });
+        let count = paths.len();
+        self.file_clipboard = Some(paths);
+        self.status = format!("Copied {count} item(s) — paste in the explorer").into();
+        cx.notify();
+    }
+
+    fn selected_or_primary(&self) -> Vec<String> {
+        self.selection.clone()
+    }
+
+    fn copy_explorer_selection(&mut self, cx: &mut Context<Self>) {
+        self.arm_file_copy(self.selected_or_primary(), cx);
+    }
+
+    fn is_dir(&self, path: &str) -> bool {
+        if self.explorer_cache.contains_key(path) {
+            return true;
+        }
+        self.explorer_cache.values().any(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry.path == path && entry.kind == FsKind::Dir)
+        })
+    }
+
+    fn paste_destination(&self) -> Option<String> {
+        let primary = self
+            .selection
+            .last()
+            .cloned()
+            .or_else(|| self.anchor.clone());
+        if let Some(path) = primary {
+            if self.is_dir(&path) {
+                return Some(path);
+            }
+            if let Some(parent) = parent_dir(&path) {
+                return Some(parent);
+            }
+        }
+        if self.explorer_root.is_empty() {
+            None
+        } else {
+            Some(self.explorer_root.clone())
+        }
+    }
+
+    fn paste_explorer(&mut self, cx: &mut Context<Self>) {
+        let Some(sources) = self.file_clipboard.clone() else {
+            self.status = "Nothing to paste".into();
+            cx.notify();
+            return;
+        };
+        let Some(destination) = self.paste_destination() else {
+            self.status = "Explorer is not ready".into();
+            cx.notify();
+            return;
+        };
+        let sources = copyable_sources(&sources, &destination);
+        if sources.is_empty() {
+            self.status = "Cannot paste into that folder".into();
+            cx.notify();
+            return;
+        }
+        self.send_fs(false, sources, destination, cx);
+    }
+
+    fn move_into_folder(
+        &mut self,
+        sources: Vec<String>,
+        destination: String,
+        cx: &mut Context<Self>,
+    ) {
+        let sources = movable_sources(&sources, &destination);
+        if sources.is_empty() {
+            self.status = "Cannot move into that folder".into();
+            cx.notify();
+            return;
+        }
+        self.send_fs(true, sources, destination, cx);
+    }
+
+    fn send_fs(
+        &mut self,
+        move_files: bool,
+        sources: Vec<String>,
+        destination: String,
+        cx: &mut Context<Self>,
+    ) {
+        let request_id = next_id(if move_files { "mv" } else { "cp" });
+        self.pending_fs.insert(
+            request_id.clone(),
+            PendingFs {
+                sources: sources.clone(),
+                destination: destination.clone(),
+            },
+        );
+        if move_files {
+            self.ade.send(AdeCmd::MovePaths {
+                request_id,
+                sources,
+                destination,
+            });
+            self.status = "Moving…".into();
+        } else {
+            self.ade.send(AdeCmd::CopyPaths {
+                request_id,
+                sources,
+                destination,
+            });
+            self.status = "Copying…".into();
+        }
+        cx.notify();
+    }
+
+    fn finish_fs(
+        &mut self,
+        request_id: &str,
+        entries: Vec<FsEntry>,
+        moved: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let pending = self.pending_fs.remove(request_id);
+        let mut dirs = Vec::new();
+        if let Some(pending) = &pending {
+            for src in &pending.sources {
+                if let Some(parent) = parent_dir(src) {
+                    dirs.push(parent);
+                }
+            }
+            dirs.push(pending.destination.clone());
+        }
+        for entry in &entries {
+            if let Some(parent) = parent_dir(&entry.path) {
+                dirs.push(parent);
+            }
+        }
+        dirs.sort();
+        dirs.dedup();
+        for dir in dirs {
+            self.relist(&dir);
+        }
+        let new_paths: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
+        if !new_paths.is_empty() {
+            self.anchor = new_paths.last().cloned();
+            self.selection = new_paths;
+        }
+        self.status = if moved {
+            format!("Moved {} item(s)", entries.len()).into()
+        } else {
+            format!("Copied {} item(s)", entries.len()).into()
+        };
+        cx.notify();
+    }
+
+    fn relist(&mut self, dir: &str) {
+        if dir.is_empty() {
+            return;
+        }
+        let prefix = format!("{dir}/");
+        self.explorer_cache
+            .retain(|key, _| key != dir && !key.starts_with(&prefix));
+        self.ade.send(AdeCmd::ListDir {
+            request_id: next_id("ex"),
+            path: dir.to_string(),
+        });
+    }
+
+    fn on_new_terminal(&mut self, _: &NewTerminal, _: &mut Window, cx: &mut Context<Self>) {
+        self.new_terminal(cx);
+        cx.notify();
+    }
+
+    fn on_close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_active_tab(window, cx);
     }
 
     fn on_save(&mut self, _: &SaveBuffer, _: &mut Window, cx: &mut Context<Self>) {
@@ -614,6 +998,7 @@ impl Workspace {
         self.palette_open = !self.palette_open;
         if self.palette_open {
             self.goto_open = false;
+            self.rename_pty = None;
             self.command_state.update(cx, |state, cx| {
                 state.focus(window, cx);
             });
@@ -625,6 +1010,7 @@ impl Workspace {
         self.goto_open = !self.goto_open;
         if self.goto_open {
             self.palette_open = false;
+            self.rename_pty = None;
             self.goto_input.update(cx, |state, cx| {
                 state.focus(window, cx);
             });
@@ -658,32 +1044,20 @@ impl Workspace {
         cx.notify();
     }
 
-    fn on_next_tab(&mut self, _: &NextTab, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.tabs.is_empty() {
-            self.active_tab = (self.active_tab + 1) % self.tabs.len();
-            cx.notify();
-        }
+    fn on_next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_tab(1, window, cx);
     }
 
-    fn on_prev_tab(&mut self, _: &PrevTab, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.tabs.is_empty() {
-            self.active_tab = (self.active_tab + self.tabs.len() - 1) % self.tabs.len();
-            cx.notify();
-        }
+    fn on_prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_tab(-1, window, cx);
     }
 
-    fn tab_label(tab: &ShellTab) -> String {
-        match tab {
-            ShellTab::Terminal { title, .. } => title.clone(),
-            ShellTab::Editor { path, dirty, .. } => {
-                let name = path.rsplit('/').next().unwrap_or(path);
-                if *dirty {
-                    format!("• {name}")
-                } else {
-                    name.to_string()
-                }
-            }
-        }
+    fn on_copy_explorer(&mut self, _: &CopyExplorer, _: &mut Window, cx: &mut Context<Self>) {
+        self.copy_explorer_selection(cx);
+    }
+
+    fn on_paste_explorer(&mut self, _: &PasteExplorer, _: &mut Window, cx: &mut Context<Self>) {
+        self.paste_explorer(cx);
     }
 
     fn render_activity_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -738,8 +1112,12 @@ impl Workspace {
                 .unwrap_or("Explorer")
                 .to_string()
         };
+        let selected: HashSet<String> = self.selection.iter().cloned().collect();
 
         v_flex()
+            .id("explorer-pane")
+            .key_context("Explorer")
+            .track_focus(&self.explorer_focus)
             .w(px(260.))
             .h_full()
             .flex_shrink_0()
@@ -766,7 +1144,9 @@ impl Workspace {
                             })),
                     ),
             )
-            .child(
+            .child({
+                let row_view = view.clone();
+                let menu_view = view;
                 tree(&self.explorer, move |ix, entry, _selected, _window, cx| {
                     let item = entry.item();
                     let is_folder = entry.is_folder();
@@ -779,7 +1159,13 @@ impl Workspace {
                     };
                     let path = item.id.to_string();
                     let label = item.label.clone();
-                    let view = view.clone();
+                    let placeholder = is_placeholder(&path);
+                    let in_selection = selected.contains(&path);
+                    let view = row_view.clone();
+                    let drag_view = view.clone();
+                    let drop_view = view.clone();
+                    let grabbed = path.clone();
+                    let selected_now: Vec<String> = selected.iter().cloned().collect();
                     ListItem::new(ix)
                         .w_full()
                         .h(px(TREE_ROW_H))
@@ -790,185 +1176,147 @@ impl Workspace {
                         .pl(px(8.) * entry.depth() + px(4.))
                         .child(
                             h_flex()
+                                .w_full()
                                 .gap_1()
                                 .items_center()
+                                .when(in_selection, |this| {
+                                    this.bg(cx.theme().accent.opacity(0.28))
+                                })
                                 .child(Icon::new(icon).small())
                                 .child(label),
                         )
-                        .on_click(move |_, _, cx| {
-                            view.update(cx, |this, cx| {
-                                if is_folder {
-                                    if !this.explorer_cache.contains_key(&path) {
-                                        this.ade.send(AdeCmd::ListDir {
-                                            request_id: next_id("ex"),
-                                            path: path.clone(),
-                                        });
-                                    }
-                                } else if !path.ends_with("/.") {
-                                    this.open_path(path.clone(), true);
-                                }
-                                cx.notify();
-                            });
+                        .when(!placeholder, |this| {
+                            let path_for_drag = grabbed.clone();
+                            this.on_drag(
+                                ExplorerDrag {
+                                    paths: drag_paths(&selected_now, &path_for_drag),
+                                },
+                                |drag, _, _, cx| {
+                                    let count = drag.paths.len();
+                                    cx.new(|_| ExplorerDragPreview { count })
+                                },
+                            )
                         })
+                        .when(is_folder && !placeholder, |this| {
+                            let dest = path.clone();
+                            let drop_view = drop_view.clone();
+                            this.drag_over::<ExplorerDrag>(|style, _, _, cx| {
+                                style.bg(cx.theme().accent.opacity(0.35))
+                            })
+                            .on_drop(
+                                move |drag: &ExplorerDrag, _, cx| {
+                                    let paths = drag.paths.clone();
+                                    let dest = dest.clone();
+                                    drop_view.update(cx, |this, cx| {
+                                        this.move_into_folder(paths, dest, cx);
+                                    });
+                                },
+                            )
+                        })
+                        .on_click({
+                            let path = path.clone();
+                            move |event, window, cx| {
+                                let mods = event.modifiers();
+                                let gesture = gesture_from_modifiers(
+                                    mods.shift,
+                                    mods.control || mods.platform,
+                                );
+                                let focus = drag_view.update(cx, |this, cx| {
+                                    this.apply_tree_click(&path, is_folder, gesture, cx);
+                                    this.explorer_focus.clone()
+                                });
+                                window.focus(&focus, cx);
+                            }
+                        })
+                })
+                .context_menu({
+                    let view = menu_view;
+                    move |_ix, entry, menu, _window, cx| {
+                        let path = entry.item().id.to_string();
+                        if is_placeholder(&path) {
+                            return menu;
+                        }
+                        let paths = view.update(cx, |this, cx| {
+                            this.ensure_context_selection(&path, cx);
+                            this.selection.clone()
+                        });
+                        let can_paste = view.read(cx).file_clipboard.is_some();
+                        let copy_paths = paths.clone();
+                        let file_paths = paths;
+                        menu.item(PopupMenuItem::new("Copy Path").on_click({
+                            let view = view.clone();
+                            move |_, _, cx| {
+                                view.update(cx, |this, cx| this.copy_path_text(&copy_paths, cx));
+                            }
+                        }))
+                        .item(PopupMenuItem::new("Copy").on_click({
+                            let view = view.clone();
+                            let file_paths = file_paths.clone();
+                            move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.arm_file_copy(file_paths.clone(), cx)
+                                });
+                            }
+                        }))
+                        .item(
+                            PopupMenuItem::new("Paste").disabled(!can_paste).on_click({
+                                let view = view.clone();
+                                move |_, _, cx| {
+                                    view.update(cx, |this, cx| this.paste_explorer(cx));
+                                }
+                            }),
+                        )
+                    }
                 })
                 .text_sm()
                 .p_0()
                 .flex_1()
-                .min_h_0(),
-            )
+                .min_h_0()
+            })
     }
 
-    fn render_new_tab_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        Button::new("new-term")
-            .ghost()
-            .xsmall()
-            .icon(IconName::Plus)
-            .tooltip("New Terminal (Ctrl+T)")
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.new_terminal();
-                cx.notify();
-            }))
-    }
-
-    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // `TabBar` paints `last_empty_space` only when a suffix or overflow
-        // menu is set, and that suffix is pinned to the far edge (after a
-        // flex-1 scroller). A zero-width suffix turns the slot on without
-        // adding a second control group, so `+` stays against the last tab.
-        let mut bar = TabBar::new("workspace-tabs")
-            .small()
-            .w_full()
-            .flex_shrink_0()
-            .selected_index(self.active_tab)
-            .on_click(cx.listener(|this, ix: &usize, _, cx| {
-                this.active_tab = *ix;
-                cx.notify();
-            }))
-            .last_empty_space(
-                h_flex()
-                    .id("tab-new-slot")
-                    .h_full()
-                    .flex_grow_1()
-                    .flex_shrink_0()
+    fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(cx.theme().background)
+            .child(
+                v_flex()
+                    .gap_2()
                     .items_center()
-                    .child(self.render_new_tab_button(cx)),
-            )
-            .suffix(
-                div()
-                    .id("tab-suffix-anchor")
-                    .w(px(0.))
-                    .min_w(px(0.))
-                    .h_full()
-                    .flex_shrink_0(),
-            );
-        for tab in &self.tabs {
-            let icon = match tab {
-                ShellTab::Terminal { .. } => IconName::SquareTerminal,
-                ShellTab::Editor { .. } => IconName::File,
-            };
-            bar = bar.child(Tab::new().label(Self::tab_label(tab)).icon(icon));
-        }
-        bar
-    }
-
-    fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.tabs.is_empty() {
-            return div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(cx.theme().background)
-                .child(
-                    v_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(div().text_lg().font_bold().child("fresh-gui"))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(match &self.connection {
-                                    ConnectionState::Connecting => {
-                                        "Connecting to the ADE daemon…".to_string()
-                                    }
-                                    ConnectionState::Offline { reason } => {
-                                        format!("Offline — {reason}")
-                                    }
-                                    ConnectionState::Online => {
-                                        "Open a terminal with Ctrl+T, or a file from the explorer."
-                                            .to_string()
-                                    }
-                                }),
-                        ),
-                )
-                .into_any_element();
-        }
-
-        let ix = self.active_tab.min(self.tabs.len() - 1);
-        match &self.tabs[ix] {
-            ShellTab::Terminal {
-                screen,
-                focus,
-                pty_id,
-                ..
-            } => {
-                let pty_id = pty_id.clone();
-                let lines = screen.visible_lines();
-                let focused = focus.is_focused(window);
-                div()
-                    .id("terminal-pane")
-                    .flex_1()
-                    .min_h_0()
-                    .p_2()
-                    .bg(cx.theme().background)
-                    .font_family(cx.theme().mono_font_family.clone())
-                    .text_sm()
-                    .track_focus(focus)
-                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                        let ks = &event.keystroke;
-                        let bytes = keystroke_to_bytes(
-                            ks.key.as_str(),
-                            ks.key_char.as_deref(),
-                            ks.modifiers.control,
-                            ks.modifiers.alt,
-                            ks.modifiers.shift,
-                        );
-                        if let Some(bytes) = bytes {
-                            cx.stop_propagation();
-                            this.ade.send(AdeCmd::WritePty {
-                                id: pty_id.clone(),
-                                data: bytes,
-                            });
-                        }
-                    }))
+                    .child(div().text_lg().font_bold().child("fresh-gui"))
                     .child(
-                        v_flex()
-                            .id("term-scroll")
-                            .size_full()
-                            .overflow_y_scroll()
-                            .children(lines.into_iter().map(|line| {
-                                div()
-                                    .h(px(18.))
-                                    .whitespace_nowrap()
-                                    .child(if line.is_empty() {
-                                        " ".to_string()
-                                    } else {
-                                        line
-                                    })
-                            }))
-                            .when(focused, |this| this.opacity(1.))
-                            .when(!focused, |this| this.opacity(0.85)),
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(match &self.connection {
+                                ConnectionState::Connecting => {
+                                    "Connecting to the ADE daemon…".to_string()
+                                }
+                                ConnectionState::Offline { reason } => {
+                                    format!("Offline — {reason}")
+                                }
+                                ConnectionState::Online => {
+                                    "Open a terminal with Ctrl+T, or a file from the explorer."
+                                        .to_string()
+                                }
+                            }),
                     )
-                    .into_any_element()
-            }
-            ShellTab::Editor { editor, .. } => Editor::new(editor)
-                .bordered(false)
-                .p_0()
-                .h(relative(1.))
-                .font_family(cx.theme().mono_font_family.clone())
-                .into_any_element(),
-        }
+                    .when(matches!(self.connection, ConnectionState::Online), |this| {
+                        this.child(
+                            Button::new("empty-new-term")
+                                .small()
+                                .label("New Terminal")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.new_terminal(cx);
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
     }
 
     fn render_palette(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1056,12 +1404,66 @@ impl Workspace {
             )
     }
 
+    fn render_rename(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("rename-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .justify_center()
+            .pt(px(80.))
+            .bg(cx.theme().background.opacity(0.45))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.rename_pty = None;
+                    cx.notify();
+                }),
+            )
+            .child(
+                v_flex()
+                    .w(px(420.))
+                    .gap_2()
+                    .p_3()
+                    .rounded(cx.theme().radius)
+                    .bg(cx.theme().background)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(div().text_sm().font_bold().child("Rename Terminal"))
+                    .child(Input::new(&self.rename_input))
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("rename-cancel")
+                                    .ghost()
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.rename_pty = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(Button::new("rename-ok").primary().label("Rename").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.confirm_rename(cx);
+                                }),
+                            )),
+                    ),
+            )
+    }
+
     fn connection_label(&self) -> String {
         match &self.connection {
             ConnectionState::Connecting => "connecting".into(),
             ConnectionState::Online => "online".into(),
             ConnectionState::Offline { .. } => "offline".into(),
         }
+    }
+
+    fn panes_empty(&self) -> bool {
+        self.terminals.is_empty() && self.editors.is_empty()
     }
 }
 
@@ -1085,6 +1487,7 @@ impl Render for Workspace {
         } else {
             self.capabilities.join(" · ")
         };
+        let dock = self.dock.clone();
 
         div()
             .id("workspace")
@@ -1105,6 +1508,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_disconnect))
             .on_action(cx.listener(Self::on_next_tab))
             .on_action(cx.listener(Self::on_prev_tab))
+            .on_action(cx.listener(Self::on_copy_explorer))
+            .on_action(cx.listener(Self::on_paste_explorer))
             .child(
                 TitleBar::new().h(px(TITLE_BAR_H)).child(
                     h_flex()
@@ -1128,12 +1533,13 @@ impl Render for Workspace {
                         this.child(self.render_explorer(cx))
                     })
                     .child(
-                        v_flex()
+                        div()
                             .flex_1()
                             .min_w_0()
                             .h_full()
-                            .child(self.render_tabs(cx))
-                            .child(self.render_main(window, cx)),
+                            .relative()
+                            .child(dock)
+                            .when(self.panes_empty(), |this| this.child(self.render_empty(cx))),
                     ),
             )
             .child(
@@ -1174,32 +1580,12 @@ impl Render for Workspace {
                 )
             })
             .when(self.goto_open, |this| this.child(self.render_goto(cx)))
+            .when(self.rename_pty.is_some(), |this| {
+                this.child(self.render_rename(cx))
+            })
             .children(dialog_layer)
             .children(notification_layer)
     }
-}
-
-fn language_from_path(path: &str, reported: Option<&str>) -> Option<String> {
-    if let Some(lang) = reported.filter(|s| !s.is_empty()) {
-        return Some(lang.to_string());
-    }
-    let ext = path.rsplit('.').next()?.to_ascii_lowercase();
-    let name = match ext.as_str() {
-        "rs" => "rust",
-        "ts" | "tsx" => "typescript",
-        "js" | "jsx" | "mjs" => "javascript",
-        "py" => "python",
-        "go" => "go",
-        "toml" => "toml",
-        "json" | "jsonc" => "json",
-        "md" | "markdown" => "markdown",
-        "sh" | "bash" | "zsh" => "bash",
-        "css" => "css",
-        "html" | "htm" => "html",
-        "yml" | "yaml" => "yaml",
-        _ => return None,
-    };
-    Some(name.into())
 }
 
 fn build_tree_items(root: &str, cache: &HashMap<String, Vec<FsEntry>>) -> Vec<TreeItem> {
@@ -1208,22 +1594,22 @@ fn build_tree_items(root: &str, cache: &HashMap<String, Vec<FsEntry>>) -> Vec<Tr
     };
     entries
         .iter()
-        .map(|e| {
-            if e.kind == FsKind::Dir {
-                let children = if cache.contains_key(&e.path) {
-                    build_tree_items(&e.path, cache)
+        .map(|entry| {
+            if entry.kind == FsKind::Dir {
+                let children = if cache.contains_key(&entry.path) {
+                    build_tree_items(&entry.path, cache)
                 } else {
                     Vec::new()
                 };
-                TreeItem::new(e.path.clone(), e.name.clone())
-                    .children(if children.is_empty() && !cache.contains_key(&e.path) {
-                        vec![TreeItem::new(format!("{}/.", e.path), "…")]
+                TreeItem::new(entry.path.clone(), entry.name.clone())
+                    .children(if children.is_empty() && !cache.contains_key(&entry.path) {
+                        vec![TreeItem::new(format!("{}/.", entry.path), "…")]
                     } else {
                         children
                     })
-                    .expanded(cache.contains_key(&e.path))
+                    .expanded(cache.contains_key(&entry.path))
             } else {
-                TreeItem::new(e.path.clone(), e.name.clone())
+                TreeItem::new(entry.path.clone(), entry.name.clone())
             }
         })
         .collect()

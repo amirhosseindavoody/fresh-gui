@@ -13,7 +13,7 @@ pixi run app -- smoke
 pixi run app -- attach
 ```
 
-**Native host:** silent connect from `--backend` (`http://…/?token=` or `ws://…/ws`). `Ctrl+T` new terminal, explorer click to open, `Ctrl+S` save, `Ctrl+Shift+P` command palette, `Ctrl+,` settings (`config.json` on the backend). Disconnect keeps the backend session.
+**Native host:** silent connect from `--backend` (`http://…/?token=` or `ws://…/ws`). `Ctrl+T` new terminal (titled `1`, `2`, `3`, …; right-click or **··· → Rename**). Drag a tab to a pane edge to split, onto a tab to merge, or along the strip to reorder. Explorer: Ctrl/Cmd-click and Shift-click to multi-select, right-click **Copy Path** (absolute), drag onto a folder to move, `Ctrl+C` / `Ctrl+V` to copy inside the tree. `Ctrl+S` save, `Ctrl+Shift+P` command palette, `Ctrl+,` settings (`config.json` on the backend). Disconnect keeps the backend session; tab titles and the in-app file clipboard do not.
 
 **SSH remote:** save a Linux target and let the host install the daemon, start it headless, and tunnel `/ws`.
 
