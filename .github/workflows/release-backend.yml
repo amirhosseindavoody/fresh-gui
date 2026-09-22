@@ -192,10 +192,10 @@ jobs:
             echo "| \`fresh-gui-*-x86_64-unknown-linux-gnu.tar.gz\` | Standalone Linux daemon (glibc **≥ 2.31**) |"
             echo "| \`fresh-gui-*-x86_64-unknown-linux-musl.tar.gz\` | Standalone Linux musl daemon (Alpine, static-friendly) |"
             echo "| \`fresh-gui-*-x86_64-pc-windows-msvc.zip\` | Standalone Windows daemon |"
-            echo "| \`fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz\` | Linux GPUI host (\`fresh-gui-app\`) |"
-            echo "| \`fresh-gui-client-*-x86_64-pc-windows-msvc.zip\` | Windows GPUI host (\`fresh-gui-app.exe\`) |"
+            echo "| \`fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz\` | Linux GPUI host (\`fresh-gui\`) |"
+            echo "| \`fresh-gui-client-*-x86_64-pc-windows-msvc.zip\` | Windows GPUI host (\`fresh-gui.exe\`) |"
             echo
-            echo "Daemon assets are headless. Separate jobs attach the GPUI hosts: Linux \`fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz\` (\`fresh-gui-app\`) and Windows \`fresh-gui-client-*-x86_64-pc-windows-msvc.zip\` (\`fresh-gui-app.exe\`). \`pixi run gui\` is still the from-source client."
+            echo "Daemon assets are headless. Separate jobs attach the GPUI hosts: Linux \`fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz\` (\`fresh-gui\`) and Windows \`fresh-gui-client-*-x86_64-pc-windows-msvc.zip\` (\`fresh-gui.exe\`). \`pixi run gui\` is still the from-source client."
             echo
             echo "### Install (pixi / conda)"
             echo
@@ -221,8 +221,8 @@ jobs:
             echo '```bash'
             echo "tar -xzf fresh-gui-client-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
             echo "cd fresh-gui-client-${VERSION}-x86_64-unknown-linux-gnu"
-            echo "./fresh-gui-app remote add lab user@server --root /path/to/project"
-            echo "./fresh-gui-app remote connect lab"
+            echo "./fresh-gui remote add lab user@server --root /path/to/project"
+            echo "./fresh-gui remote connect lab"
             echo '```'
             echo
             echo '```bash'
@@ -544,7 +544,7 @@ jobs:
           # Read the listing fully. `tar | grep -q` under pipefail fails with
           # SIGPIPE once grep exits on the first match.
           listing="$(tar -tzf "${archives[0]}")"
-          grep -q '/fresh-gui-app$' <<<"${listing}"
+          grep -q '/fresh-gui$' <<<"${listing}"
           (cd dist/client && sha256sum -c ./*.tar.gz.sha256)
 
       - name: Upload to GitHub Release
