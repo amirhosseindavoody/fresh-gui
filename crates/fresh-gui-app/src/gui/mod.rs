@@ -10,7 +10,10 @@ mod connect;
 mod explorer;
 mod osc7;
 mod pane;
+mod paths;
 mod rail;
+mod reentry;
+mod tab_chrome;
 mod terminal;
 mod workspace;
 

@@ -222,10 +222,11 @@ After connect you get terminals, an explorer, and editor tabs in one shell:
 
 | Do this | How |
 |---------|-----|
-| New terminal | `Ctrl+T` or the **+** on the active tab group (far right of the dock tab bar) |
+| New terminal | `Ctrl+T` or the **+** beside the last tab (right edge of the bar when the strip is full) |
 | Split / reorder | Drag a tab to a pane edge to split; drop it on a tab to merge; drag along the strip to reorder. A split needs two tabs — the last remaining tab does not drag |
 | Rename a terminal | Right-click the tab title, or **··· → Rename**. New terminals are titled `1`, `2`, `3`, … inside the focused workspace |
-| New workspace | Left rail **+**, or command palette → New Workspace |
+| Close a tab | **×** on the tab, right-click → Close, or `Ctrl+W`. Right-click also has Close Others and Close to the Right |
+| New workspace | Left rail **+**, or command palette → New Workspace. The project root starts as the current workspace folder |
 | Switch workspace | Click a name in the left rail. Tabs, terminals, and the explorer root swap; other workspaces keep running on the daemon |
 | Open a file | Click in the explorer (or `Ctrl+P` → path `[:line[:col]]`) |
 | Explorer selection | `Ctrl`/`Cmd`-click toggles; `Shift`-click selects a range. Right-click **Copy Path** copies absolute paths |

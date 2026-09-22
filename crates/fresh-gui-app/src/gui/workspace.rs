@@ -46,10 +46,12 @@ use super::explorer::{
     is_placeholder, movable_sources, parent_dir, real_ids,
 };
 use super::pane::{EditorPanel, TerminalPanel};
+use super::paths::{display_path, strip_verbatim_prefixes};
 use super::rail::{
-    WORKSPACE_RAIL_W, WORKSPACE_ROW_H, empty_workspace_name_hint, user_home, workspace_rail_hint,
-    workspace_root_label,
+    WORKSPACE_RAIL_W, WORKSPACE_ROW_H, empty_workspace_name_hint, explorer_header_label, user_home,
+    workspace_rail_hint, workspace_root_label,
 };
+use super::tab_chrome::{TabCloseScope, TabStripMetrics, panels_for_close_scope};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -65,6 +67,10 @@ const STATUS_BAR_H: f32 = 22.;
 
 fn next_id(prefix: &str) -> String {
     format!("{prefix}-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+fn display_paths(paths: &[String]) -> Vec<String> {
+    paths.iter().map(|path| display_path(path)).collect()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -143,6 +149,7 @@ pub struct Workspace {
     sidebar_collapsed: bool,
     activity: Activity,
     dock: Entity<DockArea>,
+    tab_metrics: TabStripMetrics,
     terminals: HashMap<String, Entity<TerminalPanel>>,
     editors: HashMap<String, Entity<EditorPanel>>,
     next_terminal_number: u32,
@@ -260,6 +267,7 @@ impl Workspace {
             sidebar_collapsed: false,
             activity: Activity::Explorer,
             dock,
+            tab_metrics: TabStripMetrics::default(),
             terminals: HashMap::new(),
             editors: HashMap::new(),
             next_terminal_number: 1,
@@ -458,7 +466,9 @@ impl Workspace {
         self.next_terminal_number = self.next_terminal_number.saturating_add(1);
         let workspace = cx.weak_entity();
         let ade = self.ade.clone();
-        let panel = cx.new(|cx| TerminalPanel::new(pty_id.clone(), number, ade, workspace, cx));
+        let metrics = self.tab_metrics.clone();
+        let panel =
+            cx.new(|cx| TerminalPanel::new(pty_id.clone(), number, ade, workspace, metrics, cx));
         let workspace_id = self.active_workspace_id.clone();
         panel.update(cx, |panel, _| panel.bind_workspace(workspace_id));
         self.dock.update(cx, |dock, cx| {
@@ -514,6 +524,7 @@ impl Workspace {
                 column,
                 ade,
                 workspace,
+                self.tab_metrics.clone(),
                 window,
                 cx,
             )
@@ -980,7 +991,9 @@ impl Workspace {
         }
         let workspace = cx.weak_entity();
         let ade = self.ade.clone();
-        let panel = cx.new(|cx| TerminalPanel::new(pty_id.clone(), number, ade, workspace, cx));
+        let metrics = self.tab_metrics.clone();
+        let panel =
+            cx.new(|cx| TerminalPanel::new(pty_id.clone(), number, ade, workspace, metrics, cx));
         let workspace_id = self.active_workspace_id.clone();
         let custom = parsed.is_none() && !title.is_empty() && title != number.to_string();
         panel.update(cx, |panel, cx| {
@@ -1027,12 +1040,34 @@ impl Workspace {
         self.goto_open = false;
         self.rename_pty = None;
         self.renaming_id = None;
+        let root = self.default_new_workspace_root();
         self.create_name.update(cx, |state, cx| {
             state.set_value("", window, cx);
             state.focus(window, cx);
         });
         self.create_root
-            .update(cx, |state, cx| state.set_value("", window, cx));
+            .update(cx, |state, cx| state.set_value(root, window, cx));
+    }
+
+    /// Folder the create panel starts in: the open workspace, or the explorer
+    /// root when that workspace has no root of its own. Empty only when neither
+    /// exists yet (the daemon default).
+    fn default_new_workspace_root(&self) -> String {
+        let from_workspace = self
+            .workspaces
+            .iter()
+            .find(|workspace| Some(&workspace.id) == self.active_workspace_id.as_ref())
+            .map(|workspace| display_path(&workspace.root))
+            .filter(|root| !root.is_empty());
+        if let Some(root) = from_workspace {
+            return root;
+        }
+        let explorer = display_path(&self.explorer_root);
+        if explorer.is_empty() {
+            String::new()
+        } else {
+            explorer
+        }
     }
 
     fn confirm_create(&mut self, cx: &mut Context<Self>) {
@@ -1099,20 +1134,68 @@ impl Workspace {
     }
 
     fn close_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match &self.active {
-            Some(ActiveSurface::Terminal(id)) => {
-                if let Some(panel) = self.terminals.get(id).cloned() {
-                    self.dock
-                        .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
-                }
+        let Some(id) = self.active_panel_id() else {
+            return;
+        };
+        self.close_panel_id(id, window, cx);
+    }
+
+    pub(crate) fn tab_close_availability(&self, panel: PanelId, cx: &App) -> (bool, bool) {
+        let order = self.panel_order(cx);
+        let ix = order.iter().position(|id| *id == panel);
+        let others = order.len() > 1 && ix.is_some();
+        let right = ix.is_some_and(|index| index + 1 < order.len());
+        (others, right)
+    }
+
+    pub(crate) fn close_panel_id(
+        &mut self,
+        id: PanelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.remove_dock_ids(&[id], window, cx);
+    }
+
+    pub(crate) fn close_panel_scope(
+        &mut self,
+        id: PanelId,
+        scope: TabCloseScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let order = self.panel_order(cx);
+        let ids = panels_for_close_scope(&order, &id, scope);
+        self.remove_dock_ids(&ids, window, cx);
+    }
+
+    fn remove_dock_ids(&mut self, ids: &[PanelId], window: &mut Window, cx: &mut Context<Self>) {
+        let mut terminals = Vec::new();
+        let mut editors = Vec::new();
+        for id in ids {
+            if let Some(panel) = self
+                .terminals
+                .values()
+                .find(|panel| PanelId::from(panel.entity_id()) == *id)
+                .cloned()
+            {
+                terminals.push(panel);
+            } else if let Some(panel) = self
+                .editors
+                .values()
+                .find(|panel| PanelId::from(panel.entity_id()) == *id)
+                .cloned()
+            {
+                editors.push(panel);
             }
-            Some(ActiveSurface::Editor(path)) => {
-                if let Some(panel) = self.editors.get(path).cloned() {
-                    self.dock
-                        .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
-                }
-            }
-            None => {}
+        }
+        for panel in terminals {
+            self.dock
+                .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
+        }
+        for panel in editors {
+            self.dock
+                .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
         }
     }
 
@@ -1334,7 +1417,9 @@ impl Workspace {
             cx.notify();
             return;
         }
-        cx.write_to_clipboard(ClipboardItem::new_string(absolute_paths_text(paths)));
+        cx.write_to_clipboard(ClipboardItem::new_string(absolute_paths_text(
+            &display_paths(paths),
+        )));
         self.status = if paths.len() == 1 {
             "Copied path".into()
         } else {
@@ -1349,7 +1434,7 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let text = absolute_paths_text(&paths);
+        let text = absolute_paths_text(&display_paths(&paths));
         let path_bufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
         cx.write_to_clipboard(ClipboardItem {
             entries: vec![
@@ -1983,7 +2068,7 @@ impl Workspace {
                     .child(Input::new(&self.create_root))
                     .child(
                         div().text_xs().text_color(muted).child(
-                            "Absolute path on the daemon. Empty uses the daemon project root.",
+                            "Absolute path on the daemon. Starts as the current workspace folder. Empty uses the daemon project root.",
                         ),
                     )
                     .child(
@@ -2055,15 +2140,7 @@ impl Workspace {
 
     fn render_explorer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
-        let root_label = if self.explorer_root.is_empty() {
-            "Explorer".to_string()
-        } else {
-            self.explorer_root
-                .rsplit('/')
-                .next()
-                .unwrap_or("Explorer")
-                .to_string()
-        };
+        let root_label = explorer_header_label(&self.explorer_root);
         let selected: HashSet<String> = self.selection.iter().cloned().collect();
 
         v_flex()
@@ -2424,6 +2501,7 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.tab_metrics.begin_frame();
         let dialog_layer = Root::render_dialog_layer(window, cx);
         let notification_layer = Root::render_notification_layer(window, cx);
         let session = self
@@ -2515,7 +2593,7 @@ impl Render for Workspace {
                     .py_0()
                     .px_2()
                     .gap_1()
-                    .left(self.status.clone())
+                    .left(strip_verbatim_prefixes(self.status.as_ref()))
                     .child(self.connection_label())
                     .right(caps)
                     .right(workspace_label)

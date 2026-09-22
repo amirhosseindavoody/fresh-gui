@@ -2,7 +2,7 @@
 
 Product UI is the **native GPUI host** (`fresh-gui`, crate `crates/fresh-gui-app`, `pixi run gui`, release asset `fresh-gui-client-*`). Architecture and protocol: [DESIGN.md](./DESIGN.md). User overview: [README.md](../README.md).
 
-Zed / VS Code-like chrome: workspace rail, activity bar, collapsible explorer, docked terminal + editor tabs (splits, reorder, merge), status bar, command palette. Ribbons are dense (30px title bar, 232px workspace rail, 36px activity rail, 26px explorer header, 22px tree rows and status bar). The dock tab strip stays at the skin default (32px); the new-terminal **+** sits in the group suffix at the far right, next to the **···** menu. Connection is silent. `fresh-gui` with no URL reads the local session token from the daemon. `--backend` still accepts a printed Local access URL with `?token=`, or `ws://…/ws` + `FRESH_GUI_TOKEN`. `fresh-gui user@host` opens an SSH remote. The daemon does not serve a page.
+Zed / VS Code-like chrome: workspace rail, activity bar, collapsible explorer, docked terminal + editor tabs (splits, reorder, merge), status bar, command palette. Ribbons are dense (30px title bar, 232px workspace rail, 36px activity rail, 26px explorer header, 22px tree rows and status bar). The dock tab strip stays at the skin default (32px). Each tab has a close button; right-click offers Close, Close Others, and Close to the Right. The new-terminal **+** sits beside the last tab when the bar has room, and in the right-hand slot (next to **···**) when the tabs fill the bar. Windows extended paths (`\\?\C:\...`) are shown as normal paths. Connection is silent. `fresh-gui` with no URL reads the local session token from the daemon. `--backend` still accepts a printed Local access URL with `?token=`, or `ws://…/ws` + `FRESH_GUI_TOKEN`. `fresh-gui user@host` opens an SSH remote. The daemon does not serve a page.
 
 A later browser host would be this same GPUI UI via WebAssembly. That is not in this tree. Sections 1–9 below are notes from the removed Vite/React shell (CodeMirror, xterm). They are not a supported host and the source is gone. Current behavior is §10.
 
@@ -239,7 +239,7 @@ Ribbon metrics live in `workspace.rs`. Workspace-rail width, row height, and roo
 | Activity rail | 36px wide, `py_1`, no gap; explorer and settings are small ghost icon buttons |
 | Explorer header | 26px, `text_xs`, xsmall collapse button |
 | Explorer rows | 22px, `text_sm`, 8px indent, no tree padding |
-| Tab strip | Dock skin default (`TabBar` medium, 32px). The **+** is in `title_suffix`, pinned at the far right of the active group with the ellipsis menu |
+| Tab strip | Dock skin default (`TabBar` medium, 32px). Each tab has an **×**. The **+** is in `title_suffix` and shifts left to the last tab while the bar has free space; it stays at the right edge, beside **···**, when the strip is full |
 | Status bar | 22px, `py_0`, `gap_1` |
 
 Dock chrome (tab height, suffix placement, the disabled Zoom item in **···**) is owned by `DockSkin`. Colors stay on the active theme (`tab_bar`, `sidebar`, `status_bar`, `border`).
@@ -247,11 +247,11 @@ Dock chrome (tab height, suffix placement, the disabled Zoom item in **···**)
 | Native host | Status |
 |-----------|--------|
 | Connect / auth / session (`?token=` URL or `--token`) | Yes |
-| Workspace rail (create, rename, close, switch) | Yes — each workspace is its own tab set; idle ones stay on the daemon. **+** asks for a name and an absolute root (empty name uses the folder name). Rename and close are on hover, the right-click menu, and the command palette |
+| Workspace rail (create, rename, close, switch) | Yes — each workspace is its own tab set; idle ones stay on the daemon. **+** asks for a name and an absolute root, prefilled with the current workspace folder (empty name uses the folder name; a cleared root uses the daemon project root). Rename and close are on hover, the right-click menu, and the command palette |
 | SSH target add + auto-install + tunnel (`remote connect`) | Yes (CLI before the window; title bar shows the destination) |
 | Activity bar + collapsible explorer (`fs_list`) | Yes |
 | Docked terminal + editor tabs | Yes. Drag a tab to the left/right/top/bottom edge to split; drop it on a tab to merge; drag in the strip to reorder. Empty groups collapse. The last remaining tab cannot be dragged |
-| Terminal titles | New PTYs are `1`, `2`, `3`, … inside the focused workspace (closing `2` does not reuse it there). Right-click the title or **··· → Rename**. `SessionTabTitle.workspace_id` is that workspace. OSC 7 updates cwd for the next terminal and does not rename the tab |
+| Terminal titles | New PTYs are `1`, `2`, `3`, … inside the focused workspace (closing `2` does not reuse it there). Right-click the title or **··· → Rename**. The same menus close that tab, the other tabs, or the tabs to the right. `SessionTabTitle.workspace_id` is that workspace. OSC 7 updates cwd for the next terminal and does not rename the tab |
 | Explorer multi-select | Ctrl/Cmd-click toggles; Shift-click selects the visible range. Extra rows use an accent background. The tree still expands a folder on mouse-down |
 | Copy path | Right-click **Copy Path**. Absolute ADE paths, newline-separated. Does not arm paste |
 | Move / copy files | Drag onto a folder sends `fs_move`. Explorer-focused `Ctrl+C`/`Cmd+C` (or **Copy**) arms an in-app clipboard and also writes those absolute paths plus GPUI `ExternalPaths`. `Ctrl+V`/`Cmd+V` (or **Paste**) sends `fs_copy` into the selected directory, or the parent of a selected file. Linux clipboard writes in this GPUI snapshot do not offer `text/uri-list`, so a file-manager paste is not reliable |

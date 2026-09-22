@@ -4,6 +4,8 @@
 //! short hint when the daemon has nothing to switch between. Path shortening
 //! lives here so the row layout does not depend on a window.
 
+use super::paths::display_path;
+
 /// Wider than the first 168px rail so a name and a root fit on two lines
 /// without loosening the rest of the chrome. Kept inside a dense Zed / VS Code
 /// sidebar (about 220–240px).
@@ -21,19 +23,19 @@ pub const WORKSPACE_ROOT_LABEL_MAX: usize = 34;
 /// Home is folded to `~`. A long path keeps both ends and ellipsizes the
 /// middle. An empty root is the daemon default and is labeled as such.
 pub fn workspace_root_label(root: &str, home: Option<&str>) -> String {
-    let root = root.trim();
+    let root = display_path(root);
     if root.is_empty() {
         return "Default root".to_string();
     }
     let root = if root == "/" || root == "\\" {
         root
     } else {
-        root.trim_end_matches(['/', '\\'])
+        root.trim_end_matches(['/', '\\']).to_string()
     };
     if root.is_empty() {
         return "Default root".to_string();
     }
-    let display = fold_home(root, home);
+    let display = fold_home(&root, home);
     truncate_middle(&display, WORKSPACE_ROOT_LABEL_MAX)
 }
 
@@ -49,11 +51,11 @@ pub fn workspace_rail_hint(count: usize) -> Option<&'static str> {
 /// Shown under the name field while it is blank. The daemon already turns an
 /// empty name into the root basename; this only previews that.
 pub fn empty_workspace_name_hint(root: &str) -> String {
-    let root = root.trim();
+    let root = display_path(root);
     if root.is_empty() {
         return "Leave empty to use the daemon project folder.".to_string();
     }
-    match path_basename(root) {
+    match path_basename(&root) {
         Some(base) => format!("Leave empty to use \"{base}\"."),
         None => "Leave empty to use the folder name.".to_string(),
     }
@@ -75,8 +77,17 @@ pub fn user_home() -> Option<String> {
     None
 }
 
+/// Explorer header: the open folder's name, never the `\\?\` form.
+pub fn explorer_header_label(root: &str) -> String {
+    let shown = display_path(root);
+    if shown.is_empty() {
+        return "Explorer".to_string();
+    }
+    path_basename(&shown).unwrap_or("Explorer").to_string()
+}
+
 fn fold_home(path: &str, home: Option<&str>) -> String {
-    let Some(home) = home.map(str::trim).filter(|home| !home.is_empty()) else {
+    let Some(home) = home.map(display_path).filter(|home| !home.is_empty()) else {
         return path.to_string();
     };
     let home = home.trim_end_matches(['/', '\\']);
@@ -125,6 +136,28 @@ mod tests {
         assert_eq!(
             workspace_root_label("   ", Some("/home/me")),
             "Default root"
+        );
+    }
+
+    #[test]
+    fn verbatim_windows_paths_display_as_normal_paths() {
+        assert_eq!(
+            workspace_root_label(r"\\?\C:\Users\jondoe", None),
+            r"C:\Users\jondoe"
+        );
+        assert_eq!(
+            workspace_root_label(r"\\?\C:\Users\me\proj", Some(r"C:\Users\me")),
+            r"~\proj"
+        );
+        assert_eq!(
+            workspace_root_label(r"\\?\C:\Users\me\proj", Some(r"\\?\C:\Users\me")),
+            r"~\proj"
+        );
+        assert_eq!(explorer_header_label(r"\\?\C:\Users\jondoe"), "jondoe");
+        assert_eq!(explorer_header_label(""), "Explorer");
+        assert_eq!(
+            empty_workspace_name_hint(r"\\?\C:\work\demo"),
+            "Leave empty to use \"demo\"."
         );
     }
 

@@ -30,6 +30,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 vte = "0.14"
 
+[dev-dependencies]
+gpui = { package = "gpui-pre", version = "=0.3.6", features = ["test-support"] }
+
 # x11/wayland features pull gpui-pre-linux, which is not a dependency on
 # Windows. Keep them on Linux/FreeBSD only so the GPUI client can build there.
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
