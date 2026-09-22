@@ -210,6 +210,38 @@ pub fn locate_daemon(exe: &Path, path_env: Option<&OsStr>) -> Option<PathBuf> {
     search_path(path_env, daemon_file_name(), exe)
 }
 
+/// Stop the per-user daemon the same way `fresh-gui close` does.
+///
+/// Returns the daemon's status text. Does not exit this process: Quit Client
+/// is a separate action and leaves the daemon running.
+pub fn close_local_daemon() -> Result<String> {
+    let bin = find_daemon()?;
+    let output = daemon_command(&bin)
+        .arg("close")
+        .output()
+        .with_context(|| format!("run {} close", bin.display()))?;
+    let mut text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !err.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&err);
+    }
+    if text.is_empty() {
+        text = if output.status.success() {
+            "Stopped the local daemon.".into()
+        } else {
+            format!("fresh-gui close failed ({})", output.status)
+        };
+    }
+    if output.status.success() {
+        Ok(text)
+    } else {
+        bail!(text);
+    }
+}
+
 pub fn find_daemon() -> Result<PathBuf> {
     if let Some(explicit) = std::env::var_os("FRESH_GUI_DAEMON") {
         let path = PathBuf::from(explicit);

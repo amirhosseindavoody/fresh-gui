@@ -4,12 +4,15 @@
 //! and return the terminal. Re-running `fresh-gui` prints status; `fresh-gui close`
 //! stops the session.
 
+mod binary;
 mod config;
 mod daemon;
 mod editor_worker;
 mod fs;
 mod fs_watch;
+mod git;
 mod memory_monitor;
+mod open_external;
 mod path_open;
 mod pty;
 mod server;

@@ -342,6 +342,12 @@ impl WorkspaceStore {
         Ok(out)
     }
 
+    /// Project root stored for `id`. Empty means the daemon FS root.
+    pub async fn root_of(&self, id: &str) -> Option<String> {
+        let guard = self.inner.lock().await;
+        guard.by_id.get(id).map(|rec| rec.root.clone())
+    }
+
     pub async fn focus(&self, id: &str) -> Result<FocusedWorkspace> {
         let mut guard = self.inner.lock().await;
         if !guard.by_id.contains_key(id) {

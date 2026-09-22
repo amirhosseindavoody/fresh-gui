@@ -1,10 +1,15 @@
 //! Roles for dock chrome that tracks focus.
 //!
-//! GPUI logs when a focused element has an element id and no accessibility
-//! role. `DockSkin`'s tab-panel frame tracks the active panel's focus handle,
-//! and the dock area tracks its own, both without a role. A role on the panel
-//! alone is not enough: prepaint visits the role-less frame first, a later
-//! node clears the once-per-focus dedup, and the next frame logs again.
+//! GPUI allows one accessibility focus node per frame. The tab group frame
+//! (`id` `tab-panel`) tracks the *active panel's* focus handle, and the panel
+//! (terminal, editor, diff) tracks that same handle and has its own id and
+//! role. A role on the tab frame makes both nodes call `set_focus`, which
+//! GPUI logs at warn:
+//! `a11y: set_focus called more than once in a single frame`.
+//! Clicking the title bar redraws while the panel stays focused, so the
+//! warning repeats. The tab frame stays role-less on purpose: the panel is
+//! the single focus owner. GPUI still notes the role-less frame at info,
+//! which the host filter (`gpui=warn`) hides.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -106,10 +111,9 @@ struct RoleTabGroup {
 
 impl TabGroupRenderer for RoleTabGroup {
     fn frame(&self, group: &TabGroupContext, window: &mut Window, cx: &mut App) -> Stateful<Div> {
-        self.inner
-            .frame(group, window, cx)
-            .role(Role::Group)
-            .aria_label("Editor group")
+        // No role. This frame and the focused panel share one focus handle;
+        // a role here is a second `set_focus` in the same frame.
+        self.inner.frame(group, window, cx)
     }
 
     fn content_frame(
