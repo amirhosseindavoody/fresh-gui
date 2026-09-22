@@ -12,7 +12,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, STILL_ACTIVE,
+    SetHandleInformation,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
 };
@@ -132,6 +135,11 @@ pub fn spawn_daemon(serve_args: &[String], paths: &SessionPaths) -> Result<u32> 
     cmd.stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
+    // The desktop launcher captures this process's stdout (`--json`). CreateProcess
+    // with bInheritHandles would also hand the child that pipe, so the launcher's
+    // read never sees EOF and the window never opens. Drop the inherit bit on our
+    // own standard handles; the log handles above are passed explicitly.
+    disarm_inherited_stdio();
 
     let child = cmd.spawn().context("spawn fresh-gui --daemon-serve")?;
     Ok(child.id())
@@ -161,6 +169,43 @@ pub fn request_stop(pid: u32) -> Result<()> {
 
 pub fn force_kill(pid: u32) {
     let _ = force_kill_inner(pid);
+}
+
+/// Stop stdin/stdout/stderr of this process from being inherited by a child.
+fn disarm_inherited_stdio() {
+    use std::os::windows::io::AsRawHandle;
+
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+
+    unsafe extern "system" {
+        fn GetStdHandle(nstdhandle: u32) -> HANDLE;
+    }
+
+    unsafe {
+        for std_handle in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let handle = GetStdHandle(std_handle);
+            clear_inherit(handle);
+        }
+    }
+    // Rust's std wrappers can be a different duplicate of the same pipe.
+    for handle in [
+        std::io::stdin().as_raw_handle() as HANDLE,
+        std::io::stdout().as_raw_handle() as HANDLE,
+        std::io::stderr().as_raw_handle() as HANDLE,
+    ] {
+        clear_inherit(handle);
+    }
+}
+
+fn clear_inherit(handle: HANDLE) {
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return;
+    }
+    unsafe {
+        SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+    }
 }
 
 fn force_kill_inner(pid: u32) -> io::Result<()> {

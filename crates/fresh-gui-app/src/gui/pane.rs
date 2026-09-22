@@ -107,7 +107,13 @@ impl TerminalPanel {
     /// Feed PTY bytes. Returns a new OSC 7 cwd when one was parsed.
     /// The numeric (or renamed) title is left alone.
     pub fn push_bytes(&mut self, bytes: &[u8], cx: &mut Context<Self>) -> Option<String> {
-        self.screen.feed(bytes);
+        let replies = self.screen.feed(bytes);
+        if !replies.is_empty() {
+            self.ade.send(AdeCmd::WritePty {
+                id: self.pty_id.clone(),
+                data: replies,
+            });
+        }
         let chunk = String::from_utf8_lossy(bytes);
         let cwd = feed_osc7_chunk(&mut self.osc_carry, &chunk);
         if let Some(cwd) = &cwd {

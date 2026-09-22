@@ -375,6 +375,7 @@ mod tests {
     #[cfg(unix)]
     use std::path::{Path, PathBuf};
 
+    #[cfg(unix)]
     fn map_probe<'a>(entries: &'a [(&'a str, Probe)]) -> impl FnMut(&str) -> Probe + 'a {
         move |command| {
             entries
@@ -385,6 +386,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn unix(
         client: Option<&str>,
         configured: &str,

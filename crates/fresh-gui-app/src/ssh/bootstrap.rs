@@ -542,6 +542,7 @@ fn wait_local_port(port: u16, child: &mut Child) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -554,6 +555,7 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     fn write_exe(path: &Path, body: &str) {
         fs::write(path, body).unwrap();
         let mut perms = fs::metadata(path).unwrap().permissions();
@@ -572,6 +574,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn listen_snippet() -> &'static str {
         r#"
 if [[ "$*" == *"-N"* ]]; then
@@ -661,6 +664,7 @@ fi
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn bootstrap_installs_when_probe_says_missing() {
         let dir = scratch();
@@ -735,6 +739,7 @@ fi
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn bootstrap_reuses_running_session_without_scp() {
         let dir = scratch();
