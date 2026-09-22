@@ -13,7 +13,7 @@ use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, Pan
 use gpui_kit::component::input::{Editor, EditorState, InputEvent, Position};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _,
+    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
     button::{Button, ButtonVariants as _},
     h_flex, v_flex,
 };
@@ -25,7 +25,11 @@ use super::osc7::feed_osc7_chunk;
 use super::paths::display_path;
 use super::rail::path_basename;
 use super::tab_chrome::{TabCloseScope, TabStripMetrics};
-use super::terminal::{TermScreen, keystroke_to_bytes};
+use super::terminal::{TermScreen, TermSpan, keystroke_to_bytes};
+
+/// `text_sm` monospace cell, matching [`super::terminal`] pixel reports.
+const TERM_CELL_W: f32 = 8.;
+const TERM_CELL_H: f32 = 18.;
 use super::workspace::Workspace;
 
 /// Label shown on a tab for this client session.
@@ -67,6 +71,8 @@ pub struct TerminalPanel {
     metrics: TabStripMetrics,
     /// How far left the **+** sits from the suffix slot. Measured last frame.
     plus_shift: Rc<Cell<f32>>,
+    /// Grid size measured after layout. Applied on the next frame.
+    pending_grid: Rc<Cell<Option<(usize, usize)>>>,
     closed: bool,
 }
 
@@ -90,6 +96,7 @@ impl TerminalPanel {
             workspace,
             metrics,
             plus_shift: Rc::new(Cell::new(0.0)),
+            pending_grid: Rc::new(Cell::new(None)),
             closed: false,
         }
     }
@@ -274,54 +281,166 @@ impl DockPanel for TerminalPanel {
 impl Render for TerminalPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pty_id = self.pty_id.clone();
-        let lines = self.screen.visible_lines();
+        if let Some((cols, rows)) = self.pending_grid.get()
+            && (cols != self.screen.cols || rows != self.screen.rows)
+        {
+            self.screen.resize(cols, rows);
+            self.ade.send(AdeCmd::ResizePty {
+                id: self.pty_id.clone(),
+                cols: cols as u16,
+                rows: rows as u16,
+            });
+        }
+        let rows = self.screen.rows();
         let focused = self.focus.is_focused(window);
+        let fg_default = cx.theme().foreground;
+        let bg_default = cx.theme().background;
+        let accent = cx.theme().accent;
+        let pending_grid = Rc::clone(&self.pending_grid);
+        let entity_id = cx.entity().entity_id();
         div()
             .id(format!("terminal-pane-{}", self.pty_id))
             .role(Role::Terminal)
             .aria_label("Terminal")
             .size_full()
+            .overflow_hidden()
             .p_2()
-            .bg(cx.theme().background)
+            .bg(bg_default)
             .font_family(cx.theme().mono_font_family.clone())
             .text_sm()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                 let ks = &event.keystroke;
+                let key = ks.key.to_lowercase();
+                if ks.modifiers.shift && !ks.modifiers.control && !ks.modifiers.alt {
+                    match key.as_str() {
+                        "pageup" => {
+                            cx.stop_propagation();
+                            this.screen.scroll_page(true);
+                            cx.notify();
+                            return;
+                        }
+                        "pagedown" => {
+                            cx.stop_propagation();
+                            this.screen.scroll_page(false);
+                            cx.notify();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 let bytes = keystroke_to_bytes(
                     ks.key.as_str(),
                     ks.key_char.as_deref(),
                     ks.modifiers.control,
                     ks.modifiers.alt,
                     ks.modifiers.shift,
+                    this.screen.app_cursor(),
                 );
                 if let Some(bytes) = bytes {
                     cx.stop_propagation();
+                    this.screen.scroll_to_bottom();
                     this.ade.send(AdeCmd::WritePty {
                         id: pty_id.clone(),
                         data: bytes,
                     });
                 }
             }))
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                cx.stop_propagation();
+                let lines = scroll_lines(event.delta);
+                if lines == 0. {
+                    return;
+                }
+                if this.screen.alt_screen() {
+                    let steps = lines.abs().round().clamp(1., 8.) as usize;
+                    let seq: &[u8] = if lines > 0. { b"\x1b[A" } else { b"\x1b[B" };
+                    let mut data = Vec::with_capacity(seq.len() * steps);
+                    for _ in 0..steps {
+                        data.extend_from_slice(seq);
+                    }
+                    this.ade.send(AdeCmd::WritePty {
+                        id: this.pty_id.clone(),
+                        data,
+                    });
+                    return;
+                }
+                let steps = lines.round() as i32;
+                if steps != 0 {
+                    this.screen.scroll_by(-steps);
+                    cx.notify();
+                }
+            }))
             .child(
                 v_flex()
                     .id(format!("term-scroll-{}", self.pty_id))
                     .size_full()
-                    .overflow_y_scroll()
-                    .children(lines.into_iter().map(|line| {
-                        div()
-                            .h(px(18.))
-                            .whitespace_nowrap()
-                            .child(if line.is_empty() {
-                                " ".to_string()
-                            } else {
-                                line
-                            })
+                    .overflow_hidden()
+                    .on_prepaint(move |bounds, _, app| {
+                        let next = grid_size(bounds.size);
+                        if pending_grid.get() != Some(next) {
+                            pending_grid.set(Some(next));
+                            app.notify(entity_id);
+                        }
+                    })
+                    .children(rows.into_iter().map(|row| {
+                        h_flex().h(px(18.)).items_center().children(
+                            row.spans
+                                .into_iter()
+                                .map(|span| term_span_el(span, fg_default, bg_default, accent)),
+                        )
                     }))
                     .when(focused, |this| this.opacity(1.))
                     .when(!focused, |this| this.opacity(0.85)),
             )
     }
+}
+
+fn grid_size(size: Size<Pixels>) -> (usize, usize) {
+    let width = f32::from(size.width);
+    let height = f32::from(size.height);
+    if width < TERM_CELL_W || height < TERM_CELL_H {
+        return (80, 24);
+    }
+    let cols = ((width / TERM_CELL_W).floor() as usize).clamp(2, 500);
+    let rows = ((height / TERM_CELL_H).floor() as usize).clamp(1, 200);
+    (cols, rows)
+}
+
+fn scroll_lines(delta: ScrollDelta) -> f32 {
+    match delta {
+        ScrollDelta::Lines(point) => point.y,
+        ScrollDelta::Pixels(point) => f32::from(point.y) / TERM_CELL_H,
+    }
+}
+
+fn term_rgb(rgb: [u8; 3]) -> gpui::Rgba {
+    gpui::rgb((u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2]))
+}
+
+fn term_span_el(span: TermSpan, fg_default: Hsla, bg_default: Hsla, accent: Hsla) -> gpui::Div {
+    let text = if span.text.is_empty() {
+        " ".to_string()
+    } else {
+        span.text
+    };
+    let cursor = span.cursor;
+    let bold = span.bold;
+    let fg = span.fg;
+    let bg = span.bg;
+    div()
+        .whitespace_nowrap()
+        .when(bold, |el| el.font_semibold())
+        .when(!cursor, |el| match fg {
+            Some(fg) => el.text_color(term_rgb(fg)),
+            None => el.text_color(fg_default),
+        })
+        .when(!cursor, |el| match bg {
+            Some(bg) => el.bg(term_rgb(bg)),
+            None => el,
+        })
+        .when(cursor, |el| el.bg(accent).text_color(bg_default))
+        .child(text)
 }
 
 struct EditorPending {

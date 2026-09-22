@@ -56,6 +56,10 @@ impl PtySession {
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
         }
+        // The daemon often inherits TERM=dumb (SSH, a detached Windows
+        // process, a desktop launch). Fish and other TUIs refuse that.
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
         if resolved.apply_osc7 {
             configure_shell_cmd(&mut cmd, &resolved.command);
         } else {
@@ -244,6 +248,12 @@ fn configure_shell_cmd(cmd: &mut CommandBuilder, shell: &str) {
                 cmd.arg("-l");
             }
         }
+        // Fish is an interactive shell. `-l` is a login shell and can reset
+        // the working directory from profile snippets; `-i` keeps the cwd
+        // the PTY was given (the workspace / remote root).
+        "fish" => {
+            cmd.arg("-i");
+        }
         // Windows console shells stay up when they are the ConPTY process.
         // A bare `-l` is not a login flag: `powershell.exe` runs it as the
         // command and exits, and `pwsh -l` binds to `-Login`.
@@ -384,5 +394,49 @@ mod tests {
         }
         session.kill();
         panic!("fallback shell did not print the marker: {collected:?}");
+    }
+
+    #[test]
+    fn spawned_shell_starts_in_the_requested_directory_with_a_real_term() {
+        let dir = std::env::temp_dir().join(format!(
+            "fresh-gui-pty-cwd-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = PtySession::spawn(
+            "cwd".into(),
+            80,
+            24,
+            Some(dir.display().to_string()),
+            Some("bash".into()),
+            &Config::default(),
+            tx,
+        )
+        .expect("spawn");
+        session
+            .write_all(b"printf 'cwd=%s term=%s\\n' \"$PWD\" \"$TERM\"\n")
+            .expect("write");
+
+        let mut collected = String::new();
+        let start = std::time::Instant::now();
+        let marker = format!("cwd={}", dir.display());
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            match rx.try_recv() {
+                Ok(bytes) => {
+                    collected.push_str(&String::from_utf8_lossy(&bytes));
+                    if collected.contains(&marker) && collected.contains("term=xterm-256color") {
+                        session.kill();
+                        let _ = std::fs::remove_dir_all(&dir);
+                        return;
+                    }
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        session.kill();
+        let _ = std::fs::remove_dir_all(&dir);
+        panic!("shell did not report cwd and TERM: {collected:?}");
     }
 }

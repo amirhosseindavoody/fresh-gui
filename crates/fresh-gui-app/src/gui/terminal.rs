@@ -1,24 +1,103 @@
-//! Minimal VTE-backed PTY screen for the native host.
+//! Terminal grid for a remote PTY.
 //!
-//! This is a view of remote PTY bytes, not a second editor core. Fresh still
-//! owns buffers on the daemon; terminals here are portable-pty children there.
+//! Bytes are parsed by [`alacritty_terminal`] (Apache-2.0), the same embeddable
+//! grid Zed paints. The daemon still owns the process (`portable-pty`). This
+//! module is only the screen: alternate buffer, cursor, colors, and the
+//! replies a shell waits on (cursor position, device attributes, palette).
 
-use vte::{Params, Parser, Perform};
+use std::cell::{Cell as StdCell, RefCell};
+use std::rc::Rc;
+
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::Line;
+use alacritty_terminal::term::Config;
+use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::{Term, TermMode};
+use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor, Rgb};
 
 const DEFAULT_COLS: usize = 80;
 const DEFAULT_ROWS: usize = 24;
-const SCROLLBACK: usize = 2000;
+/// Rough cell size of `text_sm` monospace, used when the host asks for pixels.
+const CELL_WIDTH_PX: u16 = 8;
+const CELL_HEIGHT_PX: u16 = 18;
+
+const DEFAULT_FG: [u8; 3] = [0xe6, 0xe6, 0xe6];
+const DEFAULT_BG: [u8; 3] = [0x1e, 0x1e, 0x1e];
+
+struct Shared {
+    replies: RefCell<Vec<u8>>,
+    cols: StdCell<u16>,
+    rows: StdCell<u16>,
+}
+
+struct ReplyProxy {
+    shared: Rc<Shared>,
+}
+
+impl EventListener for ReplyProxy {
+    fn send_event(&self, event: Event) {
+        match event {
+            Event::PtyWrite(text) => self.shared.replies.borrow_mut().extend(text.into_bytes()),
+            Event::ColorRequest(index, format) => {
+                let text = format(rgb_for_index(index));
+                self.shared.replies.borrow_mut().extend(text.into_bytes());
+            }
+            Event::TextAreaSizeRequest(format) => {
+                let text = format(WindowSize {
+                    num_lines: self.shared.rows.get(),
+                    num_cols: self.shared.cols.get(),
+                    cell_width: CELL_WIDTH_PX,
+                    cell_height: CELL_HEIGHT_PX,
+                });
+                self.shared.replies.borrow_mut().extend(text.into_bytes());
+            }
+            _ => {}
+        }
+    }
+}
+
+struct TermSize {
+    columns: usize,
+    screen_lines: usize,
+}
+
+impl Dimensions for TermSize {
+    fn total_lines(&self) -> usize {
+        self.screen_lines
+    }
+
+    fn screen_lines(&self) -> usize {
+        self.screen_lines
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+}
+
+/// One run of cells that share a color and cursor flag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TermSpan {
+    pub text: String,
+    /// `None` means the host theme foreground or background.
+    pub fg: Option<[u8; 3]>,
+    pub bg: Option<[u8; 3]>,
+    pub bold: bool,
+    pub cursor: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TermRow {
+    pub spans: Vec<TermSpan>,
+}
 
 pub struct TermScreen {
     pub cols: usize,
     pub rows: usize,
-    /// Scrollback + current screen rows (each row is `cols` cells, space-padded).
-    rows_data: Vec<Vec<char>>,
-    cursor_col: usize,
-    cursor_row: usize, // index into rows_data of the current line
-    parser: Parser,
-    /// Bytes to write back to the PTY (cursor-position and device-attribute reports).
-    replies: Vec<u8>,
+    term: Term<ReplyProxy>,
+    parser: Processor,
+    shared: Rc<Shared>,
 }
 
 impl Default for TermScreen {
@@ -31,39 +110,134 @@ impl TermScreen {
     pub fn new(cols: usize, rows: usize) -> Self {
         let cols = cols.max(1);
         let rows = rows.max(1);
-        let mut rows_data = Vec::with_capacity(rows);
-        for _ in 0..rows {
-            rows_data.push(vec![' '; cols]);
-        }
+        let shared = Rc::new(Shared {
+            replies: RefCell::new(Vec::new()),
+            cols: StdCell::new(cols as u16),
+            rows: StdCell::new(rows as u16),
+        });
+        // Fish 4 and other TUIs ask for the kitty keyboard protocol.
+        let config = Config {
+            scrolling_history: 2_000,
+            kitty_keyboard: true,
+            ..Config::default()
+        };
+        let term = Term::new(
+            config,
+            &TermSize {
+                columns: cols,
+                screen_lines: rows,
+            },
+            ReplyProxy {
+                shared: Rc::clone(&shared),
+            },
+        );
         Self {
             cols,
             rows,
-            rows_data,
-            cursor_col: 0,
-            cursor_row: 0,
-            parser: Parser::new(),
-            replies: Vec::new(),
+            term,
+            parser: Processor::new(),
+            shared,
         }
     }
 
-    /// Ingest PTY bytes. Returns any replies the terminal must write back
-    /// (ConPTY blocks the shell until a cursor-position report arrives).
+    /// Ingest PTY bytes. Returns replies the host must write back (device
+    /// attributes, cursor position, palette). ConPTY and fish both wait on these.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
-        let mut parser = Parser::new();
-        std::mem::swap(&mut self.parser, &mut parser);
-        parser.advance(self, bytes);
-        self.parser = parser;
-        self.trim_scrollback();
-        std::mem::take(&mut self.replies)
+        self.parser.advance(&mut self.term, bytes);
+        self.shared.replies.borrow_mut().drain(..).collect()
     }
 
+    pub fn resize(&mut self, cols: usize, rows: usize) {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        if cols == self.cols && rows == self.rows {
+            return;
+        }
+        self.cols = cols;
+        self.rows = rows;
+        self.shared.cols.set(cols as u16);
+        self.shared.rows.set(rows as u16);
+        self.term.resize(TermSize {
+            columns: cols,
+            screen_lines: rows,
+        });
+    }
+
+    pub fn app_cursor(&self) -> bool {
+        self.term.mode().contains(TermMode::APP_CURSOR)
+    }
+
+    pub fn alt_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// Scroll the viewport into history. Negative is older (page up).
+    pub fn scroll_by(&mut self, lines: i32) {
+        if lines == 0 {
+            return;
+        }
+        let scroll = if lines < 0 {
+            Scroll::Delta(lines.saturating_neg())
+        } else {
+            Scroll::Delta(-lines)
+        };
+        self.term.scroll_display(scroll);
+    }
+
+    pub fn scroll_page(&mut self, older: bool) {
+        self.term.scroll_display(if older {
+            Scroll::PageUp
+        } else {
+            Scroll::PageDown
+        });
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.term.scroll_display(Scroll::Bottom);
+    }
+
+    pub fn rows(&self) -> Vec<TermRow> {
+        let content = self.term.renderable_content();
+        let cursor_on = content.cursor.shape != CursorShape::Hidden;
+        let cursor = content.cursor.point;
+        let mut rows = Vec::new();
+        let mut current: Option<Line> = None;
+        let mut spans: Vec<TermSpan> = Vec::new();
+
+        for indexed in content.display_iter {
+            if current != Some(indexed.point.line) {
+                if current.is_some() {
+                    rows.push(TermRow { spans });
+                    spans = Vec::new();
+                }
+                current = Some(indexed.point.line);
+            }
+            let cell = indexed.cell;
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            let is_cursor = cursor_on && indexed.point == cursor;
+            push_cell(&mut spans, cell, content.colors, is_cursor);
+        }
+        if current.is_some() {
+            rows.push(TermRow { spans });
+        }
+        rows
+    }
+
+    #[cfg(test)]
     pub fn visible_lines(&self) -> Vec<String> {
-        let start = self.rows_data.len().saturating_sub(self.rows);
-        self.rows_data[start..]
-            .iter()
+        self.rows()
+            .into_iter()
             .map(|row| {
-                let s: String = row.iter().collect();
-                s.trim_end().to_string()
+                let mut text = String::new();
+                for span in row.spans {
+                    text.push_str(&span.text);
+                }
+                text.trim_end().to_string()
             })
             .collect()
     }
@@ -73,227 +247,156 @@ impl TermScreen {
         self.visible_lines().join("\n")
     }
 
-    fn current_line(&mut self) -> &mut Vec<char> {
-        if self.cursor_row >= self.rows_data.len() {
-            self.rows_data.push(vec![' '; self.cols]);
+    /// Visible cursor as `(row, column)` from the top-left of the screen.
+    #[cfg(test)]
+    pub fn cursor_cell(&self) -> Option<(usize, usize)> {
+        let content = self.term.renderable_content();
+        if content.cursor.shape == CursorShape::Hidden {
+            return None;
         }
-        &mut self.rows_data[self.cursor_row]
-    }
-
-    fn ensure_cursor(&mut self) {
-        while self.rows_data.len() <= self.cursor_row {
-            self.rows_data.push(vec![' '; self.cols]);
+        let top = -(content.display_offset as i32);
+        let row = content.cursor.point.line.0 - top;
+        if row < 0 {
+            return None;
         }
-        if self.cursor_col >= self.cols {
-            self.newline();
-        }
-    }
-
-    fn newline(&mut self) {
-        self.cursor_col = 0;
-        self.cursor_row += 1;
-        while self.rows_data.len() <= self.cursor_row {
-            self.rows_data.push(vec![' '; self.cols]);
-        }
-    }
-
-    fn trim_scrollback(&mut self) {
-        let max = SCROLLBACK + self.rows;
-        if self.rows_data.len() > max {
-            let drop = self.rows_data.len() - max;
-            self.rows_data.drain(0..drop);
-            self.cursor_row = self.cursor_row.saturating_sub(drop);
-        }
-    }
-
-    fn screen_origin(&self) -> usize {
-        self.rows_data.len().saturating_sub(self.rows)
-    }
-
-    fn cup(&mut self, row: usize, col: usize) {
-        let origin = self.screen_origin();
-        self.cursor_row = origin + row.min(self.rows - 1);
-        self.cursor_col = col.min(self.cols - 1);
-        self.ensure_cursor();
-    }
-
-    fn erase_line_from_cursor(&mut self) {
-        self.ensure_cursor();
-        let col = self.cursor_col;
-        let cols = self.cols;
-        let line = self.current_line();
-        for c in line.iter_mut().skip(col).take(cols.saturating_sub(col)) {
-            *c = ' ';
-        }
-    }
-
-    fn erase_below(&mut self) {
-        self.erase_line_from_cursor();
-        let start = self.cursor_row + 1;
-        for row in self.rows_data.iter_mut().skip(start) {
-            for c in row.iter_mut() {
-                *c = ' ';
-            }
-        }
-    }
-
-    fn erase_above(&mut self) {
-        let end = self.cursor_row;
-        for row in self.rows_data.iter_mut().take(end) {
-            for c in row.iter_mut() {
-                *c = ' ';
-            }
-        }
-        self.ensure_cursor();
-        let col = self.cursor_col;
-        let line = self.current_line();
-        for c in line.iter_mut().take(col + 1) {
-            *c = ' ';
-        }
-    }
-
-    fn erase_line_to_cursor(&mut self) {
-        self.ensure_cursor();
-        let col = self.cursor_col;
-        let line = self.current_line();
-        for c in line.iter_mut().take(col + 1) {
-            *c = ' ';
-        }
-    }
-
-    fn erase_line(&mut self) {
-        self.ensure_cursor();
-        for c in self.current_line().iter_mut() {
-            *c = ' ';
-        }
-    }
-
-    fn erase_display(&mut self) {
-        let origin = self.screen_origin();
-        for row in self.rows_data.iter_mut().skip(origin) {
-            for c in row.iter_mut() {
-                *c = ' ';
-            }
-        }
-        self.cursor_row = origin;
-        self.cursor_col = 0;
+        Some((row as usize, content.cursor.point.column.0))
     }
 }
 
-fn raw_param(params: &Params, idx: usize, default: u16) -> u16 {
-    params
-        .iter()
-        .nth(idx)
-        .and_then(|p| p.first().copied())
-        .unwrap_or(default)
+fn push_cell(
+    spans: &mut Vec<TermSpan>,
+    cell: &Cell,
+    colors: &alacritty_terminal::term::color::Colors,
+    cursor: bool,
+) {
+    let mut text = String::new();
+    let ch = if cell.flags.contains(Flags::HIDDEN) || cell.c == '\0' {
+        ' '
+    } else {
+        cell.c
+    };
+    text.push(ch);
+    if let Some(extra) = cell.zerowidth() {
+        text.extend(extra.iter().copied());
+    }
+
+    let mut fg = resolve_color(cell.fg, colors, true);
+    let mut bg = resolve_color(cell.bg, colors, false);
+    if cell.flags.contains(Flags::INVERSE) {
+        let fg_c = fg.unwrap_or(DEFAULT_FG);
+        let bg_c = bg.unwrap_or(DEFAULT_BG);
+        fg = Some(bg_c);
+        bg = Some(fg_c);
+    }
+    let bold = cell.flags.contains(Flags::BOLD);
+    if let Some(last) = spans.last_mut()
+        && last.fg == fg
+        && last.bg == bg
+        && last.bold == bold
+        && last.cursor == cursor
+    {
+        last.text.push_str(&text);
+        return;
+    }
+    spans.push(TermSpan {
+        text,
+        fg,
+        bg,
+        bold,
+        cursor,
+    });
 }
 
-impl Perform for TermScreen {
-    fn print(&mut self, c: char) {
-        self.ensure_cursor();
-        let col = self.cursor_col;
-        {
-            let line = self.current_line();
-            if col < line.len() {
-                line[col] = c;
-            }
-        }
-        self.cursor_col += 1;
-        if self.cursor_col >= self.cols {
-            self.newline();
-        }
+fn resolve_color(
+    color: Color,
+    colors: &alacritty_terminal::term::color::Colors,
+    foreground: bool,
+) -> Option<[u8; 3]> {
+    match color {
+        Color::Named(NamedColor::Foreground) if foreground => None,
+        Color::Named(NamedColor::Background) if !foreground => None,
+        Color::Named(named) => colors[named]
+            .map(rgb_array)
+            .or_else(|| named_default(named)),
+        Color::Spec(rgb) => Some(rgb_array(rgb)),
+        Color::Indexed(index) => colors[usize::from(index)]
+            .map(rgb_array)
+            .or(Some(indexed_color(index))),
     }
+}
 
-    fn execute(&mut self, byte: u8) {
-        match byte {
-            b'\n' => self.newline(),
-            b'\r' => self.cursor_col = 0,
-            b'\t' => {
-                self.cursor_col = ((self.cursor_col / 8) + 1) * 8;
-                if self.cursor_col >= self.cols {
-                    self.newline();
-                }
-            }
-            0x08 => self.cursor_col = self.cursor_col.saturating_sub(1),
-            0x07 => {}
-            _ => {}
-        }
-    }
+fn rgb_array(rgb: Rgb) -> [u8; 3] {
+    [rgb.r, rgb.g, rgb.b]
+}
 
-    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
-        let first = |idx: usize, default: u16| {
-            params
-                .iter()
-                .nth(idx)
-                .and_then(|p| p.first().copied())
-                .filter(|v| *v != 0)
-                .unwrap_or(default)
-        };
-        match action {
-            'A' => {
-                let n = first(0, 1) as usize;
-                let origin = self.screen_origin();
-                self.cursor_row = self.cursor_row.saturating_sub(n).max(origin);
-            }
-            'B' => {
-                let n = first(0, 1) as usize;
-                self.cursor_row = (self.cursor_row + n).min(self.screen_origin() + self.rows - 1);
-            }
-            'C' => {
-                let n = first(0, 1) as usize;
-                self.cursor_col = (self.cursor_col + n).min(self.cols - 1);
-            }
-            'D' => {
-                let n = first(0, 1) as usize;
-                self.cursor_col = self.cursor_col.saturating_sub(n);
-            }
-            'H' | 'f' => {
-                let row = first(0, 1).saturating_sub(1) as usize;
-                let col = first(1, 1).saturating_sub(1) as usize;
-                self.cup(row, col);
-            }
-            'J' => match raw_param(params, 0, 0) {
-                0 => self.erase_below(),
-                1 => self.erase_above(),
-                _ => self.erase_display(),
-            },
-            'K' => match raw_param(params, 0, 0) {
-                0 => self.erase_line_from_cursor(),
-                1 => self.erase_line_to_cursor(),
-                _ => self.erase_line(),
-            },
-            // Device Status Report. ConPTY sends CSI 6 n before the first
-            // prompt and waits; without CPR the pane stays blank.
-            'n' => {
-                if intermediates.is_empty() && raw_param(params, 0, 0) == 6 {
-                    let row = self.cursor_row.saturating_sub(self.screen_origin()) + 1;
-                    let col = self.cursor_col + 1;
-                    self.replies
-                        .extend(format!("\x1b[{row};{col}R").into_bytes());
-                }
-            }
-            // Primary / secondary device attributes. A short VT100-style
-            // answer keeps the console host from waiting on an identity query.
-            'c' => {
-                if intermediates == b">" {
-                    self.replies.extend_from_slice(b"\x1b[>0;0;0c");
-                } else if intermediates.is_empty() {
-                    self.replies.extend_from_slice(b"\x1b[?6c");
-                }
-            }
-            'm' => {}
-            _ => {}
-        }
+fn rgb_for_index(index: usize) -> Rgb {
+    let [r, g, b] = match index {
+        0..=15 => ansi16(index as u8),
+        256 => DEFAULT_FG,
+        257 => DEFAULT_BG,
+        n if n < 256 => indexed_color(n as u8),
+        _ => DEFAULT_FG,
+    };
+    Rgb { r, g, b }
+}
+
+fn named_default(named: NamedColor) -> Option<[u8; 3]> {
+    let index = named as usize;
+    if index < 16 {
+        Some(ansi16(index as u8))
+    } else {
+        None
     }
+}
+
+fn ansi16(index: u8) -> [u8; 3] {
+    const TABLE: [[u8; 3]; 16] = [
+        [0x1e, 0x1e, 0x1e],
+        [0xf4, 0x47, 0x47],
+        [0x3f, 0xb9, 0x50],
+        [0xd2, 0x99, 0x22],
+        [0x55, 0x99, 0xdd],
+        [0xd2, 0x6a, 0xc2],
+        [0x39, 0xc5, 0xcf],
+        [0xd0, 0xd0, 0xd0],
+        [0x80, 0x80, 0x80],
+        [0xff, 0x6b, 0x68],
+        [0x6b, 0xd4, 0x6b],
+        [0xf0, 0xc6, 0x74],
+        [0x79, 0xb8, 0xff],
+        [0xff, 0x7a, 0xd9],
+        [0x6e, 0xe7, 0xe7],
+        [0xff, 0xff, 0xff],
+    ];
+    TABLE[usize::from(index.min(15))]
+}
+
+fn indexed_color(index: u8) -> [u8; 3] {
+    if index < 16 {
+        return ansi16(index);
+    }
+    if index >= 232 {
+        let value = 8 + 10 * (index - 232);
+        return [value, value, value];
+    }
+    let cube = index - 16;
+    let r = cube / 36;
+    let g = (cube % 36) / 6;
+    let b = cube % 6;
+    let level = |n: u8| if n == 0 { 0 } else { 55 + 40 * n };
+    [level(r), level(g), level(b)]
 }
 
 /// Map a GPUI keystroke to PTY bytes. Returns `None` for chords the host owns.
+///
+/// `app_cursor` is the terminal's application-cursor mode (fish, vim, less).
 pub fn keystroke_to_bytes(
     key: &str,
     key_char: Option<&str>,
     ctrl: bool,
     alt: bool,
     shift: bool,
+    app_cursor: bool,
 ) -> Option<Vec<u8>> {
     let key = key.to_lowercase();
     if matches!(
@@ -319,18 +422,26 @@ pub fn keystroke_to_bytes(
         return None;
     }
 
+    let arrow = |normal: &[u8], app: &[u8]| {
+        Some(if app_cursor {
+            app.to_vec()
+        } else {
+            normal.to_vec()
+        })
+    };
+
     match key.as_str() {
         "enter" | "return" => Some(vec![b'\r']),
         "tab" => Some(vec![b'\t']),
         "escape" => Some(vec![0x1b]),
         "backspace" => Some(vec![0x7f]),
         "delete" => Some(b"\x1b[3~".to_vec()),
-        "up" => Some(b"\x1b[A".to_vec()),
-        "down" => Some(b"\x1b[B".to_vec()),
-        "right" => Some(b"\x1b[C".to_vec()),
-        "left" => Some(b"\x1b[D".to_vec()),
-        "home" => Some(b"\x1b[H".to_vec()),
-        "end" => Some(b"\x1b[F".to_vec()),
+        "up" => arrow(b"\x1b[A", b"\x1bOA"),
+        "down" => arrow(b"\x1b[B", b"\x1bOB"),
+        "right" => arrow(b"\x1b[C", b"\x1bOC"),
+        "left" => arrow(b"\x1b[D", b"\x1bOD"),
+        "home" => arrow(b"\x1b[H", b"\x1bOH"),
+        "end" => arrow(b"\x1b[F", b"\x1bOF"),
         "pageup" => Some(b"\x1b[5~".to_vec()),
         "pagedown" => Some(b"\x1b[6~".to_vec()),
         "space" => Some(vec![b' ']),
@@ -360,8 +471,8 @@ mod tests {
         let mut s = TermScreen::new(40, 8);
         s.feed(b"hello\r\nworld");
         let text = s.visible_text();
-        assert!(text.contains("hello"));
-        assert!(text.contains("world"));
+        assert!(text.contains("hello"), "{text}");
+        assert!(text.contains("world"), "{text}");
     }
 
     #[test]
@@ -382,35 +493,81 @@ mod tests {
     }
 
     #[test]
+    fn cursor_is_visible_after_text() {
+        let mut s = TermScreen::new(80, 24);
+        s.feed(b"ab");
+        assert_eq!(s.cursor_cell(), Some((0, 2)));
+        assert!(
+            s.rows()
+                .iter()
+                .flat_map(|row| row.spans.iter())
+                .any(|span| span.cursor),
+            "screen rows should mark the cursor cell"
+        );
+    }
+
+    #[test]
     fn cursor_position_report_answers_conpty_dsr() {
         let mut s = TermScreen::new(80, 24);
         let reply = s.feed(b"\x1b[6n");
-        assert_eq!(reply, b"\x1b[1;1R");
+        assert!(
+            reply.windows(6).any(|w| w == *b"\x1b[1;1R"),
+            "reply {reply:?}"
+        );
         assert!(s.visible_text().trim().is_empty());
 
         s.feed(b"ab");
         let reply = s.feed(b"\x1b[6n");
-        assert_eq!(reply, b"\x1b[1;3R");
+        assert!(
+            reply.windows(6).any(|w| w == *b"\x1b[1;3R"),
+            "reply {reply:?}"
+        );
     }
 
     #[test]
-    fn device_attributes_get_a_short_reply() {
+    fn device_attributes_get_a_reply() {
         let mut s = TermScreen::new(80, 24);
-        assert_eq!(s.feed(b"\x1b[c"), b"\x1b[?6c");
-        assert_eq!(s.feed(b"\x1b[>c"), b"\x1b[>0;0;0c");
+        let primary = s.feed(b"\x1b[c");
+        assert!(primary.starts_with(b"\x1b["), "{primary:?}");
+        assert!(primary.contains(&b'c'), "{primary:?}");
+        let secondary = s.feed(b"\x1b[>c");
+        assert!(secondary.starts_with(b"\x1b["), "{secondary:?}");
         assert!(s.visible_text().trim().is_empty());
+    }
+
+    #[test]
+    fn alternate_screen_restores_the_primary_buffer() {
+        let mut s = TermScreen::new(20, 6);
+        s.feed(b"primary");
+        s.feed(b"\x1b[?1049h");
+        s.feed(b"\x1b[2J\x1b[H");
+        s.feed(b"altscreen");
+        let alt = s.visible_text();
+        assert!(alt.contains("altscreen"), "{alt}");
+        assert!(!alt.contains("primary"), "{alt}");
+        s.feed(b"\x1b[?1049l");
+        let primary = s.visible_text();
+        assert!(primary.contains("primary"), "{primary}");
+        assert!(!primary.contains("altscreen"), "{primary}");
     }
 
     #[test]
     fn maps_ctrl_c_and_arrows() {
         assert_eq!(
-            keystroke_to_bytes("c", None, true, false, false),
+            keystroke_to_bytes("c", None, true, false, false, false),
             Some(vec![0x03])
         );
         assert_eq!(
-            keystroke_to_bytes("up", None, false, false, false),
+            keystroke_to_bytes("up", None, false, false, false, false),
             Some(b"\x1b[A".to_vec())
         );
-        assert_eq!(keystroke_to_bytes("w", None, true, false, false), None);
+        assert_eq!(
+            keystroke_to_bytes("up", None, false, false, false, true),
+            Some(b"\x1bOA".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes("w", None, true, false, false, false),
+            None
+        );
     }
 }
