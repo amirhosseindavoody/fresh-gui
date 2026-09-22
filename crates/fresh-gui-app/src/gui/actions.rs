@@ -20,6 +20,7 @@ actions!(
         PasteExplorer,
         NewWorkspace,
         RenameWorkspace,
+        CloseWorkspace,
     ]
 );
 

@@ -2,7 +2,7 @@
 
 Product UI is the **native GPUI host** (`fresh-gui`, crate `crates/fresh-gui-app`, `pixi run gui`, release asset `fresh-gui-client-*`). Architecture and protocol: [DESIGN.md](./DESIGN.md). User overview: [README.md](../README.md).
 
-Zed / VS Code-like chrome: activity bar, collapsible explorer, docked terminal + editor tabs (splits, reorder, merge), status bar, command palette. Ribbons are dense (30px title bar, 36px activity rail, 26px explorer header, 22px tree rows and status bar). The dock tab strip stays at the skin default (32px); the new-terminal **+** sits in the group suffix at the far right, next to the **···** menu. Connection is silent. `fresh-gui` with no URL reads the local session token from the daemon. `--backend` still accepts a printed Local access URL with `?token=`, or `ws://…/ws` + `FRESH_GUI_TOKEN`. `fresh-gui user@host` opens an SSH remote. The daemon does not serve a page.
+Zed / VS Code-like chrome: workspace rail, activity bar, collapsible explorer, docked terminal + editor tabs (splits, reorder, merge), status bar, command palette. Ribbons are dense (30px title bar, 232px workspace rail, 36px activity rail, 26px explorer header, 22px tree rows and status bar). The dock tab strip stays at the skin default (32px); the new-terminal **+** sits in the group suffix at the far right, next to the **···** menu. Connection is silent. `fresh-gui` with no URL reads the local session token from the daemon. `--backend` still accepts a printed Local access URL with `?token=`, or `ws://…/ws` + `FRESH_GUI_TOKEN`. `fresh-gui user@host` opens an SSH remote. The daemon does not serve a page.
 
 A later browser host would be this same GPUI UI via WebAssembly. That is not in this tree. Sections 1–9 below are notes from the removed Vite/React shell (CodeMirror, xterm). They are not a supported host and the source is gone. Current behavior is §10.
 
@@ -33,7 +33,7 @@ Inspired by Terax’s public UI / [TERAX.md](https://github.com/crynta/terax-ai/
 | AI chat rail, agent diffs, composer | **Not shipped** — Terax parity is a non-goal; terminal/ACP agent direction is design-only ([COPILOT.md](./COPILOT.md)); right rail stays reserved |
 | Source control / git graph | Not present |
 | Web preview / markdown tabs | Markdown WYSIWYG helper exists for editor tabs (toggle with `Mod+Shift+V`); not a separate tab kind |
-| Spaces / multi-project switcher | GPUI workspace rail (several workspaces on the one daemon). The removed React shell had none |
+| Spaces / multi-project switcher | GPUI workspace rail (name + project root, left of the activity bar). The removed React shell had none |
 | React 19 + Tailwind + shadcn | Yes — chrome in `src/app` + `src/components/ui` (Button, Tabs, DropdownMenu, ContextMenu, Separator, … like Terax); ADE controller remains imperative (`src/ade/bootstrap.ts`) |
 | Large trees via React reconciliation | **No** — explorer stays `VirtualTree` (windowed rows) |
 
@@ -230,12 +230,12 @@ Agent panels (right rail) may appear later per [COPILOT.md](./COPILOT.md); that 
 
 `crates/fresh-gui-app/src/gui/` is the primary renderer. It reuses `fresh-gui-client` + ADE; it does **not** link Fresh.
 
-Ribbon metrics live in `workspace.rs` and override gpui-component’s medium defaults (32px icon buttons, 32px tabs, `py_2` rails), which read sparse next to VS Code / Zed:
+Ribbon metrics live in `workspace.rs`. Workspace-rail width, row height, and root-label shortening live in `rail.rs`. They override gpui-component’s medium defaults (32px icon buttons, 32px tabs, `py_2` rails), which read sparse next to VS Code / Zed:
 
 | Container | Size |
 |-----------|------|
 | Title bar | 30px (`TitleBar` height); label is `text_sm` with a 4px gap |
-| Workspace rail | 168px, left of the activity bar. Header is the explorer header height (26px). Rows are 22px. The active workspace shows Rename and Close |
+| Workspace rail | 232px, left of the activity bar, only when `hello` includes `workspace`. Header is the explorer header height (26px), a muted **Workspaces** section title plus **+**. Rows are two lines and at least 40px: display name, then the project root (`~` for home, **Default root** when empty). The active row has an accent fill and a 3px left accent. Hover reveals Rename and Close; right-click has the same menu. The last workspace cannot be closed. One workspace shows a footer hint |
 | Activity rail | 36px wide, `py_1`, no gap; explorer and settings are small ghost icon buttons |
 | Explorer header | 26px, `text_xs`, xsmall collapse button |
 | Explorer rows | 22px, `text_sm`, 8px indent, no tree padding |
@@ -247,7 +247,7 @@ Dock chrome (tab height, suffix placement, the disabled Zoom item in **···**)
 | Native host | Status |
 |-----------|--------|
 | Connect / auth / session (`?token=` URL or `--token`) | Yes |
-| Workspace rail (create, rename, close, switch) | Yes — each workspace is its own tab set; idle ones stay on the daemon |
+| Workspace rail (create, rename, close, switch) | Yes — each workspace is its own tab set; idle ones stay on the daemon. **+** asks for a name and an absolute root (empty name uses the folder name). Rename and close are on hover, the right-click menu, and the command palette |
 | SSH target add + auto-install + tunnel (`remote connect`) | Yes (CLI before the window; title bar shows the destination) |
 | Activity bar + collapsible explorer (`fs_list`) | Yes |
 | Docked terminal + editor tabs | Yes. Drag a tab to the left/right/top/bottom edge to split; drop it on a tab to merge; drag in the strip to reorder. Empty groups collapse. The last remaining tab cannot be dragged |
