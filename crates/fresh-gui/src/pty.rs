@@ -225,6 +225,38 @@ fresh_gui_osc7
     Some(dir)
 }
 
+/// Fish has no rcfile flag. An init command defines a prompt hook that
+/// reports `$PWD` and does not change it, so the PTY cwd (workspace / remote
+/// root) stays put.
+fn ensure_fish_osc7() -> Option<PathBuf> {
+    let dir = shell_init_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("osc7.fish");
+    std::fs::write(&path, fish_osc7_script()).ok()?;
+    Some(path)
+}
+
+fn fish_osc7_script() -> &'static str {
+    r#"# fresh-gui OSC 7 cwd reporting
+function _fresh_gui_osc7 --on-event fish_prompt --description 'fresh-gui OSC 7 cwd'
+    set -l path (string escape --style=url -- $PWD 2>/dev/null)
+    if test -z "$path"
+        set path $PWD
+    end
+    printf '\033]7;file://%s%s\033\\' (prompt_hostname) $path
+end
+"#
+}
+
+fn fish_init_arg(script: &std::path::Path) -> String {
+    let text = script
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    format!("source \"{text}\"")
+}
+
 /// Interactive shell args + OSC 7 hooks so the host can track cwd / tab titles.
 fn configure_shell_cmd(cmd: &mut CommandBuilder, shell: &str) {
     match shell_basename(shell) {
@@ -250,9 +282,14 @@ fn configure_shell_cmd(cmd: &mut CommandBuilder, shell: &str) {
         }
         // Fish is an interactive shell. `-l` is a login shell and can reset
         // the working directory from profile snippets; `-i` keeps the cwd
-        // the PTY was given (the workspace / remote root).
+        // the PTY was given (the workspace / remote root). `-C` loads the
+        // OSC 7 hook after the user's config, without replacing `fish_prompt`.
         "fish" => {
             cmd.arg("-i");
+            if let Some(script) = ensure_fish_osc7() {
+                cmd.arg("-C");
+                cmd.arg(fish_init_arg(&script));
+            }
         }
         // Windows console shells stay up when they are the ConPTY process.
         // A bare `-l` is not a login flag: `powershell.exe` runs it as the
@@ -288,6 +325,16 @@ mod shell_args_tests {
         assert!(!windows_console_shell("bash"));
         assert!(!windows_console_shell("zsh"));
         assert!(!windows_console_shell("fish"));
+    }
+
+    #[test]
+    fn fish_osc7_hook_reports_pwd_without_changing_directory() {
+        let script = super::fish_osc7_script();
+        assert!(script.contains("--on-event fish_prompt"));
+        assert!(script.contains("$PWD"));
+        assert!(!script.contains("cd "));
+        let arg = super::fish_init_arg(std::path::Path::new("/tmp/fresh-gui-shell/osc7.fish"));
+        assert_eq!(arg, "source \"/tmp/fresh-gui-shell/osc7.fish\"");
     }
 }
 

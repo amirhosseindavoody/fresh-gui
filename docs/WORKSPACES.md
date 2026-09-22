@@ -79,7 +79,7 @@ Each row is two lines: the display name, then the project root (a home prefix fo
 
 Dock panels, terminals, and the explorer root are replaced from `workspace_switched`.
 
-Inside the focused workspace the dock still splits, merges, and reorders, terminal titles are `1`, `2`, `3`, … for that workspace, and the explorer multi-selects. A new shell starts in that workspace's root (or the remote session root when no workspace is attached). After the user `cd`s, bash and zsh OSC 7 cwd is reused for the next shell. Switching clears that remembered directory so the next workspace does not inherit it. Switching removes those panels without `pty_close` / `editor_close`, so idle PTYs keep running. The saved layout is the center panel order (a flat tab list). Coming back rebuilds one group, so split geometry is not restored.
+Inside the focused workspace the dock still splits, merges, and reorders, terminal titles are `1`, `2`, `3`, … for that workspace, and the explorer multi-selects. A new shell starts in that workspace's root (or the remote session root when no workspace is attached). After the user `cd`s, bash, zsh, and fish OSC 7 cwd is reused for the next shell. Switching clears that remembered directory so the next workspace does not inherit it. Switching removes those panels without `pty_close` / `editor_close`, so idle PTYs keep running. The saved layout is the center panel order (a flat tab list). Coming back rebuilds one group, so split geometry is not restored.
 
 The host ignores `pty_opened` it did not request and `editor_opened` whose `request_id` it did not send, so a late reply from workspace A cannot insert a tab into B.
 

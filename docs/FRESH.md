@@ -165,7 +165,7 @@ Workspace rule: prefer extending Fresh-backed backend surfaces over inventing a 
 | Location | Relation to Fresh |
 |----------|-------------------|
 | `~/.config/fresh-gui/config.json` | fresh-gui daemon config (JSONC) |
-| `terminal.shell` | Same field shape as Fresh shell config; empty `args` keep interactive + OSC 7 setup. Unix PTY spawn falls back when the command is missing (`$SHELL`, then `bash`, then `sh`). Fresh `detect_shell` is not used: it does not probe executability, and PTYs are host `portable-pty` |
+| `terminal.shell` | Same field shape as Fresh shell config; empty `args` keep interactive + OSC 7 setup (bash rcfile, zsh `ZDOTDIR`, fish `fish_prompt` hook). Unix PTY spawn falls back when the command is missing (`$SHELL`, then `bash`, then `sh`). Fresh `detect_shell` is not used: it does not probe executability, and PTYs are host `portable-pty` |
 | `ui.editorLineWrap` | Host soft wrap; mirrors Fresh `editor.line_wrap` (default on). Toggle via `Alt+Z` / command palette |
 | `ui.*` | Host-only prefs → `Hello.ui` |
 | Fresh editor state dir | Ephemeral under `/tmp/fresh-gui-editor-{pid}` for the embedded `Editor` |

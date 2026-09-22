@@ -10,10 +10,10 @@ use std::rc::Rc;
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::Line;
-use alacritty_terminal::term::Config;
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::term::{Term, TermMode};
+use alacritty_terminal::term::{Config, Osc52, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor, Rgb};
 
 const DEFAULT_COLS: usize = 80;
@@ -24,9 +24,13 @@ const CELL_HEIGHT_PX: u16 = 18;
 
 const DEFAULT_FG: [u8; 3] = [0xe6, 0xe6, 0xe6];
 const DEFAULT_BG: [u8; 3] = [0x1e, 0x1e, 0x1e];
+/// OSC 52 copy larger than this is dropped. A remote program must not be
+/// able to push an unbounded blob onto the host clipboard.
+const OSC52_MAX_BYTES: usize = 256 * 1024;
 
 struct Shared {
     replies: RefCell<Vec<u8>>,
+    clipboard: RefCell<Vec<String>>,
     cols: StdCell<u16>,
     rows: StdCell<u16>,
 }
@@ -39,6 +43,11 @@ impl EventListener for ReplyProxy {
     fn send_event(&self, event: Event) {
         match event {
             Event::PtyWrite(text) => self.shared.replies.borrow_mut().extend(text.into_bytes()),
+            Event::ClipboardStore(_, text) => {
+                if text.len() <= OSC52_MAX_BYTES {
+                    self.shared.clipboard.borrow_mut().push(text);
+                }
+            }
             Event::ColorRequest(index, format) => {
                 let text = format(rgb_for_index(index));
                 self.shared.replies.borrow_mut().extend(text.into_bytes());
@@ -85,6 +94,7 @@ pub struct TermSpan {
     pub bg: Option<[u8; 3]>,
     pub bold: bool,
     pub cursor: bool,
+    pub selected: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,13 +122,16 @@ impl TermScreen {
         let rows = rows.max(1);
         let shared = Rc::new(Shared {
             replies: RefCell::new(Vec::new()),
+            clipboard: RefCell::new(Vec::new()),
             cols: StdCell::new(cols as u16),
             rows: StdCell::new(rows as u16),
         });
         // Fish 4 and other TUIs ask for the kitty keyboard protocol.
+        // OSC 52 copy is on; paste/read stays off (alacritty's OnlyCopy).
         let config = Config {
             scrolling_history: 2_000,
             kitty_keyboard: true,
+            osc52: Osc52::OnlyCopy,
             ..Config::default()
         };
         let term = Term::new(
@@ -145,6 +158,13 @@ impl TermScreen {
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
         self.parser.advance(&mut self.term, bytes);
         self.shared.replies.borrow_mut().drain(..).collect()
+    }
+
+    /// Text an OSC 52 copy sequence asked the host to place on the clipboard.
+    /// Sequences over [`OSC52_MAX_BYTES`] are dropped. OSC 52 paste is not
+    /// answered: a program in the shell must not read the host clipboard.
+    pub fn take_clipboard_stores(&self) -> Vec<String> {
+        self.shared.clipboard.borrow_mut().drain(..).collect()
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -196,10 +216,49 @@ impl TermScreen {
         self.term.scroll_display(Scroll::Bottom);
     }
 
+    /// Start a drag selection at a viewport cell `(column, row)`.
+    pub fn begin_selection(&mut self, col: usize, row: usize) {
+        let point = self.viewport_point(col, row);
+        self.term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+    }
+
+    /// Move the end of the current drag selection.
+    pub fn update_selection(&mut self, col: usize, row: usize) {
+        let point = self.viewport_point(col, row);
+        if let Some(selection) = self.term.selection.as_mut() {
+            selection.update(point, Side::Right);
+        } else {
+            self.begin_selection(col, row);
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.term.selection = None;
+    }
+
+    pub fn selection_is_empty(&self) -> bool {
+        self.term.selection.as_ref().is_none_or(Selection::is_empty)
+    }
+
+    /// Selected text, without trailing empty selections.
+    pub fn selection_text(&self) -> Option<String> {
+        self.term
+            .selection_to_string()
+            .filter(|text| !text.is_empty())
+    }
+
+    fn viewport_point(&self, col: usize, row: usize) -> Point {
+        let col = col.min(self.cols.saturating_sub(1));
+        let row = row.min(self.rows.saturating_sub(1));
+        let offset = self.term.grid().display_offset();
+        alacritty_terminal::term::viewport_to_point(offset, Point::new(row, Column(col)))
+    }
+
     pub fn rows(&self) -> Vec<TermRow> {
         let content = self.term.renderable_content();
         let cursor_on = content.cursor.shape != CursorShape::Hidden;
         let cursor = content.cursor.point;
+        let selection = content.selection;
         let mut rows = Vec::new();
         let mut current: Option<Line> = None;
         let mut spans: Vec<TermSpan> = Vec::new();
@@ -220,7 +279,8 @@ impl TermScreen {
                 continue;
             }
             let is_cursor = cursor_on && indexed.point == cursor;
-            push_cell(&mut spans, cell, content.colors, is_cursor);
+            let selected = selection.is_some_and(|range| range.contains(indexed.point));
+            push_cell(&mut spans, cell, content.colors, is_cursor, selected);
         }
         if current.is_some() {
             rows.push(TermRow { spans });
@@ -268,6 +328,7 @@ fn push_cell(
     cell: &Cell,
     colors: &alacritty_terminal::term::color::Colors,
     cursor: bool,
+    selected: bool,
 ) {
     let mut text = String::new();
     let ch = if cell.flags.contains(Flags::HIDDEN) || cell.c == '\0' {
@@ -294,6 +355,7 @@ fn push_cell(
         && last.bg == bg
         && last.bold == bold
         && last.cursor == cursor
+        && last.selected == selected
     {
         last.text.push_str(&text);
         return;
@@ -304,6 +366,7 @@ fn push_cell(
         bg,
         bold,
         cursor,
+        selected,
     });
 }
 
@@ -569,5 +632,84 @@ mod tests {
             keystroke_to_bytes("w", None, true, false, false, false),
             None
         );
+    }
+
+    #[test]
+    fn drag_selection_covers_the_cells_and_clears() {
+        let mut s = TermScreen::new(40, 6);
+        s.feed(b"hello world");
+        s.begin_selection(0, 0);
+        assert!(s.selection_is_empty());
+        s.update_selection(4, 0);
+        assert_eq!(s.selection_text().as_deref(), Some("hello"));
+        assert!(
+            s.rows()
+                .iter()
+                .flat_map(|row| row.spans.iter())
+                .any(|span| span.selected && span.text.contains('h')),
+            "selected cells should be marked"
+        );
+        s.clear_selection();
+        assert!(s.selection_text().is_none());
+        assert!(s.selection_is_empty());
+    }
+
+    #[test]
+    fn osc52_copy_is_captured_and_paste_is_not_answered() {
+        let mut s = TermScreen::new(40, 6);
+        let reply = s.feed(b"\x1b]52;c;aGVsbG8=\x07");
+        assert!(reply.is_empty(), "{reply:?}");
+        assert_eq!(s.take_clipboard_stores(), vec!["hello".to_string()]);
+        assert!(s.visible_text().trim().is_empty());
+
+        let query = s.feed(b"\x1b]52;c;?\x07");
+        assert!(
+            query.is_empty(),
+            "OSC 52 paste must not read the host clipboard: {query:?}"
+        );
+        assert!(s.take_clipboard_stores().is_empty());
+    }
+
+    #[test]
+    fn osc52_copy_over_the_size_cap_is_dropped() {
+        let mut s = TermScreen::new(20, 4);
+        let raw = vec![b'a'; OSC52_MAX_BYTES + 1];
+        let encoded = base64_encode(&raw);
+        let mut seq = b"\x1b]52;c;".to_vec();
+        seq.extend(encoded);
+        seq.push(0x07);
+        s.feed(&seq);
+        assert!(s.take_clipboard_stores().is_empty());
+    }
+
+    fn base64_encode(bytes: &[u8]) -> Vec<u8> {
+        const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 3 <= bytes.len() {
+            let n = (u32::from(bytes[i]) << 16)
+                | (u32::from(bytes[i + 1]) << 8)
+                | u32::from(bytes[i + 2]);
+            out.push(TABLE[((n >> 18) & 63) as usize]);
+            out.push(TABLE[((n >> 12) & 63) as usize]);
+            out.push(TABLE[((n >> 6) & 63) as usize]);
+            out.push(TABLE[(n & 63) as usize]);
+            i += 3;
+        }
+        if i < bytes.len() {
+            let mut n = u32::from(bytes[i]) << 16;
+            if i + 1 < bytes.len() {
+                n |= u32::from(bytes[i + 1]) << 8;
+            }
+            out.push(TABLE[((n >> 18) & 63) as usize]);
+            out.push(TABLE[((n >> 12) & 63) as usize]);
+            if i + 1 < bytes.len() {
+                out.push(TABLE[((n >> 6) & 63) as usize]);
+            } else {
+                out.push(b'=');
+            }
+            out.push(b'=');
+        }
+        out
     }
 }

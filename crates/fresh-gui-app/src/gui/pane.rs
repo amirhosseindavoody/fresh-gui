@@ -73,6 +73,10 @@ pub struct TerminalPanel {
     plus_shift: Rc<Cell<f32>>,
     /// Grid size measured after layout. Applied on the next frame.
     pending_grid: Rc<Cell<Option<(usize, usize)>>>,
+    /// Top-left of the cell grid in window coordinates, from the last layout.
+    grid_origin: Rc<Cell<Option<Point<Pixels>>>>,
+    /// Left-button drag is in progress.
+    selecting: bool,
     closed: bool,
 }
 
@@ -97,6 +101,8 @@ impl TerminalPanel {
             metrics,
             plus_shift: Rc::new(Cell::new(0.0)),
             pending_grid: Rc::new(Cell::new(None)),
+            grid_origin: Rc::new(Cell::new(None)),
+            selecting: false,
             closed: false,
         }
     }
@@ -140,8 +146,56 @@ impl TerminalPanel {
         if let Some(cwd) = &cwd {
             self.cwd = Some(cwd.clone());
         }
+        for text in self.screen.take_clipboard_stores() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
         cx.notify();
         cwd
+    }
+
+    fn cell_at(&self, position: Point<Pixels>) -> Option<(usize, usize)> {
+        let origin = self.grid_origin.get()?;
+        let x = f32::from(position.x - origin.x);
+        let y = f32::from(position.y - origin.y);
+        let cols = self.screen.cols.max(1);
+        let rows = self.screen.rows.max(1);
+        let col = (x / TERM_CELL_W).floor() as isize;
+        let row = (y / TERM_CELL_H).floor() as isize;
+        let col = col.clamp(0, cols as isize - 1) as usize;
+        let row = row.clamp(0, rows as isize - 1) as usize;
+        Some((col, row))
+    }
+
+    fn pointer_select(&mut self, position: Point<Pixels>, start: bool, cx: &mut Context<Self>) {
+        let Some((col, row)) = self.cell_at(position) else {
+            return;
+        };
+        if start {
+            self.screen.begin_selection(col, row);
+            self.selecting = true;
+        } else if self.selecting {
+            self.screen.update_selection(col, row);
+        }
+        cx.notify();
+    }
+
+    fn finish_select(&mut self, cx: &mut Context<Self>) {
+        if !self.selecting {
+            return;
+        }
+        self.selecting = false;
+        if self.screen.selection_is_empty() {
+            self.screen.clear_selection();
+        }
+        cx.notify();
+    }
+
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = self.screen.selection_text() else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        cx.notify();
     }
 }
 
@@ -256,7 +310,16 @@ impl DockPanel for TerminalPanel {
         let pty = self.pty_id.clone();
         let workspace = self.workspace.clone();
         let panel_id = PanelId::from(cx.entity().entity_id());
+        let copy_from = cx.entity().downgrade();
         let menu = menu
+            .item(PopupMenuItem::new("Copy").on_click({
+                let copy_from = copy_from.clone();
+                move |_, _, cx| {
+                    copy_from
+                        .update(cx, |panel, cx| panel.copy_selection(cx))
+                        .ok();
+                }
+            }))
             .item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
                 workspace
                     .update(cx, |workspace, cx| {
@@ -297,7 +360,11 @@ impl Render for TerminalPanel {
         let bg_default = cx.theme().background;
         let accent = cx.theme().accent;
         let pending_grid = Rc::clone(&self.pending_grid);
+        let grid_origin = Rc::clone(&self.grid_origin);
         let entity_id = cx.entity().entity_id();
+        let selecting = self.selecting;
+        let select_entity = cx.entity().downgrade();
+        let menu_entity = cx.entity().downgrade();
         div()
             .id(format!("terminal-pane-{}", self.pty_id))
             .role(Role::Terminal)
@@ -309,9 +376,39 @@ impl Render for TerminalPanel {
             .font_family(cx.theme().mono_font_family.clone())
             .text_sm()
             .track_focus(&self.focus)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    window.focus(&this.focus, cx);
+                    this.pointer_select(event.position, true, cx);
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if event.pressed_button != Some(MouseButton::Left) || !this.selecting {
+                    return;
+                }
+                cx.stop_propagation();
+                this.pointer_select(event.position, false, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    this.finish_select(cx);
+                }),
+            )
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                 let ks = &event.keystroke;
                 let key = ks.key.to_lowercase();
+                let copy = (ks.modifiers.control || ks.modifiers.platform)
+                    && !ks.modifiers.alt
+                    && key == "c"
+                    && this.screen.selection_text().is_some();
+                if copy {
+                    cx.stop_propagation();
+                    this.copy_selection(cx);
+                    return;
+                }
                 if ks.modifiers.shift && !ks.modifiers.control && !ks.modifiers.alt {
                     match key.as_str() {
                         "pageup" => {
@@ -339,6 +436,7 @@ impl Render for TerminalPanel {
                 );
                 if let Some(bytes) = bytes {
                     cx.stop_propagation();
+                    this.screen.clear_selection();
                     this.screen.scroll_to_bottom();
                     this.ade.send(AdeCmd::WritePty {
                         id: pty_id.clone(),
@@ -376,12 +474,38 @@ impl Render for TerminalPanel {
                     .id(format!("term-scroll-{}", self.pty_id))
                     .size_full()
                     .overflow_hidden()
-                    .on_prepaint(move |bounds, _, app| {
+                    .on_prepaint(move |bounds, window, app| {
+                        grid_origin.set(Some(bounds.origin));
                         let next = grid_size(bounds.size);
                         if pending_grid.get() != Some(next) {
                             pending_grid.set(Some(next));
                             app.notify(entity_id);
                         }
+                        if !selecting {
+                            return;
+                        }
+                        let moved = select_entity.clone();
+                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, app| {
+                            if phase.capture() {
+                                return;
+                            }
+                            moved
+                                .update(app, |panel, cx| {
+                                    if panel.selecting {
+                                        panel.pointer_select(event.position, false, cx);
+                                    }
+                                })
+                                .ok();
+                        });
+                        let released = select_entity.clone();
+                        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, app| {
+                            if phase.capture() || event.button != MouseButton::Left {
+                                return;
+                            }
+                            released
+                                .update(app, |panel, cx| panel.finish_select(cx))
+                                .ok();
+                        });
                     })
                     .children(rows.into_iter().map(|row| {
                         h_flex().h(px(18.)).items_center().children(
@@ -393,6 +517,14 @@ impl Render for TerminalPanel {
                     .when(focused, |this| this.opacity(1.))
                     .when(!focused, |this| this.opacity(0.85)),
             )
+            .context_menu(move |menu, _, _| {
+                let menu_entity = menu_entity.clone();
+                menu.item(PopupMenuItem::new("Copy").on_click(move |_, _, cx| {
+                    menu_entity
+                        .update(cx, |panel, cx| panel.copy_selection(cx))
+                        .ok();
+                }))
+            })
     }
 }
 
@@ -431,13 +563,16 @@ fn term_span_el(span: TermSpan, fg_default: Hsla, bg_default: Hsla, accent: Hsla
     div()
         .whitespace_nowrap()
         .when(bold, |el| el.font_semibold())
-        .when(!cursor, |el| match fg {
+        .when(!cursor && !span.selected, |el| match fg {
             Some(fg) => el.text_color(term_rgb(fg)),
             None => el.text_color(fg_default),
         })
-        .when(!cursor, |el| match bg {
+        .when(!cursor && !span.selected, |el| match bg {
             Some(bg) => el.bg(term_rgb(bg)),
             None => el,
+        })
+        .when(span.selected && !cursor, |el| {
+            el.bg(accent.opacity(0.45)).text_color(fg_default)
         })
         .when(cursor, |el| el.bg(accent).text_color(bg_default))
         .child(text)
