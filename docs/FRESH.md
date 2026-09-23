@@ -1,197 +1,21 @@
-# Fresh integration
+# Fresh editor integration
 
-How **fresh-gui** embeds and talks to [Fresh](https://github.com/sinelaw/fresh). Product architecture: [DESIGN.md](./DESIGN.md). Host UI: [UI.md](./UI.md).
+The daemon embeds Fresh's editor library for buffer open, edit, and save. The GPUI client does not link Fresh; it exchanges editor snapshots and edits with the daemon over ADE.
 
-## 1. Role of Fresh
+## Build setup
 
-Fresh is the **remote buffer authority** inside the Linux daemon (`fresh-gui`). The host UI (native GPUI) never links Fresh crates. It speaks the ADE WebSocket protocol; the daemon translates editor messages into in-process Fresh `Editor` calls.
+Fresh is a pinned git submodule in `vendor/fresh`. Initialize it when cloning:
 
-```
-┌──────────────────────┐         ADE /ws (JSON)         ┌────────────────────────────┐
-│  Host UI             │◄──────────────────────────────►│  fresh-gui (Linux)          │
-│  GPUI               │   editor_open / buffer_edit /  │  EditorHandle ──► Fresh     │
-│  (renderer only)     │   buffer_save / …              │  Editor (!Send thread)      │
-└──────────────────────┘                                 │  vendor/fresh (submodule)   │
-                                                         └────────────────────────────┘
+```sh
+git clone --recurse-submodules https://github.com/amirhosseindavoody/fresh-gui.git
 ```
 
-**Fresh owns:** open file → buffer text, language mode, disk save via Fresh’s filesystem, path-link / `:line:col` parsing helpers.
+The daemon crate depends on `fresh-editor` with its `runtime` feature. Fresh's web UI, GUI, and plugins are not part of the desktop host. The daemon runs Fresh's `!Send` editor on its own thread and sends editor operations to that thread.
 
-**fresh-gui owns:** ADE protocol, sessions, PTY, FS sandbox for the explorer, GPUI host rendering (VTE grid and editor view), revision CAS on the wire, config chrome (`ui.*`).
+To update the pin, check out the desired commit in `vendor/fresh` and update `vendor/fresh.rev` to the same SHA. The package recipe uses that revision when the submodule is unavailable.
 
-This is intentional: the wire is a **PTY-first ADE protocol**, not Fresh `--web` scene envelopes (see DESIGN D1).
+## Runtime boundary
 
-## 2. Vendoring and build
+Fresh provides the editor buffer and save behavior. `fresh-gui` provides the ADE protocol, client connection, PTYs, file explorer sandbox, workspace state, and GPUI rendering. The client sends full buffer edits with a revision token; the daemon applies them to Fresh and saves through Fresh.
 
-| Piece | Behavior |
-|-------|----------|
-| Submodule | `vendor/fresh` → integration fork `https://github.com/amirhosseindavoody/fresh.git` (upstream: sinelaw/fresh) |
-| Pin | Commit SHA in the submodule **and** `vendor/fresh.rev` (for package builds without submodule checkout) |
-| Workspace | Root `Cargo.toml` `exclude = ["vendor/fresh"]` so Fresh keeps its own Cargo workspace |
-| Link | Only `crates/fresh-gui` depends on Fresh |
-
-Cargo dependency (`crates/fresh-gui/Cargo.toml`):
-
-```toml
-fresh = {
-  path = "../../vendor/fresh/crates/fresh-editor",
-  package = "fresh-editor",
-  default-features = false,
-  features = ["runtime"]
-}
-```
-
-The Rust crate name imported in code is `fresh` (lib name of `fresh-editor`).
-
-### Features
-
-| Feature | Status | Why |
-|---------|--------|-----|
-| `runtime` | **on** | Editor core, languages, syntect, etc. |
-| `default` | **off** | Avoid pulling unused Fresh defaults |
-| `plugins` / `embed-plugins` | **off** | Embedding is buffer open/edit/save only |
-| `tree-sitter` | **off** | Not used by the ADE host |
-| `web` | **off** | No Fresh `--web` / web-ui |
-| `gui` | **off** | Fresh’s own wgpu GUI crate is not linked (name collision only with this repo’s `fresh-gui`) |
-
-Package builds (`recipe/build.sh`) call `ensure_vendor_fresh()`: init the submodule if possible, otherwise shallow-fetch `vendor/fresh.rev`.
-
-**Pin:** `14f7d28b7ab18b6cdefc75ab94c5df34044ae3d0` on fork `master` ([fresh#4](https://github.com/amirhosseindavoody/fresh/pull/4) on top of [fresh#3](https://github.com/amirhosseindavoody/fresh/pull/3)). Delta from `ddfc322` is CI/plugin-test only. Upstream Fresh is **GPL-3.0-or-later**; `fresh-gui` matches that license. Feature set stays `runtime` only.
-
-### Bumping Fresh
-
-```bash
-git -C vendor/fresh fetch
-git -C vendor/fresh checkout --detach <rev>
-# stage submodule + write the same SHA to vendor/fresh.rev
-```
-
-## 3. In-process editor (`EditorWorker`)
-
-Fresh’s `Editor` is **`!Send`**. The daemon therefore runs it on a dedicated OS thread (`"fresh-editor"`) with a current-thread Tokio runtime. All ADE editor ops go through a cloneable `EditorHandle` that serializes commands onto that thread.
-
-Implementation: `crates/fresh-gui/src/editor_worker.rs`.
-
-### Lifecycle
-
-1. After bind, `main` calls `EditorHandle::spawn(working_dir)` unless `--no-editor` / `FRESH_GUI_NO_EDITOR`.
-2. Worker builds Fresh config via `Config::load_with_layers` under a private temp state dir (`/tmp/fresh-gui-editor-{pid}`), forces `animations = false`, and constructs `Editor::with_working_dir` with `StdFileSystem`.
-3. On failure to spawn, `AppState.editor` stays `None` and Hello omits `editor` / `scene` capabilities.
-4. `Editor` is dropped **after** the worker’s `block_on` returns (avoids Drop during Tokio async teardown).
-
-### Handle API ↔ Fresh
-
-| `EditorHandle` | Fresh / ADE behavior |
-|----------------|----------------------|
-| `open(path, preview)` | `open_file` / `open_file_preview`; snapshot text + language; track path/rev |
-| `edit(buffer_id, base_rev, text)` | Activate buffer, CAS on ADE `rev`, `replace_content` with full text |
-| `save(buffer_id, base_rev)` | CAS then Fresh `Editor::save` |
-| `close(buffer_id)` | Drop ADE tracking only — does **not** call a Fresh close API |
-| `scene()` | List tracked buffers + Fresh `active_buffer()` for thin ADE scene |
-
-Limits: snapshots larger than **2 MiB** are rejected (`MAX_SNAPSHOT_BYTES`). Large-file unloaded regions in Fresh can make `buffer.to_string()` fail.
-
-### Revisions
-
-`buffer_id` is Fresh’s `BufferId` as a decimal string. **`rev` is ADE-side** (starts at `0`, increments on successful edit/save). It is not Fresh’s internal undo revision. The host CodeMirror document is the interactive view; the daemon’s tracked rev is the conflict token on the wire.
-
-### `--no-editor`
-
-- Skips `EditorHandle::spawn`.
-- Strips `editor` and `scene` from Hello capabilities.
-- Editor/scene messages return `editor_unavailable` / `scene_unavailable`.
-- PTY, session, and FS still work.
-
-## 4. Protocol surface
-
-Capability `editor` (and optional `scene`) on the same `/ws` connection as PTY/FS.
-
-| Direction | Messages |
-|-----------|----------|
-| Open | `editor_open` → `editor_opened` + `buffer_snapshot` |
-| Ctrl/Cmd+click | `editor_open_link` → same opened + snapshot pair |
-| Edit | `buffer_edit` (`base_rev`, full `text`) → `buffer_changed` (new `rev`) or `error` |
-| Save | `buffer_save` → `buffer_saved` (path + `rev`) |
-| Close | `editor_close` (ADE tracking) |
-| Scene | `scene_get` → `scene_snapshot` (open-buffer list for chrome — **not** Fresh `--web` cell scene) |
-
-Open replies are produced in `server.rs` (`reply_editor_opened`). Settings `config.json` is a special open path: the file is created/hydrated if missing, then opened like any other buffer; a successful save of that path reloads live UI prefs.
-
-## 5. Path resolution and link open
-
-`crates/fresh-gui/src/path_open.rs` reuses Fresh detectors so terminal and quick-open behavior match Fresh:
-
-| Fresh API | Use |
-|-----------|-----|
-| `parse_path_line_col` | `path:line` / `path:line:col` suffixes on `editor_open` |
-| `expand_tilde` | `~` expansion |
-| `detect_link_at` | `editor_open_link` from a line of text + column |
-
-Candidate order matches Fresh `terminal_link`: absolute (after `~`), then terminal OSC 7 `cwd`, then the FS sandbox root. Relative paths under a cwd outside `--root` may call `FsRoot::authorize` so explorer and editor stay consistent with Terax-style cwd sync.
-
-Line/column from path or link are returned on `editor_opened` for the **host** to reveal in CodeMirror. The Fresh in-process cursor is not moved for that jump.
-
-## 6. What uses Fresh vs what does not
-
-### From Fresh
-
-- In-process `Editor` for buffer open / content replace / save.
-- `path_link` + quick-open path parsing.
-- Theme **color values** copied into host palettes (`ui/src/palettes.ts` maps RGB from `vendor/fresh/crates/fresh-editor/themes/*.json` onto CSS variables for chrome, xterm, and CodeMirror). Primer remains a host-native palette in `tokens.css`.
-- `terminal.shell.{command,args}` shape aligned with Fresh’s shell config (stored under fresh-gui’s `config.json`, not Fresh’s config directory).
-
-### Not from Fresh (by design)
-
-| Area | fresh-gui implementation |
-|------|--------------------------|
-| Wire protocol | ADE JSON over `/ws` — not Fresh `--web` scene |
-| PTY | Host `portable-pty` + OSC 7 hooks (`pty.rs`); Fresh’s `TerminalManager` unused |
-| Explorer FS | Sandboxed `fs.rs` / `fs_watch.rs` (list, create, copy, move, watch). Fresh `StdFileSystem` is only used inside the editor for buffer I/O |
-| Host editing UX | gpui-component `Editor` view of Fresh snapshots (save is `buffer_edit` then `buffer_save`). Fresh Compose/Page View is a plugin and plugins are not enabled on the ADE path |
-| Host terminal UX | `alacritty_terminal` grid of remote PTY bytes (cursor, color, alternate screen, DECSET mouse modes 1000/1002/1003). Same library Fresh's TUI terminal wraps. Mouse bytes are encoded in the host the way Fresh's TUI encodes them; those helpers are private to Fresh's editor, not a callable API. `TerminalManager` is not mounted: it is tied to Fresh's own view, not GPUI |
-| Host chrome | GPUI + gpui-component |
-| Plugins / LSP / tree-sitter in the ADE path | Features off; not exposed over the protocol |
-| Orchestrator / coding agents | Fresh plugin not loaded; agent direction for ADE is design-only ([COPILOT.md](./COPILOT.md)) — steal registry/resume patterns, do not embed Orchestrator yet |
-| Session / explorer restore | Host layout blob in Rust `SessionStore` (`layout_set`); explorer expanded/scroll snapshots mirror Fresh `FileExplorerState` fields without using Fresh workspace files under `$XDG_DATA_HOME/fresh/workspaces` (ADE uses host `VirtualTree` + sandboxed FS) |
-
-## 7. Host UI wiring
-
-The GPUI host does not import Fresh. It speaks ADE through `fresh-gui-client` (`crates/fresh-gui-app/src/gui/`). Editor tabs are a view of Fresh snapshots; save sends `buffer_edit` then `buffer_save`. Terminal tabs parse PTY bytes with `alacritty_terminal` and paint the grid in GPUI. Fresh's terminal service was checked first; it cannot be embedded as a GPUI panel, so the host uses the same grid crate Fresh uses and leaves `TerminalManager` on the editor side.
-
-Workspace rule: prefer extending Fresh-backed backend surfaces over inventing a second editor engine in the host (see `.cursor/rules/leverage-fresh-editor.mdc`).
-
-## 8. Config touchpoints
-
-| Location | Relation to Fresh |
-|----------|-------------------|
-| `~/.config/fresh-gui/config.json` | fresh-gui daemon config (JSONC) |
-| `terminal.shell` | Same field shape as Fresh shell config; empty `args` keep interactive + OSC 7 setup (bash rcfile, zsh `ZDOTDIR`, fish `fish_prompt` hook). Unix PTY spawn falls back when the command is missing (`$SHELL`, then `bash`, then `sh`). Fresh `detect_shell` is not used: it does not probe executability, and PTYs are host `portable-pty` |
-| `ui.editorLineWrap` | Host soft wrap; mirrors Fresh `editor.line_wrap` (default on). Toggle via `Alt+Z` / command palette |
-| `ui.*` | Host-only prefs → `Hello.ui` |
-| Fresh editor state dir | Ephemeral under `/tmp/fresh-gui-editor-{pid}` for the embedded `Editor` |
-| Fresh user config | Not loaded wholesale into the ADE daemon |
-
-## 9. Key source files
-
-| Path | Role |
-|------|------|
-| `vendor/fresh/` | Fresh submodule tree |
-| `vendor/fresh.rev` | Packaging pin SHA |
-| `crates/fresh-gui/Cargo.toml` | Sole Fresh path dependency |
-| `crates/fresh-gui/src/editor_worker.rs` | `!Send` Fresh thread + `EditorHandle` |
-| `crates/fresh-gui/src/path_open.rs` | Fresh path/link resolve + sandbox |
-| `crates/fresh-gui/src/server.rs` | ADE handlers, capabilities, settings open/reload |
-| `crates/fresh-gui/src/main.rs` | `--no-editor`, spawn after bind |
-| `crates/fresh-gui/src/pty.rs` | Host PTY (not Fresh terminal) |
-| `crates/fresh-gui/src/fs.rs` | Explorer FS sandbox |
-| `crates/fresh-gui-protocol/src/lib.rs` | `editor_*` / `buffer_*` / `scene_*` messages |
-| `crates/fresh-gui-app/src/gui/` | Native GPUI ADE host (renderer) |
-| `recipe/build.sh` | Ensure Fresh pin for package builds |
-
-## 10. Operational summary
-
-1. Clone with submodules (or let `recipe/build.sh` fetch `fresh.rev`).
-2. `fresh-gui` starts → optional Fresh `Editor` thread → Hello advertises `editor` + `scene`.
-3. Host opens a path → ADE `editor_open` → Fresh open → snapshot to the GPUI editor view.
-4. Edits replace full buffer text under ADE revision CAS; save writes through Fresh.
-5. Disable embedding with `--no-editor` for a PTY/FS-only daemon.
+The daemon can run without the editor using `--no-editor`; terminal and filesystem features remain available. See [Architecture](./DESIGN.md) for process boundaries and [WORKSPACES.md](./WORKSPACES.md) for workspace behavior.

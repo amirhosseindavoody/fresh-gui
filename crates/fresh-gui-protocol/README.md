@@ -1,5 +1,5 @@
 # fresh-gui-protocol
 
-Versioned ADE message types shared by the host UI / client and the Linux remote backend (`hello`, session, PTY, FS, editor, scene).
+Shared Rust message types for communication between the desktop host and daemon. The protocol covers connection setup, workspaces and sessions, terminals, files, editor operations, and source control.
 
-See [docs/DESIGN.md](../../docs/DESIGN.md) §5.
+This crate is an implementation component, not a separate user-facing application. See the [project README](../../README.md) for installation and use.
