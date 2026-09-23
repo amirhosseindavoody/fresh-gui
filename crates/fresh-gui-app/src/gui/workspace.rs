@@ -35,8 +35,9 @@ use gpui_kit::*;
 
 use super::actions::{
     ClearExplorerInput, CloseTab, CloseWorkspace, CopyExplorer, Disconnect, FilterExplorer,
-    GoToFile, NewTerminal, NewWorkspace, NextTab, OpenSettings, PasteExplorer, PrevTab, QuitClient,
-    Reconnect, RenameWorkspace, SaveBuffer, StopServer, ToggleCommandPalette, ToggleSidebar,
+    GoToFile, NewTerminal, NewWorkspace, NextTab, OpenDefaultSettings, OpenSettings, PasteExplorer,
+    PrevTab, QuitClient, Reconnect, RenameWorkspace, SaveBuffer, StopServer, ToggleCommandPalette,
+    ToggleSidebar,
 };
 use super::ade::AttachedWorkspace;
 use super::ade::{AdeCmd, AdeEvent, AdeHandle};
@@ -260,6 +261,7 @@ pub struct Workspace {
     create_open: bool,
     capabilities: Vec<String>,
     config_path: Option<String>,
+    defaults_path: Option<String>,
     status: SharedString,
     sidebar_collapsed: bool,
     activity: Activity,
@@ -489,6 +491,7 @@ impl Workspace {
             create_open: false,
             capabilities: Vec::new(),
             config_path: None,
+            defaults_path: None,
             status: "Connecting…".into(),
             sidebar_collapsed: false,
             activity: Activity::Explorer,
@@ -858,6 +861,7 @@ impl Workspace {
     fn apply_hello(&mut self, hello: &Hello) {
         self.capabilities = hello.capabilities.clone();
         self.config_path = hello.config_path.clone();
+        self.defaults_path = hello.defaults_path.clone();
         self.git_cap = hello.capabilities.iter().any(|cap| cap == CAP_GIT);
     }
 
@@ -1042,8 +1046,11 @@ impl Workspace {
             .any(|panel| PanelId::from(panel.entity_id()) == id)
             || self
                 .editors
-                .values()
-                .any(|panel| PanelId::from(panel.entity_id()) == id)
+                .iter()
+                .any(|(path, panel)| {
+                    Some(path) != self.defaults_path.as_ref()
+                        && PanelId::from(panel.entity_id()) == id
+                })
     }
 
     pub(crate) fn note_terminal_active(
@@ -1102,6 +1109,12 @@ impl Workspace {
 
     pub(crate) fn forget_editor(&mut self, path: &str, cx: &mut Context<Self>) {
         self.editors.remove(path);
+        if self.defaults_path.as_deref() == Some(path) {
+            self.ade.send(AdeCmd::DeletePaths {
+                request_id: next_id("defaults-delete"),
+                paths: vec![path.to_owned()],
+            });
+        }
         if matches!(&self.active, Some(ActiveSurface::Editor(current)) if current == path) {
             self.active = None;
         }
@@ -1255,7 +1268,10 @@ impl Workspace {
             } else if let Some((path, _)) = self
                 .editors
                 .iter()
-                .find(|(_, panel)| PanelId::from(panel.entity_id()) == id)
+                .find(|(path, panel)| {
+                    Some(*path) != self.defaults_path.as_ref()
+                        && PanelId::from(panel.entity_id()) == id
+                })
             {
                 seen_path.insert(path.clone());
                 let title = path
@@ -1282,6 +1298,9 @@ impl Workspace {
             }
         }
         for path in self.editors.keys() {
+            if Some(path) == self.defaults_path.as_ref() {
+                continue;
+            }
             if seen_path.insert(path.clone()) {
                 let title = path
                     .rsplit(['/', '\\'])
@@ -1875,6 +1894,14 @@ impl Workspace {
             self.open_path(path, false);
         } else {
             self.status = "Backend did not send config_path".into();
+        }
+    }
+
+    fn open_default_settings(&mut self) {
+        if let Some(path) = self.defaults_path.clone() {
+            self.open_path(path, false);
+        } else {
+            self.status = "Backend did not send defaults_path".into();
         }
     }
 
@@ -2689,6 +2716,16 @@ impl Workspace {
 
     fn on_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
         self.open_settings();
+        cx.notify();
+    }
+
+    fn on_default_settings(
+        &mut self,
+        _: &OpenDefaultSettings,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_default_settings();
         cx.notify();
     }
 
@@ -3880,6 +3917,7 @@ impl Workspace {
             ("Toggle Sidebar", Box::new(ToggleSidebar)),
             ("Go to File…", Box::new(GoToFile)),
             ("Open Settings", Box::new(OpenSettings)),
+            ("Open Default Settings", Box::new(OpenDefaultSettings)),
             ("Reconnect", Box::new(Reconnect)),
             ("Disconnect", Box::new(Disconnect)),
             ("Stop Server", Box::new(StopServer)),
@@ -4067,6 +4105,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_toggle_palette))
             .on_action(cx.listener(Self::on_goto_file))
             .on_action(cx.listener(Self::on_settings))
+            .on_action(cx.listener(Self::on_default_settings))
             .on_action(cx.listener(Self::on_reconnect))
             .on_action(cx.listener(Self::on_disconnect))
             .on_action(cx.listener(Self::on_next_tab))

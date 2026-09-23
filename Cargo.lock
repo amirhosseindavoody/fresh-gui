@@ -2505,6 +2505,7 @@ dependencies = [
  "gpui-kit",
  "gpui-pre",
  "gpui-pre-platform",
+ "jsonc-parser",
  "serde",
  "serde_json",
  "tokio",

@@ -55,6 +55,10 @@ pub enum AdeCmd {
     CloseEditor {
         buffer_id: String,
     },
+    DeletePaths {
+        request_id: String,
+        paths: Vec<String>,
+    },
     CopyPaths {
         request_id: String,
         sources: Vec<String>,
@@ -471,6 +475,9 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
         }
         AdeCmd::CloseEditor { buffer_id } => {
             client.send(Message::EditorClose { buffer_id }).await?;
+        }
+        AdeCmd::DeletePaths { request_id, paths } => {
+            client.send(Message::FsDelete { request_id, paths }).await?;
         }
         AdeCmd::CopyPaths {
             request_id,

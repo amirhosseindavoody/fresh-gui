@@ -2,6 +2,7 @@
 
 use gpui_kit::component::GlobalState;
 use gpui_kit::{App, KeyBinding, Menu, MenuItem, actions};
+use serde::Deserialize;
 
 /// File menu: stop the local daemon, or leave it running and close the window.
 pub fn install_menus(cx: &mut App) {
@@ -28,6 +29,7 @@ actions!(
         ToggleCommandPalette,
         GoToFile,
         OpenSettings,
+        OpenDefaultSettings,
         Reconnect,
         Disconnect,
         NextTab,
@@ -45,23 +47,52 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys(vec![
-        KeyBinding::new("ctrl-t", NewTerminal, None),
-        KeyBinding::new("ctrl-w", CloseTab, None),
-        KeyBinding::new("ctrl-s", SaveBuffer, None),
-        KeyBinding::new("ctrl-b", ToggleSidebar, None),
-        KeyBinding::new("ctrl-shift-p", ToggleCommandPalette, None),
-        KeyBinding::new("ctrl-p", GoToFile, None),
-        KeyBinding::new("ctrl-,", OpenSettings, None),
-        KeyBinding::new("ctrl-tab", NextTab, None),
-        KeyBinding::new("ctrl-shift-tab", PrevTab, None),
-        KeyBinding::new("ctrl-shift-r", Reconnect, None),
-        KeyBinding::new("ctrl-c", CopyExplorer, Some("Explorer")),
-        KeyBinding::new("cmd-c", CopyExplorer, Some("Explorer")),
-        KeyBinding::new("ctrl-v", PasteExplorer, Some("Explorer")),
-        KeyBinding::new("cmd-v", PasteExplorer, Some("Explorer")),
-        KeyBinding::new("ctrl-f", FilterExplorer, Some("Explorer")),
-        KeyBinding::new("cmd-f", FilterExplorer, Some("Explorer")),
-        KeyBinding::new("escape", ClearExplorerInput, Some("Explorer")),
-    ]);
+    #[derive(Deserialize)]
+    struct Defaults {
+        shortkeys: Vec<Shortkey>,
+    }
+    #[derive(Deserialize)]
+    struct Shortkey {
+        action: String,
+        shortkey: String,
+        when: Option<String>,
+    }
+    let defaults: Defaults = jsonc_parser::parse_to_serde_value(
+        include_str!("../../../fresh-gui/defaults/config.default.jsonc"),
+        &jsonc_parser::ParseOptions::default(),
+    )
+    .expect("embedded default shortkeys must parse");
+    let bindings = defaults.shortkeys.iter().filter_map(|entry| {
+        let key = entry.shortkey.as_str();
+        let when = entry.when.as_deref();
+        let binding = match entry.action.as_str() {
+            "NewTerminal" => KeyBinding::new(key, NewTerminal, when),
+            "CloseTab" => KeyBinding::new(key, CloseTab, when),
+            "SaveBuffer" => KeyBinding::new(key, SaveBuffer, when),
+            "ToggleSidebar" => KeyBinding::new(key, ToggleSidebar, when),
+            "ToggleCommandPalette" => KeyBinding::new(key, ToggleCommandPalette, when),
+            "GoToFile" => KeyBinding::new(key, GoToFile, when),
+            "OpenSettings" => KeyBinding::new(key, OpenSettings, when),
+            "OpenDefaultSettings" => KeyBinding::new(key, OpenDefaultSettings, when),
+            "Reconnect" => KeyBinding::new(key, Reconnect, when),
+            "Disconnect" => KeyBinding::new(key, Disconnect, when),
+            "NextTab" => KeyBinding::new(key, NextTab, when),
+            "PrevTab" => KeyBinding::new(key, PrevTab, when),
+            "CopyExplorer" => KeyBinding::new(key, CopyExplorer, when),
+            "PasteExplorer" => KeyBinding::new(key, PasteExplorer, when),
+            "FilterExplorer" => KeyBinding::new(key, FilterExplorer, when),
+            "ClearExplorerInput" => KeyBinding::new(key, ClearExplorerInput, when),
+            "NewWorkspace" => KeyBinding::new(key, NewWorkspace, when),
+            "RenameWorkspace" => KeyBinding::new(key, RenameWorkspace, when),
+            "CloseWorkspace" => KeyBinding::new(key, CloseWorkspace, when),
+            "StopServer" => KeyBinding::new(key, StopServer, when),
+            "QuitClient" => KeyBinding::new(key, QuitClient, when),
+            unknown => {
+                tracing::warn!(action = unknown, "unknown default shortkey action");
+                return None;
+            }
+        };
+        Some(binding)
+    });
+    cx.bind_keys(bindings);
 }

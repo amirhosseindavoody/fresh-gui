@@ -2,7 +2,7 @@
 
 #![allow(clippy::result_large_err)] // ADE `Message` is the shared error envelope.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -97,6 +97,10 @@ async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) ->
 
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (mut sink, mut stream) = socket.split();
+    let defaults_path = std::env::temp_dir().join(format!(
+        "fresh-gui-defaults-{}.jsonc",
+        uuid::Uuid::new_v4()
+    ));
 
     let mut caps = Hello::default_backend_caps();
     if state.editor.is_none() {
@@ -122,6 +126,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     };
     let mut hello = Hello::backend(format!("fresh-gui/{}", env!("CARGO_PKG_VERSION")), caps);
     hello.config_path = Some(state.config_path.display().to_string());
+    hello.defaults_path = Some(defaults_path.display().to_string());
     hello.ui = Some(ui);
     let hello = Message::Hello(hello);
     if send_msg(&mut sink, &hello).await.is_err() {
@@ -168,6 +173,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 if let Err(resp) = handle_client_msg(
                     msg,
                     &state,
+                    &defaults_path,
                     &mut authed,
                     &mut session_id,
                     out_tx.clone(),
@@ -184,12 +190,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     if let Some(sid) = session_id {
         state.sessions.detach_subscriber(&sid).await;
     }
+    let _ = std::fs::remove_file(&defaults_path);
     info!("websocket client disconnected");
 }
 
 async fn handle_client_msg(
     msg: Message,
     state: &AppState,
+    defaults_path: &Path,
     authed: &mut bool,
     session_id: &mut Option<String>,
     out_tx: mpsc::UnboundedSender<Message>,
@@ -614,6 +622,23 @@ async fn handle_client_msg(
         }
         Message::FsDelete { request_id, paths } => {
             require_auth(*authed)?;
+            if paths.len() == 1 && Path::new(&paths[0]) == defaults_path {
+                match std::fs::remove_file(defaults_path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(Message::Error {
+                        code: "fs_delete_failed".into(),
+                        message: format!("{request_id}: {err}"),
+                    }),
+                }
+                send_msg(sink, &Message::FsDeleted { request_id, paths })
+                    .await
+                    .map_err(|_| Message::Error {
+                        code: "send_failed".into(),
+                        message: "failed to send FsDeleted".into(),
+                    })?;
+                return Ok(());
+            }
             match state.fs_root.delete_paths(&paths).await {
                 Ok(paths) => {
                     send_msg(sink, &Message::FsDeleted { request_id, paths })
@@ -645,12 +670,13 @@ async fn handle_client_msg(
                     message: format!("{request_id}: editor capability not available"),
                 });
             };
-            let resolved = resolve_editor_open(state, &path, cwd.as_deref(), line, column)
-                .await
-                .map_err(|err| Message::Error {
-                    code: "editor_open_failed".into(),
-                    message: format!("{request_id}: {err:#}"),
-                })?;
+            let resolved =
+                resolve_editor_open(state, defaults_path, &path, cwd.as_deref(), line, column)
+                    .await
+                    .map_err(|err| Message::Error {
+                        code: "editor_open_failed".into(),
+                        message: format!("{request_id}: {err:#}"),
+                    })?;
             reply_editor_opened(
                 sink,
                 editor,
@@ -1273,6 +1299,7 @@ async fn mirror_workspace_layout(state: &AppState, update: Option<(String, Strin
 /// terminal cwds).
 async fn resolve_editor_open(
     state: &AppState,
+    defaults_path: &Path,
     path: &str,
     cwd: Option<&str>,
     line: Option<u32>,
@@ -1281,6 +1308,15 @@ async fn resolve_editor_open(
     let (path_part, parsed_line, parsed_col) = fresh::input::quick_open::parse_path_line_col(path);
     let line = line.or(parsed_line.map(|n| n as u32));
     let column = column.or(parsed_col.map(|n| n as u32));
+
+    if Path::new(&path_part) == defaults_path {
+        std::fs::write(defaults_path, crate::config::DEFAULT_CONFIG_TEMPLATE)?;
+        return Ok(crate::path_open::ResolvedOpen {
+            path: defaults_path.to_path_buf(),
+            line,
+            column,
+        });
+    }
 
     if Config::path_matches(&state.config_path, &path_part)
         || path_part == state.config_path.display().to_string()

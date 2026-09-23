@@ -33,6 +33,9 @@ pub struct Hello {
     /// Absolute path to the backend `config.json` (settings file). Backend only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_path: Option<String>,
+    /// Per-connection temporary path for the documented defaults view. Backend only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defaults_path: Option<String>,
     /// Host UI prefs snapshot from that config (theme / fonts / webgl). Backend only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<HelloUi>,
@@ -683,6 +686,7 @@ impl Hello {
             implementation: implementation.into(),
             capabilities,
             config_path: None,
+            defaults_path: None,
             ui: None,
         }
     }
@@ -694,6 +698,7 @@ impl Hello {
             implementation: implementation.into(),
             capabilities,
             config_path: None,
+            defaults_path: None,
             ui: None,
         }
     }
