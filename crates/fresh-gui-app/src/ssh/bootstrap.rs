@@ -262,7 +262,7 @@ pub fn bootstrap(
 }
 
 pub fn start_command(binary: &str, remote_root: Option<&str>) -> String {
-    let mut cmd = String::from("FRESH_GUI_QUIET=1 ");
+    let mut cmd = String::from("env FRESH_GUI_QUIET=1 ");
     if binary == INSTALLED_BIN {
         cmd.push_str("\"$HOME/.local/bin/fresh-gui\"");
     } else {
@@ -407,7 +407,7 @@ pub(crate) fn ssh_command_args(target: &SshTarget, remote_cmd: &str) -> Vec<Stri
     let mut args = common_opts(target, "-p");
     args.push("-T".into());
     args.push(target.destination.clone());
-    args.push(remote_cmd.to_string());
+    args.push(format!("sh -c {}", probe::shell_single_quote(remote_cmd)));
     args
 }
 
@@ -769,11 +769,11 @@ fi
     fn start_command_quotes_root_and_uses_home_bin() {
         assert_eq!(
             start_command(INSTALLED_BIN, Some("/work/o'brien")),
-            "FRESH_GUI_QUIET=1 \"$HOME/.local/bin/fresh-gui\" --no-ui --json --root '/work/o'\\''brien'"
+            "env FRESH_GUI_QUIET=1 \"$HOME/.local/bin/fresh-gui\" --no-ui --json --root '/work/o'\\''brien'"
         );
         assert_eq!(
             start_command("/opt/bin/fresh-gui", None),
-            "FRESH_GUI_QUIET=1 '/opt/bin/fresh-gui' --no-ui --json"
+            "env FRESH_GUI_QUIET=1 '/opt/bin/fresh-gui' --no-ui --json"
         );
     }
 
@@ -785,7 +785,9 @@ fi
         assert!(args.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
         assert!(args.windows(2).any(|w| w == ["-p", "2222"]));
         assert_eq!(args[args.len() - 2], "ada@lab");
-        assert_eq!(args.last().unwrap(), "echo hi");
+        assert_eq!(args.last().unwrap(), "sh -c 'echo hi'");
+        let quoted = ssh_command_args(&t, "echo 'hi'");
+        assert_eq!(quoted.last().unwrap(), "sh -c 'echo '\\''hi'\\'''");
         assert!(!args.iter().any(|a| a.contains("token")));
         let scp = scp_args(&t, Path::new("/tmp/fresh-gui"));
         assert!(scp.windows(2).any(|w| w == ["-P", "2222"]));
