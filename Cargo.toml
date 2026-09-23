@@ -17,7 +17,7 @@ default-members = [
 exclude = ["vendor/fresh"]
 
 [workspace.package]
-version = "2026.923.3"
+version = "2026.923.4"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/amirhosseindavoody/fresh-gui"
