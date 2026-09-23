@@ -290,16 +290,12 @@ pub fn parse_porcelain_z(bytes: &[u8]) -> Status {
         }
         let xy = String::from_utf8_lossy(&rec[..2]).into_owned();
         let path = String::from_utf8_lossy(&rec[3..]).into_owned();
-        let renamed = xy.starts_with('R') || xy.starts_with('C');
-        let path = if renamed {
-            records
-                .next()
-                .map(|next| String::from_utf8_lossy(next).into_owned())
-                .filter(|next| !next.is_empty())
-                .unwrap_or(path)
-        } else {
-            path
-        };
+        // With -z, Git emits the destination first and the source as a
+        // separate NUL-terminated record. The destination is the file to
+        // show and the path accepted by git diff/stage.
+        if xy.contains(['R', 'C']) {
+            records.next();
+        }
         if path.is_empty() {
             continue;
         }
@@ -340,7 +336,7 @@ fn git(cwd: &Path, args: &[&str], timeout: Duration) -> Result<Output> {
 
     let mut child = Command::new("git")
         .arg("-C")
-        .arg(cwd)
+        .arg(git_cwd(cwd))
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never")
@@ -390,6 +386,33 @@ fn git(cwd: &Path, args: &[&str], timeout: Duration) -> Result<Output> {
     })
 }
 
+fn git_cwd(cwd: &Path) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(path) = cwd.to_str().and_then(git_windows_path) {
+        return PathBuf::from(path);
+    }
+    cwd.to_path_buf()
+}
+
+/// Rust's Windows `canonicalize` returns verbatim paths. Git for Windows does
+/// not accept those as a `-C` directory, so pass the equivalent Win32 path.
+#[cfg(any(test, windows))]
+fn git_windows_path(path: &str) -> Option<String> {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        return Some(format!(r"\\{rest}"));
+    }
+    let rest = path.strip_prefix(r"\\?\")?;
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'\\'
+    {
+        return Some(rest.to_string());
+    }
+    None
+}
+
 fn floor_char_boundary(bytes: &[u8], mut index: usize) -> usize {
     if index >= bytes.len() {
         return bytes.len();
@@ -406,7 +429,8 @@ mod tests {
 
     #[test]
     fn porcelain_parses_branch_and_renames() {
-        let raw = b"## main...origin/main [ahead 1, behind 2]\0 M src/a.rs\0A  src/b.rs\0?? new file.txt\0R  old.rs\0new.rs\0";
+        // In porcelain -z output, the destination precedes the source.
+        let raw = b"## main...origin/main [ahead 1, behind 2]\0 M src/a.rs\0A  src/b.rs\0?? new file.txt\0R  new.rs\0old.rs\0";
         let status = parse_porcelain_z(raw);
         assert_eq!(status.branch, "main");
         assert_eq!(status.upstream.as_deref(), Some("origin/main"));
@@ -418,6 +442,43 @@ mod tests {
         assert_eq!(status.files[2].path, "new file.txt");
         assert_eq!(status.files[3].path, "new.rs");
         assert_eq!(status.files[3].xy, "R ");
+    }
+
+    #[test]
+    fn porcelain_keeps_literal_paths_and_skips_rename_sources() {
+        let raw = concat!(
+            "## feature\0 M dir/back\\slash ü.txt\0",
+            " R moved name.txt\0old name.txt\0",
+            "C  copied.txt\0original.txt\0?? last.txt\0",
+        );
+        let status = parse_porcelain_z(raw.as_bytes());
+        assert_eq!(status.branch, "feature");
+        assert_eq!(status.files.len(), 4);
+        assert_eq!(status.files[0].path, "dir/back\\slash ü.txt");
+        assert_eq!(status.files[1].path, "moved name.txt");
+        assert_eq!(status.files[2].path, "copied.txt");
+        assert_eq!(status.files[3].path, "last.txt");
+    }
+
+    #[test]
+    fn porcelain_empty_repository_has_no_files() {
+        let status = parse_porcelain_z(b"## No commits yet on main\0");
+        assert!(status.files.is_empty());
+        assert!(status.repo);
+    }
+
+    #[test]
+    fn windows_git_paths_drop_only_verbatim_prefixes() {
+        assert_eq!(
+            git_windows_path(r"\\?\C:\Users\Ada\repo"),
+            Some(r"C:\Users\Ada\repo".into())
+        );
+        assert_eq!(
+            git_windows_path(r"\\?\UNC\server\share\repo"),
+            Some(r"\\server\share\repo".into())
+        );
+        assert_eq!(git_windows_path(r"C:\Users\Ada\repo"), None);
+        assert_eq!(git_windows_path(r"\\?\Volume{abc}\repo"), None);
     }
 
     #[test]
@@ -437,6 +498,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fresh-gui-git-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        let outside = status(&dir).unwrap();
+        assert!(!outside.repo, "{outside:?}");
+        assert!(outside.files.is_empty());
+        assert_eq!(outside.detail.as_deref(), Some("not a git repository"));
         assert!(
             Command::new("git")
                 .arg("-C")
@@ -446,12 +511,39 @@ mod tests {
                 .unwrap()
                 .success()
         );
+        let empty = status(&dir).unwrap();
+        assert!(empty.repo, "{empty:?}");
+        assert!(empty.files.is_empty(), "{empty:?}");
         std::fs::write(dir.join("note.txt"), "hello\n").unwrap();
-        let status = status(&dir).unwrap();
-        assert!(status.repo, "{status:?}");
+        let dirty = status(&dir).unwrap();
+        assert!(dirty.repo, "{dirty:?}");
         assert!(
-            status.files.iter().any(|file| file.path == "note.txt"),
-            "{status:?}"
+            dirty.files.iter().any(|file| file.path == "note.txt" && file.xy == "??"),
+            "{dirty:?}"
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["add", "--", "note.txt"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let staged = status(&dir).unwrap();
+        assert!(
+            staged.files.iter().any(|file| file.path == "note.txt" && file.xy == "A "),
+            "{staged:?}"
+        );
+        std::fs::create_dir(dir.join("subdir")).unwrap();
+        let nested = status(&dir.join("subdir")).unwrap();
+        assert!(nested.repo, "{nested:?}");
+        assert_eq!(nested.files, staged.files);
+        std::fs::write(dir.join("note.txt"), "hello again\n").unwrap();
+        let both = status(&dir).unwrap();
+        assert!(
+            both.files.iter().any(|file| file.path == "note.txt" && file.xy == "AM"),
+            "{both:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
