@@ -18,6 +18,8 @@ curl -fsSL https://raw.githubusercontent.com/amirhosseindavoody/fresh-gui/main/s
 
 The installers download the latest [GitHub Release](https://github.com/amirhosseindavoody/fresh-gui/releases), check published SHA-256 files when available, and put the app and daemon in `~/.fresh-gui/bin` (Windows: `%USERPROFILE%\.fresh-gui\bin`). Open a new terminal after installation so `fresh-gui` is on your `PATH`. There is no macOS release.
 
+If a local daemon is running during an update, the installer asks before stopping it. For an unattended update, set `FRESH_GUI_STOP_DAEMON=1` to approve stopping it; without a console or that setting, the update stops before replacing binaries. The Windows script also accepts `-StopDaemon` when run from a file.
+
 On Linux, the desktop app needs an X11 or Wayland session, fontconfig, and Vulkan. The published Linux client needs glibc 2.39 or newer.
 
 ## Open locally
@@ -39,7 +41,7 @@ From your Windows or Linux laptop:
 fresh-gui user@host
 ```
 
-The app installs the Linux daemon on the server if needed, starts or reuses its session, opens an SSH tunnel, and shows the desktop window on your laptop. Set up OpenSSH keys or an agent first: `ssh user@host` must work without a password prompt.
+The app installs the Linux daemon on the server if needed, starts or reuses its session, opens an SSH tunnel, and shows the desktop window on your laptop. If the local client is newer than the remote daemon, it asks before stopping the remote session and installing a matching daemon. Run the command in an interactive terminal to approve the upgrade. Set up OpenSSH keys or an agent first: `ssh user@host` must work without a password prompt.
 
 For a server you visit often, save it:
 

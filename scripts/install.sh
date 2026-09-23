@@ -24,6 +24,7 @@
 #   FRESH_GUI_LIBC            gnu (default) | musl  — Linux daemon libc.
 #                             Alpine is detected as musl. The GPUI client is
 #                             published for gnu only.
+#   FRESH_GUI_STOP_DAEMON     1 stops a running local daemon without prompting.
 #   FRESH_GUI_ARCH            override uname -m (only x86_64 is published)
 #   FRESH_GUI_OS              override uname -s (Linux, Darwin, MINGW*, MSYS*)
 #   FRESH_GUI_DRY_RUN         any non-empty value prints the plan and exits
@@ -70,6 +71,16 @@ main() {
   os=$(detect_os) || exit 1
   arch=$(detect_arch) || exit 1
   libc=$(detect_libc) || exit 1
+  glibc_version=$(detect_glibc_version)
+  if [ "$os" = Linux ] && [ "$want_client" -eq 1 ] && [ "$libc" = gnu ] && version_lt "$glibc_version" 2.39; then
+    if [ "$want_daemon" -eq 1 ]; then
+      echo "note: the GPUI client requires glibc >= 2.39 (detected ${glibc_version:-unknown}); skipping the client." >&2
+      want_client=0
+    else
+      echo "error: the GPUI client requires glibc >= 2.39 (detected ${glibc_version:-unknown})." >&2
+      exit 1
+    fi
+  fi
   target=$(select_target "$os" "$arch" "$libc") || exit 1
   ext=$(archive_ext "$target")
 
@@ -135,20 +146,16 @@ main() {
   fi
   got_client=0
   got_daemon=0
-  # Client archive members are `fresh-gui-app` on current releases and
-  # `fresh-gui` once package-client.sh renames the host. Install that file
-  # as `fresh-gui` either way, and keep a `fresh-gui-app` name for old notes.
+  # Package names inside older archives varied; the installed command is always fresh-gui.
   if [ "$want_client" -eq 1 ]; then
     if [ "$ext" = "zip" ]; then
       if install_named "$client_url" "$work/client" "fresh-gui.exe" "$bin_dir" "$ext" "$optional" \
         fresh-gui-app.exe fresh-gui.exe; then
         got_client=1
-        link_same "${bin_dir}/fresh-gui.exe" "${bin_dir}/fresh-gui-app.exe"
       fi
     elif install_named "$client_url" "$work/client" "fresh-gui" "$bin_dir" "$ext" "$optional" \
       fresh-gui-app fresh-gui; then
       got_client=1
-      link_same "${bin_dir}/fresh-gui" "${bin_dir}/fresh-gui-app"
     fi
   fi
   if [ "$want_daemon" -eq 1 ]; then
@@ -180,6 +187,8 @@ main() {
     echo "error: no fresh-gui archive from this release could be installed." >&2
     exit 1
   fi
+  # Remove the compatibility name left by older installer versions.
+  rm -f "${bin_dir}/fresh-gui-app" "${bin_dir}/fresh-gui-app.exe"
 
   echo "Installed into '${bin_dir}'."
 
@@ -191,6 +200,74 @@ main() {
   fi
 
   print_next_steps "$got_client" "$got_daemon" "$os"
+}
+
+# Ask before replacing an installed daemon while its per-user session is live.
+# Match the product's session.json path and pid liveness check, then use its
+# close command to stop paired and daemon-only installs.
+stop_running_local_daemon() {
+  install_bin_dir=$1
+  runtime_dir="${XDG_RUNTIME_DIR:-/tmp/fresh-gui-$(id -u)}"
+  meta_file="$runtime_dir/fresh-gui/session.json"
+  [ -n "${XDG_RUNTIME_DIR:-}" ] || meta_file="$runtime_dir/session.json"
+  [ -f "$meta_file" ] || return 0
+  running_pid=$(sed -nE 's/.*"pid"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$meta_file" | awk 'NR == 1 { print; exit }')
+  case "$running_pid" in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+  kill -0 "$running_pid" 2>/dev/null || return 0
+
+  running_bin=""
+  for candidate in "$install_bin_dir/fresh-gui-daemon" "$install_bin_dir/fresh-gui"; do
+    if [ -x "$candidate" ]; then
+      running_bin=$candidate
+      break
+    fi
+  done
+  if [ -z "$running_bin" ]; then
+    for command_name in fresh-gui-daemon fresh-gui; do
+      running_bin=$(command -v "$command_name" 2>/dev/null || true)
+      [ -n "$running_bin" ] && break
+    done
+  fi
+  if [ -z "$running_bin" ]; then
+    echo "error: a fresh-gui daemon session (pid $running_pid) is running, but no fresh-gui command was found to stop it. Stop it manually, then retry the install." >&2
+    return 1
+  fi
+
+  echo "A local fresh-gui daemon session (pid $running_pid) is running. Updating requires stopping it." >&2
+  if [ "${FRESH_GUI_STOP_DAEMON:-}" = 1 ]; then
+    answer=yes
+  elif [ -t 0 ] || [ -t 1 ] || [ -t 2 ]; then
+    if ! printf '%s\n' "Stop the daemon before continuing? [y/N] " >/dev/tty; then
+      echo "error: cannot open the interactive console. Stop it manually or rerun with FRESH_GUI_STOP_DAEMON=1." >&2
+      return 1
+    fi
+    IFS= read -r answer </dev/tty || answer=""
+  else
+    echo "error: no interactive console is available. Stop it manually with '$running_bin close', or rerun with FRESH_GUI_STOP_DAEMON=1." >&2
+    return 1
+  fi
+  case "$answer" in
+    y | Y | yes | YES | Yes) ;;
+    *)
+      echo "error: install cancelled; the running daemon was left untouched." >&2
+      return 1
+      ;;
+  esac
+  if ! "$running_bin" close; then
+    echo "error: could not stop the running fresh-gui daemon; install cancelled." >&2
+    return 1
+  fi
+  attempts=0
+  while kill -0 "$running_pid" 2>/dev/null && [ "$attempts" -lt 20 ]; do
+    sleep 0.1
+    attempts=$((attempts + 1))
+  done
+  if kill -0 "$running_pid" 2>/dev/null; then
+    echo "error: fresh-gui daemon is still running; install cancelled." >&2
+    return 1
+  fi
 }
 
 detect_os() {
@@ -235,6 +312,11 @@ detect_libc() {
     printf '%s\n' musl
     return
   fi
+  glibc_version=$(detect_glibc_version)
+  if [ -n "$glibc_version" ] && version_lt "$glibc_version" 2.31; then
+    printf '%s\n' musl
+    return
+  fi
   if command -v ldd >/dev/null 2>&1; then
     ldd_out=$(ldd --version 2>&1 || true)
     case "$ldd_out" in
@@ -245,6 +327,20 @@ detect_libc() {
     esac
   fi
   printf '%s\n' gnu
+}
+
+# Parse glibc's own version from ldd output. On systems without ldd or where
+# its output is not recognizable, return empty so explicit libc selection can
+# still be used and we do not invent a version.
+detect_glibc_version() {
+  command -v ldd >/dev/null 2>&1 || return 0
+  ldd_out=$(ldd --version 2>&1 || true)
+  printf '%s\n' "$ldd_out" | sed -nE 's/.*[Gg][Ll][Ii][Bb][Cc][^0-9]*([0-9]+\.[0-9]+).*/\1/p; t; s/.*[^0-9]([0-9]+\.[0-9]+)([^0-9].*)?$/\1/p' | awk 'NR == 1 { print; exit }'
+}
+
+version_lt() {
+  [ -n "$1" ] || return 1
+  awk -v a="$1" -v b="$2" 'BEGIN { split(a,x,"."); split(b,y,"."); exit !((x[1]+0 < y[1]+0) || (x[1]+0 == y[1]+0 && x[2]+0 < y[2]+0)) }'
 }
 
 select_target() {
@@ -537,29 +633,22 @@ install_named() {
     echo "error: archive does not contain any of: $*" >&2
     exit 1
   fi
+  # Run only once the archive is ready and immediately before the first
+  # replacement, so any session started while downloading is caught too.
+  stop_running_local_daemon "$dest_dir" || exit 1
   mkdir -p "$dest_dir"
   tmp_dest="${dest_dir}/${dest_base}.partial"
-  cp "$src" "$tmp_dest"
-  chmod 755 "$tmp_dest"
-  mv -f "$tmp_dest" "${dest_dir}/${dest_base}"
+  if ! cp "$src" "$tmp_dest"; then
+    rm -f "$tmp_dest"
+    echo "error: could not copy the binary into '${dest_dir}' (possibly disk quota exceeded). Free space or change FRESH_GUI_HOME, then retry." >&2
+    exit 1
+  fi
+  if ! chmod 755 "$tmp_dest" || ! mv -f "$tmp_dest" "${dest_dir}/${dest_base}"; then
+    rm -f "$tmp_dest"
+    echo "error: could not install binary into '${dest_dir}'. Free space or change FRESH_GUI_HOME, then retry." >&2
+    exit 1
+  fi
   echo "Installed ${dest_dir}/${dest_base}"
-}
-
-# Second name for the same bytes (hardlink, or a copy when links are refused).
-link_same() {
-  src=$1
-  dest=$2
-  if [ "$src" = "$dest" ] || [ ! -f "$src" ]; then
-    return 0
-  fi
-  rm -f "$dest"
-  if ln "$src" "$dest" 2>/dev/null; then
-    echo "Installed ${dest}"
-    return 0
-  fi
-  cp "$src" "$dest"
-  chmod 755 "$dest"
-  echo "Installed ${dest}"
 }
 
 update_shell_file() {

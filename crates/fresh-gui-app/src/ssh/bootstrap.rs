@@ -1,7 +1,7 @@
 //! Connect path: probe → maybe SCP the Linux daemon → start headless → tunnel.
 
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{self, IsTerminal, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -115,6 +115,7 @@ const GITHUB_LATEST: &str =
     "https://api.github.com/repos/amirhosseindavoody/fresh-gui/releases/latest";
 
 const INSTALLED_BIN: &str = "$HOME/.local/bin/fresh-gui";
+const FINISH_INSTALL: &str = "chmod 755 \"$HOME/.local/bin/fresh-gui.partial\" && mv -f \"$HOME/.local/bin/fresh-gui.partial\" \"$HOME/.local/bin/fresh-gui\"";
 
 pub fn bootstrap(
     target: &SshTarget,
@@ -134,46 +135,93 @@ pub fn bootstrap(
     let mut probe = ssh_probe(target, tools)?;
     let mut start_output = None;
 
+    if probe.installed {
+        let remote_version = probe.version.as_deref().context(
+            "remote fresh-gui did not report a version; run `fresh-gui --version` on the server",
+        )?;
+        if compare_versions(env!("CARGO_PKG_VERSION"), remote_version)?
+            == std::cmp::Ordering::Greater
+        {
+            consent_to_upgrade(&target.destination, remote_version)?;
+            log("Downloading the matching Linux daemon before stopping the remote session…");
+            let libc = remote_libc(target, tools)?;
+            let url = release_daemon_url(env!("CARGO_PKG_VERSION"), libc);
+            let binary = materialize_daemon(
+                &DaemonSource {
+                    path: None,
+                    url: Some(url),
+                },
+                tools,
+                &mut log,
+            )?;
+            if probe.running {
+                let old_bin = probe
+                    .binary
+                    .as_deref()
+                    .context("remote probe has no binary path")?;
+                log("Stopping the remote fresh-gui session…");
+                ssh_simple(
+                    target,
+                    tools,
+                    &format!("{} close", probe::shell_single_quote(old_bin)),
+                )?;
+                if ssh_probe(target, tools)?.running {
+                    bail!("remote fresh-gui session is still running after close; upgrade cancelled");
+                }
+            }
+            log("Installing the matching Linux daemon…");
+            ssh_simple(target, tools, "mkdir -p \"$HOME/.local/bin\"")?;
+            scp_binary(target, tools, &binary)?;
+            ssh_simple(target, tools, FINISH_INSTALL)?;
+            probe = ssh_probe(target, tools)?;
+            if probe.version.as_deref() != Some(env!("CARGO_PKG_VERSION")) {
+                bail!(
+                    "remote daemon version after upgrade does not match this client ({})",
+                    env!("CARGO_PKG_VERSION")
+                );
+            }
+            if probe.running {
+                bail!("remote session remained running during the daemon upgrade; reconnect after stopping it");
+            }
+        }
+    }
+
     if !probe.installed {
         log("Remote fresh-gui is not installed.");
         let binary = materialize_daemon(daemon, tools, &mut log)?;
         log("Copying the Linux daemon to ~/.local/bin/fresh-gui…");
         ssh_simple(target, tools, "mkdir -p \"$HOME/.local/bin\"")?;
         scp_binary(target, tools, &binary)?;
-        ssh_simple(target, tools, "chmod 755 \"$HOME/.local/bin/fresh-gui\"")?;
+        ssh_simple(target, tools, FINISH_INSTALL)?;
         log("Starting headless fresh-gui…");
-        start_output = Some(ssh_simple(
+        start_output = Some(ssh_start(
             target,
             tools,
             &start_command(INSTALLED_BIN, target.remote_root.as_deref()),
         )?);
-        probe = ssh_probe(target, tools)?;
+        probe = probe_after_start(target, tools)?;
     } else if !probe.running {
         let bin = probe
             .binary
             .clone()
             .context("remote fresh-gui is installed but the probe did not report its path")?;
         log("Remote fresh-gui is installed but no session is running. Starting it…");
-        start_output = Some(ssh_simple(
+        start_output = Some(ssh_start(
             target,
             tools,
             &start_command(&bin, target.remote_root.as_deref()),
         )?);
-        probe = ssh_probe(target, tools)?;
+        probe = probe_after_start(target, tools)?;
     } else {
         log("Remote fresh-gui session is already running.");
     }
 
     if !probe.running {
-        let mut detail = String::from(
-            "remote fresh-gui is not running after start. On the server, see ~/.local/state/fresh-gui/fresh-gui.log",
-        );
+        let mut detail = String::from("remote fresh-gui is not running after start.");
+        append_remote_log(&mut detail, target, tools);
         if let Some(output) = start_output {
-            let stdout = tail_redacted(&output.stdout);
             let stderr = tail_redacted(&output.stderr);
-            if !stdout.is_empty() || !stderr.is_empty() {
-                detail.push_str("\n--- start stdout ---\n");
-                detail.push_str(&stdout);
+            if !stderr.is_empty() {
                 detail.push_str("\n--- start stderr ---\n");
                 detail.push_str(&stderr);
             }
@@ -214,13 +262,13 @@ pub fn bootstrap(
 }
 
 pub fn start_command(binary: &str, remote_root: Option<&str>) -> String {
-    let mut cmd = String::from("exec ");
+    let mut cmd = String::from("FRESH_GUI_QUIET=1 ");
     if binary == INSTALLED_BIN {
         cmd.push_str("\"$HOME/.local/bin/fresh-gui\"");
     } else {
         cmd.push_str(&probe::shell_single_quote(binary));
     }
-    cmd.push_str(" --no-ui");
+    cmd.push_str(" --no-ui --json");
     if let Some(root) = remote_root.map(str::trim).filter(|s| !s.is_empty()) {
         cmd.push_str(" --root ");
         cmd.push_str(&probe::shell_single_quote(root));
@@ -235,6 +283,14 @@ fn ssh_probe(target: &SshTarget, tools: &Toolchain) -> Result<Probe> {
     probe::parse_probe(&String::from_utf8_lossy(&output.stdout))
 }
 
+fn probe_after_start(target: &SshTarget, tools: &Toolchain) -> Result<Probe> {
+    ssh_probe(target, tools).map_err(|error| {
+        let mut detail = format!("remote session check after start failed: {error:#}");
+        append_remote_log(&mut detail, target, tools);
+        anyhow::anyhow!(detail)
+    })
+}
+
 fn ssh_simple(
     target: &SshTarget,
     tools: &Toolchain,
@@ -244,6 +300,91 @@ fn ssh_simple(
     let output = run_capturing(&tools.ssh, &args, None)?;
     ensure_success("ssh", &output)?;
     Ok(output)
+}
+
+fn ssh_start(target: &SshTarget, tools: &Toolchain, remote_cmd: &str) -> Result<std::process::Output> {
+    let output = run_capturing(&tools.ssh, &ssh_command_args(target, remote_cmd), None)?;
+    if !output.status.success() {
+        let mut detail = format!("remote fresh-gui start failed ({})", output.status);
+        append_remote_log(&mut detail, target, tools);
+        let stderr = tail_redacted(&output.stderr);
+        if !stderr.is_empty() {
+            detail.push_str("\n--- start stderr ---\n");
+            detail.push_str(&stderr);
+        }
+        bail!(detail);
+    }
+    Ok(output)
+}
+
+fn append_remote_log(detail: &mut String, target: &SshTarget, tools: &Toolchain) {
+    let command = "log=\"${XDG_STATE_HOME:-$HOME/.local/state}/fresh-gui/fresh-gui.log\"; printf '\\nFRESH_GUI_LOG_BEGIN\\n'; if [ -f \"$log\" ]; then tail -n 80 \"$log\"; else printf 'No daemon log at %s\\n' \"$log\"; fi; printf '\\nFRESH_GUI_LOG_END\\n'";
+    if let Ok(output) = ssh_simple(target, tools, command) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some((_, rest)) = stdout.rsplit_once("FRESH_GUI_LOG_BEGIN\n") {
+            if let Some((log, _)) = rest.split_once("\nFRESH_GUI_LOG_END") {
+                detail.push_str("\n--- remote daemon log ---\n");
+                detail.push_str(&probe::redact_secrets(log));
+            }
+        }
+    }
+}
+
+fn parse_version(version: &str) -> Result<Vec<u64>> {
+    let value = version.trim().trim_start_matches('v');
+    let parts: Vec<u64> = value.split('.').map(str::parse).collect::<std::result::Result<_, _>>()
+        .with_context(|| format!("invalid fresh-gui version {version:?}"))?;
+    if parts.len() < 2 || parts.len() > 3 {
+        bail!("invalid fresh-gui version {version:?}");
+    }
+    Ok(parts)
+}
+
+fn compare_versions(local: &str, remote: &str) -> Result<std::cmp::Ordering> {
+    let mut local = parse_version(local)?;
+    let mut remote = parse_version(remote)?;
+    local.resize(3, 0);
+    remote.resize(3, 0);
+    Ok(local.cmp(&remote))
+}
+
+fn consent_to_upgrade(destination: &str, remote_version: &str) -> Result<()> {
+    let local_version = env!("CARGO_PKG_VERSION");
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        bail!("remote fresh-gui on {destination} is {remote_version}, but this client is {local_version}. An upgrade is required. Re-run in an interactive terminal to approve stopping the remote session and installing the matching daemon.");
+    }
+    eprint!("Remote fresh-gui on {destination} is {remote_version}; this client is {local_version}. Stop the remote session, install the matching Linux daemon, and reconnect? [y/N] ");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        bail!("remote upgrade declined; connection cancelled");
+    }
+    Ok(())
+}
+
+fn remote_libc(target: &SshTarget, tools: &Toolchain) -> Result<&'static str> {
+    let output = ssh_simple(target, tools, "printf 'FRESH_GUI_ARCH=%s\\n' \"$(uname -m)\"; if [ -f /etc/alpine-release ]; then printf 'FRESH_GUI_LDD=musl\\n'; else printf 'FRESH_GUI_LDD=%s\\n' \"$(ldd --version 2>&1 | head -n 1)\"; fi")?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let arch = text.lines().rev().find_map(|line| line.strip_prefix("FRESH_GUI_ARCH="))
+        .context("remote architecture check returned no marker")?;
+    if arch != "x86_64" && arch != "amd64" {
+        bail!("no published Linux daemon for remote architecture {arch}");
+    }
+    let ldd = text.lines().rev().find_map(|line| line.strip_prefix("FRESH_GUI_LDD="))
+        .unwrap_or("");
+    if ldd.to_ascii_lowercase().contains("musl") {
+        return Ok("musl");
+    }
+    let glibc = ldd.split_whitespace().rev().find_map(|word| {
+        let word = word.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
+        parse_version(word).ok()
+    });
+    Ok(if glibc.is_some_and(|v| v.as_slice() >= [2, 31].as_slice()) { "gnu" } else { "musl" })
+}
+
+fn release_daemon_url(version: &str, libc: &str) -> String {
+    format!("https://github.com/amirhosseindavoody/fresh-gui/releases/download/v{version}/fresh-gui-{version}-x86_64-unknown-linux-{libc}.tar.gz")
 }
 
 fn scp_binary(target: &SshTarget, tools: &Toolchain, local: &Path) -> Result<()> {
@@ -273,7 +414,7 @@ pub(crate) fn ssh_command_args(target: &SshTarget, remote_cmd: &str) -> Vec<Stri
 pub(crate) fn scp_args(target: &SshTarget, local: &Path) -> Vec<String> {
     let mut args = common_opts(target, "-P");
     args.push(local.display().to_string());
-    args.push(format!("{}:.local/bin/fresh-gui", target.destination));
+    args.push(format!("{}:.local/bin/fresh-gui.partial", target.destination));
     args
 }
 
@@ -297,6 +438,8 @@ fn common_opts(target: &SshTarget, port_flag: &str) -> Vec<String> {
         "ConnectTimeout=20".into(),
         "-o".into(),
         "ServerAliveInterval=30".into(),
+        "-o".into(),
+        "LogLevel=ERROR".into(),
     ];
     if let Some(port) = target.port {
         args.push(port_flag.into());
@@ -614,14 +757,23 @@ fi
     }
 
     #[test]
+    fn compares_calver_components_numerically() {
+        assert_eq!(compare_versions("2026.923.10", "2026.923.2").unwrap(), std::cmp::Ordering::Greater);
+        assert_eq!(compare_versions("2026.923.2", "2026.923.2").unwrap(), std::cmp::Ordering::Equal);
+        assert_eq!(compare_versions("2026.922.9", "2026.923.2").unwrap(), std::cmp::Ordering::Less);
+        assert!(compare_versions("2026.923.2", "hello").is_err());
+        assert!(release_daemon_url("2026.923.2", "musl").ends_with("fresh-gui-2026.923.2-x86_64-unknown-linux-musl.tar.gz"));
+    }
+
+    #[test]
     fn start_command_quotes_root_and_uses_home_bin() {
         assert_eq!(
             start_command(INSTALLED_BIN, Some("/work/o'brien")),
-            "exec \"$HOME/.local/bin/fresh-gui\" --no-ui --root '/work/o'\\''brien'"
+            "FRESH_GUI_QUIET=1 \"$HOME/.local/bin/fresh-gui\" --no-ui --json --root '/work/o'\\''brien'"
         );
         assert_eq!(
             start_command("/opt/bin/fresh-gui", None),
-            "exec '/opt/bin/fresh-gui' --no-ui"
+            "FRESH_GUI_QUIET=1 '/opt/bin/fresh-gui' --no-ui --json"
         );
     }
 
@@ -637,7 +789,7 @@ fi
         assert!(!args.iter().any(|a| a.contains("token")));
         let scp = scp_args(&t, Path::new("/tmp/fresh-gui"));
         assert!(scp.windows(2).any(|w| w == ["-P", "2222"]));
-        assert!(scp.iter().any(|a| a == "ada@lab:.local/bin/fresh-gui"));
+        assert!(scp.iter().any(|a| a == "ada@lab:.local/bin/fresh-gui.partial"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -688,10 +840,10 @@ fi
         script.push_str("  n=$((n + 1))\n  echo \"$n\" > \"$count_file\"\n");
         script.push_str("  if [[ \"$n\" == \"1\" ]]; then\n");
         script.push_str(
-            "    echo 'FRESH_GUI_PROBE v=1 installed=0 running=0 port= token= binary='\n",
+            "    echo 'FRESH_GUI_PROBE v=1 installed=0 running=0 port= token= version= binary='\n",
         );
         script.push_str("  else\n");
-        script.push_str("    echo 'FRESH_GUI_PROBE v=1 installed=1 running=1 port=7420 token=sekret binary=/home/u/.local/bin/fresh-gui'\n");
+        script.push_str(&format!("    echo 'FRESH_GUI_PROBE v=1 installed=1 running=1 port=7420 token=sekret version={} binary=/home/u/.local/bin/fresh-gui'\n", env!("CARGO_PKG_VERSION")));
         script.push_str("  fi\n  exit 0\nfi\nexit 0\n");
         write_exe(&ssh, &script);
         write_exe(
@@ -730,7 +882,7 @@ fi
         assert!(ssh_text.contains("-N"));
         assert!(ssh_text.contains("127.0.0.1:"));
         let scp_text = fs::read_to_string(&scp_log).unwrap();
-        assert!(scp_text.contains(".local/bin/fresh-gui"));
+        assert!(scp_text.contains(".local/bin/fresh-gui.partial"));
         assert!(scp_text.contains(&daemon.display().to_string()));
         let debug = format!("{session:?}");
         assert!(debug.contains("<redacted>"));
@@ -754,7 +906,7 @@ printf '%s\n' "$*" >> {log}
 {listen}
 if [[ "$*" == *"sh -s"* ]]; then
   cat >/dev/null
-  echo 'FRESH_GUI_PROBE v=1 installed=1 running=1 port=7421 token=sekret binary=/usr/bin/fresh-gui'
+  echo 'FRESH_GUI_PROBE v=1 installed=1 running=1 port=7421 token=sekret version={version} binary=/usr/bin/fresh-gui'
   exit 0
 fi
 echo "unexpected ssh: $*" >&2
@@ -762,6 +914,7 @@ exit 1
 "#,
                 log = ssh_log.display(),
                 listen = listen_snippet(),
+                version = env!("CARGO_PKG_VERSION"),
             ),
         );
         write_exe(
@@ -784,6 +937,40 @@ exit 1
         assert!(!ssh_text.contains("--no-ui"));
         assert!(ssh_text.contains("-N"));
         drop(session);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_failure_reports_daemon_log_after_ssh_banner() {
+        let dir = scratch();
+        fs::write(dir.join("id"), b"key").unwrap();
+        let ssh = dir.join("ssh");
+        write_exe(&ssh, &format!(
+            r#"#!/bin/bash
+echo 'Welcome to the server' >&2
+if [[ "$*" == *"sh -s"* ]]; then
+  cat >/dev/null
+  echo 'Welcome to the server'
+  echo 'FRESH_GUI_PROBE v=1 installed=1 running=0 port= token= version={version} binary=/home/u/.local/bin/fresh-gui'
+elif [[ "$*" == *"FRESH_GUI_LOG_BEGIN"* ]]; then
+  printf '\nFRESH_GUI_LOG_BEGIN\nfailed to bind socket: address in use\nFRESH_GUI_LOG_END\n'
+elif [[ "$*" == *"--no-ui"* ]]; then
+  exit 1
+fi
+"#,
+            version = env!("CARGO_PKG_VERSION")
+        ));
+        let tools = Toolchain {
+            ssh,
+            scp: PathBuf::from("/bin/false"),
+            curl: PathBuf::from("/bin/false"),
+            tar: PathBuf::from("/bin/false"),
+        };
+        let err = bootstrap(&target(&dir), &DaemonSource::default(), &tools, |_| {}).err().unwrap();
+        let message = format!("{err:#}");
+        assert!(message.contains("failed to bind socket: address in use"), "{message}");
+        assert!(message.contains("remote daemon log"), "{message}");
         let _ = fs::remove_dir_all(&dir);
     }
 }
