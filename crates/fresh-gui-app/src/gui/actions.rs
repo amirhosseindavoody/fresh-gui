@@ -34,6 +34,8 @@ actions!(
         PrevTab,
         CopyExplorer,
         PasteExplorer,
+        FilterExplorer,
+        ClearExplorerInput,
         NewWorkspace,
         RenameWorkspace,
         CloseWorkspace,
@@ -58,5 +60,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-c", CopyExplorer, Some("Explorer")),
         KeyBinding::new("ctrl-v", PasteExplorer, Some("Explorer")),
         KeyBinding::new("cmd-v", PasteExplorer, Some("Explorer")),
+        KeyBinding::new("ctrl-f", FilterExplorer, Some("Explorer")),
+        KeyBinding::new("cmd-f", FilterExplorer, Some("Explorer")),
+        KeyBinding::new("escape", ClearExplorerInput, Some("Explorer")),
     ]);
 }

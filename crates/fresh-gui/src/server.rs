@@ -590,6 +590,28 @@ async fn handle_client_msg(
                 }),
             }
         }
+        Message::FsRename {
+            request_id,
+            path,
+            name,
+        } => {
+            require_auth(*authed)?;
+            match state.fs_root.rename(&path, &name).await {
+                Ok(entry) => {
+                    send_msg(sink, &Message::FsRenamed { request_id, entry })
+                        .await
+                        .map_err(|_| Message::Error {
+                            code: "send_failed".into(),
+                            message: "failed to send FsRenamed".into(),
+                        })?;
+                    Ok(())
+                }
+                Err(err) => Err(Message::Error {
+                    code: "fs_rename_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                }),
+            }
+        }
         Message::FsDelete { request_id, paths } => {
             require_auth(*authed)?;
             match state.fs_root.delete_paths(&paths).await {

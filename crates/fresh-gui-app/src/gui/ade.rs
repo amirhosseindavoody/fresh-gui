@@ -64,6 +64,11 @@ pub enum AdeCmd {
         sources: Vec<String>,
         destination: String,
     },
+    RenamePath {
+        request_id: String,
+        path: String,
+        name: String,
+    },
     CreateWorkspace {
         name: String,
         root: String,
@@ -216,6 +221,10 @@ pub enum AdeEvent {
     FsMoved {
         request_id: String,
         entries: Vec<FsEntry>,
+    },
+    FsRenamed {
+        request_id: String,
+        entry: FsEntry,
     },
     Error {
         code: String,
@@ -478,6 +487,19 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
                     request_id,
                     sources,
                     destination,
+                })
+                .await?;
+        }
+        AdeCmd::RenamePath {
+            request_id,
+            path,
+            name,
+        } => {
+            client
+                .send(Message::FsRename {
+                    request_id,
+                    path,
+                    name,
                 })
                 .await?;
         }
@@ -830,6 +852,7 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             request_id,
             entries,
         }),
+        Message::FsRenamed { request_id, entry } => Some(AdeEvent::FsRenamed { request_id, entry }),
         Message::Error { code, message } => Some(AdeEvent::Error { code, message }),
         Message::GitStatusResult {
             request_id,
