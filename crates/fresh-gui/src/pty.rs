@@ -56,6 +56,10 @@ impl PtySession {
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
         }
+        // The daemon often inherits TERM=dumb (SSH, a detached Windows
+        // process, a desktop launch). Fish and other TUIs refuse that.
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
         if resolved.apply_osc7 {
             configure_shell_cmd(&mut cmd, &resolved.command);
         } else {
@@ -221,6 +225,38 @@ fresh_gui_osc7
     Some(dir)
 }
 
+/// Fish has no rcfile flag. An init command defines a prompt hook that
+/// reports `$PWD` and does not change it, so the PTY cwd (workspace / remote
+/// root) stays put.
+fn ensure_fish_osc7() -> Option<PathBuf> {
+    let dir = shell_init_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("osc7.fish");
+    std::fs::write(&path, fish_osc7_script()).ok()?;
+    Some(path)
+}
+
+fn fish_osc7_script() -> &'static str {
+    r#"# fresh-gui OSC 7 cwd reporting
+function _fresh_gui_osc7 --on-event fish_prompt --description 'fresh-gui OSC 7 cwd'
+    set -l path (string escape --style=url -- $PWD 2>/dev/null)
+    if test -z "$path"
+        set path $PWD
+    end
+    printf '\033]7;file://%s%s\033\\' (prompt_hostname) $path
+end
+"#
+}
+
+fn fish_init_arg(script: &std::path::Path) -> String {
+    let text = script
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    format!("source \"{text}\"")
+}
+
 /// Interactive shell args + OSC 7 hooks so the host can track cwd / tab titles.
 fn configure_shell_cmd(cmd: &mut CommandBuilder, shell: &str) {
     match shell_basename(shell) {
@@ -242,6 +278,17 @@ fn configure_shell_cmd(cmd: &mut CommandBuilder, shell: &str) {
                 cmd.arg("-i");
             } else {
                 cmd.arg("-l");
+            }
+        }
+        // Fish is an interactive shell. `-l` is a login shell and can reset
+        // the working directory from profile snippets; `-i` keeps the cwd
+        // the PTY was given (the workspace / remote root). `-C` loads the
+        // OSC 7 hook after the user's config, without replacing `fish_prompt`.
+        "fish" => {
+            cmd.arg("-i");
+            if let Some(script) = ensure_fish_osc7() {
+                cmd.arg("-C");
+                cmd.arg(fish_init_arg(&script));
             }
         }
         // Windows console shells stay up when they are the ConPTY process.
@@ -278,6 +325,16 @@ mod shell_args_tests {
         assert!(!windows_console_shell("bash"));
         assert!(!windows_console_shell("zsh"));
         assert!(!windows_console_shell("fish"));
+    }
+
+    #[test]
+    fn fish_osc7_hook_reports_pwd_without_changing_directory() {
+        let script = super::fish_osc7_script();
+        assert!(script.contains("--on-event fish_prompt"));
+        assert!(script.contains("$PWD"));
+        assert!(!script.contains("cd "));
+        let arg = super::fish_init_arg(std::path::Path::new("/tmp/fresh-gui-shell/osc7.fish"));
+        assert_eq!(arg, "source \"/tmp/fresh-gui-shell/osc7.fish\"");
     }
 }
 
@@ -384,5 +441,49 @@ mod tests {
         }
         session.kill();
         panic!("fallback shell did not print the marker: {collected:?}");
+    }
+
+    #[test]
+    fn spawned_shell_starts_in_the_requested_directory_with_a_real_term() {
+        let dir = std::env::temp_dir().join(format!(
+            "fresh-gui-pty-cwd-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = PtySession::spawn(
+            "cwd".into(),
+            80,
+            24,
+            Some(dir.display().to_string()),
+            Some("bash".into()),
+            &Config::default(),
+            tx,
+        )
+        .expect("spawn");
+        session
+            .write_all(b"printf 'cwd=%s term=%s\\n' \"$PWD\" \"$TERM\"\n")
+            .expect("write");
+
+        let mut collected = String::new();
+        let start = std::time::Instant::now();
+        let marker = format!("cwd={}", dir.display());
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            match rx.try_recv() {
+                Ok(bytes) => {
+                    collected.push_str(&String::from_utf8_lossy(&bytes));
+                    if collected.contains(&marker) && collected.contains("term=xterm-256color") {
+                        session.kill();
+                        let _ = std::fs::remove_dir_all(&dir);
+                        return;
+                    }
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        session.kill();
+        let _ = std::fs::remove_dir_all(&dir);
+        panic!("shell did not report cwd and TERM: {collected:?}");
     }
 }

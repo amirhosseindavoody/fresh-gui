@@ -1,24 +1,113 @@
-//! Minimal VTE-backed PTY screen for the native host.
+//! Terminal grid for a remote PTY.
 //!
-//! This is a view of remote PTY bytes, not a second editor core. Fresh still
-//! owns buffers on the daemon; terminals here are portable-pty children there.
+//! Bytes are parsed by [`alacritty_terminal`] (Apache-2.0), the same embeddable
+//! grid Zed paints. The daemon still owns the process (`portable-pty`). This
+//! module is only the screen: alternate buffer, cursor, colors, and the
+//! replies a shell waits on (cursor position, device attributes, palette).
 
-use vte::{Params, Parser, Perform};
+use std::cell::{Cell as StdCell, RefCell};
+use std::rc::Rc;
+
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::{Config, Osc52, Term, TermMode};
+use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor, Rgb};
 
 const DEFAULT_COLS: usize = 80;
 const DEFAULT_ROWS: usize = 24;
-const SCROLLBACK: usize = 2000;
+/// Rough cell size of `text_sm` monospace, used when the host asks for pixels.
+const CELL_WIDTH_PX: u16 = 8;
+const CELL_HEIGHT_PX: u16 = 18;
+
+const DEFAULT_FG: [u8; 3] = [0xe6, 0xe6, 0xe6];
+const DEFAULT_BG: [u8; 3] = [0x1e, 0x1e, 0x1e];
+/// OSC 52 copy larger than this is dropped. A remote program must not be
+/// able to push an unbounded blob onto the host clipboard.
+const OSC52_MAX_BYTES: usize = 256 * 1024;
+
+struct Shared {
+    replies: RefCell<Vec<u8>>,
+    clipboard: RefCell<Vec<String>>,
+    cols: StdCell<u16>,
+    rows: StdCell<u16>,
+}
+
+struct ReplyProxy {
+    shared: Rc<Shared>,
+}
+
+impl EventListener for ReplyProxy {
+    fn send_event(&self, event: Event) {
+        match event {
+            Event::PtyWrite(text) => self.shared.replies.borrow_mut().extend(text.into_bytes()),
+            Event::ClipboardStore(_, text) => {
+                if text.len() <= OSC52_MAX_BYTES {
+                    self.shared.clipboard.borrow_mut().push(text);
+                }
+            }
+            Event::ColorRequest(index, format) => {
+                let text = format(rgb_for_index(index));
+                self.shared.replies.borrow_mut().extend(text.into_bytes());
+            }
+            Event::TextAreaSizeRequest(format) => {
+                let text = format(WindowSize {
+                    num_lines: self.shared.rows.get(),
+                    num_cols: self.shared.cols.get(),
+                    cell_width: CELL_WIDTH_PX,
+                    cell_height: CELL_HEIGHT_PX,
+                });
+                self.shared.replies.borrow_mut().extend(text.into_bytes());
+            }
+            _ => {}
+        }
+    }
+}
+
+struct TermSize {
+    columns: usize,
+    screen_lines: usize,
+}
+
+impl Dimensions for TermSize {
+    fn total_lines(&self) -> usize {
+        self.screen_lines
+    }
+
+    fn screen_lines(&self) -> usize {
+        self.screen_lines
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+}
+
+/// One run of cells that share a color and cursor flag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TermSpan {
+    pub text: String,
+    /// `None` means the host theme foreground or background.
+    pub fg: Option<[u8; 3]>,
+    pub bg: Option<[u8; 3]>,
+    pub bold: bool,
+    pub cursor: bool,
+    pub selected: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TermRow {
+    pub spans: Vec<TermSpan>,
+}
 
 pub struct TermScreen {
     pub cols: usize,
     pub rows: usize,
-    /// Scrollback + current screen rows (each row is `cols` cells, space-padded).
-    rows_data: Vec<Vec<char>>,
-    cursor_col: usize,
-    cursor_row: usize, // index into rows_data of the current line
-    parser: Parser,
-    /// Bytes to write back to the PTY (cursor-position and device-attribute reports).
-    replies: Vec<u8>,
+    term: Term<ReplyProxy>,
+    parser: Processor,
+    shared: Rc<Shared>,
 }
 
 impl Default for TermScreen {
@@ -31,39 +120,196 @@ impl TermScreen {
     pub fn new(cols: usize, rows: usize) -> Self {
         let cols = cols.max(1);
         let rows = rows.max(1);
-        let mut rows_data = Vec::with_capacity(rows);
-        for _ in 0..rows {
-            rows_data.push(vec![' '; cols]);
-        }
+        let shared = Rc::new(Shared {
+            replies: RefCell::new(Vec::new()),
+            clipboard: RefCell::new(Vec::new()),
+            cols: StdCell::new(cols as u16),
+            rows: StdCell::new(rows as u16),
+        });
+        // Fish 4 and other TUIs ask for the kitty keyboard protocol.
+        // OSC 52 copy is on; paste/read stays off (alacritty's OnlyCopy).
+        let config = Config {
+            scrolling_history: 2_000,
+            kitty_keyboard: true,
+            osc52: Osc52::OnlyCopy,
+            ..Config::default()
+        };
+        let term = Term::new(
+            config,
+            &TermSize {
+                columns: cols,
+                screen_lines: rows,
+            },
+            ReplyProxy {
+                shared: Rc::clone(&shared),
+            },
+        );
         Self {
             cols,
             rows,
-            rows_data,
-            cursor_col: 0,
-            cursor_row: 0,
-            parser: Parser::new(),
-            replies: Vec::new(),
+            term,
+            parser: Processor::new(),
+            shared,
         }
     }
 
-    /// Ingest PTY bytes. Returns any replies the terminal must write back
-    /// (ConPTY blocks the shell until a cursor-position report arrives).
+    /// Ingest PTY bytes. Returns replies the host must write back (device
+    /// attributes, cursor position, palette). ConPTY and fish both wait on these.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
-        let mut parser = Parser::new();
-        std::mem::swap(&mut self.parser, &mut parser);
-        parser.advance(self, bytes);
-        self.parser = parser;
-        self.trim_scrollback();
-        std::mem::take(&mut self.replies)
+        self.parser.advance(&mut self.term, bytes);
+        self.shared.replies.borrow_mut().drain(..).collect()
     }
 
+    /// Text an OSC 52 copy sequence asked the host to place on the clipboard.
+    /// Sequences over [`OSC52_MAX_BYTES`] are dropped. OSC 52 paste is not
+    /// answered: a program in the shell must not read the host clipboard.
+    pub fn take_clipboard_stores(&self) -> Vec<String> {
+        self.shared.clipboard.borrow_mut().drain(..).collect()
+    }
+
+    pub fn resize(&mut self, cols: usize, rows: usize) {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        if cols == self.cols && rows == self.rows {
+            return;
+        }
+        self.cols = cols;
+        self.rows = rows;
+        self.shared.cols.set(cols as u16);
+        self.shared.rows.set(rows as u16);
+        self.term.resize(TermSize {
+            columns: cols,
+            screen_lines: rows,
+        });
+    }
+
+    pub fn app_cursor(&self) -> bool {
+        self.term.mode().contains(TermMode::APP_CURSOR)
+    }
+
+    pub fn alt_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// DECSET mouse tracking currently enabled by the program in the PTY.
+    pub fn mouse_tracking(&self) -> MouseTracking {
+        let mode = *self.term.mode();
+        MouseTracking {
+            clicks: mode.contains(TermMode::MOUSE_REPORT_CLICK),
+            drag: mode.contains(TermMode::MOUSE_DRAG),
+            motion: mode.contains(TermMode::MOUSE_MOTION),
+            sgr: mode.contains(TermMode::SGR_MOUSE),
+            utf8: mode.contains(TermMode::UTF8_MOUSE),
+        }
+    }
+
+    /// Scroll the viewport into history. Negative is older (page up).
+    pub fn scroll_by(&mut self, lines: i32) {
+        if lines == 0 {
+            return;
+        }
+        let scroll = if lines < 0 {
+            Scroll::Delta(lines.saturating_neg())
+        } else {
+            Scroll::Delta(-lines)
+        };
+        self.term.scroll_display(scroll);
+    }
+
+    pub fn scroll_page(&mut self, older: bool) {
+        self.term.scroll_display(if older {
+            Scroll::PageUp
+        } else {
+            Scroll::PageDown
+        });
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.term.scroll_display(Scroll::Bottom);
+    }
+
+    /// Start a drag selection at a viewport cell `(column, row)`.
+    pub fn begin_selection(&mut self, col: usize, row: usize) {
+        let point = self.viewport_point(col, row);
+        self.term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+    }
+
+    /// Move the end of the current drag selection.
+    pub fn update_selection(&mut self, col: usize, row: usize) {
+        let point = self.viewport_point(col, row);
+        if let Some(selection) = self.term.selection.as_mut() {
+            selection.update(point, Side::Right);
+        } else {
+            self.begin_selection(col, row);
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.term.selection = None;
+    }
+
+    pub fn selection_is_empty(&self) -> bool {
+        self.term.selection.as_ref().is_none_or(Selection::is_empty)
+    }
+
+    /// Selected text, without trailing empty selections.
+    pub fn selection_text(&self) -> Option<String> {
+        self.term
+            .selection_to_string()
+            .filter(|text| !text.is_empty())
+    }
+
+    fn viewport_point(&self, col: usize, row: usize) -> Point {
+        let col = col.min(self.cols.saturating_sub(1));
+        let row = row.min(self.rows.saturating_sub(1));
+        let offset = self.term.grid().display_offset();
+        alacritty_terminal::term::viewport_to_point(offset, Point::new(row, Column(col)))
+    }
+
+    pub fn rows(&self) -> Vec<TermRow> {
+        let content = self.term.renderable_content();
+        let cursor_on = content.cursor.shape != CursorShape::Hidden;
+        let cursor = content.cursor.point;
+        let selection = content.selection;
+        let mut rows = Vec::new();
+        let mut current: Option<Line> = None;
+        let mut spans: Vec<TermSpan> = Vec::new();
+
+        for indexed in content.display_iter {
+            if current != Some(indexed.point.line) {
+                if current.is_some() {
+                    rows.push(TermRow { spans });
+                    spans = Vec::new();
+                }
+                current = Some(indexed.point.line);
+            }
+            let cell = indexed.cell;
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            let is_cursor = cursor_on && indexed.point == cursor;
+            let selected = selection.is_some_and(|range| range.contains(indexed.point));
+            push_cell(&mut spans, cell, content.colors, is_cursor, selected);
+        }
+        if current.is_some() {
+            rows.push(TermRow { spans });
+        }
+        rows
+    }
+
+    #[cfg(test)]
     pub fn visible_lines(&self) -> Vec<String> {
-        let start = self.rows_data.len().saturating_sub(self.rows);
-        self.rows_data[start..]
-            .iter()
+        self.rows()
+            .into_iter()
             .map(|row| {
-                let s: String = row.iter().collect();
-                s.trim_end().to_string()
+                let mut text = String::new();
+                for span in row.spans {
+                    text.push_str(&span.text);
+                }
+                text.trim_end().to_string()
             })
             .collect()
     }
@@ -73,227 +319,326 @@ impl TermScreen {
         self.visible_lines().join("\n")
     }
 
-    fn current_line(&mut self) -> &mut Vec<char> {
-        if self.cursor_row >= self.rows_data.len() {
-            self.rows_data.push(vec![' '; self.cols]);
+    /// Visible cursor as `(row, column)` from the top-left of the screen.
+    #[cfg(test)]
+    pub fn cursor_cell(&self) -> Option<(usize, usize)> {
+        let content = self.term.renderable_content();
+        if content.cursor.shape == CursorShape::Hidden {
+            return None;
         }
-        &mut self.rows_data[self.cursor_row]
-    }
-
-    fn ensure_cursor(&mut self) {
-        while self.rows_data.len() <= self.cursor_row {
-            self.rows_data.push(vec![' '; self.cols]);
+        let top = -(content.display_offset as i32);
+        let row = content.cursor.point.line.0 - top;
+        if row < 0 {
+            return None;
         }
-        if self.cursor_col >= self.cols {
-            self.newline();
-        }
-    }
-
-    fn newline(&mut self) {
-        self.cursor_col = 0;
-        self.cursor_row += 1;
-        while self.rows_data.len() <= self.cursor_row {
-            self.rows_data.push(vec![' '; self.cols]);
-        }
-    }
-
-    fn trim_scrollback(&mut self) {
-        let max = SCROLLBACK + self.rows;
-        if self.rows_data.len() > max {
-            let drop = self.rows_data.len() - max;
-            self.rows_data.drain(0..drop);
-            self.cursor_row = self.cursor_row.saturating_sub(drop);
-        }
-    }
-
-    fn screen_origin(&self) -> usize {
-        self.rows_data.len().saturating_sub(self.rows)
-    }
-
-    fn cup(&mut self, row: usize, col: usize) {
-        let origin = self.screen_origin();
-        self.cursor_row = origin + row.min(self.rows - 1);
-        self.cursor_col = col.min(self.cols - 1);
-        self.ensure_cursor();
-    }
-
-    fn erase_line_from_cursor(&mut self) {
-        self.ensure_cursor();
-        let col = self.cursor_col;
-        let cols = self.cols;
-        let line = self.current_line();
-        for c in line.iter_mut().skip(col).take(cols.saturating_sub(col)) {
-            *c = ' ';
-        }
-    }
-
-    fn erase_below(&mut self) {
-        self.erase_line_from_cursor();
-        let start = self.cursor_row + 1;
-        for row in self.rows_data.iter_mut().skip(start) {
-            for c in row.iter_mut() {
-                *c = ' ';
-            }
-        }
-    }
-
-    fn erase_above(&mut self) {
-        let end = self.cursor_row;
-        for row in self.rows_data.iter_mut().take(end) {
-            for c in row.iter_mut() {
-                *c = ' ';
-            }
-        }
-        self.ensure_cursor();
-        let col = self.cursor_col;
-        let line = self.current_line();
-        for c in line.iter_mut().take(col + 1) {
-            *c = ' ';
-        }
-    }
-
-    fn erase_line_to_cursor(&mut self) {
-        self.ensure_cursor();
-        let col = self.cursor_col;
-        let line = self.current_line();
-        for c in line.iter_mut().take(col + 1) {
-            *c = ' ';
-        }
-    }
-
-    fn erase_line(&mut self) {
-        self.ensure_cursor();
-        for c in self.current_line().iter_mut() {
-            *c = ' ';
-        }
-    }
-
-    fn erase_display(&mut self) {
-        let origin = self.screen_origin();
-        for row in self.rows_data.iter_mut().skip(origin) {
-            for c in row.iter_mut() {
-                *c = ' ';
-            }
-        }
-        self.cursor_row = origin;
-        self.cursor_col = 0;
+        Some((row as usize, content.cursor.point.column.0))
     }
 }
 
-fn raw_param(params: &Params, idx: usize, default: u16) -> u16 {
-    params
-        .iter()
-        .nth(idx)
-        .and_then(|p| p.first().copied())
-        .unwrap_or(default)
+/// Which mouse reports the PTY asked for.
+///
+/// `alacritty_terminal` treats 1000, 1002, and 1003 as mutually exclusive
+/// flags. 1002 and 1003 still include presses and releases. 1006 (SGR) and
+/// 1005 (UTF-8) choose the encoding. Private mode 1015 (urxvt) is not parsed
+/// by that library, so it is not reported here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MouseTracking {
+    clicks: bool,
+    drag: bool,
+    motion: bool,
+    sgr: bool,
+    utf8: bool,
 }
 
-impl Perform for TermScreen {
-    fn print(&mut self, c: char) {
-        self.ensure_cursor();
-        let col = self.cursor_col;
-        {
-            let line = self.current_line();
-            if col < line.len() {
-                line[col] = c;
-            }
-        }
-        self.cursor_col += 1;
-        if self.cursor_col >= self.cols {
-            self.newline();
-        }
+impl MouseTracking {
+    pub fn active(self) -> bool {
+        self.clicks || self.drag || self.motion
     }
 
-    fn execute(&mut self, byte: u8) {
-        match byte {
-            b'\n' => self.newline(),
-            b'\r' => self.cursor_col = 0,
-            b'\t' => {
-                self.cursor_col = ((self.cursor_col / 8) + 1) * 8;
-                if self.cursor_col >= self.cols {
-                    self.newline();
-                }
-            }
-            0x08 => self.cursor_col = self.cursor_col.saturating_sub(1),
-            0x07 => {}
+    /// Button-down motion (1002 cell motion, or 1003 any motion).
+    pub fn reports_drag(self) -> bool {
+        self.drag || self.motion
+    }
+
+    /// Motion with no button (1003 only).
+    pub fn reports_move(self) -> bool {
+        self.motion
+    }
+
+    /// Bytes to write to the PTY, or `None` when this mode does not want `kind`.
+    pub fn encode(
+        self,
+        col: usize,
+        row: usize,
+        kind: TermMouseKind,
+        mods: TermMouseMods,
+    ) -> Option<Vec<u8>> {
+        if !self.active() {
+            return None;
+        }
+        match kind {
+            TermMouseKind::Move if !self.reports_move() => return None,
+            TermMouseKind::Drag(_) if !self.reports_drag() => return None,
             _ => {}
         }
-    }
-
-    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
-        let first = |idx: usize, default: u16| {
-            params
-                .iter()
-                .nth(idx)
-                .and_then(|p| p.first().copied())
-                .filter(|v| *v != 0)
-                .unwrap_or(default)
+        let protocol = if self.sgr {
+            MouseProtocol::Sgr
+        } else if self.utf8 {
+            MouseProtocol::Utf8
+        } else {
+            MouseProtocol::Normal
         };
-        match action {
-            'A' => {
-                let n = first(0, 1) as usize;
-                let origin = self.screen_origin();
-                self.cursor_row = self.cursor_row.saturating_sub(n).max(origin);
-            }
-            'B' => {
-                let n = first(0, 1) as usize;
-                self.cursor_row = (self.cursor_row + n).min(self.screen_origin() + self.rows - 1);
-            }
-            'C' => {
-                let n = first(0, 1) as usize;
-                self.cursor_col = (self.cursor_col + n).min(self.cols - 1);
-            }
-            'D' => {
-                let n = first(0, 1) as usize;
-                self.cursor_col = self.cursor_col.saturating_sub(n);
-            }
-            'H' | 'f' => {
-                let row = first(0, 1).saturating_sub(1) as usize;
-                let col = first(1, 1).saturating_sub(1) as usize;
-                self.cup(row, col);
-            }
-            'J' => match raw_param(params, 0, 0) {
-                0 => self.erase_below(),
-                1 => self.erase_above(),
-                _ => self.erase_display(),
-            },
-            'K' => match raw_param(params, 0, 0) {
-                0 => self.erase_line_from_cursor(),
-                1 => self.erase_line_to_cursor(),
-                _ => self.erase_line(),
-            },
-            // Device Status Report. ConPTY sends CSI 6 n before the first
-            // prompt and waits; without CPR the pane stays blank.
-            'n' => {
-                if intermediates.is_empty() && raw_param(params, 0, 0) == 6 {
-                    let row = self.cursor_row.saturating_sub(self.screen_origin()) + 1;
-                    let col = self.cursor_col + 1;
-                    self.replies
-                        .extend(format!("\x1b[{row};{col}R").into_bytes());
-                }
-            }
-            // Primary / secondary device attributes. A short VT100-style
-            // answer keeps the console host from waiting on an identity query.
-            'c' => {
-                if intermediates == b">" {
-                    self.replies.extend_from_slice(b"\x1b[>0;0;0c");
-                } else if intermediates.is_empty() {
-                    self.replies.extend_from_slice(b"\x1b[?6c");
-                }
-            }
-            'm' => {}
-            _ => {}
+        Some(encode_mouse_bytes(protocol, col, row, kind, mods))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TermMouseButton {
+    Left,
+    Middle,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TermMouseKind {
+    Down(TermMouseButton),
+    Up(TermMouseButton),
+    Drag(TermMouseButton),
+    Move,
+    ScrollUp,
+    ScrollDown,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermMouseMods {
+    pub shift: bool,
+    pub alt: bool,
+    pub control: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MouseProtocol {
+    Sgr,
+    Utf8,
+    Normal,
+}
+
+fn button_base(button: TermMouseButton) -> u32 {
+    match button {
+        TermMouseButton::Left => 0,
+        TermMouseButton::Middle => 1,
+        TermMouseButton::Right => 2,
+    }
+}
+
+fn button_code(kind: TermMouseKind, mods: TermMouseMods) -> (u32, bool) {
+    let (code, release) = match kind {
+        TermMouseKind::Down(button) => (button_base(button), false),
+        TermMouseKind::Up(button) => (button_base(button), true),
+        TermMouseKind::Drag(button) => (button_base(button) + 32, false),
+        TermMouseKind::Move => (3 + 32, false),
+        TermMouseKind::ScrollUp => (64, false),
+        TermMouseKind::ScrollDown => (65, false),
+    };
+    let mut code = code;
+    if mods.shift {
+        code += 4;
+    }
+    if mods.alt {
+        code += 8;
+    }
+    if mods.control {
+        code += 16;
+    }
+    (code, release)
+}
+
+fn encode_mouse_bytes(
+    protocol: MouseProtocol,
+    col: usize,
+    row: usize,
+    kind: TermMouseKind,
+    mods: TermMouseMods,
+) -> Vec<u8> {
+    let (code, release) = button_code(kind, mods);
+    // Protocols report 1-based cells.
+    let cx = col.saturating_add(1);
+    let cy = row.saturating_add(1);
+    match protocol {
+        MouseProtocol::Sgr => {
+            let end = if release { b'm' } else { b'M' };
+            let mut out = format!("\x1b[<{code};{cx};{cy}").into_bytes();
+            out.push(end);
+            out
+        }
+        MouseProtocol::Normal => {
+            // Legacy normal tracking: one byte each, biased by 32. Release is
+            // button 3 and does not name which button went up. Coords cap at 223.
+            let cb = legacy_button(code, release).saturating_add(32);
+            let cx = (cx.min(223) as u32).saturating_add(32);
+            let cy = (cy.min(223) as u32).saturating_add(32);
+            vec![0x1b, b'[', b'M', cb as u8, cx as u8, cy as u8]
+        }
+        MouseProtocol::Utf8 => {
+            let cb = legacy_button(code, release).saturating_add(32);
+            let mut out = vec![0x1b, b'[', b'M'];
+            push_utf8(&mut out, cb);
+            push_utf8(&mut out, cx.saturating_add(32) as u32);
+            push_utf8(&mut out, cy.saturating_add(32) as u32);
+            out
         }
     }
+}
+
+/// X10 / UTF-8 button byte before the +32 bias. Drag's motion bit is already
+/// in `code`. Release collapses to button 3 and keeps only the modifier bits.
+fn legacy_button(code: u32, release: bool) -> u32 {
+    if release { 3 + (code & !0b11) } else { code }
+}
+
+fn push_utf8(out: &mut Vec<u8>, value: u32) {
+    let mut buf = [0u8; 4];
+    let ch = char::from_u32(value).unwrap_or('\u{FFFD}');
+    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+}
+
+fn push_cell(
+    spans: &mut Vec<TermSpan>,
+    cell: &Cell,
+    colors: &alacritty_terminal::term::color::Colors,
+    cursor: bool,
+    selected: bool,
+) {
+    let mut text = String::new();
+    let ch = if cell.flags.contains(Flags::HIDDEN) || cell.c == '\0' {
+        ' '
+    } else {
+        cell.c
+    };
+    text.push(ch);
+    if let Some(extra) = cell.zerowidth() {
+        text.extend(extra.iter().copied());
+    }
+
+    let mut fg = resolve_color(cell.fg, colors, true);
+    let mut bg = resolve_color(cell.bg, colors, false);
+    if cell.flags.contains(Flags::INVERSE) {
+        let fg_c = fg.unwrap_or(DEFAULT_FG);
+        let bg_c = bg.unwrap_or(DEFAULT_BG);
+        fg = Some(bg_c);
+        bg = Some(fg_c);
+    }
+    let bold = cell.flags.contains(Flags::BOLD);
+    if let Some(last) = spans.last_mut()
+        && last.fg == fg
+        && last.bg == bg
+        && last.bold == bold
+        && last.cursor == cursor
+        && last.selected == selected
+    {
+        last.text.push_str(&text);
+        return;
+    }
+    spans.push(TermSpan {
+        text,
+        fg,
+        bg,
+        bold,
+        cursor,
+        selected,
+    });
+}
+
+fn resolve_color(
+    color: Color,
+    colors: &alacritty_terminal::term::color::Colors,
+    foreground: bool,
+) -> Option<[u8; 3]> {
+    match color {
+        Color::Named(NamedColor::Foreground) if foreground => None,
+        Color::Named(NamedColor::Background) if !foreground => None,
+        Color::Named(named) => colors[named]
+            .map(rgb_array)
+            .or_else(|| named_default(named)),
+        Color::Spec(rgb) => Some(rgb_array(rgb)),
+        Color::Indexed(index) => colors[usize::from(index)]
+            .map(rgb_array)
+            .or(Some(indexed_color(index))),
+    }
+}
+
+fn rgb_array(rgb: Rgb) -> [u8; 3] {
+    [rgb.r, rgb.g, rgb.b]
+}
+
+fn rgb_for_index(index: usize) -> Rgb {
+    let [r, g, b] = match index {
+        0..=15 => ansi16(index as u8),
+        256 => DEFAULT_FG,
+        257 => DEFAULT_BG,
+        n if n < 256 => indexed_color(n as u8),
+        _ => DEFAULT_FG,
+    };
+    Rgb { r, g, b }
+}
+
+fn named_default(named: NamedColor) -> Option<[u8; 3]> {
+    let index = named as usize;
+    if index < 16 {
+        Some(ansi16(index as u8))
+    } else {
+        None
+    }
+}
+
+fn ansi16(index: u8) -> [u8; 3] {
+    const TABLE: [[u8; 3]; 16] = [
+        [0x1e, 0x1e, 0x1e],
+        [0xf4, 0x47, 0x47],
+        [0x3f, 0xb9, 0x50],
+        [0xd2, 0x99, 0x22],
+        [0x55, 0x99, 0xdd],
+        [0xd2, 0x6a, 0xc2],
+        [0x39, 0xc5, 0xcf],
+        [0xd0, 0xd0, 0xd0],
+        [0x80, 0x80, 0x80],
+        [0xff, 0x6b, 0x68],
+        [0x6b, 0xd4, 0x6b],
+        [0xf0, 0xc6, 0x74],
+        [0x79, 0xb8, 0xff],
+        [0xff, 0x7a, 0xd9],
+        [0x6e, 0xe7, 0xe7],
+        [0xff, 0xff, 0xff],
+    ];
+    TABLE[usize::from(index.min(15))]
+}
+
+fn indexed_color(index: u8) -> [u8; 3] {
+    if index < 16 {
+        return ansi16(index);
+    }
+    if index >= 232 {
+        let value = 8 + 10 * (index - 232);
+        return [value, value, value];
+    }
+    let cube = index - 16;
+    let r = cube / 36;
+    let g = (cube % 36) / 6;
+    let b = cube % 6;
+    let level = |n: u8| if n == 0 { 0 } else { 55 + 40 * n };
+    [level(r), level(g), level(b)]
 }
 
 /// Map a GPUI keystroke to PTY bytes. Returns `None` for chords the host owns.
+///
+/// `app_cursor` is the terminal's application-cursor mode (fish, vim, less).
 pub fn keystroke_to_bytes(
     key: &str,
     key_char: Option<&str>,
     ctrl: bool,
     alt: bool,
     shift: bool,
+    app_cursor: bool,
 ) -> Option<Vec<u8>> {
     let key = key.to_lowercase();
     if matches!(
@@ -319,18 +664,26 @@ pub fn keystroke_to_bytes(
         return None;
     }
 
+    let arrow = |normal: &[u8], app: &[u8]| {
+        Some(if app_cursor {
+            app.to_vec()
+        } else {
+            normal.to_vec()
+        })
+    };
+
     match key.as_str() {
         "enter" | "return" => Some(vec![b'\r']),
         "tab" => Some(vec![b'\t']),
         "escape" => Some(vec![0x1b]),
         "backspace" => Some(vec![0x7f]),
         "delete" => Some(b"\x1b[3~".to_vec()),
-        "up" => Some(b"\x1b[A".to_vec()),
-        "down" => Some(b"\x1b[B".to_vec()),
-        "right" => Some(b"\x1b[C".to_vec()),
-        "left" => Some(b"\x1b[D".to_vec()),
-        "home" => Some(b"\x1b[H".to_vec()),
-        "end" => Some(b"\x1b[F".to_vec()),
+        "up" => arrow(b"\x1b[A", b"\x1bOA"),
+        "down" => arrow(b"\x1b[B", b"\x1bOB"),
+        "right" => arrow(b"\x1b[C", b"\x1bOC"),
+        "left" => arrow(b"\x1b[D", b"\x1bOD"),
+        "home" => arrow(b"\x1b[H", b"\x1bOH"),
+        "end" => arrow(b"\x1b[F", b"\x1bOF"),
         "pageup" => Some(b"\x1b[5~".to_vec()),
         "pagedown" => Some(b"\x1b[6~".to_vec()),
         "space" => Some(vec![b' ']),
@@ -360,8 +713,8 @@ mod tests {
         let mut s = TermScreen::new(40, 8);
         s.feed(b"hello\r\nworld");
         let text = s.visible_text();
-        assert!(text.contains("hello"));
-        assert!(text.contains("world"));
+        assert!(text.contains("hello"), "{text}");
+        assert!(text.contains("world"), "{text}");
     }
 
     #[test]
@@ -382,35 +735,250 @@ mod tests {
     }
 
     #[test]
+    fn cursor_is_visible_after_text() {
+        let mut s = TermScreen::new(80, 24);
+        s.feed(b"ab");
+        assert_eq!(s.cursor_cell(), Some((0, 2)));
+        assert!(
+            s.rows()
+                .iter()
+                .flat_map(|row| row.spans.iter())
+                .any(|span| span.cursor),
+            "screen rows should mark the cursor cell"
+        );
+    }
+
+    #[test]
     fn cursor_position_report_answers_conpty_dsr() {
         let mut s = TermScreen::new(80, 24);
         let reply = s.feed(b"\x1b[6n");
-        assert_eq!(reply, b"\x1b[1;1R");
+        assert!(
+            reply.windows(6).any(|w| w == *b"\x1b[1;1R"),
+            "reply {reply:?}"
+        );
         assert!(s.visible_text().trim().is_empty());
 
         s.feed(b"ab");
         let reply = s.feed(b"\x1b[6n");
-        assert_eq!(reply, b"\x1b[1;3R");
+        assert!(
+            reply.windows(6).any(|w| w == *b"\x1b[1;3R"),
+            "reply {reply:?}"
+        );
     }
 
     #[test]
-    fn device_attributes_get_a_short_reply() {
+    fn device_attributes_get_a_reply() {
         let mut s = TermScreen::new(80, 24);
-        assert_eq!(s.feed(b"\x1b[c"), b"\x1b[?6c");
-        assert_eq!(s.feed(b"\x1b[>c"), b"\x1b[>0;0;0c");
+        let primary = s.feed(b"\x1b[c");
+        assert!(primary.starts_with(b"\x1b["), "{primary:?}");
+        assert!(primary.contains(&b'c'), "{primary:?}");
+        let secondary = s.feed(b"\x1b[>c");
+        assert!(secondary.starts_with(b"\x1b["), "{secondary:?}");
         assert!(s.visible_text().trim().is_empty());
+    }
+
+    #[test]
+    fn alternate_screen_restores_the_primary_buffer() {
+        let mut s = TermScreen::new(20, 6);
+        s.feed(b"primary");
+        s.feed(b"\x1b[?1049h");
+        s.feed(b"\x1b[2J\x1b[H");
+        s.feed(b"altscreen");
+        let alt = s.visible_text();
+        assert!(alt.contains("altscreen"), "{alt}");
+        assert!(!alt.contains("primary"), "{alt}");
+        s.feed(b"\x1b[?1049l");
+        let primary = s.visible_text();
+        assert!(primary.contains("primary"), "{primary}");
+        assert!(!primary.contains("altscreen"), "{primary}");
     }
 
     #[test]
     fn maps_ctrl_c_and_arrows() {
         assert_eq!(
-            keystroke_to_bytes("c", None, true, false, false),
+            keystroke_to_bytes("c", None, true, false, false, false),
             Some(vec![0x03])
         );
         assert_eq!(
-            keystroke_to_bytes("up", None, false, false, false),
+            keystroke_to_bytes("up", None, false, false, false, false),
             Some(b"\x1b[A".to_vec())
         );
-        assert_eq!(keystroke_to_bytes("w", None, true, false, false), None);
+        assert_eq!(
+            keystroke_to_bytes("up", None, false, false, false, true),
+            Some(b"\x1bOA".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes("w", None, true, false, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn drag_selection_covers_the_cells_and_clears() {
+        let mut s = TermScreen::new(40, 6);
+        s.feed(b"hello world");
+        s.begin_selection(0, 0);
+        assert!(s.selection_is_empty());
+        s.update_selection(4, 0);
+        assert_eq!(s.selection_text().as_deref(), Some("hello"));
+        assert!(
+            s.rows()
+                .iter()
+                .flat_map(|row| row.spans.iter())
+                .any(|span| span.selected && span.text.contains('h')),
+            "selected cells should be marked"
+        );
+        s.clear_selection();
+        assert!(s.selection_text().is_none());
+        assert!(s.selection_is_empty());
+    }
+
+    #[test]
+    fn osc52_copy_is_captured_and_paste_is_not_answered() {
+        let mut s = TermScreen::new(40, 6);
+        let reply = s.feed(b"\x1b]52;c;aGVsbG8=\x07");
+        assert!(reply.is_empty(), "{reply:?}");
+        assert_eq!(s.take_clipboard_stores(), vec!["hello".to_string()]);
+        assert!(s.visible_text().trim().is_empty());
+
+        let query = s.feed(b"\x1b]52;c;?\x07");
+        assert!(
+            query.is_empty(),
+            "OSC 52 paste must not read the host clipboard: {query:?}"
+        );
+        assert!(s.take_clipboard_stores().is_empty());
+    }
+
+    #[test]
+    fn osc52_copy_over_the_size_cap_is_dropped() {
+        let mut s = TermScreen::new(20, 4);
+        let raw = vec![b'a'; OSC52_MAX_BYTES + 1];
+        let encoded = base64_encode(&raw);
+        let mut seq = b"\x1b]52;c;".to_vec();
+        seq.extend(encoded);
+        seq.push(0x07);
+        s.feed(&seq);
+        assert!(s.take_clipboard_stores().is_empty());
+    }
+
+    fn report(screen: &TermScreen, col: usize, row: usize, kind: TermMouseKind) -> Option<Vec<u8>> {
+        screen
+            .mouse_tracking()
+            .encode(col, row, kind, TermMouseMods::default())
+    }
+
+    #[test]
+    fn mouse_modes_encode_press_drag_move_and_wheel() {
+        let mut s = TermScreen::new(80, 24);
+        assert!(!s.mouse_tracking().active());
+        assert!(report(&s, 0, 0, TermMouseKind::Down(TermMouseButton::Left)).is_none());
+
+        // 1000: clicks and wheel, normal encoding, no motion.
+        s.feed(b"\x1b[?1000h");
+        let tracking = s.mouse_tracking();
+        assert!(tracking.active());
+        assert!(!tracking.reports_drag());
+        assert!(!tracking.reports_move());
+        // Cell (0, 0) is 1-based 1;1, button 0, each field biased by 32.
+        assert_eq!(
+            report(&s, 0, 0, TermMouseKind::Down(TermMouseButton::Left)).as_deref(),
+            Some(&b"\x1b[M !!"[..])
+        );
+        assert!(report(&s, 1, 1, TermMouseKind::Drag(TermMouseButton::Left)).is_none());
+        assert!(report(&s, 1, 1, TermMouseKind::Move).is_none());
+        assert_eq!(
+            report(&s, 0, 0, TermMouseKind::ScrollDown).as_deref(),
+            Some(&[0x1b, b'[', b'M', 65 + 32, 33, 33][..])
+        );
+
+        // 1006 SGR, still click-only until 1002/1003.
+        s.feed(b"\x1b[?1006h");
+        assert_eq!(
+            report(&s, 9, 4, TermMouseKind::Down(TermMouseButton::Left)).as_deref(),
+            Some(b"\x1b[<0;10;5M".as_slice())
+        );
+        assert_eq!(
+            report(&s, 9, 4, TermMouseKind::Up(TermMouseButton::Left)).as_deref(),
+            Some(b"\x1b[<0;10;5m".as_slice())
+        );
+        assert_eq!(
+            report(&s, 9, 4, TermMouseKind::ScrollUp).as_deref(),
+            Some(b"\x1b[<64;10;5M".as_slice())
+        );
+
+        // 1002 replaces 1000 and reports drags, not buttonless moves.
+        s.feed(b"\x1b[?1002h");
+        let tracking = s.mouse_tracking();
+        assert!(tracking.reports_drag());
+        assert!(!tracking.reports_move());
+        assert_eq!(
+            report(&s, 9, 4, TermMouseKind::Drag(TermMouseButton::Left)).as_deref(),
+            Some(b"\x1b[<32;10;5M".as_slice())
+        );
+        assert!(report(&s, 9, 4, TermMouseKind::Move).is_none());
+
+        // 1003 reports every move.
+        s.feed(b"\x1b[?1003h");
+        assert!(s.mouse_tracking().reports_move());
+        assert_eq!(
+            report(&s, 9, 4, TermMouseKind::Move).as_deref(),
+            Some(b"\x1b[<35;10;5M".as_slice())
+        );
+
+        let shifted = s.mouse_tracking().encode(
+            9,
+            4,
+            TermMouseKind::Down(TermMouseButton::Right),
+            TermMouseMods {
+                shift: true,
+                alt: false,
+                control: true,
+            },
+        );
+        // 2 + 4 (shift) + 16 (control)
+        assert_eq!(shifted.as_deref(), Some(b"\x1b[<22;10;5M".as_slice()));
+
+        s.feed(b"\x1b[?1003l\x1b[?1006l");
+        assert!(!s.mouse_tracking().active());
+    }
+
+    #[test]
+    fn utf8_mouse_encodes_wide_coordinates() {
+        let mut s = TermScreen::new(250, 30);
+        s.feed(b"\x1b[?1000h\x1b[?1005h");
+        // Column 200 → 1-based 201 + 32 = 233 = U+00E9 = UTF-8 C3 A9.
+        let bytes = report(&s, 200, 0, TermMouseKind::Down(TermMouseButton::Left)).unwrap();
+        assert_eq!(bytes, b"\x1b[M \xc3\xa9!");
+    }
+
+    fn base64_encode(bytes: &[u8]) -> Vec<u8> {
+        const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 3 <= bytes.len() {
+            let n = (u32::from(bytes[i]) << 16)
+                | (u32::from(bytes[i + 1]) << 8)
+                | u32::from(bytes[i + 2]);
+            out.push(TABLE[((n >> 18) & 63) as usize]);
+            out.push(TABLE[((n >> 12) & 63) as usize]);
+            out.push(TABLE[((n >> 6) & 63) as usize]);
+            out.push(TABLE[(n & 63) as usize]);
+            i += 3;
+        }
+        if i < bytes.len() {
+            let mut n = u32::from(bytes[i]) << 16;
+            if i + 1 < bytes.len() {
+                n |= u32::from(bytes[i + 1]) << 8;
+            }
+            out.push(TABLE[((n >> 18) & 63) as usize]);
+            out.push(TABLE[((n >> 12) & 63) as usize]);
+            if i + 1 < bytes.len() {
+                out.push(TABLE[((n >> 6) & 63) as usize]);
+            } else {
+                out.push(b'=');
+            }
+            out.push(b'=');
+        }
+        out
     }
 }

@@ -348,6 +348,13 @@ impl WorkspaceStore {
         guard.by_id.get(id).map(|rec| rec.root.clone())
     }
 
+    /// Project root of the workspace that owns this ADE session.
+    pub async fn root_for_session(&self, session_id: &str) -> Option<String> {
+        let guard = self.inner.lock().await;
+        let id = guard.by_session.get(session_id)?.clone();
+        guard.by_id.get(&id).map(|rec| rec.root.clone())
+    }
+
     pub async fn focus(&self, id: &str) -> Result<FocusedWorkspace> {
         let mut guard = self.inner.lock().await;
         if !guard.by_id.contains_key(id) {
@@ -509,6 +516,28 @@ fn sanitize_expanded(paths: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// Directory a new shell should start in.
+///
+/// An explicit cwd (the user already `cd`'d, or the host asked) wins. Otherwise
+/// the workspace root, then the daemon FS root. An empty string is not a
+/// directory: remote daemons are often started from `$HOME`, and that must not
+/// override a session root.
+pub fn shell_working_directory(
+    requested: Option<&str>,
+    workspace_root: Option<&str>,
+    fs_root: &str,
+) -> Option<String> {
+    fn nonempty(value: Option<&str>) -> Option<String> {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    }
+    nonempty(requested)
+        .or_else(|| nonempty(workspace_root))
+        .or_else(|| nonempty(Some(fs_root)))
+}
+
 fn normalize_name(name: Option<String>, root: &str) -> String {
     let trimmed = name.unwrap_or_default();
     let trimmed = trimmed.trim();
@@ -604,6 +633,37 @@ mod tests {
             pty_id: None,
             path: Some(path.to_owned()),
         }
+    }
+
+    #[test]
+    fn shell_cwd_prefers_an_explicit_directory_then_the_workspace_root() {
+        assert_eq!(
+            shell_working_directory(Some("/tmp/here"), Some("/work/proj"), "/home/me").as_deref(),
+            Some("/tmp/here")
+        );
+        assert_eq!(
+            shell_working_directory(Some("  "), Some("/work/proj"), "/home/me").as_deref(),
+            Some("/work/proj")
+        );
+        assert_eq!(
+            shell_working_directory(None, Some(""), "/srv/app").as_deref(),
+            Some("/srv/app")
+        );
+        assert_eq!(shell_working_directory(None, None, "  "), None);
+    }
+
+    #[tokio::test]
+    async fn session_root_is_the_workspace_directory() {
+        let sessions = SessionStore::new();
+        let store = WorkspaceStore::new();
+        let info = store
+            .create(&sessions, None, "/work/remote-root".into())
+            .await;
+        assert_eq!(
+            store.root_for_session(&info.session_id).await.as_deref(),
+            Some("/work/remote-root")
+        );
+        assert_eq!(store.root_for_session("missing").await, None);
     }
 
     #[tokio::test]

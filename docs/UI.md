@@ -235,7 +235,7 @@ Ribbon metrics live in `workspace.rs`. Workspace-rail width, row height, and roo
 | Container | Size |
 |-----------|------|
 | Title bar | 30px (`TitleBar` height); label is `text_sm` with a 4px gap |
-| Workspace rail | 232px, left of the activity bar, only when `hello` includes `workspace`. Header is the explorer header height (26px), a muted **Workspaces** section title plus **+**. Rows are two lines and at least 40px: display name, then the project root (`~` for home, **Default root** when empty). The active row has an accent fill and a 3px left accent. Hover reveals Rename and Close; right-click has the same menu. The last workspace cannot be closed. One workspace shows a footer hint |
+| Workspace rail | 232px, left of the activity bar. A daemon that includes `workspace` in `hello` gets the full list. An older remote that does not still shows one row for the session root. Header is the explorer header height (26px), a muted **Workspaces** section title plus **+**. Rows are two lines and at least 40px: display name, then the project root (`~` for home, **Default root** when empty). The active row has an accent fill and a 3px left accent. Hover reveals Rename and Close; right-click has the same menu. The last workspace cannot be closed. One workspace shows a footer hint |
 | Activity rail | 36px wide, `py_1`, no gap; explorer, source control (when `hello` includes `git`), and settings are small ghost icon buttons |
 | Explorer header | 26px, `text_xs`, xsmall collapse button |
 | Explorer rows | 22px, `text_sm`, 8px indent, no tree padding. A chevron marks a folder that has (or may have) children. Lucide file-type icons, tinted by kind, distinguish files from folders |
@@ -247,7 +247,7 @@ Dock chrome (tab height, suffix placement, the disabled Zoom item in **···**)
 | Native host | Status |
 |-----------|--------|
 | Connect / auth / session (`?token=` URL or `--token`) | Yes |
-| Workspace rail (create, rename, close, switch) | Yes — each workspace is its own tab set; idle ones stay on the daemon. **+** asks for a name and an absolute root, prefilled with the current workspace folder (empty name uses the folder name; a cleared root uses the daemon project root). Rename and close are on hover, the right-click menu, and the command palette |
+| Workspace rail (create, rename, close, switch) | Yes — each workspace is its own tab set; idle ones stay on the daemon. **+** asks for a name and an absolute root, prefilled with the current workspace folder (empty name uses the folder name; a cleared root uses the daemon project root). Rename and close are on hover, the right-click menu, and the command palette. A current daemon advertises `workspace` for local and SSH the same way. An older remote that does not still shows one row for the session root; **+** explains that the daemon has to be upgraded and restarted before more projects can be added |
 | SSH target add + auto-install + tunnel (`remote connect`) | Yes (CLI before the window; title bar shows the destination) |
 | Activity bar + collapsible explorer (`fs_list`) | Yes. Source Control replaces the explorer while that activity is selected |
 | File menu | **Stop Server** disconnects and, locally, stops the daemon the same way as `fresh-gui close`. **Quit Client** closes the window and leaves the daemon running. An SSH session's Stop Server only disconnects |
@@ -262,7 +262,7 @@ Dock chrome (tab height, suffix placement, the disabled Zoom item in **···**)
 | Move / copy files | Drag onto a folder sends `fs_move`. Explorer-focused `Ctrl+C`/`Cmd+C` (or **Copy**) arms an in-app clipboard and also writes those absolute paths plus GPUI `ExternalPaths`. `Ctrl+V`/`Cmd+V` (or **Paste**) sends `fs_copy` into the selected directory, or the parent of a selected file. Linux clipboard writes in this GPUI snapshot do not offer `text/uri-list`, so a file-manager paste is not reliable |
 | Status bar (connection, workspace name, session, capabilities) | Yes |
 | Command palette + Go to File | Yes |
-| PTY I/O (VTE grid) | Yes (plain text rows; prompt color/escape sequences may show literally; no WebGL xterm or mouse select) |
+| PTY I/O (`alacritty_terminal` grid) | Yes. Cursor, SGR colors, and the alternate screen (vim, htop, fish). The grid follows the pane (about 8×18px cells). Wheel scrolls history; on the alternate screen it sends up/down, unless the program enabled mouse tracking, in which case the wheel is a mouse report (Shift keeps the host behavior). Shift+PageUp / Shift+PageDown scroll history. Drag selects text; `Ctrl+C` / `Cmd+C` or **Copy** (right-click, or **···** while a program owns the pointer) copies it, and a click or typing clears it. DECSET 1000/1002/1003 forwards mouse events (1006 SGR, 1005 UTF-8, otherwise normal tracking). Shift+drag selects while tracking is on. OSC 52 copy sets the host clipboard (256 KiB cap); OSC 52 paste is ignored. New shells start in the workspace or remote root. Bash, zsh, and fish emit OSC 7 so the next shell follows `cd` |
 | Editor open / edit / save (gpui `Editor` view of Fresh snapshots) | Yes. Editor tabs keep the filename (`•` when dirty) |
 | Layout v4 restore, markdown WYSIWYG, minimap, find, palettes, tab pin, editor rename, Ctrl/Cmd+click path_link | Not in this host |
 

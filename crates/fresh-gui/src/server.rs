@@ -363,6 +363,12 @@ async fn handle_client_msg(
             };
 
             let cfg = state.config.read().expect("config lock").clone();
+            let workspace_root = state.workspaces.root_for_session(&sid).await;
+            let cwd = crate::workspace::shell_working_directory(
+                cwd.as_deref(),
+                workspace_root.as_deref(),
+                &state.fs_root.root_display(),
+            );
             let id = state
                 .sessions
                 .open_pty(&sid, cols, rows, cwd, shell, &cfg)

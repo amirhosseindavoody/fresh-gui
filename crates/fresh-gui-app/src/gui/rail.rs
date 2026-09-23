@@ -39,6 +39,32 @@ pub fn workspace_root_label(root: &str, home: Option<&str>) -> String {
     truncate_middle(&display, WORKSPACE_ROOT_LABEL_MAX)
 }
 
+/// The left rail is the workspace manager. A daemon that advertises
+/// `workspace` gets the full list. An older daemon still shows one row for
+/// the session root so a remote window is not a blank activity bar.
+pub fn show_workspace_rail(
+    workspace_cap: bool,
+    online: bool,
+    preferred_root: Option<&str>,
+) -> bool {
+    if workspace_cap {
+        return true;
+    }
+    online && preferred_root.is_some_and(|root| !root.trim().is_empty())
+}
+
+/// Where a new shell starts. An explicit cwd (OSC 7 after the user `cd`s)
+/// wins. Otherwise the workspace or session root.
+pub fn choose_shell_cwd(explicit: Option<&str>, workspace_root: Option<&str>) -> Option<String> {
+    fn nonempty(value: Option<&str>) -> Option<String> {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    }
+    nonempty(explicit).or_else(|| nonempty(workspace_root))
+}
+
 /// Footer copy when the list would otherwise look like unused chrome.
 pub fn workspace_rail_hint(count: usize) -> Option<&'static str> {
     match count {
@@ -200,6 +226,32 @@ mod tests {
         );
         assert_eq!(workspace_rail_hint(2), None);
         assert_eq!(workspace_rail_hint(6), None);
+    }
+
+    #[test]
+    fn rail_shows_for_a_session_root_without_the_workspace_capability() {
+        assert!(show_workspace_rail(true, false, None));
+        assert!(!show_workspace_rail(false, true, None));
+        assert!(!show_workspace_rail(false, false, Some("/work/demo")));
+        assert!(show_workspace_rail(false, true, Some("/work/demo")));
+        assert!(!show_workspace_rail(false, true, Some("  ")));
+    }
+
+    #[test]
+    fn shell_cwd_uses_the_workspace_when_the_user_has_not_cd() {
+        assert_eq!(
+            choose_shell_cwd(Some("/tmp/elsewhere"), Some("/work/demo")),
+            Some("/tmp/elsewhere".into())
+        );
+        assert_eq!(
+            choose_shell_cwd(None, Some("/work/demo")),
+            Some("/work/demo".into())
+        );
+        assert_eq!(
+            choose_shell_cwd(Some("  "), Some("/work/demo")),
+            Some("/work/demo".into())
+        );
+        assert_eq!(choose_shell_cwd(None, Some(" ")), None);
     }
 
     #[test]

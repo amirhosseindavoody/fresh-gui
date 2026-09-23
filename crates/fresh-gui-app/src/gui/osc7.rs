@@ -11,8 +11,28 @@ pub fn parse_osc7(data: &str) -> Option<String> {
 }
 
 fn decode_abs(s: &str) -> Option<String> {
-    let decoded = percent_decode(s);
-    decoded.starts_with('/').then_some(decoded)
+    let mut decoded = percent_decode(s);
+    // `file://host/C:/Users` arrives as `/C:/Users`. Keep the drive path.
+    if let Some(rest) = decoded.strip_prefix('/')
+        && rest.len() >= 3
+        && rest.as_bytes()[0].is_ascii_alphabetic()
+        && rest.as_bytes()[1] == b':'
+        && (rest.as_bytes()[2] == b'/' || rest.as_bytes()[2] == b'\\')
+    {
+        decoded = rest.to_string();
+    }
+    if decoded.starts_with('/') || decoded.starts_with('\\') {
+        return Some(decoded);
+    }
+    let bytes = decoded.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
+    {
+        return Some(decoded);
+    }
+    None
 }
 
 fn percent_decode(s: &str) -> String {
@@ -93,6 +113,10 @@ mod tests {
         assert_eq!(
             parse_osc7("file://host/home/me/proj"),
             Some("/home/me/proj".into())
+        );
+        assert_eq!(
+            parse_osc7("file://host/C:/Users/me/proj"),
+            Some("C:/Users/me/proj".into())
         );
     }
 

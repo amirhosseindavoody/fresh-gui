@@ -52,8 +52,9 @@ use super::file_icons::explorer_glyph;
 use super::pane::{EditorPanel, TerminalPanel};
 use super::paths::{display_path, strip_verbatim_prefixes};
 use super::rail::{
-    WORKSPACE_RAIL_W, WORKSPACE_ROW_H, empty_workspace_name_hint, explorer_header_label, user_home,
-    workspace_rail_hint, workspace_root_label,
+    WORKSPACE_RAIL_W, WORKSPACE_ROW_H, choose_shell_cwd, empty_workspace_name_hint,
+    explorer_header_label, path_basename, show_workspace_rail, user_home, workspace_rail_hint,
+    workspace_root_label,
 };
 use super::restore::{RestoreStep, restore_plan};
 use super::tab_chrome::{TabCloseScope, TabStripMetrics, panels_for_close_scope};
@@ -537,7 +538,7 @@ impl Workspace {
                     self.ade.send(AdeCmd::OpenPty {
                         cols: 80,
                         rows: 24,
-                        cwd: None,
+                        cwd: self.shell_cwd(cx),
                     });
                     self.list_dir("");
                     self.refresh_git();
@@ -1032,7 +1033,7 @@ impl Workspace {
             self.status = "Not connected".into();
             return;
         }
-        let cwd = self.active_cwd(cx);
+        let cwd = self.shell_cwd(cx);
         self.pty_opens_pending = self.pty_opens_pending.saturating_add(1);
         self.ade.send(AdeCmd::OpenPty {
             cols: 80,
@@ -1041,16 +1042,42 @@ impl Workspace {
         });
     }
 
-    fn active_cwd(&self, cx: &App) -> Option<String> {
-        if let Some(ActiveSurface::Terminal(id)) = &self.active
-            && let Some(cwd) = self
-                .terminals
+    /// OSC 7 cwd of the focused shell, otherwise the workspace or session root.
+    ///
+    /// A missing cwd used to leave the PTY in the daemon's process directory,
+    /// which for an SSH session is `$HOME` even when the remote root is set.
+    fn shell_cwd(&self, cx: &App) -> Option<String> {
+        let from_terminal = if let Some(ActiveSurface::Terminal(id)) = &self.active {
+            self.terminals
                 .get(id)
                 .and_then(|panel| panel.read(cx).cwd())
-        {
-            return Some(cwd);
-        }
-        self.last_cwd.clone()
+        } else {
+            None
+        };
+        let explicit = from_terminal.or(self.last_cwd.clone());
+        choose_shell_cwd(explicit.as_deref(), self.workspace_root().as_deref())
+    }
+
+    /// Focused workspace directory, else the explorer folder, else the root
+    /// this window was opened with (saved remote root or `--root`).
+    fn workspace_root(&self) -> Option<String> {
+        let from_workspace = self.active_workspace_id.as_ref().and_then(|id| {
+            self.workspaces
+                .iter()
+                .find(|workspace| &workspace.id == id)
+                .map(|workspace| workspace.root.clone())
+        });
+        let explorer = if self.explorer_root.trim().is_empty() {
+            None
+        } else {
+            Some(self.explorer_root.clone())
+        };
+        choose_shell_cwd(
+            from_workspace.as_deref(),
+            explorer
+                .as_deref()
+                .or(self.target.preferred_root.as_deref()),
+        )
     }
 
     fn upsert_workspace(&mut self, info: WorkspaceInfo) {
@@ -1101,6 +1128,8 @@ impl Workspace {
         self.active = None;
         self.last_saved_panel = None;
         self.next_terminal_number = 1;
+        // A shell cwd from the workspace we just left must not follow the next one.
+        self.last_cwd = None;
         self.clear_git_view();
     }
 
@@ -1417,7 +1446,7 @@ impl Workspace {
 
     fn open_create_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.workspace_cap {
-            self.status = "This daemon has no workspace capability".into();
+            self.status = "This daemon has no workspace list. Upgrade and restart the remote fresh-gui to add projects.".into();
             return;
         }
         self.create_open = true;
@@ -2538,6 +2567,113 @@ impl Workspace {
         }
     }
 
+    fn workspace_rail_visible(&self) -> bool {
+        show_workspace_rail(
+            self.workspace_cap,
+            matches!(self.connection, ConnectionState::Online),
+            self.workspace_root().as_deref(),
+        )
+    }
+
+    /// One row for a daemon that never advertised `workspace` (an older remote
+    /// binary the probe left running). Create/switch still need the capability.
+    fn render_session_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let root = self.workspace_root().unwrap_or_default();
+        let shown = display_path(&root);
+        let name = path_basename(&shown).unwrap_or("Session").to_string();
+        let home = user_home();
+        let root_label = workspace_root_label(&root, home.as_deref());
+        let muted = cx.theme().muted_foreground;
+
+        v_flex()
+            .id("workspace-rail")
+            .w(px(WORKSPACE_RAIL_W))
+            .h_full()
+            .flex_shrink_0()
+            .bg(cx.theme().sidebar)
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .w_full()
+                    .h(px(SIDEBAR_HEADER_H))
+                    .px_2()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(muted)
+                            .child("Workspaces"),
+                    )
+                    .child(
+                        Button::new("workspace-create")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Plus)
+                            .tooltip("New Workspace")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_create_dialog(window, cx);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .id("session-root-row")
+                    .w_full()
+                    .min_h(px(WORKSPACE_ROW_H))
+                    .items_stretch()
+                    .bg(cx.theme().accent.opacity(0.20))
+                    .child(
+                        div()
+                            .w(px(3.))
+                            .min_h(px(WORKSPACE_ROW_H))
+                            .flex_shrink_0()
+                            .bg(cx.theme().accent),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .py(px(4.))
+                            .pl(px(8.))
+                            .pr_1()
+                            .justify_center()
+                            .gap(px(1.))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_ellipsis()
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_ellipsis()
+                                    .text_color(muted)
+                                    .child(root_label),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("workspace-rail-hint")
+                    .w_full()
+                    .flex_shrink_0()
+                    .px_2()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .text_xs()
+                    .text_color(muted)
+                    .child(
+                        "This daemon has no workspace list. Upgrade and restart it to add projects.",
+                    ),
+            )
+    }
+
     fn render_workspace_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let home = user_home();
         let hint = if matches!(self.connection, ConnectionState::Online) {
@@ -3597,8 +3733,12 @@ impl Render for Workspace {
                 h_flex()
                     .flex_1()
                     .min_h_0()
-                    .when(self.workspace_cap, |this| {
-                        this.child(self.render_workspace_rail(cx))
+                    .when(self.workspace_rail_visible(), |this| {
+                        this.child(if self.workspace_cap {
+                            self.render_workspace_rail(cx).into_any_element()
+                        } else {
+                            self.render_session_rail(cx).into_any_element()
+                        })
                     })
                     .child(self.render_activity_bar(cx))
                     .when(!self.sidebar_collapsed, |this| {

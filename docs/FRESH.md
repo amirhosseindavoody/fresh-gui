@@ -148,7 +148,7 @@ Line/column from path or link are returned on `editor_opened` for the **host** t
 | PTY | Host `portable-pty` + OSC 7 hooks (`pty.rs`); Fresh’s `TerminalManager` unused |
 | Explorer FS | Sandboxed `fs.rs` / `fs_watch.rs` (list, create, copy, move, watch). Fresh `StdFileSystem` is only used inside the editor for buffer I/O |
 | Host editing UX | gpui-component `Editor` view of Fresh snapshots (save is `buffer_edit` then `buffer_save`). Fresh Compose/Page View is a plugin and plugins are not enabled on the ADE path |
-| Host terminal UX | VTE grid of remote PTY bytes |
+| Host terminal UX | `alacritty_terminal` grid of remote PTY bytes (cursor, color, alternate screen, DECSET mouse modes 1000/1002/1003). Same library Fresh's TUI terminal wraps. Mouse bytes are encoded in the host the way Fresh's TUI encodes them; those helpers are private to Fresh's editor, not a callable API. `TerminalManager` is not mounted: it is tied to Fresh's own view, not GPUI |
 | Host chrome | GPUI + gpui-component |
 | Plugins / LSP / tree-sitter in the ADE path | Features off; not exposed over the protocol |
 | Orchestrator / coding agents | Fresh plugin not loaded; agent direction for ADE is design-only ([COPILOT.md](./COPILOT.md)) — steal registry/resume patterns, do not embed Orchestrator yet |
@@ -156,7 +156,7 @@ Line/column from path or link are returned on `editor_opened` for the **host** t
 
 ## 7. Host UI wiring
 
-The GPUI host does not import Fresh. It speaks ADE through `fresh-gui-client` (`crates/fresh-gui-app/src/gui/`). Editor tabs are a view of Fresh snapshots; save sends `buffer_edit` then `buffer_save`. Terminal tabs are a VTE grid of PTY bytes.
+The GPUI host does not import Fresh. It speaks ADE through `fresh-gui-client` (`crates/fresh-gui-app/src/gui/`). Editor tabs are a view of Fresh snapshots; save sends `buffer_edit` then `buffer_save`. Terminal tabs parse PTY bytes with `alacritty_terminal` and paint the grid in GPUI. Fresh's terminal service was checked first; it cannot be embedded as a GPUI panel, so the host uses the same grid crate Fresh uses and leaves `TerminalManager` on the editor side.
 
 Workspace rule: prefer extending Fresh-backed backend surfaces over inventing a second editor engine in the host (see `.cursor/rules/leverage-fresh-editor.mdc`).
 
@@ -165,7 +165,7 @@ Workspace rule: prefer extending Fresh-backed backend surfaces over inventing a 
 | Location | Relation to Fresh |
 |----------|-------------------|
 | `~/.config/fresh-gui/config.json` | fresh-gui daemon config (JSONC) |
-| `terminal.shell` | Same field shape as Fresh shell config; empty `args` keep interactive + OSC 7 setup. Unix PTY spawn falls back when the command is missing (`$SHELL`, then `bash`, then `sh`). Fresh `detect_shell` is not used: it does not probe executability, and PTYs are host `portable-pty` |
+| `terminal.shell` | Same field shape as Fresh shell config; empty `args` keep interactive + OSC 7 setup (bash rcfile, zsh `ZDOTDIR`, fish `fish_prompt` hook). Unix PTY spawn falls back when the command is missing (`$SHELL`, then `bash`, then `sh`). Fresh `detect_shell` is not used: it does not probe executability, and PTYs are host `portable-pty` |
 | `ui.editorLineWrap` | Host soft wrap; mirrors Fresh `editor.line_wrap` (default on). Toggle via `Alt+Z` / command palette |
 | `ui.*` | Host-only prefs → `Hello.ui` |
 | Fresh editor state dir | Ephemeral under `/tmp/fresh-gui-editor-{pid}` for the embedded `Editor` |

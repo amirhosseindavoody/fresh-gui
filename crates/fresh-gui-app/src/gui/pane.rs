@@ -13,7 +13,7 @@ use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, Pan
 use gpui_kit::component::input::{Editor, EditorState, InputEvent, Position};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _,
+    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
     button::{Button, ButtonVariants as _},
     h_flex, v_flex,
 };
@@ -25,7 +25,13 @@ use super::osc7::feed_osc7_chunk;
 use super::paths::display_path;
 use super::rail::path_basename;
 use super::tab_chrome::{TabCloseScope, TabStripMetrics};
-use super::terminal::{TermScreen, keystroke_to_bytes};
+use super::terminal::{
+    TermMouseButton, TermMouseKind, TermMouseMods, TermScreen, TermSpan, keystroke_to_bytes,
+};
+
+/// `text_sm` monospace cell, matching [`super::terminal`] pixel reports.
+const TERM_CELL_W: f32 = 8.;
+const TERM_CELL_H: f32 = 18.;
 use super::workspace::Workspace;
 
 /// Label shown on a tab for this client session.
@@ -67,6 +73,16 @@ pub struct TerminalPanel {
     metrics: TabStripMetrics,
     /// How far left the **+** sits from the suffix slot. Measured last frame.
     plus_shift: Rc<Cell<f32>>,
+    /// Grid size measured after layout. Applied on the next frame.
+    pending_grid: Rc<Cell<Option<(usize, usize)>>>,
+    /// Top-left of the cell grid in window coordinates, from the last layout.
+    grid_origin: Rc<Cell<Option<Point<Pixels>>>>,
+    /// Left-button drag is selecting text on the host.
+    selecting: bool,
+    /// Button held for a report to the PTY.
+    pressed: Option<TermMouseButton>,
+    /// Last cell written as a move or drag, so a hover does not repeat.
+    last_mouse_cell: Option<(usize, usize)>,
     closed: bool,
 }
 
@@ -90,6 +106,11 @@ impl TerminalPanel {
             workspace,
             metrics,
             plus_shift: Rc::new(Cell::new(0.0)),
+            pending_grid: Rc::new(Cell::new(None)),
+            grid_origin: Rc::new(Cell::new(None)),
+            selecting: false,
+            pressed: None,
+            last_mouse_cell: None,
             closed: false,
         }
     }
@@ -133,8 +154,201 @@ impl TerminalPanel {
         if let Some(cwd) = &cwd {
             self.cwd = Some(cwd.clone());
         }
+        for text in self.screen.take_clipboard_stores() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
         cx.notify();
         cwd
+    }
+
+    fn cell_at(&self, position: Point<Pixels>) -> Option<(usize, usize)> {
+        let origin = self.grid_origin.get()?;
+        let x = f32::from(position.x - origin.x);
+        let y = f32::from(position.y - origin.y);
+        let cols = self.screen.cols.max(1);
+        let rows = self.screen.rows.max(1);
+        let col = (x / TERM_CELL_W).floor() as isize;
+        let row = (y / TERM_CELL_H).floor() as isize;
+        let col = col.clamp(0, cols as isize - 1) as usize;
+        let row = row.clamp(0, rows as isize - 1) as usize;
+        Some((col, row))
+    }
+
+    fn write_pty(&self, data: Vec<u8>) {
+        if data.is_empty() {
+            return;
+        }
+        self.ade.send(AdeCmd::WritePty {
+            id: self.pty_id.clone(),
+            data,
+        });
+    }
+
+    fn mouse_mods(modifiers: &Modifiers) -> TermMouseMods {
+        TermMouseMods {
+            shift: modifiers.shift,
+            alt: modifiers.alt,
+            control: modifiers.control || modifiers.platform,
+        }
+    }
+
+    /// Host selection when the program is not tracking the mouse, or when
+    /// Shift is held (the usual bypass).
+    fn host_selects(&self, button: TermMouseButton, modifiers: &Modifiers) -> bool {
+        button == TermMouseButton::Left
+            && (modifiers.shift || !self.screen.mouse_tracking().active())
+    }
+
+    fn on_mouse_button(
+        &mut self,
+        button: TermMouseButton,
+        down: bool,
+        position: Point<Pixels>,
+        modifiers: &Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        if down {
+            window.focus(&self.focus, cx);
+        }
+        if down && self.host_selects(button, modifiers) {
+            self.pressed = None;
+            self.pointer_select(position, true, cx);
+            return;
+        }
+        if !down {
+            self.release_mouse(button, position, modifiers, cx);
+            return;
+        }
+        let tracking = self.screen.mouse_tracking();
+        if !tracking.active() {
+            return;
+        }
+        self.selecting = false;
+        self.screen.clear_selection();
+        self.pressed = Some(button);
+        self.last_mouse_cell = self.cell_at(position);
+        self.send_mouse(position, TermMouseKind::Down(button), modifiers, false);
+        cx.notify();
+    }
+
+    fn release_mouse(
+        &mut self,
+        button: TermMouseButton,
+        position: Point<Pixels>,
+        modifiers: &Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selecting && button == TermMouseButton::Left {
+            self.finish_select(cx);
+            return;
+        }
+        if self.pressed == Some(button) {
+            self.pressed = None;
+            self.last_mouse_cell = None;
+            self.send_mouse(position, TermMouseKind::Up(button), modifiers, false);
+        }
+    }
+
+    fn on_pointer_move(
+        &mut self,
+        position: Point<Pixels>,
+        modifiers: &Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selecting {
+            self.pointer_select(position, false, cx);
+            return;
+        }
+        let tracking = self.screen.mouse_tracking();
+        let kind = if let Some(button) = self.pressed {
+            if !tracking.reports_drag() {
+                return;
+            }
+            TermMouseKind::Drag(button)
+        } else if tracking.reports_move() {
+            TermMouseKind::Move
+        } else {
+            return;
+        };
+        self.send_mouse(position, kind, modifiers, true);
+    }
+
+    fn send_mouse(
+        &mut self,
+        position: Point<Pixels>,
+        kind: TermMouseKind,
+        modifiers: &Modifiers,
+        dedup: bool,
+    ) {
+        let Some((col, row)) = self.cell_at(position) else {
+            return;
+        };
+        if dedup && self.last_mouse_cell == Some((col, row)) {
+            return;
+        }
+        let Some(bytes) =
+            self.screen
+                .mouse_tracking()
+                .encode(col, row, kind, Self::mouse_mods(modifiers))
+        else {
+            return;
+        };
+        if dedup {
+            self.last_mouse_cell = Some((col, row));
+        }
+        self.write_pty(bytes);
+    }
+
+    fn scroll_host(&mut self, lines: f32, cx: &mut Context<Self>) {
+        if self.screen.alt_screen() {
+            let steps = lines.abs().round().clamp(1., 8.) as usize;
+            let seq: &[u8] = if lines > 0. { b"\x1b[A" } else { b"\x1b[B" };
+            let mut data = Vec::with_capacity(seq.len() * steps);
+            for _ in 0..steps {
+                data.extend_from_slice(seq);
+            }
+            self.write_pty(data);
+            return;
+        }
+        let steps = lines.round() as i32;
+        if steps != 0 {
+            self.screen.scroll_by(-steps);
+            cx.notify();
+        }
+    }
+
+    fn pointer_select(&mut self, position: Point<Pixels>, start: bool, cx: &mut Context<Self>) {
+        let Some((col, row)) = self.cell_at(position) else {
+            return;
+        };
+        if start {
+            self.screen.begin_selection(col, row);
+            self.selecting = true;
+        } else if self.selecting {
+            self.screen.update_selection(col, row);
+        }
+        cx.notify();
+    }
+
+    fn finish_select(&mut self, cx: &mut Context<Self>) {
+        if !self.selecting {
+            return;
+        }
+        self.selecting = false;
+        if self.screen.selection_is_empty() {
+            self.screen.clear_selection();
+        }
+        cx.notify();
+    }
+
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = self.screen.selection_text() else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        cx.notify();
     }
 }
 
@@ -249,7 +463,16 @@ impl DockPanel for TerminalPanel {
         let pty = self.pty_id.clone();
         let workspace = self.workspace.clone();
         let panel_id = PanelId::from(cx.entity().entity_id());
+        let copy_from = cx.entity().downgrade();
         let menu = menu
+            .item(PopupMenuItem::new("Copy").on_click({
+                let copy_from = copy_from.clone();
+                move |_, _, cx| {
+                    copy_from
+                        .update(cx, |panel, cx| panel.copy_selection(cx))
+                        .ok();
+                }
+            }))
             .item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
                 workspace
                     .update(cx, |workspace, cx| {
@@ -274,54 +497,333 @@ impl DockPanel for TerminalPanel {
 impl Render for TerminalPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pty_id = self.pty_id.clone();
-        let lines = self.screen.visible_lines();
+        if let Some((cols, rows)) = self.pending_grid.get()
+            && (cols != self.screen.cols || rows != self.screen.rows)
+        {
+            self.screen.resize(cols, rows);
+            self.ade.send(AdeCmd::ResizePty {
+                id: self.pty_id.clone(),
+                cols: cols as u16,
+                rows: rows as u16,
+            });
+        }
+        let rows = self.screen.rows();
         let focused = self.focus.is_focused(window);
-        div()
+        let fg_default = cx.theme().foreground;
+        let bg_default = cx.theme().background;
+        let accent = cx.theme().accent;
+        let pending_grid = Rc::clone(&self.pending_grid);
+        let grid_origin = Rc::clone(&self.grid_origin);
+        let entity_id = cx.entity().entity_id();
+        let track_outside = self.selecting || self.pressed.is_some();
+        let select_entity = cx.entity().downgrade();
+        let reporting = self.screen.mouse_tracking().active();
+        let pane = div()
             .id(format!("terminal-pane-{}", self.pty_id))
             .role(Role::Terminal)
             .aria_label("Terminal")
             .size_full()
+            .overflow_hidden()
             .p_2()
-            .bg(cx.theme().background)
+            .bg(bg_default)
             .font_family(cx.theme().mono_font_family.clone())
             .text_sm()
             .track_focus(&self.focus)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.on_mouse_button(
+                        TermMouseButton::Left,
+                        true,
+                        event.position,
+                        &event.modifiers,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.on_mouse_button(
+                        TermMouseButton::Middle,
+                        true,
+                        event.position,
+                        &event.modifiers,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.on_mouse_button(
+                        TermMouseButton::Right,
+                        true,
+                        event.position,
+                        &event.modifiers,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                this.on_pointer_move(event.position, &event.modifiers, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    this.on_mouse_button(
+                        TermMouseButton::Left,
+                        false,
+                        event.position,
+                        &event.modifiers,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    this.on_mouse_button(
+                        TermMouseButton::Middle,
+                        false,
+                        event.position,
+                        &event.modifiers,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    this.on_mouse_button(
+                        TermMouseButton::Right,
+                        false,
+                        event.position,
+                        &event.modifiers,
+                        window,
+                        cx,
+                    );
+                }),
+            )
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                 let ks = &event.keystroke;
+                let key = ks.key.to_lowercase();
+                let copy = (ks.modifiers.control || ks.modifiers.platform)
+                    && !ks.modifiers.alt
+                    && key == "c"
+                    && this.screen.selection_text().is_some();
+                if copy {
+                    cx.stop_propagation();
+                    this.copy_selection(cx);
+                    return;
+                }
+                if ks.modifiers.shift && !ks.modifiers.control && !ks.modifiers.alt {
+                    match key.as_str() {
+                        "pageup" => {
+                            cx.stop_propagation();
+                            this.screen.scroll_page(true);
+                            cx.notify();
+                            return;
+                        }
+                        "pagedown" => {
+                            cx.stop_propagation();
+                            this.screen.scroll_page(false);
+                            cx.notify();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 let bytes = keystroke_to_bytes(
                     ks.key.as_str(),
                     ks.key_char.as_deref(),
                     ks.modifiers.control,
                     ks.modifiers.alt,
                     ks.modifiers.shift,
+                    this.screen.app_cursor(),
                 );
                 if let Some(bytes) = bytes {
                     cx.stop_propagation();
+                    this.screen.clear_selection();
+                    this.screen.scroll_to_bottom();
                     this.ade.send(AdeCmd::WritePty {
                         id: pty_id.clone(),
                         data: bytes,
                     });
                 }
             }))
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                cx.stop_propagation();
+                let lines = scroll_lines(event.delta);
+                if lines == 0. {
+                    return;
+                }
+                // Wheel is a mouse report while tracking is on. Shift keeps
+                // the host's history / alternate-screen arrows.
+                if this.screen.mouse_tracking().active() && !event.modifiers.shift {
+                    let steps = lines.abs().round().clamp(1., 8.) as usize;
+                    let kind = if lines > 0. {
+                        TermMouseKind::ScrollUp
+                    } else {
+                        TermMouseKind::ScrollDown
+                    };
+                    let Some((col, row)) = this.cell_at(event.position) else {
+                        return;
+                    };
+                    let mut data = Vec::new();
+                    for _ in 0..steps {
+                        if let Some(bytes) = this.screen.mouse_tracking().encode(
+                            col,
+                            row,
+                            kind,
+                            Self::mouse_mods(&event.modifiers),
+                        ) {
+                            data.extend(bytes);
+                        }
+                    }
+                    this.write_pty(data);
+                    return;
+                }
+                this.scroll_host(lines, cx);
+            }))
             .child(
                 v_flex()
                     .id(format!("term-scroll-{}", self.pty_id))
                     .size_full()
-                    .overflow_y_scroll()
-                    .children(lines.into_iter().map(|line| {
-                        div()
-                            .h(px(18.))
-                            .whitespace_nowrap()
-                            .child(if line.is_empty() {
-                                " ".to_string()
-                            } else {
-                                line
-                            })
+                    .overflow_hidden()
+                    .on_prepaint(move |bounds, window, app| {
+                        grid_origin.set(Some(bounds.origin));
+                        let next = grid_size(bounds.size);
+                        if pending_grid.get() != Some(next) {
+                            pending_grid.set(Some(next));
+                            app.notify(entity_id);
+                        }
+                        if !track_outside {
+                            return;
+                        }
+                        let moved = select_entity.clone();
+                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, app| {
+                            if phase.capture() {
+                                return;
+                            }
+                            moved
+                                .update(app, |panel, cx| {
+                                    panel.on_pointer_move(event.position, &event.modifiers, cx);
+                                })
+                                .ok();
+                        });
+                        let released = select_entity.clone();
+                        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, app| {
+                            if phase.capture() {
+                                return;
+                            }
+                            let Some(button) = term_mouse_button(event.button) else {
+                                return;
+                            };
+                            released
+                                .update(app, |panel, cx| {
+                                    panel.release_mouse(
+                                        button,
+                                        event.position,
+                                        &event.modifiers,
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                        });
+                    })
+                    .children(rows.into_iter().map(|row| {
+                        h_flex().h(px(18.)).items_center().children(
+                            row.spans
+                                .into_iter()
+                                .map(|span| term_span_el(span, fg_default, bg_default, accent)),
+                        )
                     }))
                     .when(focused, |this| this.opacity(1.))
                     .when(!focused, |this| this.opacity(0.85)),
-            )
+            );
+        // Right-click Copy stays available until a program takes the pointer.
+        // While tracking is on, that click belongs to the PTY; Copy remains
+        // on the tab's ··· menu.
+        if reporting {
+            pane.into_any_element()
+        } else {
+            let menu_entity = cx.entity().downgrade();
+            pane.context_menu(move |menu, _, _| {
+                let menu_entity = menu_entity.clone();
+                menu.item(PopupMenuItem::new("Copy").on_click(move |_, _, cx| {
+                    menu_entity
+                        .update(cx, |panel, cx| panel.copy_selection(cx))
+                        .ok();
+                }))
+            })
+            .into_any_element()
+        }
     }
+}
+
+fn grid_size(size: Size<Pixels>) -> (usize, usize) {
+    let width = f32::from(size.width);
+    let height = f32::from(size.height);
+    if width < TERM_CELL_W || height < TERM_CELL_H {
+        return (80, 24);
+    }
+    let cols = ((width / TERM_CELL_W).floor() as usize).clamp(2, 500);
+    let rows = ((height / TERM_CELL_H).floor() as usize).clamp(1, 200);
+    (cols, rows)
+}
+
+fn term_mouse_button(button: MouseButton) -> Option<TermMouseButton> {
+    match button {
+        MouseButton::Left => Some(TermMouseButton::Left),
+        MouseButton::Middle => Some(TermMouseButton::Middle),
+        MouseButton::Right => Some(TermMouseButton::Right),
+        MouseButton::Navigate(_) => None,
+    }
+}
+
+fn scroll_lines(delta: ScrollDelta) -> f32 {
+    match delta {
+        ScrollDelta::Lines(point) => point.y,
+        ScrollDelta::Pixels(point) => f32::from(point.y) / TERM_CELL_H,
+    }
+}
+
+fn term_rgb(rgb: [u8; 3]) -> gpui::Rgba {
+    gpui::rgb((u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2]))
+}
+
+fn term_span_el(span: TermSpan, fg_default: Hsla, bg_default: Hsla, accent: Hsla) -> gpui::Div {
+    let text = if span.text.is_empty() {
+        " ".to_string()
+    } else {
+        span.text
+    };
+    let cursor = span.cursor;
+    let bold = span.bold;
+    let fg = span.fg;
+    let bg = span.bg;
+    div()
+        .whitespace_nowrap()
+        .when(bold, |el| el.font_semibold())
+        .when(!cursor && !span.selected, |el| match fg {
+            Some(fg) => el.text_color(term_rgb(fg)),
+            None => el.text_color(fg_default),
+        })
+        .when(!cursor && !span.selected, |el| match bg {
+            Some(bg) => el.bg(term_rgb(bg)),
+            None => el,
+        })
+        .when(span.selected && !cursor, |el| {
+            el.bg(accent.opacity(0.45)).text_color(fg_default)
+        })
+        .when(cursor, |el| el.bg(accent).text_color(bg_default))
+        .child(text)
 }
 
 struct EditorPending {

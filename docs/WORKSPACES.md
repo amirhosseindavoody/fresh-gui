@@ -71,7 +71,7 @@ PTY open/close on a workspace session updates that workspace’s terminal tabs. 
 
 ## GPUI rail
 
-The host paints a spaces column to the left of the activity bar when `hello.capabilities` includes `workspace` (232px). The header is a section title, **Workspaces**, with **+**.
+The host paints a spaces column to the left of the activity bar (232px). A daemon that advertises `workspace` (current local and remote builds do) gets the full list. An older remote that is already running, so the SSH probe did not replace it, still gets one row for the session root. **+** on that row says the daemon has to be upgraded and restarted before another project can be created. The header is a section title, **Workspaces**, with **+**.
 
 Each row is two lines: the display name, then the project root (a home prefix folds to `~`, and a long path keeps both ends). An empty root is labeled **Default root**. The active workspace has an accent background and a 3px left accent. Hover lightens the row and reveals Rename and Close; the same actions are on the right-click menu. Close is refused for the last workspace (the daemon already rejects that close). With one workspace, a short footer says that **+** adds another project, so the column is not an empty strip.
 
@@ -79,7 +79,7 @@ Each row is two lines: the display name, then the project root (a home prefix fo
 
 Dock panels, terminals, and the explorer root are replaced from `workspace_switched`.
 
-Inside the focused workspace the dock still splits, merges, and reorders, terminal titles are `1`, `2`, `3`, … for that workspace, and the explorer multi-selects. Switching removes those panels without `pty_close` / `editor_close`, so idle PTYs keep running. The saved layout is the center panel order (a flat tab list). Coming back rebuilds one group, so split geometry is not restored.
+Inside the focused workspace the dock still splits, merges, and reorders, terminal titles are `1`, `2`, `3`, … for that workspace, and the explorer multi-selects. A new shell starts in that workspace's root (or the remote session root when no workspace is attached). After the user `cd`s, bash, zsh, and fish OSC 7 cwd is reused for the next shell. Switching clears that remembered directory so the next workspace does not inherit it. Switching removes those panels without `pty_close` / `editor_close`, so idle PTYs keep running. The saved layout is the center panel order (a flat tab list). Coming back rebuilds one group, so split geometry is not restored.
 
 The host ignores `pty_opened` it did not request and `editor_opened` whose `request_id` it did not send, so a late reply from workspace A cannot insert a tab into B.
 

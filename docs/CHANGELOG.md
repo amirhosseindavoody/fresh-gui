@@ -2,6 +2,16 @@
 
 ## 2026-09-22
 
+### Shell tabs and remote sessions
+
+- Shell tabs use an `alacritty_terminal` grid (Apache-2.0), the same library Fresh's TUI terminal wraps. The cursor is drawn, SGR colors are kept, and the alternate screen works, so vim, htop, and fish can run. Fresh `TerminalManager` is still not mounted: it belongs to Fresh's own view, not this GPUI window. libghostty was not integrated; it ships its own GPU renderer rather than a cell grid. The daemon PTY stays `portable-pty`.
+- Each PTY child gets `TERM=xterm-256color` and `COLORTERM=truecolor`. Fish is started with `-i` and an init command that hooks `fish_prompt` to emit OSC 7, without changing the directory the PTY was given. The pane resizes the grid (about 8×18px cells). The wheel scrolls history, and on the alternate screen sends up/down. Shift+PageUp / Shift+PageDown scroll history.
+- Drag on the grid selects text. `Ctrl+C` / `Cmd+C` copies that selection; with no selection, `Ctrl+C` is still the interrupt. The terminal's right-click and **···** menus have **Copy**. A click with no drag, or typing, clears the selection. When a program enables mouse tracking (DECSET 1000, 1002, or 1003), clicks, drags, moves, and the wheel are written to the PTY instead. Shift+drag still selects on the host. Encoding is normal tracking, UTF-8 (1005), or SGR (1006). urxvt 1015 is not tracked by `alacritty_terminal`.
+- OSC 52 copy (`\e]52;c;…`) writes the host clipboard, capped at 256 KiB. OSC 52 paste/read is not answered, so a program in the shell cannot read the host clipboard.
+- A new shell starts in the workspace root, or the remote session root, when the client does not send a directory. The daemon no longer inherits `$HOME` just because the SSH process was started there. An explicit cwd (OSC 7 after `cd`) still wins. Switching workspaces forgets the previous shell's directory.
+- Windows ConPTY spawn hides the child console (`STARTF_USESHOWWINDOW` / `SW_HIDE`) via a vendored `portable-pty` 0.9.0 (MIT) under `vendor/portable-pty`. `CREATE_NO_WINDOW` is not set on that child; it stops the conhost helper. This was not run on Windows in CI here.
+- A remote window shows the Workspaces rail when the daemon advertises `workspace`, same as local. An older remote that is already running shows one row for the session root until that daemon is upgraded and restarted.
+
 ### Windows client menu, binary files, and Git
 
 - Clicking the title bar no longer warns `a11y: set_focus called more than once in a single frame`. The dock tab frame tracks the focused panel's focus handle. Giving that frame a group role (so GPUI would stop noting a role-less id) made both nodes call `set_focus` on every redraw, including a title-bar click that does not move focus. The tab frame stays role-less and the panel is the only focus owner. GPUI still notes the role-less frame at info; the host filter (`gpui=warn`) hides that.

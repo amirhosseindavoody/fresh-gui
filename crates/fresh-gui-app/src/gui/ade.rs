@@ -21,7 +21,6 @@ pub enum AdeCmd {
         id: String,
         data: Vec<u8>,
     },
-    #[allow(dead_code)]
     ResizePty {
         id: String,
         cols: u16,
