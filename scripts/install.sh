@@ -70,6 +70,16 @@ main() {
   os=$(detect_os) || exit 1
   arch=$(detect_arch) || exit 1
   libc=$(detect_libc) || exit 1
+  glibc_version=$(detect_glibc_version)
+  if [ "$os" = Linux ] && [ "$want_client" -eq 1 ] && [ "$libc" = gnu ] && version_lt "$glibc_version" 2.39; then
+    if [ "$want_daemon" -eq 1 ]; then
+      echo "note: the GPUI client requires glibc >= 2.39 (detected ${glibc_version:-unknown}); skipping the client." >&2
+      want_client=0
+    else
+      echo "error: the GPUI client requires glibc >= 2.39 (detected ${glibc_version:-unknown})." >&2
+      exit 1
+    fi
+  fi
   target=$(select_target "$os" "$arch" "$libc") || exit 1
   ext=$(archive_ext "$target")
 
@@ -135,20 +145,16 @@ main() {
   fi
   got_client=0
   got_daemon=0
-  # Client archive members are `fresh-gui-app` on current releases and
-  # `fresh-gui` once package-client.sh renames the host. Install that file
-  # as `fresh-gui` either way, and keep a `fresh-gui-app` name for old notes.
+  # Package names inside older archives varied; the installed command is always fresh-gui.
   if [ "$want_client" -eq 1 ]; then
     if [ "$ext" = "zip" ]; then
       if install_named "$client_url" "$work/client" "fresh-gui.exe" "$bin_dir" "$ext" "$optional" \
         fresh-gui-app.exe fresh-gui.exe; then
         got_client=1
-        link_same "${bin_dir}/fresh-gui.exe" "${bin_dir}/fresh-gui-app.exe"
       fi
     elif install_named "$client_url" "$work/client" "fresh-gui" "$bin_dir" "$ext" "$optional" \
       fresh-gui-app fresh-gui; then
       got_client=1
-      link_same "${bin_dir}/fresh-gui" "${bin_dir}/fresh-gui-app"
     fi
   fi
   if [ "$want_daemon" -eq 1 ]; then
@@ -235,6 +241,11 @@ detect_libc() {
     printf '%s\n' musl
     return
   fi
+  glibc_version=$(detect_glibc_version)
+  if [ -n "$glibc_version" ] && version_lt "$glibc_version" 2.31; then
+    printf '%s\n' musl
+    return
+  fi
   if command -v ldd >/dev/null 2>&1; then
     ldd_out=$(ldd --version 2>&1 || true)
     case "$ldd_out" in
@@ -245,6 +256,20 @@ detect_libc() {
     esac
   fi
   printf '%s\n' gnu
+}
+
+# Parse glibc's own version from ldd output. On systems without ldd or where
+# its output is not recognizable, return empty so explicit libc selection can
+# still be used and we do not invent a version.
+detect_glibc_version() {
+  command -v ldd >/dev/null 2>&1 || return 0
+  ldd_out=$(ldd --version 2>&1 || true)
+  printf '%s\n' "$ldd_out" | sed -nE 's/.*[Gg][Ll][Ii][Bb][Cc][^0-9]*([0-9]+\.[0-9]+).*/\1/p; t; s/.*[^0-9]([0-9]+\.[0-9]+)([^0-9].*)?$/\1/p' | awk 'NR == 1 { print; exit }'
+}
+
+version_lt() {
+  [ -n "$1" ] || return 1
+  awk -v a="$1" -v b="$2" 'BEGIN { split(a,x,"."); split(b,y,"."); exit !((x[1]+0 < y[1]+0) || (x[1]+0 == y[1]+0 && x[2]+0 < y[2]+0)) }'
 }
 
 select_target() {
@@ -539,27 +564,17 @@ install_named() {
   fi
   mkdir -p "$dest_dir"
   tmp_dest="${dest_dir}/${dest_base}.partial"
-  cp "$src" "$tmp_dest"
-  chmod 755 "$tmp_dest"
-  mv -f "$tmp_dest" "${dest_dir}/${dest_base}"
+  if ! cp "$src" "$tmp_dest"; then
+    rm -f "$tmp_dest"
+    echo "error: could not copy the binary into '${dest_dir}' (possibly disk quota exceeded). Free space or change FRESH_GUI_HOME, then retry." >&2
+    exit 1
+  fi
+  if ! chmod 755 "$tmp_dest" || ! mv -f "$tmp_dest" "${dest_dir}/${dest_base}"; then
+    rm -f "$tmp_dest"
+    echo "error: could not install binary into '${dest_dir}'. Free space or change FRESH_GUI_HOME, then retry." >&2
+    exit 1
+  fi
   echo "Installed ${dest_dir}/${dest_base}"
-}
-
-# Second name for the same bytes (hardlink, or a copy when links are refused).
-link_same() {
-  src=$1
-  dest=$2
-  if [ "$src" = "$dest" ] || [ ! -f "$src" ]; then
-    return 0
-  fi
-  rm -f "$dest"
-  if ln "$src" "$dest" 2>/dev/null; then
-    echo "Installed ${dest}"
-    return 0
-  fi
-  cp "$src" "$dest"
-  chmod 755 "$dest"
-  echo "Installed ${dest}"
 }
 
 update_shell_file() {

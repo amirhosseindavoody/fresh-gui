@@ -23,7 +23,7 @@
 #   FRESH_GUI_DRY_RUN         any non-empty value prints the plan and exits
 #
 # Both components: fresh-gui.exe is the GPUI host, fresh-gui-daemon.exe is the
-# headless daemon, fresh-gui-app.exe is another name for the host.
+# headless daemon.
 # Daemon only: fresh-gui.exe is the headless daemon.
 
 # Parse -File arguments here. `irm | iex` has no script-level param block
@@ -237,25 +237,6 @@ public static extern IntPtr SendMessageTimeout(
         return $Value -match '^[0-9a-f]{64}$'
     }
 
-    function Install-CompatName {
-        param(
-            [string] $Source,
-            [string] $Dest
-        )
-        if ($Source -eq $Dest -or -not (Test-Path -LiteralPath $Source)) {
-            return
-        }
-        if (Test-Path -LiteralPath $Dest) {
-            Remove-Item -LiteralPath $Dest -Force
-        }
-        try {
-            New-Item -ItemType HardLink -Path $Dest -Target $Source | Out-Null
-        } catch {
-            Copy-Item -LiteralPath $Source -Destination $Dest -Force
-        }
-        Write-Host "Installed $Dest"
-    }
-
     function Install-Component {
         param(
             [string] $Url,
@@ -335,7 +316,14 @@ public static extern IntPtr SendMessageTimeout(
             throw "Archive does not contain: $($BinaryNames -join ', ')."
         }
         $destination = Join-Path $BinDir $DestName
-        Copy-Item -LiteralPath $found.FullName -Destination $destination -Force
+        $partial = "$destination.partial"
+        try {
+            Copy-Item -LiteralPath $found.FullName -Destination $partial -Force
+            Move-Item -LiteralPath $partial -Destination $destination -Force
+        } catch {
+            Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
+            throw "Could not copy/install the binary into '$BinDir' (possibly disk quota exceeded). Free space or change FRESH_GUI_HOME, then retry. $($_.Exception.Message)"
+        }
         Write-Host "Installed $destination"
         return $true
     }
@@ -473,7 +461,6 @@ public static extern IntPtr SendMessageTimeout(
         if ($wantClient) {
             if (Install-Component -Url $clientUrl -Work (Join-Path $work 'client') -BinaryNames @('fresh-gui-app.exe', 'fresh-gui.exe') -DestName 'fresh-gui.exe' -BinDir $binDir -Optional:$optional) {
                 $gotClient = $true
-                Install-CompatName -Source (Join-Path $binDir 'fresh-gui.exe') -Dest (Join-Path $binDir 'fresh-gui-app.exe')
             }
         }
         if ($wantDaemon) {
