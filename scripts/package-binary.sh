@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Package a standalone fresh-gui binary archive (bin + embedded UI assets).
+# Package a standalone archive for the headless fresh-gui daemon.
 #
 # Usage:
 #   scripts/package-binary.sh <target> <version> [out-dir]

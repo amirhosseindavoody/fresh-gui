@@ -1,5 +1,5 @@
 # fresh-gui-client
 
-Host-side library: dial the remote backend, authenticate, and speak `fresh-gui-protocol` (typed helpers for session, PTY, FS, editor).
+Rust library used by the desktop host to connect to a fresh-gui daemon over WebSocket. It handles authentication and provides typed helpers for the shared protocol, including sessions, terminals, files, editor messages, and source control.
 
-See [docs/DESIGN.md](../../docs/DESIGN.md).
+This crate is an implementation component, not a separate user-facing application. See the [project README](../../README.md) for installation and use.

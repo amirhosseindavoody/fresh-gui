@@ -58,8 +58,8 @@ pub async fn resolve_link_open(
 
 async fn resolve_existing_file(fs_root: &FsRoot, raw: &str, cwd: Option<&str>) -> Result<PathBuf> {
     if let Some(cwd) = cwd.filter(|s| !s.is_empty()) {
-        // Terax/Fresh: relative paths follow the terminal cwd, which may lie
-        // outside `--root` — authorize it like explorer re-root does.
+        // Relative paths follow the terminal cwd, which may lie outside
+        // `--root`; authorize it as the explorer does when re-rooted.
         let _ = fs_root.authorize(cwd).await;
     }
 

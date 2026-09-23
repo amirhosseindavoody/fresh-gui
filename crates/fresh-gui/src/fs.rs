@@ -1,4 +1,4 @@
-//! Filesystem listing and mutation under a sandboxed root (+ Terax-style authorized cwds).
+//! Filesystem listing and mutation under a sandboxed root with authorized cwd paths.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -44,7 +44,7 @@ impl FsRoot {
         guard.iter().any(|p| canon.starts_with(p))
     }
 
-    /// Terax-style: allow listing/opening under `path` (absolute directory) for this process.
+    /// Allow listing/opening under `path` (absolute directory) for this process.
     /// Safe relative to PTY access — the shell can already read these paths.
     pub async fn authorize(&self, path: &str) -> Result<PathBuf> {
         if path.is_empty() || path == "." || path == "/" {

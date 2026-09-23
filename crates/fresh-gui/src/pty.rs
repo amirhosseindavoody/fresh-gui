@@ -165,7 +165,7 @@ fn ensure_bash_rcfile() -> Option<PathBuf> {
     let dir = shell_init_dir();
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join("bashrc");
-    // Terax-style: ST terminator, urlencoded path, fire once at load, then PROMPT_COMMAND.
+    // Report cwd with an OSC 7 sequence at shell startup and after each prompt.
     let body = r#"# fresh-gui OSC 7 cwd reporting
 [[ -f /etc/bash.bashrc ]] && . /etc/bash.bashrc
 [[ -f ~/.bashrc ]] && . ~/.bashrc

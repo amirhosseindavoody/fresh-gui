@@ -1,50 +1,21 @@
-# fresh-gui (GPUI host)
+# Desktop host
 
-Native **GPUI** ADE host. Cargo builds it as `fresh-gui-app` so the file does not collide with the daemon binary. Installers and `scripts/package-client.sh` put it on `PATH` as **`fresh-gui`**.
+This crate builds the native GPUI desktop host. The installed command is `fresh-gui`; it starts or attaches to the local daemon and opens a window.
+
+From a checkout:
 
 ```bash
-# Starts the local daemon when this user has none, then opens the window.
-# The token comes from the session file (daemon --json), not from the command line.
 pixi run gui
-fresh-gui
-fresh-gui /path/to/project
-
-# Explicit backend, when you already have a URL:
-pixi run gui -- --backend 'http://127.0.0.1:7420/?token=…'
-cargo run -p fresh-gui-app -- --backend ws://127.0.0.1:7420/ws --token "$FRESH_GUI_TOKEN"
-
-pixi run app -- ping
-pixi run app -- smoke
-pixi run app -- attach
-fresh-gui status
-fresh-gui close
 ```
 
-`pixi run gui` builds the daemon (`cargo build -p fresh-gui`) first. In `target/debug` the host finds the sibling `fresh-gui` daemon. An installed layout looks for `fresh-gui-daemon` beside the host, then on `PATH`. `FRESH_GUI_DAEMON` overrides that lookup.
-
-**Native host:** silent connect. A left rail lists workspaces on the daemon (create, switch, rename, close). New Workspace starts in the current workspace folder. Each workspace has its own dock tabs and terminals. `Ctrl+T` new terminal (titled `1`, `2`, `3`, … inside that workspace; the **+** sits beside the last tab). Right-click or **··· → Rename**. Each tab has **×**; right-click also closes that tab, the others, or the tabs to the right. `Ctrl+W` closes the active tab. Windows paths are shown without the `\\?\` prefix. Drag a tab to a pane edge to split, onto a tab to merge, or along the strip to reorder. Explorer: Lucide file-type icons (folders stay folders; a click toggles only that folder), Ctrl/Cmd-click and Shift-click to multi-select, right-click **Copy Path** (absolute), drag onto a folder to move, `Ctrl+C` / `Ctrl+V` to copy inside the tree. `Ctrl+S` save, `Ctrl+Shift+P` command palette, `Ctrl+,` settings (`config.json` on the backend). Disconnect keeps the daemon and its workspaces. The daemon also saves workspaces, tab titles and order, and open explorer folders to disk, so they return after the daemon restarts (terminals come back as new shells). The in-app file clipboard is per window. Symlinked folders inside the project expand like folders. `fresh-gui /path` while a session is already running focuses or creates a workspace at that root.
-
-**SSH remote:** one command installs the Linux daemon if needed, starts it headless, tunnels `/ws`, and opens the window.
+Common installed commands:
 
 ```bash
-fresh-gui user@server
-fresh-gui remote add lab user@server --root /path/to/project
-fresh-gui remote daemon --path ./fresh-gui    # or --url <linux-gnu.tar.gz>, or omit for GitHub latest
-fresh-gui remote connect lab                  # window; closing it closes the tunnel
-fresh-gui lab                                 # saved name, when no local directory has that name
+fresh-gui                 # open the local desktop
+fresh-gui /path/to/project # open a project as a workspace
+fresh-gui user@host        # connect to a Linux daemon over SSH
+fresh-gui status           # show the local daemon status
+fresh-gui close            # stop the local daemon
 ```
 
-OpenSSH only (`ssh` / `scp` on `PATH`, keys or agent). Targets are stored in `~/.config/fresh-gui/remotes.json` (`%APPDATA%\fresh-gui\remotes.json` on Windows). The ADE token is not saved. `--no-ui` starts or reuses the local daemon and does not open a window (what the remote probe runs).
-
-GitHub Releases publish this host as `fresh-gui-client-*-x86_64-unknown-linux-gnu.tar.gz` and `fresh-gui-client-*-x86_64-pc-windows-msvc.zip`. New archives name the file `fresh-gui` / `fresh-gui.exe`. Older archives name it `fresh-gui-app`. The repo installer accepts both and installs the command as `fresh-gui`. See the root [README](../../README.md#install).
-
-```bash
-tar -xzf fresh-gui-client-YYYY.MMDD.N-x86_64-unknown-linux-gnu.tar.gz
-cd fresh-gui-client-YYYY.MMDD.N-x86_64-unknown-linux-gnu
-./fresh-gui user@server
-./fresh-gui remote connect lab
-```
-
-Linux needs glibc ≥ 2.39, an X11 or Wayland display, fontconfig, and a working wgpu/Vulkan backend (`libvulkan1` plus Wayland/XKB/XCB). The Linux release binary is built on `ubuntu-latest`. Combined with gpui-kit (Apache-2.0) the application is GPL-3.0-or-later.
-
-Product overview: [README.md](../../README.md). Architecture: [docs/DESIGN.md](../../docs/DESIGN.md), [docs/UI.md](../../docs/UI.md).
+The host uses the `fresh-gui-client` crate to connect to the daemon and `fresh-gui-protocol` for shared message types. See the [project README](../../README.md) for installation and user guidance.
