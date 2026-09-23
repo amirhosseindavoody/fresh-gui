@@ -20,6 +20,7 @@
 #   FRESH_GUI_REPOURL         GitHub repository
 #   FRESH_GUI_NO_PATH_UPDATE  any non-empty value skips the user PATH update
 #   FRESH_GUI_COMPONENTS      both (default) | client | daemon
+#   FRESH_GUI_STOP_DAEMON     1 | true | yes: stop a running local daemon before replacing binaries
 #   FRESH_GUI_DRY_RUN         any non-empty value prints the plan and exits
 #
 # Both components: fresh-gui.exe is the GPUI host, fresh-gui-daemon.exe is the
@@ -47,6 +48,7 @@ if ($entryScript -eq 'install.ps1') {
             '-FreshGuiRepourl' { $pending = 'FreshGuiRepourl' }
             '-FreshGuiComponents' { $pending = 'FreshGuiComponents' }
             '-NoPathUpdate' { $script:FreshGuiFileArgs['NoPathUpdate'] = $true }
+            '-StopDaemon' { $script:FreshGuiFileArgs['StopDaemon'] = $true }
             '-DryRun' { $script:FreshGuiFileArgs['DryRun'] = $true }
             default { throw "Unknown argument: $arg" }
         }
@@ -63,6 +65,7 @@ if ($entryScript -eq 'install.ps1') {
         [switch] $NoPathUpdate,
         [string] $FreshGuiRepourl = 'https://github.com/amirhosseindavoody/fresh-gui',
         [string] $FreshGuiComponents = 'both',
+        [switch] $StopDaemon,
         [switch] $DryRun
     )
 
@@ -237,6 +240,94 @@ public static extern IntPtr SendMessageTimeout(
         return $Value -match '^[0-9a-f]{64}$'
     }
 
+    function Get-RunningFreshGuiSession {
+        $runtime = if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+            Join-Path $env:LOCALAPPDATA 'fresh-gui'
+        } else {
+            Join-Path ([System.IO.Path]::GetTempPath()) 'fresh-gui'
+        }
+        $meta = Join-Path $runtime 'session.json'
+        if (-not (Test-Path -LiteralPath $meta -PathType Leaf)) {
+            return $null
+        }
+        try {
+            $session = Get-Content -LiteralPath $meta -Raw | ConvertFrom-Json
+            $sessionPid = [int] $session.pid
+        } catch {
+            throw "Could not inspect the local fresh-gui session at '$meta': $($_.Exception.Message)"
+        }
+        if ($sessionPid -le 0) {
+            return $null
+        }
+        try {
+            Get-Process -Id $sessionPid -ErrorAction Stop | Out-Null
+            return $session
+        } catch {
+            return $null
+        }
+    }
+
+    function Confirm-StopFreshGuiDaemon {
+        param(
+            [string] $BinDir,
+            [switch] $StopDaemon
+        )
+
+        $session = Get-RunningFreshGuiSession
+        if ($null -eq $session) {
+            return
+        }
+        Write-Warning "A local fresh-gui daemon session (PID $($session.pid)) is running. Updating binaries requires stopping it."
+        if (-not $StopDaemon) {
+            $interactive = $false
+            try {
+                $interactive = -not [Console]::IsInputRedirected -and -not [Console]::IsErrorRedirected
+            } catch {
+                $interactive = $false
+            }
+            if (-not $interactive) {
+                throw 'A local fresh-gui daemon is running. Run fresh-gui close manually, or re-run with -StopDaemon / FRESH_GUI_STOP_DAEMON=1 to stop it before updating.'
+            }
+            $answer = Read-Host 'Stop the local fresh-gui daemon before updating? [y/N]'
+            if ($answer -notmatch '^(y|yes)$') {
+                throw 'Installation cancelled; the running fresh-gui daemon was left untouched.'
+            }
+        }
+
+        $candidates = @(
+            (Join-Path $BinDir 'fresh-gui-daemon.exe'),
+            (Join-Path $BinDir 'fresh-gui.exe')
+        )
+        foreach ($name in @('fresh-gui-daemon.exe', 'fresh-gui.exe')) {
+            $command = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue
+            if ($null -ne $command) {
+                $candidates += $command.Source
+            }
+        }
+        $daemonBinary = $null
+        foreach ($candidate in ($candidates | Select-Object -Unique)) {
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                $daemonBinary = $candidate
+                break
+            }
+        }
+        if ($null -eq $daemonBinary) {
+            throw 'Could not find a local fresh-gui command to stop the daemon. Run fresh-gui close manually, then retry the installer.'
+        }
+        & $daemonBinary close | Out-Null
+        $closeExitCode = $LASTEXITCODE
+        $processStillRunning = $false
+        try {
+            Get-Process -Id ([int] $session.pid) -ErrorAction Stop | Out-Null
+            $processStillRunning = $true
+        } catch {
+            $processStillRunning = $false
+        }
+        if ($closeExitCode -ne 0 -or $processStillRunning -or $null -ne (Get-RunningFreshGuiSession)) {
+            throw 'Could not stop the local fresh-gui daemon. Run fresh-gui close manually, then retry the installer.'
+        }
+    }
+
     function Install-Component {
         param(
             [string] $Url,
@@ -244,7 +335,8 @@ public static extern IntPtr SendMessageTimeout(
             [string[]] $BinaryNames,
             [string] $DestName,
             [string] $BinDir,
-            [switch] $Optional
+            [switch] $Optional,
+            [switch] $StopDaemon
         )
 
         New-Item -ItemType Directory -Path $Work | Out-Null
@@ -315,6 +407,7 @@ public static extern IntPtr SendMessageTimeout(
         if ($null -eq $found) {
             throw "Archive does not contain: $($BinaryNames -join ', ')."
         }
+        Confirm-StopFreshGuiDaemon -BinDir $BinDir -StopDaemon:$StopDaemon
         $destination = Join-Path $BinDir $DestName
         $partial = "$destination.partial"
         try {
@@ -361,6 +454,9 @@ public static extern IntPtr SendMessageTimeout(
     }
     if ($env:FRESH_GUI_DRY_RUN) {
         $DryRun = $true
+    }
+    if ($env:FRESH_GUI_STOP_DAEMON -match '^(1|true|yes)$') {
+        $StopDaemon = $true
     }
 
     $FreshGuiRepourl = $FreshGuiRepourl.TrimEnd('/')
@@ -459,7 +555,7 @@ public static extern IntPtr SendMessageTimeout(
     New-Item -ItemType Directory -Path $work | Out-Null
     try {
         if ($wantClient) {
-            if (Install-Component -Url $clientUrl -Work (Join-Path $work 'client') -BinaryNames @('fresh-gui-app.exe', 'fresh-gui.exe') -DestName 'fresh-gui.exe' -BinDir $binDir -Optional:$optional) {
+            if (Install-Component -Url $clientUrl -Work (Join-Path $work 'client') -BinaryNames @('fresh-gui-app.exe', 'fresh-gui.exe') -DestName 'fresh-gui.exe' -BinDir $binDir -Optional:$optional -StopDaemon:$StopDaemon) {
                 $gotClient = $true
             }
         }
@@ -467,7 +563,7 @@ public static extern IntPtr SendMessageTimeout(
             # Beside the desktop command the daemon cannot also be named fresh-gui.exe.
             # Daemon-only installs keep that historical name.
             $daemonDest = if ($gotClient) { 'fresh-gui-daemon.exe' } else { 'fresh-gui.exe' }
-            if (Install-Component -Url $daemonUrl -Work (Join-Path $work 'daemon') -BinaryNames @('fresh-gui.exe', 'fresh-gui-daemon.exe') -DestName $daemonDest -BinDir $binDir -Optional:$optional) {
+            if (Install-Component -Url $daemonUrl -Work (Join-Path $work 'daemon') -BinaryNames @('fresh-gui.exe', 'fresh-gui-daemon.exe') -DestName $daemonDest -BinDir $binDir -Optional:$optional -StopDaemon:$StopDaemon) {
                 $gotDaemon = $true
             }
         }

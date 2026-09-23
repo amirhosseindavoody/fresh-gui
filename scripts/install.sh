@@ -24,6 +24,7 @@
 #   FRESH_GUI_LIBC            gnu (default) | musl  — Linux daemon libc.
 #                             Alpine is detected as musl. The GPUI client is
 #                             published for gnu only.
+#   FRESH_GUI_STOP_DAEMON     1 stops a running local daemon without prompting.
 #   FRESH_GUI_ARCH            override uname -m (only x86_64 is published)
 #   FRESH_GUI_OS              override uname -s (Linux, Darwin, MINGW*, MSYS*)
 #   FRESH_GUI_DRY_RUN         any non-empty value prints the plan and exits
@@ -199,6 +200,74 @@ main() {
   fi
 
   print_next_steps "$got_client" "$got_daemon" "$os"
+}
+
+# Ask before replacing an installed daemon while its per-user session is live.
+# Match the product's session.json path and pid liveness check, then use its
+# close command to stop paired and daemon-only installs.
+stop_running_local_daemon() {
+  install_bin_dir=$1
+  runtime_dir="${XDG_RUNTIME_DIR:-/tmp/fresh-gui-$(id -u)}"
+  meta_file="$runtime_dir/fresh-gui/session.json"
+  [ -n "${XDG_RUNTIME_DIR:-}" ] || meta_file="$runtime_dir/session.json"
+  [ -f "$meta_file" ] || return 0
+  running_pid=$(sed -nE 's/.*"pid"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$meta_file" | awk 'NR == 1 { print; exit }')
+  case "$running_pid" in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+  kill -0 "$running_pid" 2>/dev/null || return 0
+
+  running_bin=""
+  for candidate in "$install_bin_dir/fresh-gui-daemon" "$install_bin_dir/fresh-gui"; do
+    if [ -x "$candidate" ]; then
+      running_bin=$candidate
+      break
+    fi
+  done
+  if [ -z "$running_bin" ]; then
+    for command_name in fresh-gui-daemon fresh-gui; do
+      running_bin=$(command -v "$command_name" 2>/dev/null || true)
+      [ -n "$running_bin" ] && break
+    done
+  fi
+  if [ -z "$running_bin" ]; then
+    echo "error: a fresh-gui daemon session (pid $running_pid) is running, but no fresh-gui command was found to stop it. Stop it manually, then retry the install." >&2
+    return 1
+  fi
+
+  echo "A local fresh-gui daemon session (pid $running_pid) is running. Updating requires stopping it." >&2
+  if [ "${FRESH_GUI_STOP_DAEMON:-}" = 1 ]; then
+    answer=yes
+  elif [ -t 0 ] || [ -t 1 ] || [ -t 2 ]; then
+    if ! printf '%s\n' "Stop the daemon before continuing? [y/N] " >/dev/tty; then
+      echo "error: cannot open the interactive console. Stop it manually or rerun with FRESH_GUI_STOP_DAEMON=1." >&2
+      return 1
+    fi
+    IFS= read -r answer </dev/tty || answer=""
+  else
+    echo "error: no interactive console is available. Stop it manually with '$running_bin close', or rerun with FRESH_GUI_STOP_DAEMON=1." >&2
+    return 1
+  fi
+  case "$answer" in
+    y | Y | yes | YES | Yes) ;;
+    *)
+      echo "error: install cancelled; the running daemon was left untouched." >&2
+      return 1
+      ;;
+  esac
+  if ! "$running_bin" close; then
+    echo "error: could not stop the running fresh-gui daemon; install cancelled." >&2
+    return 1
+  fi
+  attempts=0
+  while kill -0 "$running_pid" 2>/dev/null && [ "$attempts" -lt 20 ]; do
+    sleep 0.1
+    attempts=$((attempts + 1))
+  done
+  if kill -0 "$running_pid" 2>/dev/null; then
+    echo "error: fresh-gui daemon is still running; install cancelled." >&2
+    return 1
+  fi
 }
 
 detect_os() {
@@ -564,6 +633,9 @@ install_named() {
     echo "error: archive does not contain any of: $*" >&2
     exit 1
   fi
+  # Run only once the archive is ready and immediately before the first
+  # replacement, so any session started while downloading is caught too.
+  stop_running_local_daemon "$dest_dir" || exit 1
   mkdir -p "$dest_dir"
   tmp_dest="${dest_dir}/${dest_base}.partial"
   if ! cp "$src" "$tmp_dest"; then

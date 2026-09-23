@@ -18,6 +18,8 @@ curl -fsSL https://raw.githubusercontent.com/amirhosseindavoody/fresh-gui/main/s
 
 The installers download the latest [GitHub Release](https://github.com/amirhosseindavoody/fresh-gui/releases), check published SHA-256 files when available, and put the app and daemon in `~/.fresh-gui/bin` (Windows: `%USERPROFILE%\.fresh-gui\bin`). Open a new terminal after installation so `fresh-gui` is on your `PATH`. There is no macOS release.
 
+If a local daemon is running during an update, the installer asks before stopping it. For an unattended update, set `FRESH_GUI_STOP_DAEMON=1` to approve stopping it; without a console or that setting, the update stops before replacing binaries. The Windows script also accepts `-StopDaemon` when run from a file.
+
 On Linux, the desktop app needs an X11 or Wayland session, fontconfig, and Vulkan. The published Linux client needs glibc 2.39 or newer.
 
 ## Open locally
