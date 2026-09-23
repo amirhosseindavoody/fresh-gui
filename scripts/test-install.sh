@@ -76,3 +76,18 @@ if ! grep -q 'Free space or change FRESH_GUI_HOME' "$scratch/quota.out"; then
   exit 1
 fi
 printf 'PASS: disk quota copy failure is fatal and cleans partial\n'
+
+# A daemon-only update also removes an older client compatibility name.
+cat > "$scratch/bin/cp" <<'SH'
+#!/bin/sh
+exec /bin/cp "$@"
+SH
+chmod 755 "$scratch/bin/cp"
+mkdir -p "$scratch/home/bin"
+printf 'old alias\n' > "$scratch/home/bin/fresh-gui-app"
+PATH="$scratch/bin:$PATH" TEST_ARCHIVE="$scratch/daemon.tar.gz" FRESH_GUI_OS=Linux FRESH_GUI_ARCH=x86_64 FRESH_GUI_LIBC=musl FRESH_GUI_VERSION=2026.923.2 FRESH_GUI_COMPONENTS=daemon FRESH_GUI_HOME="$scratch/home" FRESH_GUI_NO_PATH_UPDATE=1 sh "$installer" >"$scratch/daemon.out" 2>&1
+if [ -e "$scratch/home/bin/fresh-gui-app" ] || [ ! -x "$scratch/home/bin/fresh-gui" ]; then
+  echo 'FAIL: daemon-only update left old client alias or missed daemon' >&2
+  exit 1
+fi
+printf 'PASS: daemon-only update removes old client alias\n'
