@@ -7,11 +7,13 @@
 mod actions;
 mod ade;
 mod assets;
+mod chrome;
 mod connect;
 mod diff_view;
 mod dock_a11y;
 mod explorer;
 mod file_icons;
+mod icon;
 mod osc7;
 mod pane;
 mod paths;
@@ -37,6 +39,7 @@ pub fn run(backend: String, token: Option<String>) -> Result<()> {
 
 /// Same as [`run`], with an already-parsed target (used after SSH bootstrap).
 pub fn run_target(target: ConnectTarget) -> Result<()> {
+    icon::install_user_desktop_entry();
     let app = gpui_kit::application().with_assets(assets::HostAssets);
 
     app.run(move |cx| {
@@ -54,6 +57,8 @@ pub fn run_target(target: ConnectTarget) -> Result<()> {
         options.window_bounds = Some(WindowBounds::centered(window_size, cx));
         options.window_min_size = Some(size(px(720.0), px(480.0)));
         options.kind = WindowKind::Normal;
+        options.app_id = Some(icon::APP_ID.to_string());
+        options.icon = icon::window_icon();
         #[cfg(target_os = "linux")]
         {
             options.window_background = WindowBackgroundAppearance::Transparent;
@@ -70,6 +75,7 @@ pub fn run_target(target: ConnectTarget) -> Result<()> {
 
             let _ = window.update(cx, |_, window, cx| {
                 window.set_window_title("fresh-gui");
+                chrome::install_initial_theme(Some(window), cx);
                 window.activate_window();
                 cx.on_release(|_, cx| cx.quit()).detach();
             });

@@ -55,6 +55,14 @@
     { "action": "PasteExplorer", "shortkey": "cmd-v", "when": "Explorer" },
     { "action": "FilterExplorer", "shortkey": "ctrl-f", "when": "Explorer" },
     { "action": "FilterExplorer", "shortkey": "cmd-f", "when": "Explorer" },
-    { "action": "ClearExplorerInput", "shortkey": "escape", "when": "Explorer" }
+    { "action": "ClearExplorerInput", "shortkey": "escape", "when": "Explorer" },
+    { "action": "ZoomInContent", "shortkey": "ctrl-=", "when": null },
+    { "action": "ZoomInContent", "shortkey": "ctrl-+", "when": null },
+    { "action": "ZoomOutContent", "shortkey": "ctrl--", "when": null },
+    { "action": "ResetContentZoom", "shortkey": "ctrl-0", "when": null },
+    { "action": "ZoomInUi", "shortkey": "ctrl-shift-=", "when": null },
+    { "action": "ZoomInUi", "shortkey": "ctrl-shift-+", "when": null },
+    { "action": "ZoomOutUi", "shortkey": "ctrl-shift--", "when": null },
+    { "action": "ResetUiZoom", "shortkey": "ctrl-shift-0", "when": null }
   ]
 }

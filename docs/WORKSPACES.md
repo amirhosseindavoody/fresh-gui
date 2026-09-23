@@ -10,6 +10,10 @@ On Linux, the file is `workspaces.json` in `$XDG_STATE_HOME/fresh-gui/` (normall
 
 Closing the client window disconnects it and leaves the daemon and its workspaces running. `fresh-gui close` stops the daemon. The last workspace cannot be closed.
 
+## Name and location
+
+Right-click a workspace in the rail to rename it or choose **Change location…**. The daemon saves the new root and authorizes it for file operations. The explorer reloads that folder. Source Control requests git status for the same workspace, so the branch, file list, and root path follow the new location. Diff tabs that were open for the previous location close when the active workspace moves.
+
 ## Scope
 
 Workspace roots are authorized alongside the daemon root for file operations; they are not separate OS-level sandboxes. Editor buffers are managed by the daemon process. Dock split geometry is not persisted.

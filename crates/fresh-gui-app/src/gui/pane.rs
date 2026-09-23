@@ -83,6 +83,10 @@ pub struct TerminalPanel {
     pressed: Option<TermMouseButton>,
     /// Last cell written as a move or drag, so a hover does not repeat.
     last_mouse_cell: Option<(usize, usize)>,
+    /// Monospace cell, scaled with content and UI zoom. 8×18 at 14px.
+    cell_w: f32,
+    cell_h: f32,
+    font_px: f32,
     closed: bool,
 }
 
@@ -111,8 +115,24 @@ impl TerminalPanel {
             selecting: false,
             pressed: None,
             last_mouse_cell: None,
+            cell_w: TERM_CELL_W,
+            cell_h: TERM_CELL_H,
+            font_px: 14.0,
             closed: false,
         }
+    }
+
+    pub fn set_metrics(&mut self, cell_w: f32, cell_h: f32, font_px: f32, cx: &mut Context<Self>) {
+        if (self.cell_w - cell_w).abs() < 0.1
+            && (self.cell_h - cell_h).abs() < 0.1
+            && (self.font_px - font_px).abs() < 0.1
+        {
+            return;
+        }
+        self.cell_w = cell_w;
+        self.cell_h = cell_h;
+        self.font_px = font_px;
+        cx.notify();
     }
 
     pub fn cwd(&self) -> Option<String> {
@@ -167,8 +187,8 @@ impl TerminalPanel {
         let y = f32::from(position.y - origin.y);
         let cols = self.screen.cols.max(1);
         let rows = self.screen.rows.max(1);
-        let col = (x / TERM_CELL_W).floor() as isize;
-        let row = (y / TERM_CELL_H).floor() as isize;
+        let col = (x / self.cell_w).floor() as isize;
+        let row = (y / self.cell_h).floor() as isize;
         let col = col.clamp(0, cols as isize - 1) as usize;
         let row = row.clamp(0, rows as isize - 1) as usize;
         Some((col, row))
@@ -197,6 +217,23 @@ impl TerminalPanel {
     fn host_selects(&self, button: TermMouseButton, modifiers: &Modifiers) -> bool {
         button == TermMouseButton::Left
             && (modifiers.shift || !self.screen.mouse_tracking().active())
+    }
+
+    /// Dock splits finish on mouse-up over the pane. The terminal used to
+    /// stop that event, so a terminal tab could not land in a split.
+    fn host_pointer(
+        &mut self,
+        button: TermMouseButton,
+        down: bool,
+        position: Point<Pixels>,
+        modifiers: &Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if cx.has_active_drag() {
+            return;
+        }
+        self.on_mouse_button(button, down, position, modifiers, window, cx);
     }
 
     fn on_mouse_button(
@@ -514,6 +551,8 @@ impl Render for TerminalPanel {
         let accent = cx.theme().accent;
         let pending_grid = Rc::clone(&self.pending_grid);
         let grid_origin = Rc::clone(&self.grid_origin);
+        let cell_w = self.cell_w;
+        let cell_h = self.cell_h;
         let entity_id = cx.entity().entity_id();
         let track_outside = self.selecting || self.pressed.is_some();
         let select_entity = cx.entity().downgrade();
@@ -527,12 +566,12 @@ impl Render for TerminalPanel {
             .p_2()
             .bg(bg_default)
             .font_family(cx.theme().mono_font_family.clone())
-            .text_sm()
+            .text_size(px(self.font_px))
             .track_focus(&self.focus)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    this.on_mouse_button(
+                    this.host_pointer(
                         TermMouseButton::Left,
                         true,
                         event.position,
@@ -545,7 +584,7 @@ impl Render for TerminalPanel {
             .on_mouse_down(
                 MouseButton::Middle,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    this.on_mouse_button(
+                    this.host_pointer(
                         TermMouseButton::Middle,
                         true,
                         event.position,
@@ -558,7 +597,7 @@ impl Render for TerminalPanel {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    this.on_mouse_button(
+                    this.host_pointer(
                         TermMouseButton::Right,
                         true,
                         event.position,
@@ -569,12 +608,15 @@ impl Render for TerminalPanel {
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if cx.has_active_drag() {
+                    return;
+                }
                 this.on_pointer_move(event.position, &event.modifiers, cx);
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                    this.on_mouse_button(
+                    this.host_pointer(
                         TermMouseButton::Left,
                         false,
                         event.position,
@@ -587,7 +629,7 @@ impl Render for TerminalPanel {
             .on_mouse_up(
                 MouseButton::Middle,
                 cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                    this.on_mouse_button(
+                    this.host_pointer(
                         TermMouseButton::Middle,
                         false,
                         event.position,
@@ -600,7 +642,7 @@ impl Render for TerminalPanel {
             .on_mouse_up(
                 MouseButton::Right,
                 cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                    this.on_mouse_button(
+                    this.host_pointer(
                         TermMouseButton::Right,
                         false,
                         event.position,
@@ -659,7 +701,7 @@ impl Render for TerminalPanel {
             }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                 cx.stop_propagation();
-                let lines = scroll_lines(event.delta);
+                let lines = scroll_lines(event.delta, this.cell_h);
                 if lines == 0. {
                     return;
                 }
@@ -698,7 +740,7 @@ impl Render for TerminalPanel {
                     .overflow_hidden()
                     .on_prepaint(move |bounds, window, app| {
                         grid_origin.set(Some(bounds.origin));
-                        let next = grid_size(bounds.size);
+                        let next = grid_size(bounds.size, cell_w, cell_h);
                         if pending_grid.get() != Some(next) {
                             pending_grid.set(Some(next));
                             app.notify(entity_id);
@@ -738,7 +780,7 @@ impl Render for TerminalPanel {
                         });
                     })
                     .children(rows.into_iter().map(|row| {
-                        h_flex().h(px(18.)).items_center().children(
+                        h_flex().h(px(cell_h)).items_center().children(
                             row.spans
                                 .into_iter()
                                 .map(|span| term_span_el(span, fg_default, bg_default, accent)),
@@ -767,14 +809,14 @@ impl Render for TerminalPanel {
     }
 }
 
-fn grid_size(size: Size<Pixels>) -> (usize, usize) {
+fn grid_size(size: Size<Pixels>, cell_w: f32, cell_h: f32) -> (usize, usize) {
     let width = f32::from(size.width);
     let height = f32::from(size.height);
-    if width < TERM_CELL_W || height < TERM_CELL_H {
+    if width < cell_w || height < cell_h {
         return (80, 24);
     }
-    let cols = ((width / TERM_CELL_W).floor() as usize).clamp(2, 500);
-    let rows = ((height / TERM_CELL_H).floor() as usize).clamp(1, 200);
+    let cols = ((width / cell_w).floor() as usize).clamp(2, 500);
+    let rows = ((height / cell_h).floor() as usize).clamp(1, 200);
     (cols, rows)
 }
 
@@ -787,10 +829,10 @@ fn term_mouse_button(button: MouseButton) -> Option<TermMouseButton> {
     }
 }
 
-fn scroll_lines(delta: ScrollDelta) -> f32 {
+fn scroll_lines(delta: ScrollDelta, cell_h: f32) -> f32 {
     match delta {
         ScrollDelta::Lines(point) => point.y,
-        ScrollDelta::Pixels(point) => f32::from(point.y) / TERM_CELL_H,
+        ScrollDelta::Pixels(point) => f32::from(point.y) / cell_h,
     }
 }
 
@@ -842,6 +884,7 @@ pub struct EditorPanel {
     workspace: WeakEntity<Workspace>,
     metrics: TabStripMetrics,
     plus_shift: Rc<Cell<f32>>,
+    font_px: f32,
     closed: bool,
     _subscription: Subscription,
 }
@@ -886,9 +929,18 @@ impl EditorPanel {
             workspace,
             metrics,
             plus_shift: Rc::new(Cell::new(0.0)),
+            font_px: 14.0,
             closed: false,
             _subscription: subscription,
         }
+    }
+
+    pub fn set_font_px(&mut self, font_px: f32, cx: &mut Context<Self>) {
+        if (self.font_px - font_px).abs() < 0.1 {
+            return;
+        }
+        self.font_px = font_px;
+        cx.notify();
     }
 
     pub fn buffer_id(&self) -> &str {
@@ -1088,6 +1140,7 @@ impl Render for EditorPanel {
                 .bordered(false)
                 .p_0()
                 .h(relative(1.))
+                .text_size(px(self.font_px))
                 .font_family(cx.theme().mono_font_family.clone()),
         )
     }
