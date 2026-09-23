@@ -25,6 +25,7 @@ gpui = { package = "gpui-pre", version = "=0.3.6" }
 gpui-kit = "0.6.6"
 serde = { workspace = true }
 serde_json = { workspace = true }
+jsonc-parser = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

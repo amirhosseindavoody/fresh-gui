@@ -19,65 +19,17 @@ use tracing::{info, warn};
 /// Filename under the config directory (same as Fresh).
 pub const FILENAME: &str = "config.json";
 
-macro_rules! define_shell_defaults {
-    ($shell:literal, $terminal_comment:literal) => {
-        /// Default shell when config omits `terminal.shell` or leaves it empty.
-        pub const DEFAULT_SHELL_COMMAND: &str = $shell;
-
-        /// Documented starter file (JSONC) written on first settings open.
-        pub const DEFAULT_CONFIG_TEMPLATE: &str = concat!(
-            r#"{
-  // Host UI chrome — applied on connect and when this file is saved.
-  "ui": {
-    // system | light | dark  (used when palette is "primer")
-    "theme": "system",
-    // Color pack: primer | nord | dracula | solarized-dark | high-contrast |
-    // nostalgia | dark | light  (Fresh theme names where applicable)
-    "palette": "primer",
-    "terminalFontSize": 14,
-    "editorFontSize": 14,
-    // UI chrome weight (100–900, steps of 100)
-    "fontWeight": 400,
-    // Terminal + editor monospace weight
-    "monoFontWeight": 400,
-    // Optional CSS font-family overrides (empty = IBM Plex)
-    "fontFamily": "",
-    "monoFontFamily": "",
-    "webgl": true,
-    // Explorer: hide .* by default; .git stays hidden unless showGitDirs is true
-    "showDotfiles": false,
-    "showGitDirs": false,
-    // VS Code–style editor document map (minimap). Off = not loaded (no UI cost).
-    "editorMinimap": false,
-    // Soft-wrap long lines (Fresh editor.line_wrap). Default on.
-    "editorLineWrap": true
-  },
-"#,
-            $terminal_comment,
-            r#"  "terminal": {
-    "shell": {
-      "command": ""#,
-            $shell,
-            r#"",
-      "args": []
-    }
-  }
-}
-"#
-        );
-    };
-}
-
-#[cfg(unix)]
-define_shell_defaults!(
-    "zsh",
-    "  // Default PTY shell when the client does not pass `shell`.\n  // Unix default is zsh. If that command is missing or not executable, a new terminal falls back to $SHELL (when usable), then bash, then sh.\n  // Empty args keep interactive / OSC 7 setup for known shells.\n"
-);
+/// Default shell when config omits `terminal.shell` or leaves it empty.
+#[cfg(not(windows))]
+pub const DEFAULT_SHELL_COMMAND: &str = "zsh";
 #[cfg(windows)]
-define_shell_defaults!(
-    "powershell",
-    "  // Default PTY shell when the client does not pass `shell`.\n  // Empty args start an interactive powershell, pwsh, or cmd (no Unix -l).\n  // bash and zsh still get interactive / OSC 7 setup.\n"
-);
+pub const DEFAULT_SHELL_COMMAND: &str = "powershell";
+
+/// Documented starter file (JSONC) written on first settings open.
+#[cfg(not(windows))]
+pub const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../defaults/config.default.jsonc");
+#[cfg(windows)]
+pub const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../defaults/config.default.windows.jsonc");
 
 const KNOWN_PALETTES: &[&str] = &[
     "primer",
@@ -97,6 +49,17 @@ pub struct Config {
     pub ui: UiConfig,
     #[serde(default)]
     pub terminal: TerminalConfig,
+    #[serde(default)]
+    pub shortkeys: Vec<ShortkeyEntry>,
+}
+
+/// A GPUI action name, keystroke, and optional focus context.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShortkeyEntry {
+    pub action: String,
+    pub shortkey: String,
+    #[serde(default)]
+    pub when: Option<String>,
 }
 
 /// Host UI settings sent on the ADE hello (GPUI chrome).
@@ -701,6 +664,10 @@ mod tests {
             text.contains("\"terminal\""),
             "missing terminal section should be inserted:\n{text}"
         );
+        assert!(
+            text.contains("\"shortkeys\""),
+            "missing shortkeys should be inserted:\n{text}"
+        );
 
         let cfg = Config::load_from_path(&path).unwrap();
         assert_eq!(cfg.ui.theme, "light");
@@ -708,6 +675,7 @@ mod tests {
         assert_eq!(cfg.ui.palette, "primer");
         assert_eq!(cfg.ui.font_weight, 400);
         assert_eq!(cfg.resolve_shell().0, DEFAULT_SHELL_COMMAND);
+        assert_eq!(cfg.shortkeys.len(), 17);
 
         // Second call is a no-op.
         assert!(!Config::ensure_file(&path).unwrap());
@@ -757,6 +725,21 @@ mod tests {
         assert!(!cfg.ui.show_git_dirs);
         assert!(!cfg.ui.editor_minimap);
         assert!(cfg.ui.editor_line_wrap);
+        assert_eq!(cfg.shortkeys.len(), 17);
+        assert_eq!(cfg.shortkeys[0].action, "NewTerminal");
+        assert_eq!(cfg.shortkeys[0].shortkey, "ctrl-t");
+        assert_eq!(cfg.shortkeys[0].when, None);
+        assert!(cfg.shortkeys.iter().any(|key| {
+            key.action == "CopyExplorer" && key.when.as_deref() == Some("Explorer")
+        }));
+    }
+
+    #[test]
+    fn shortkeys_deserialize_with_optional_context() {
+        let cfg = Config::parse(r#"{"shortkeys":[{"action":"NewTerminal","shortkey":"ctrl-t"},{"action":"CopyExplorer","shortkey":"ctrl-c","when":"Explorer"}]}"#).unwrap();
+        assert_eq!(cfg.shortkeys.len(), 2);
+        assert_eq!(cfg.shortkeys[0].when, None);
+        assert_eq!(cfg.shortkeys[1].when.as_deref(), Some("Explorer"));
     }
 
     #[test]

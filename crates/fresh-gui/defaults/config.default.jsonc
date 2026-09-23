@@ -1,0 +1,60 @@
+{
+  // Host UI chrome — applied on connect and when this file is saved.
+  "ui": {
+    // system | light | dark (used when palette is "primer")
+    "theme": "system",
+    // Color pack: primer | nord | dracula | solarized-dark | high-contrast |
+    // nostalgia | dark | light (Fresh theme names where applicable)
+    "palette": "primer",
+    "terminalFontSize": 14,
+    "editorFontSize": 14,
+    // UI chrome weight (100–900, steps of 100)
+    "fontWeight": 400,
+    // Terminal + editor monospace weight
+    "monoFontWeight": 400,
+    // Optional CSS font-family overrides (empty = IBM Plex)
+    "fontFamily": "",
+    "monoFontFamily": "",
+    "webgl": true,
+    // Explorer: hide .* by default; .git stays hidden unless showGitDirs is true
+    "showDotfiles": false,
+    "showGitDirs": false,
+    // VS Code–style editor document map (minimap). Off = not loaded (no UI cost).
+    "editorMinimap": false,
+    // Soft-wrap long lines (Fresh editor.line_wrap). Default on.
+    "editorLineWrap": true
+  },
+  // Default PTY shell when the client does not pass shell.
+  // Unix default is zsh. If that command is missing or not executable,
+  // a new terminal falls back to $SHELL (when usable), then bash, then sh.
+  // Empty args keep interactive / OSC 7 setup for known shells.
+  "terminal": {
+    "shell": {
+      "command": "zsh",
+      "args": []
+    }
+  },
+  // action is the Rust action name to run. when is an optional GPUI focus
+  // context: null means global; Explorer and Terminal scope keys to a pane.
+  // A future Terminal Ctrl+C binding can inspect selection before choosing
+  // copy or interrupt; richer predicates are not part of this schema yet.
+  "shortkeys": [
+    { "action": "NewTerminal", "shortkey": "ctrl-t", "when": null },
+    { "action": "CloseTab", "shortkey": "ctrl-w", "when": null },
+    { "action": "SaveBuffer", "shortkey": "ctrl-s", "when": null },
+    { "action": "ToggleSidebar", "shortkey": "ctrl-b", "when": null },
+    { "action": "ToggleCommandPalette", "shortkey": "ctrl-shift-p", "when": null },
+    { "action": "GoToFile", "shortkey": "ctrl-p", "when": null },
+    { "action": "OpenSettings", "shortkey": "ctrl-,", "when": null },
+    { "action": "NextTab", "shortkey": "ctrl-tab", "when": null },
+    { "action": "PrevTab", "shortkey": "ctrl-shift-tab", "when": null },
+    { "action": "Reconnect", "shortkey": "ctrl-shift-r", "when": null },
+    { "action": "CopyExplorer", "shortkey": "ctrl-c", "when": "Explorer" },
+    { "action": "CopyExplorer", "shortkey": "cmd-c", "when": "Explorer" },
+    { "action": "PasteExplorer", "shortkey": "ctrl-v", "when": "Explorer" },
+    { "action": "PasteExplorer", "shortkey": "cmd-v", "when": "Explorer" },
+    { "action": "FilterExplorer", "shortkey": "ctrl-f", "when": "Explorer" },
+    { "action": "FilterExplorer", "shortkey": "cmd-f", "when": "Explorer" },
+    { "action": "ClearExplorerInput", "shortkey": "escape", "when": "Explorer" }
+  ]
+}
