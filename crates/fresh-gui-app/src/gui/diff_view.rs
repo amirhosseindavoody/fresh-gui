@@ -428,19 +428,21 @@ fn split_row(row: SplitRow, cx: &App) -> impl IntoElement {
             Some(cx.theme().success.opacity(0.22)),
         ),
     };
+    let rule = cx.theme().border;
     h_flex()
         .w_full()
         .items_start()
-        .child(diff_cell(row.left.unwrap_or_default(), left_bg))
-        .child(diff_cell(row.right.unwrap_or_default(), right_bg))
+        .child(diff_cell(row.left.unwrap_or_default(), left_bg, Some(rule)))
+        .child(diff_cell(row.right.unwrap_or_default(), right_bg, None))
 }
 
-fn diff_cell(text: String, bg: Option<Hsla>) -> impl IntoElement {
+fn diff_cell(text: String, bg: Option<Hsla>, rule: Option<Hsla>) -> impl IntoElement {
     div()
         .w(relative(0.5))
         .min_w_0()
         .px_2()
         .when_some(bg, |cell, color| cell.bg(color))
+        .when_some(rule, |cell, color| cell.border_r_1().border_color(color))
         .child(if text.is_empty() {
             " ".to_string()
         } else {

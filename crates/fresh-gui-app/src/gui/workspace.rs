@@ -36,11 +36,13 @@ use gpui_kit::*;
 use super::actions::{
     ClearExplorerInput, CloseTab, CloseWorkspace, CopyExplorer, Disconnect, FilterExplorer,
     GoToFile, NewTerminal, NewWorkspace, NextTab, OpenDefaultSettings, OpenSettings, PasteExplorer,
-    PrevTab, QuitClient, Reconnect, RenameWorkspace, SaveBuffer, StopServer, ToggleCommandPalette,
-    ToggleSidebar,
+    PrevTab, QuitClient, Reconnect, RenameWorkspace, ResetContentZoom, ResetUiZoom, SaveBuffer,
+    StopServer, ToggleCommandPalette, ToggleSidebar, ZoomInContent, ZoomInUi, ZoomOutContent,
+    ZoomOutUi,
 };
 use super::ade::AttachedWorkspace;
 use super::ade::{AdeCmd, AdeEvent, AdeHandle};
+use super::chrome;
 use super::connect::{ConnectTarget, parse_goto_spec};
 use super::diff_view::{self, BinaryPanel, DiffPanel};
 use super::dock_a11y::install_workspace_dock;
@@ -76,6 +78,10 @@ const STATUS_BAR_H: f32 = 22.;
 
 fn next_id(prefix: &str) -> String {
     format!("{prefix}-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+fn zoom_percent(zoom: f32) -> i32 {
+    (zoom * 100.0).round() as i32
 }
 
 /// `{request_id}: {path}` or `{request_id}: binary file: {path}`.
@@ -262,6 +268,12 @@ pub struct Workspace {
     capabilities: Vec<String>,
     config_path: Option<String>,
     defaults_path: Option<String>,
+    /// Editor and terminal text scale. Does not resize the rails.
+    content_zoom: f32,
+    /// Rem-based chrome text. Also multiplies panel text.
+    ui_zoom: f32,
+    editor_font_base: f32,
+    terminal_font_base: f32,
     status: SharedString,
     sidebar_collapsed: bool,
     activity: Activity,
@@ -492,6 +504,10 @@ impl Workspace {
             capabilities: Vec::new(),
             config_path: None,
             defaults_path: None,
+            content_zoom: 1.0,
+            ui_zoom: 1.0,
+            editor_font_base: 14.0,
+            terminal_font_base: 14.0,
             status: "Connecting…".into(),
             sidebar_collapsed: false,
             activity: Activity::Explorer,
@@ -577,7 +593,7 @@ impl Workspace {
                 workspaces,
                 attached,
             } => {
-                self.apply_hello(&hello);
+                self.apply_hello(&hello, window, cx);
                 self.workspace_cap = hello.capabilities.iter().any(|cap| cap == CAP_WORKSPACE);
                 self.workspaces = workspaces;
                 self.session_id = Some(session_id);
@@ -610,8 +626,11 @@ impl Workspace {
             }
             AdeEvent::WorkspaceRootSet { workspace } => {
                 let active = self.active_workspace_id.as_deref() == Some(workspace.id.as_str());
-                self.status =
-                    format!("Workspace location changed to {}", display_path(&workspace.root)).into();
+                self.status = format!(
+                    "Workspace location changed to {}",
+                    display_path(&workspace.root)
+                )
+                .into();
                 if active {
                     self.explorer_root = workspace.root.clone();
                     self.explorer_cache.clear();
@@ -621,6 +640,8 @@ impl Workspace {
                     self.anchor = None;
                     self.rebuild_tree(cx);
                     self.list_dir(&workspace.root);
+                    self.clear_git_view();
+                    self.close_open_diffs(window, cx);
                     self.refresh_git();
                 }
                 self.upsert_workspace(workspace);
@@ -858,11 +879,36 @@ impl Workspace {
         cx.notify();
     }
 
-    fn apply_hello(&mut self, hello: &Hello) {
+    fn apply_hello(&mut self, hello: &Hello, window: &mut Window, cx: &mut Context<Self>) {
         self.capabilities = hello.capabilities.clone();
         self.config_path = hello.config_path.clone();
         self.defaults_path = hello.defaults_path.clone();
         self.git_cap = hello.capabilities.iter().any(|cap| cap == CAP_GIT);
+        if let Some(ui) = &hello.ui {
+            self.editor_font_base = (ui.editor_font_size as f32).clamp(8.0, 64.0);
+            self.terminal_font_base = (ui.terminal_font_size as f32).clamp(8.0, 64.0);
+            chrome::apply_configured_theme(&ui.theme, Some(window), cx);
+        }
+        self.apply_zoom(window, cx);
+    }
+
+    fn apply_zoom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.set_rem_size(px(chrome::ui_rem(self.ui_zoom)));
+        chrome::scale_ui_fonts(self.ui_zoom, cx);
+        let editor_px =
+            chrome::content_font_px(self.editor_font_base, self.content_zoom, self.ui_zoom);
+        let term_px =
+            chrome::content_font_px(self.terminal_font_base, self.content_zoom, self.ui_zoom);
+        let (cell_w, cell_h) = chrome::terminal_cell(term_px);
+        for panel in self.terminals.values() {
+            panel.update(cx, |panel, cx| {
+                panel.set_metrics(cell_w, cell_h, term_px, cx);
+            });
+        }
+        for panel in self.editors.values() {
+            panel.update(cx, |panel, cx| panel.set_font_px(editor_px, cx));
+        }
+        window.refresh();
     }
 
     fn add_terminal_tab(&mut self, pty_id: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -885,6 +931,7 @@ impl Workspace {
             );
         });
         self.terminals.insert(pty_id, panel);
+        self.apply_zoom(window, cx);
     }
 
     fn on_pty_data(&mut self, pty_id: &str, bytes: &[u8], cx: &mut Context<Self>) {
@@ -944,6 +991,7 @@ impl Workspace {
             );
         });
         self.editors.insert(path, panel.clone());
+        self.apply_zoom(window, cx);
         if activate {
             self.select_entity(&panel, window, cx);
         }
@@ -1044,13 +1092,9 @@ impl Workspace {
         self.terminals
             .values()
             .any(|panel| PanelId::from(panel.entity_id()) == id)
-            || self
-                .editors
-                .iter()
-                .any(|(path, panel)| {
-                    Some(path) != self.defaults_path.as_ref()
-                        && PanelId::from(panel.entity_id()) == id
-                })
+            || self.editors.iter().any(|(path, panel)| {
+                Some(path) != self.defaults_path.as_ref() && PanelId::from(panel.entity_id()) == id
+            })
     }
 
     pub(crate) fn note_terminal_active(
@@ -1265,14 +1309,9 @@ impl Workspace {
                     pty_id: Some(pty_id.clone()),
                     path: None,
                 });
-            } else if let Some((path, _)) = self
-                .editors
-                .iter()
-                .find(|(path, panel)| {
-                    Some(*path) != self.defaults_path.as_ref()
-                        && PanelId::from(panel.entity_id()) == id
-                })
-            {
+            } else if let Some((path, _)) = self.editors.iter().find(|(path, panel)| {
+                Some(*path) != self.defaults_path.as_ref() && PanelId::from(panel.entity_id()) == id
+            }) {
                 seen_path.insert(path.clone());
                 let title = path
                     .rsplit(['/', '\\'])
@@ -1551,6 +1590,7 @@ impl Workspace {
             );
         });
         self.terminals.insert(pty_id, panel);
+        self.apply_zoom(window, cx);
     }
 
     fn open_editor(&mut self, path: String, preview: bool, activate: bool) {
@@ -2181,6 +2221,14 @@ impl Workspace {
         self.request_git_diff(&rel);
     }
 
+    fn close_open_diffs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_diffs.clear();
+        let rels: Vec<String> = self.diffs.keys().cloned().collect();
+        for rel in rels {
+            self.close_diff(&rel, window, cx);
+        }
+    }
+
     fn close_diff(&mut self, rel: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(panel) = self.diffs.get(rel).cloned() else {
             return;
@@ -2383,7 +2431,9 @@ impl Workspace {
     }
 
     fn begin_file_rename(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        let name = path_basename(&display_path(&path)).unwrap_or("").to_string();
+        let name = path_basename(&display_path(&path))
+            .unwrap_or("")
+            .to_string();
         self.renaming_path = Some(path);
         self.file_rename_input.update(cx, |state, cx| {
             state.set_value(name, window, cx);
@@ -2406,11 +2456,16 @@ impl Workspace {
             cx.notify();
             return;
         }
-        if self.pending_renames.values().any(|pending| pending == &path) {
+        if self
+            .pending_renames
+            .values()
+            .any(|pending| pending == &path)
+        {
             return;
         }
         let request_id = next_id("rename");
-        self.pending_renames.insert(request_id.clone(), path.clone());
+        self.pending_renames
+            .insert(request_id.clone(), path.clone());
         self.ade.send(AdeCmd::RenamePath {
             request_id,
             path,
@@ -2427,7 +2482,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.filter_open = true;
-        self.filter_input.update(cx, |state, cx| state.focus(window, cx));
+        self.filter_input
+            .update(cx, |state, cx| state.focus(window, cx));
         cx.notify();
     }
 
@@ -2441,7 +2497,8 @@ impl Workspace {
             window.focus(&self.explorer_focus, cx);
         } else if self.filter_open {
             self.filter_open = false;
-            self.filter_input.update(cx, |state, cx| state.set_value("", window, cx));
+            self.filter_input
+                .update(cx, |state, cx| state.set_value("", window, cx));
             self.rebuild_tree(cx);
             window.focus(&self.explorer_focus, cx);
         }
@@ -2675,6 +2732,75 @@ impl Workspace {
 
     fn on_toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
+        cx.notify();
+    }
+
+    fn on_zoom_in_content(
+        &mut self,
+        _: &ZoomInContent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.step_content_zoom(1, window, cx);
+    }
+
+    fn on_zoom_out_content(
+        &mut self,
+        _: &ZoomOutContent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.step_content_zoom(-1, window, cx);
+    }
+
+    fn on_reset_content_zoom(
+        &mut self,
+        _: &ResetContentZoom,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.content_zoom = 1.0;
+        self.apply_zoom(window, cx);
+        self.status = "Panel zoom 100%".into();
+        cx.notify();
+    }
+
+    fn on_zoom_in_ui(&mut self, _: &ZoomInUi, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_ui_zoom(1, window, cx);
+    }
+
+    fn on_zoom_out_ui(&mut self, _: &ZoomOutUi, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_ui_zoom(-1, window, cx);
+    }
+
+    fn on_reset_ui_zoom(&mut self, _: &ResetUiZoom, window: &mut Window, cx: &mut Context<Self>) {
+        self.ui_zoom = 1.0;
+        self.apply_zoom(window, cx);
+        self.status = "UI zoom 100%".into();
+        cx.notify();
+    }
+
+    fn step_content_zoom(&mut self, steps: i32, window: &mut Window, cx: &mut Context<Self>) {
+        self.content_zoom = chrome::step_zoom(
+            self.content_zoom,
+            steps,
+            chrome::CONTENT_ZOOM_MIN,
+            chrome::CONTENT_ZOOM_MAX,
+        );
+        self.apply_zoom(window, cx);
+        self.status = format!("Panel zoom {}%", zoom_percent(self.content_zoom)).into();
+        cx.notify();
+    }
+
+    fn step_ui_zoom(&mut self, steps: i32, window: &mut Window, cx: &mut Context<Self>) {
+        self.ui_zoom = chrome::step_zoom(
+            self.ui_zoom,
+            steps,
+            chrome::UI_ZOOM_MIN,
+            chrome::UI_ZOOM_MAX,
+        );
+        self.apply_zoom(window, cx);
+        self.status = format!("UI zoom {}%", zoom_percent(self.ui_zoom)).into();
         cx.notify();
     }
 
@@ -3107,7 +3233,8 @@ impl Workspace {
                         .into_any_element()
                     })
                     .child(if relocating {
-                        self.render_workspace_root_editor(&id, cx).into_any_element()
+                        self.render_workspace_root_editor(&id, cx)
+                            .into_any_element()
                     } else {
                         div()
                             .w_full()
@@ -3134,12 +3261,14 @@ impl Workspace {
                         cx.notify();
                     });
                 }))
-                .item(PopupMenuItem::new("Change location…").on_click(move |_, window, cx| {
-                    relocate_view.update(cx, |this, cx| {
-                        this.begin_workspace_root_for(&relocate_id, window, cx);
-                        cx.notify();
-                    });
-                }))
+                .item(
+                    PopupMenuItem::new("Change location…").on_click(move |_, window, cx| {
+                        relocate_view.update(cx, |this, cx| {
+                            this.begin_workspace_root_for(&relocate_id, window, cx);
+                            cx.notify();
+                        });
+                    }),
+                )
                 .item(
                     PopupMenuItem::new("Close")
                         .disabled(!can_close)
@@ -3276,7 +3405,12 @@ impl Workspace {
                     cx.notify();
                 }
             }))
-            .child(div().flex_1().min_w_0().child(Input::new(&self.ws_root_input)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&self.ws_root_input)),
+            )
             .child(
                 Button::new(format!("ws-root-ok-{id}"))
                     .ghost()
@@ -3482,7 +3616,12 @@ impl Workspace {
                         .w_full()
                         .px_2()
                         .gap_1()
-                        .child(div().flex_1().min_w_0().child(Input::new(&self.filter_input)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(Input::new(&self.filter_input)),
+                        )
                         .child(
                             Button::new("clear-explorer-filter")
                                 .ghost()
@@ -3491,9 +3630,8 @@ impl Workspace {
                                 .tooltip("Clear filter")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.filter_open = false;
-                                    this.filter_input.update(cx, |state, cx| {
-                                        state.set_value("", window, cx)
-                                    });
+                                    this.filter_input
+                                        .update(cx, |state, cx| state.set_value("", window, cx));
                                     this.rebuild_tree(cx);
                                     window.focus(&this.explorer_focus, cx);
                                     cx.notify();
@@ -3750,6 +3888,13 @@ impl Workspace {
         let files = self.git_files.clone();
         let busy = self.git_busy;
         let repo = self.git_repo;
+        let root_label = if !self.git_root.is_empty() {
+            Some(display_path(&self.git_root))
+        } else if !self.explorer_root.trim().is_empty() {
+            Some(display_path(&self.explorer_root))
+        } else {
+            None
+        };
 
         v_flex()
             .id("git-pane")
@@ -3809,6 +3954,18 @@ impl Workspace {
                             .text_color(cx.theme().muted_foreground)
                             .child(branch),
                     )
+                    .when_some(root_label, |column, root| {
+                        column.child(
+                            div()
+                                .w_full()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(root),
+                        )
+                    })
                     .when_some(self.git_detail.clone(), |column, detail| {
                         column.child(
                             div()
@@ -3918,6 +4075,12 @@ impl Workspace {
             ("Go to File…", Box::new(GoToFile)),
             ("Open Settings", Box::new(OpenSettings)),
             ("Open Default Settings", Box::new(OpenDefaultSettings)),
+            ("Zoom In Panel", Box::new(ZoomInContent)),
+            ("Zoom Out Panel", Box::new(ZoomOutContent)),
+            ("Reset Panel Zoom", Box::new(ResetContentZoom)),
+            ("Zoom In UI", Box::new(ZoomInUi)),
+            ("Zoom Out UI", Box::new(ZoomOutUi)),
+            ("Reset UI Zoom", Box::new(ResetUiZoom)),
             ("Reconnect", Box::new(Reconnect)),
             ("Disconnect", Box::new(Disconnect)),
             ("Stop Server", Box::new(StopServer)),
@@ -4102,6 +4265,12 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_toggle_sidebar))
+            .on_action(cx.listener(Self::on_zoom_in_content))
+            .on_action(cx.listener(Self::on_zoom_out_content))
+            .on_action(cx.listener(Self::on_reset_content_zoom))
+            .on_action(cx.listener(Self::on_zoom_in_ui))
+            .on_action(cx.listener(Self::on_zoom_out_ui))
+            .on_action(cx.listener(Self::on_reset_ui_zoom))
             .on_action(cx.listener(Self::on_toggle_palette))
             .on_action(cx.listener(Self::on_goto_file))
             .on_action(cx.listener(Self::on_settings))

@@ -19,3 +19,5 @@ fresh-gui close            # stop the local daemon
 ```
 
 The host uses the `fresh-gui-client` crate to connect to the daemon and `fresh-gui-protocol` for shared message types. See the [project README](../../README.md) for installation and user guidance.
+
+The window icon is `assets/fresh-gui.png`. On Windows, `build.rs` embeds `assets/fresh-gui.ico` as icon resource 1. On Linux the process writes that PNG and a `fresh-gui.desktop` file under the user data directory so the dock can show the same mark.
