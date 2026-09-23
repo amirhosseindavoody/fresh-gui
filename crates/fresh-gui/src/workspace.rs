@@ -315,6 +315,22 @@ impl WorkspaceStore {
         Ok(info)
     }
 
+    /// Persist a new canonical root. The server authorizes the directory first.
+    pub async fn set_root(&self, id: &str, root: String) -> Result<WorkspaceInfo> {
+        let mut guard = self.inner.lock().await;
+        let rec = guard
+            .by_id
+            .get_mut(id)
+            .with_context(|| format!("unknown workspace {id}"))?;
+        rec.root = root;
+        // Expanded folders belonged to the previous tree.
+        rec.explorer_expanded.clear();
+        let info = rec.info(0);
+        drop(guard);
+        self.mark_dirty();
+        Ok(info)
+    }
+
     /// Replace the tab list and open explorer folders. Returns
     /// `(session_id, layout_json)` so the server can mirror it onto the ADE
     /// session blob.
@@ -749,6 +765,29 @@ mod tests {
             Uuid::new_v4().simple()
         ));
         dir.join(crate::daemon::WORKSPACES_NAME)
+    }
+
+    #[tokio::test]
+    async fn changing_root_persists_and_clears_old_explorer_folders() {
+        let path = temp_state("set-root");
+        let sessions = SessionStore::new();
+        let store = WorkspaceStore::persistent(path.clone());
+        let created = store
+            .create(&sessions, Some("project".into()), "/old".into())
+            .await;
+        store
+            .set_layout(&created.id, vec![], 0, vec!["/old/src".into()])
+            .await
+            .unwrap();
+        let changed = store.set_root(&created.id, "/new".into()).await.unwrap();
+        assert_eq!(changed.root, "/new");
+        assert_eq!(changed.name, "project");
+        assert!(store.focus(&created.id).await.unwrap().explorer_expanded.is_empty());
+        store.save_now().await.unwrap();
+        let restored = WorkspaceStore::persistent(path.clone());
+        restored.load(&SessionStore::new()).await;
+        assert_eq!(restored.list().await.0[0].root, "/new");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[tokio::test]

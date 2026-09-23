@@ -997,7 +997,7 @@ async fn handle_client_msg(
         }
         Message::WorkspaceCreate { name, root } => {
             require_auth(*authed)?;
-            let root = resolve_workspace_root(state, root).await?;
+            let root = resolve_workspace_root(state, root, "workspace_create_failed").await?;
             let mut workspace = state.workspaces.create(&state.sessions, name, root).await;
             workspace.pty_count = state.sessions.pty_count(&workspace.session_id).await;
             debug!(id = %workspace.id, name = %workspace.name, "workspace created");
@@ -1025,6 +1025,33 @@ async fn handle_client_msg(
                 .map_err(|_| Message::Error {
                     code: "send_failed".into(),
                     message: "failed to send WorkspaceRenamed".into(),
+                })?;
+            Ok(())
+        }
+        Message::WorkspaceSetRoot { workspace_id, root } => {
+            require_auth(*authed)?;
+            if root.trim().is_empty() {
+                return Err(Message::Error {
+                    code: "workspace_set_root_failed".into(),
+                    message: "workspace root is empty".into(),
+                });
+            }
+            let root =
+                resolve_workspace_root(state, Some(root), "workspace_set_root_failed").await?;
+            let mut workspace = state
+                .workspaces
+                .set_root(&workspace_id, root)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "workspace_set_root_failed".into(),
+                    message: err.to_string(),
+                })?;
+            workspace.pty_count = state.sessions.pty_count(&workspace.session_id).await;
+            send_msg(sink, &Message::WorkspaceRootSet { workspace })
+                .await
+                .map_err(|_| Message::Error {
+                    code: "send_failed".into(),
+                    message: "failed to send WorkspaceRootSet".into(),
                 })?;
             Ok(())
         }
@@ -1156,28 +1183,79 @@ async fn workspace_list(
     (workspaces, focused)
 }
 
-async fn resolve_workspace_root(state: &AppState, root: Option<String>) -> Result<String, Message> {
+async fn resolve_workspace_root(
+    state: &AppState,
+    root: Option<String>,
+    code: &str,
+) -> Result<String, Message> {
     let Some(raw) = root
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
     else {
         return Ok(state.fs_root.root_display());
     };
-    if !std::path::Path::new(&raw).is_absolute() {
-        return Err(Message::Error {
-            code: "workspace_create_failed".into(),
-            message: format!("workspace root must be an absolute path, got {raw}"),
-        });
-    }
+    validate_workspace_root(&raw).map_err(|message| Message::Error {
+        code: code.into(),
+        message,
+    })?;
     let canon = state
         .fs_root
         .authorize(&raw)
         .await
         .map_err(|err| Message::Error {
-            code: "workspace_create_failed".into(),
+            code: code.into(),
             message: err.to_string(),
         })?;
     Ok(canon.display().to_string())
+}
+
+fn validate_workspace_root(raw: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    if raw.starts_with("\\\\")
+        || raw.starts_with("//")
+        || (raw.as_bytes().len() >= 2
+            && raw.as_bytes()[0].is_ascii_alphabetic()
+            && raw.as_bytes()[1] == b':')
+    {
+        return Err(
+            "This is a Windows path; the remote daemon is Unix. Use an absolute Unix path like /home/user/project"
+                .into(),
+        );
+    }
+    if !std::path::Path::new(raw).is_absolute() {
+        return Err(format!("workspace root must be an absolute path, got {raw}"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod workspace_root_tests {
+    use super::validate_workspace_root;
+
+    #[test]
+    fn paths_follow_daemon_os() {
+        #[cfg(unix)]
+        {
+            assert!(validate_workspace_root("/home/me/project").is_ok());
+            assert!(validate_workspace_root("home/me/project")
+                .unwrap_err()
+                .contains("absolute"));
+            assert!(validate_workspace_root(r"C:\work\project")
+                .unwrap_err()
+                .contains("Windows path"));
+            assert!(validate_workspace_root("C:/work/project")
+                .unwrap_err()
+                .contains("Windows path"));
+            assert!(validate_workspace_root(r"\\server\share")
+                .unwrap_err()
+                .contains("Windows path"));
+        }
+        #[cfg(windows)]
+        {
+            assert!(validate_workspace_root(r"C:\work\project").is_ok());
+            assert!(validate_workspace_root("relative\\project").is_err());
+        }
+    }
 }
 
 async fn mirror_workspace_layout(state: &AppState, update: Option<(String, String)>) {
