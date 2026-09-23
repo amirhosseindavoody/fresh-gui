@@ -4,21 +4,17 @@ use anyhow::{Context, Result, bail};
 
 /// POSIX `sh` script. Prints one `FRESH_GUI_PROBE` line on stdout.
 ///
-/// Looks for `~/.local/bin/fresh-gui` first (the path we install), then
-/// `PATH`. A live session is `session.json` whose pid still answers `kill -0`,
-/// matching the daemon's runtime dir (`$XDG_RUNTIME_DIR/fresh-gui` or
-/// `/tmp/fresh-gui-$UID`).
+/// Looks for the remote-installed daemon first, then the daemon on `PATH`.
+/// The daemon's `status --json` command checks the live session itself;
+/// a marker keeps SSH login banners separate from the result.
 pub const PROBE_SCRIPT: &str = r#"set -eu
 bin=""
 if [ -x "$HOME/.local/bin/fresh-gui" ]; then
   bin="$HOME/.local/bin/fresh-gui"
+elif command -v fresh-gui-daemon >/dev/null 2>&1; then
+  bin=$(command -v fresh-gui-daemon)
 elif command -v fresh-gui >/dev/null 2>&1; then
   bin=$(command -v fresh-gui)
-fi
-if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
-  meta="${XDG_RUNTIME_DIR}/fresh-gui/session.json"
-else
-  meta="/tmp/fresh-gui-$(id -u)/session.json"
 fi
 installed=0
 running=0
@@ -27,18 +23,21 @@ token=""
 if [ -n "$bin" ]; then
   installed=1
 fi
-if [ -f "$meta" ]; then
-  pid=$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$meta" | head -n 1)
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    running=1
-    token=$(sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$meta" | head -n 1)
-    bound=$(sed -n 's/.*"bound"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$meta" | head -n 1)
+version=""
+if [ -n "$bin" ]; then
+  version=$("$bin" --version 2>/dev/null | sed -n 's/^fresh-gui[[:space:]]\{1,\}//p' | head -n 1)
+fi
+if [ -n "$bin" ]; then
+  status=$("$bin" status --json 2>/dev/null || true)
+  if [ -n "$status" ]; then
+    token=$(printf '%s\n' "$status" | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+    bound=$(printf '%s\n' "$status" | sed -n 's/.*"ws_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
     case "$bound" in
-      *:*) port=${bound##*:} ;;
+      *:*/ws*) port=${bound##*:}; port=${port%%/*}; running=1 ;;
     esac
   fi
 fi
-echo "FRESH_GUI_PROBE v=1 installed=${installed} running=${running} port=${port} token=${token} binary=${bin}"
+echo "FRESH_GUI_PROBE v=1 installed=${installed} running=${running} port=${port} token=${token} version=${version} binary=${bin}"
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +46,7 @@ pub struct Probe {
     pub running: bool,
     pub port: Option<u16>,
     pub token: Option<String>,
+    pub version: Option<String>,
     pub binary: Option<String>,
 }
 
@@ -71,6 +71,7 @@ pub fn parse_probe(text: &str) -> Result<Probe> {
     let mut running = false;
     let mut port = None;
     let mut token = None;
+    let mut version = None;
     for part in line[..binary_at].split_whitespace() {
         if let Some(v) = part.strip_prefix("installed=") {
             installed = v == "1";
@@ -83,6 +84,8 @@ pub fn parse_probe(text: &str) -> Result<Probe> {
             );
         } else if let Some(v) = part.strip_prefix("token=").filter(|v| !v.is_empty()) {
             token = Some(v.to_string());
+        } else if let Some(v) = part.strip_prefix("version=").filter(|v| !v.is_empty()) {
+            version = Some(v.to_string());
         }
     }
     Ok(Probe {
@@ -90,6 +93,7 @@ pub fn parse_probe(text: &str) -> Result<Probe> {
         running,
         port,
         token,
+        version,
         binary,
     })
 }
@@ -263,12 +267,13 @@ mod tests {
     #[test]
     fn parses_probe_line() {
         let probe = parse_probe(
-            "motd\nFRESH_GUI_PROBE v=1 installed=1 running=1 port=7420 token=abc binary=/home/u/.local/bin/fresh-gui\n",
+            "motd\nFRESH_GUI_PROBE v=1 installed=1 running=1 port=7420 token=abc version=2026.923.2 binary=/home/u/.local/bin/fresh-gui\n",
         )
         .unwrap();
         assert!(probe.installed && probe.running);
         assert_eq!(probe.port, Some(7420));
         assert_eq!(probe.token.as_deref(), Some("abc"));
+        assert_eq!(probe.version.as_deref(), Some("2026.923.2"));
         assert_eq!(
             probe.binary.as_deref(),
             Some("/home/u/.local/bin/fresh-gui")
@@ -278,12 +283,12 @@ mod tests {
     #[test]
     fn parses_missing_install_and_binary_with_spaces() {
         let probe =
-            parse_probe("FRESH_GUI_PROBE v=1 installed=0 running=0 port= token= binary=").unwrap();
+            parse_probe("FRESH_GUI_PROBE v=1 installed=0 running=0 port= token= version= binary=").unwrap();
         assert!(!probe.installed);
         assert!(probe.port.is_none() && probe.token.is_none() && probe.binary.is_none());
 
         let spaced = parse_probe(
-            "FRESH_GUI_PROBE v=1 installed=1 running=0 port= token= binary=/home/my user/bin/fresh-gui",
+            "FRESH_GUI_PROBE v=1 installed=1 running=0 port= token= version=1.2.3 binary=/home/my user/bin/fresh-gui",
         )
         .unwrap();
         assert_eq!(
@@ -349,5 +354,34 @@ mod tests {
             "sh -n failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_uses_daemon_status_despite_banner() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = std::env::temp_dir().join(format!("fresh-gui-probe-{}", std::process::id()));
+        let bin_dir = home.join(".local/bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bin = bin_dir.join("fresh-gui");
+        std::fs::write(&bin, "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'fresh-gui 2026.923.2' ;;\n  status) echo '{\"ws_url\":\"ws://127.0.0.1:7420/ws\",\"token\":\"secret\"}' ;;\nesac\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut child = Command::new("sh")
+            .arg("-s")
+            .env("HOME", &home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(PROBE_SCRIPT.as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let stdout = format!("Welcome to the server\n{}", String::from_utf8_lossy(&output.stdout));
+        let result = parse_probe(&stdout).unwrap();
+        assert!(result.installed && result.running);
+        assert_eq!(result.port, Some(7420));
+        assert_eq!(result.version.as_deref(), Some("2026.923.2"));
+        assert_eq!(result.token.as_deref(), Some("secret"));
+        std::fs::remove_dir_all(home).unwrap();
     }
 }

@@ -39,7 +39,7 @@ From your Windows or Linux laptop:
 fresh-gui user@host
 ```
 
-The app installs the Linux daemon on the server if needed, starts or reuses its session, opens an SSH tunnel, and shows the desktop window on your laptop. Set up OpenSSH keys or an agent first: `ssh user@host` must work without a password prompt.
+The app installs the Linux daemon on the server if needed, starts or reuses its session, opens an SSH tunnel, and shows the desktop window on your laptop. If the local client is newer than the remote daemon, it asks before stopping the remote session and installing a matching daemon. Run the command in an interactive terminal to approve the upgrade. Set up OpenSSH keys or an agent first: `ssh user@host` must work without a password prompt.
 
 For a server you visit often, save it:
 

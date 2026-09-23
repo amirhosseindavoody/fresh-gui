@@ -157,6 +157,10 @@ main() {
       got_client=1
     fi
   fi
+  if [ "$got_client" -eq 1 ]; then
+    # Remove the compatibility name left by older installer versions.
+    rm -f "${bin_dir}/fresh-gui-app" "${bin_dir}/fresh-gui-app.exe"
+  fi
   if [ "$want_daemon" -eq 1 ]; then
     # Beside the desktop command the daemon cannot also be named fresh-gui.
     # Daemon-only (servers, musl) keeps the historical `fresh-gui` name so

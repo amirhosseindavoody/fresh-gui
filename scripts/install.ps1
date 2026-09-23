@@ -461,6 +461,8 @@ public static extern IntPtr SendMessageTimeout(
         if ($wantClient) {
             if (Install-Component -Url $clientUrl -Work (Join-Path $work 'client') -BinaryNames @('fresh-gui-app.exe', 'fresh-gui.exe') -DestName 'fresh-gui.exe' -BinDir $binDir -Optional:$optional) {
                 $gotClient = $true
+                # Older installers left a second public name for the client.
+                Remove-Item -LiteralPath (Join-Path $binDir 'fresh-gui-app.exe') -Force -ErrorAction SilentlyContinue
             }
         }
         if ($wantDaemon) {
