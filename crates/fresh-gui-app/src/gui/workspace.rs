@@ -34,9 +34,9 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::actions::{
-    CloseTab, CloseWorkspace, CopyExplorer, Disconnect, GoToFile, NewTerminal, NewWorkspace,
-    NextTab, OpenSettings, PasteExplorer, PrevTab, QuitClient, Reconnect, RenameWorkspace,
-    SaveBuffer, StopServer, ToggleCommandPalette, ToggleSidebar,
+    ClearExplorerInput, CloseTab, CloseWorkspace, CopyExplorer, Disconnect, FilterExplorer,
+    GoToFile, NewTerminal, NewWorkspace, NextTab, OpenSettings, PasteExplorer, PrevTab, QuitClient,
+    Reconnect, RenameWorkspace, SaveBuffer, StopServer, ToggleCommandPalette, ToggleSidebar,
 };
 use super::ade::AttachedWorkspace;
 use super::ade::{AdeCmd, AdeEvent, AdeHandle};
@@ -308,6 +308,11 @@ pub struct Workspace {
     /// restore's editors have opened (they would otherwise take focus).
     restore_focus: Option<String>,
     explorer_focus: FocusHandle,
+    filter_open: bool,
+    filter_input: Entity<InputState>,
+    renaming_path: Option<String>,
+    file_rename_input: Entity<InputState>,
+    pending_renames: HashMap<String, String>,
     /// Selected absolute paths. The last entry is the primary row.
     selection: Vec<String>,
     anchor: Option<String>,
@@ -339,6 +344,9 @@ impl Workspace {
         let ws_rename_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Workspace name"));
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Terminal name"));
+        let filter_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter files and folders"));
+        let file_rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("New name"));
         let commit_input = cx.new(|cx| InputState::new(window, cx).placeholder("Commit message"));
         let menu_bar = AppMenuBar::new(cx);
         let tree_sub = cx.subscribe(&explorer, |this, _, ev: &TreeEvent, cx| {
@@ -371,6 +379,22 @@ impl Workspace {
         let rename_sub = cx.subscribe(&rename_input, |this, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::PressEnter { .. }) && this.rename_pty.is_some() {
                 this.confirm_rename(cx);
+            }
+        });
+        let filter_sub = cx.subscribe(&filter_input, |_, _, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::Change) {
+                let workspace = cx.entity();
+                cx.defer(move |cx| {
+                    workspace.update(cx, |this, cx| {
+                        this.rebuild_tree(cx);
+                        cx.notify();
+                    });
+                });
+            }
+        });
+        let file_rename_sub = cx.subscribe(&file_rename_input, |this, _, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::PressEnter { .. }) && this.renaming_path.is_some() {
+                this.confirm_file_rename(cx);
             }
         });
         let ws_rename_sub = cx.subscribe(&ws_rename_input, |this, _, ev: &InputEvent, cx| {
@@ -484,6 +508,11 @@ impl Workspace {
             respawn_titles: VecDeque::new(),
             restore_focus: None,
             explorer_focus: cx.focus_handle(),
+            filter_open: false,
+            filter_input,
+            renaming_path: None,
+            file_rename_input,
+            pending_renames: HashMap::new(),
             selection: Vec::new(),
             anchor: None,
             file_clipboard: None,
@@ -501,6 +530,8 @@ impl Workspace {
                 tree_sub,
                 dock_sub,
                 rename_sub,
+                filter_sub,
+                file_rename_sub,
                 ws_rename_sub,
                 create_name_sub,
                 create_root_sub,
@@ -625,6 +656,22 @@ impl Workspace {
             } => {
                 self.finish_fs(&request_id, entries, true, cx);
             }
+            AdeEvent::FsRenamed { request_id, entry } => {
+                if let Some(old_path) = self.pending_renames.remove(&request_id) {
+                    self.renaming_path = None;
+                    self.filter_open = false;
+                    self.filter_input
+                        .update(cx, |state, cx| state.set_value("", window, cx));
+                    self.selection = vec![entry.path.clone()];
+                    self.anchor = Some(entry.path.clone());
+                    if let Some(parent) = parent_dir(&old_path) {
+                        self.relist(&parent);
+                    }
+                    self.status = format!("Renamed to {}", entry.name).into();
+                    self.refresh_git();
+                    window.focus(&self.explorer_focus, cx);
+                }
+            }
             AdeEvent::FsCopied {
                 request_id,
                 entries,
@@ -665,6 +712,11 @@ impl Workspace {
             } => self.on_buffer_saved(&buffer_id, path, rev, cx),
             AdeEvent::Error { code, message } => {
                 self.pending_fs.clear();
+                if code == "fs_rename_failed" {
+                    if let Some((request_id, _)) = split_request_message(&message) {
+                        self.pending_renames.remove(request_id);
+                    }
+                }
                 if code == "pty_open_failed" {
                     self.pty_opens_pending = self.pty_opens_pending.saturating_sub(1);
                     self.respawn_titles.pop_front();
@@ -691,7 +743,14 @@ impl Workspace {
                         self.restoring = false;
                         self.pending_editors.clear();
                     }
-                    self.status = format!("{code}: {message}").into();
+                    self.status = if code == "fs_rename_failed" {
+                        let detail = split_request_message(&message)
+                            .map(|(_, detail)| detail)
+                            .unwrap_or(&message);
+                        format!("Rename failed: {detail}").into()
+                    } else {
+                        format!("{code}: {message}").into()
+                    };
                 }
             }
             AdeEvent::GitStatus {
@@ -1021,7 +1080,12 @@ impl Workspace {
         if root.is_empty() {
             return;
         }
-        let items = build_explorer_tree(&root, &self.explorer_cache, &self.expanded_dirs);
+        let filter = if self.filter_open {
+            self.filter_input.read(cx).value().to_string()
+        } else {
+            String::new()
+        };
+        let items = build_explorer_tree(&root, &self.explorer_cache, &self.expanded_dirs, &filter);
         self.explorer.update(cx, |state, cx| {
             state.set_items(items, cx);
         });
@@ -1318,6 +1382,9 @@ impl Workspace {
         self.session_id = Some(info.session_id.clone());
         self.active_workspace_id = Some(info.id.clone());
         self.explorer_cache.clear();
+        self.filter_open = false;
+        self.renaming_path = None;
+        self.pending_renames.clear();
         self.pending_lists.clear();
         self.expanded_dirs = explorer_expanded.into_iter().collect();
         self.selection.clear();
@@ -1762,6 +1829,9 @@ impl Workspace {
         self.rail_hover = None;
         self.create_open = false;
         self.explorer_cache.clear();
+        self.filter_open = false;
+        self.renaming_path = None;
+        self.pending_renames.clear();
         self.expanded_dirs.clear();
         self.explorer_kinds = Rc::default();
         self.pending_lists.clear();
@@ -2172,6 +2242,72 @@ impl Workspace {
         self.selection = vec![path.to_string()];
         self.anchor = Some(path.to_string());
         self.sync_tree_highlight(None, cx);
+    }
+
+    fn begin_file_rename(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        let name = path_basename(&display_path(&path)).unwrap_or("").to_string();
+        self.renaming_path = Some(path);
+        self.file_rename_input.update(cx, |state, cx| {
+            state.set_value(name, window, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn confirm_file_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.renaming_path.clone() else {
+            return;
+        };
+        let name = self.file_rename_input.read(cx).value().to_string();
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.chars().any(|ch| matches!(ch, '/' | '\\' | '\0'))
+        {
+            self.status = "Invalid name: enter one non-empty file or folder name".into();
+            cx.notify();
+            return;
+        }
+        if self.pending_renames.values().any(|pending| pending == &path) {
+            return;
+        }
+        let request_id = next_id("rename");
+        self.pending_renames.insert(request_id.clone(), path.clone());
+        self.ade.send(AdeCmd::RenamePath {
+            request_id,
+            path,
+            name,
+        });
+        self.status = "Renaming…".into();
+        cx.notify();
+    }
+
+    fn on_filter_explorer(
+        &mut self,
+        _: &FilterExplorer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.filter_open = true;
+        self.filter_input.update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    fn on_clear_explorer_input(
+        &mut self,
+        _: &ClearExplorerInput,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.renaming_path.take().is_some() {
+            window.focus(&self.explorer_focus, cx);
+        } else if self.filter_open {
+            self.filter_open = false;
+            self.filter_input.update(cx, |state, cx| state.set_value("", window, cx));
+            self.rebuild_tree(cx);
+            window.focus(&self.explorer_focus, cx);
+        }
+        cx.notify();
     }
 
     fn copy_path_text(&mut self, paths: &[String], cx: &mut Context<Self>) {
@@ -3105,6 +3241,8 @@ impl Workspace {
 
         let kinds = self.explorer_kinds.clone();
         let dark = cx.theme().is_dark();
+        let renaming_path = self.renaming_path.clone();
+        let file_rename_input = self.file_rename_input.clone();
 
         v_flex()
             .id("explorer-pane")
@@ -3138,6 +3276,31 @@ impl Workspace {
                             })),
                     ),
             )
+            .when(self.filter_open, |this| {
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .px_2()
+                        .gap_1()
+                        .child(div().flex_1().min_w_0().child(Input::new(&self.filter_input)))
+                        .child(
+                            Button::new("clear-explorer-filter")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Close)
+                                .tooltip("Clear filter")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.filter_open = false;
+                                    this.filter_input.update(cx, |state, cx| {
+                                        state.set_value("", window, cx)
+                                    });
+                                    this.rebuild_tree(cx);
+                                    window.focus(&this.explorer_focus, cx);
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             .child({
                 let row_view = view.clone();
                 let menu_view = view;
@@ -3195,7 +3358,58 @@ impl Workspace {
                                         Icon::new(glyph.icon).small().text_color(glyph.color(dark)),
                                     )
                                 })
-                                .child(label),
+                                .when(renaming_path.as_deref() == Some(path.as_str()), |this| {
+                                    let view = view.clone();
+                                    let cancel_view = view.clone();
+                                    this.child(
+                                        h_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                cx.stop_propagation()
+                                            })
+                                            .on_mouse_up(MouseButton::Left, |_, _, cx| {
+                                                cx.stop_propagation()
+                                            })
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .child(Input::new(&file_rename_input).small()),
+                                            )
+                                            .child(
+                                                Button::new(format!("file-rename-ok-{ix}"))
+                                                    .ghost()
+                                                    .xsmall()
+                                                    .icon(IconName::Check)
+                                                    .tooltip("Rename")
+                                                    .on_click(move |_, _, cx| {
+                                                        view.update(cx, |this, cx| {
+                                                            this.confirm_file_rename(cx)
+                                                        });
+                                                        cx.stop_propagation();
+                                                    }),
+                                            )
+                                            .child(
+                                                Button::new(format!("file-rename-cancel-{ix}"))
+                                                    .ghost()
+                                                    .xsmall()
+                                                    .icon(IconName::Close)
+                                                    .tooltip("Cancel")
+                                                    .on_click(move |_, window, cx| {
+                                                        cancel_view.update(cx, |this, cx| {
+                                                            this.renaming_path = None;
+                                                            window.focus(&this.explorer_focus, cx);
+                                                            cx.notify();
+                                                        });
+                                                        cx.stop_propagation();
+                                                    }),
+                                            ),
+                                    )
+                                })
+                                .when(renaming_path.as_deref() != Some(path.as_str()), |this| {
+                                    this.child(label)
+                                }),
                         )
                         .when(!placeholder, |this| {
                             let path_for_drag = grabbed.clone();
@@ -3280,6 +3494,15 @@ impl Workspace {
                             let view = view.clone();
                             move |_, _, cx| {
                                 view.update(cx, |this, cx| this.copy_path_text(&copy_paths, cx));
+                            }
+                        }))
+                        .item(PopupMenuItem::new("Rename").on_click({
+                            let view = view.clone();
+                            let path = path.clone();
+                            move |_, window, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.begin_file_rename(path.clone(), window, cx);
+                                });
                             }
                         }))
                         .item(PopupMenuItem::new("Copy").on_click({
@@ -3687,6 +3910,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_prev_tab))
             .on_action(cx.listener(Self::on_copy_explorer))
             .on_action(cx.listener(Self::on_paste_explorer))
+            .on_action(cx.listener(Self::on_filter_explorer))
+            .on_action(cx.listener(Self::on_clear_explorer_input))
             .on_action(cx.listener(Self::on_new_workspace))
             .on_action(cx.listener(Self::on_rename_workspace))
             .on_action(cx.listener(Self::on_close_workspace))

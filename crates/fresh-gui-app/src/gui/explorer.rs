@@ -217,7 +217,8 @@ pub fn prune_expanded(expanded: &mut HashSet<String>, cache: &HashMap<String, Ve
     });
 }
 
-/// Explorer rows. A directory is expanded only when `expanded` says so.
+/// Explorer rows. `filter` matches only direct children of `root`.
+/// A directory is expanded only when `expanded` says so.
 /// Listing it (so `cache` has its children) does not open it. A directory
 /// that has not been listed yet keeps a `{path}/.` child so the tree treats
 /// the row as a folder and the click can toggle it.
@@ -225,17 +226,29 @@ pub fn build_explorer_tree(
     root: &str,
     cache: &HashMap<String, Vec<FsEntry>>,
     expanded: &HashSet<String>,
+    filter: &str,
+) -> Vec<TreeItem> {
+    build_tree_layer(root, cache, expanded, Some(filter))
+}
+
+fn build_tree_layer(
+    root: &str,
+    cache: &HashMap<String, Vec<FsEntry>>,
+    expanded: &HashSet<String>,
+    filter: Option<&str>,
 ) -> Vec<TreeItem> {
     let Some(entries) = cache.get(root) else {
         return Vec::new();
     };
+    let needle = filter.unwrap_or_default().to_lowercase();
     entries
         .iter()
+        .filter(|entry| needle.is_empty() || entry.name.to_lowercase().contains(&needle))
         .map(|entry| {
             if is_dir_entry(entry) {
                 let listed = cache.contains_key(&entry.path);
                 let children = if listed {
-                    build_explorer_tree(&entry.path, cache, expanded)
+                    build_tree_layer(&entry.path, cache, expanded, None)
                 } else {
                     vec![TreeItem::new(format!("{}/.", entry.path), "…")]
                 };
@@ -375,7 +388,7 @@ mod tests {
     #[test]
     fn cached_directory_stays_collapsed_until_toggled() {
         let (root, cache) = sample_tree();
-        let items = build_explorer_tree(&root, &cache, &HashSet::new());
+        let items = build_explorer_tree(&root, &cache, &HashSet::new(), "");
         let src = find(&items, "/proj/src").unwrap();
         assert!(!src.is_expanded());
         assert!(src.is_folder());
@@ -391,10 +404,25 @@ mod tests {
         record_tree_toggle(&mut expanded, "/proj/docs", true);
         record_tree_toggle(&mut expanded, "/proj/docs", false);
         record_tree_toggle(&mut expanded, "/proj/src/.", true);
-        let items = build_explorer_tree(&root, &cache, &expanded);
+        let items = build_explorer_tree(&root, &cache, &expanded, "");
         assert!(find(&items, "/proj/src").unwrap().is_expanded());
         assert!(!find(&items, "/proj/docs").unwrap().is_expanded());
         assert!(!expanded.iter().any(|path| is_placeholder(path)));
+    }
+
+    #[test]
+    fn filter_only_matches_direct_children_and_keeps_nested_rows() {
+        let (root, cache) = sample_tree();
+        let expanded = HashSet::from(["/proj/src".to_string()]);
+        let items = build_explorer_tree(&root, &cache, &expanded, "SRC");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id.as_ref(), "/proj/src");
+        assert!(find(&items, "/proj/src/main.rs").is_some());
+        assert!(build_explorer_tree(&root, &cache, &expanded, "main").is_empty());
+        assert_eq!(
+            build_explorer_tree(&root, &cache, &expanded, "").len(),
+            cache[&root].len()
+        );
     }
 
     #[test]
@@ -412,7 +440,7 @@ mod tests {
             }],
         );
         let expanded = HashSet::from(["/proj/src".to_string()]);
-        let items = build_explorer_tree(root, &cache, &expanded);
+        let items = build_explorer_tree(root, &cache, &expanded, "");
         let src = find(&items, "/proj/src").unwrap();
         assert!(src.is_expanded());
         assert!(src.is_folder());
@@ -434,7 +462,7 @@ mod tests {
             }],
         );
         cache.insert("/proj/empty".into(), Vec::new());
-        let items = build_explorer_tree(root, &cache, &HashSet::new());
+        let items = build_explorer_tree(root, &cache, &HashSet::new(), "");
         let empty = find(&items, "/proj/empty").unwrap();
         assert!(!empty.is_folder());
         assert!(empty.children.is_empty());
@@ -459,7 +487,7 @@ mod tests {
                 link("escape", None),
             ],
         );
-        let items = build_explorer_tree("/proj", &cache, &HashSet::new());
+        let items = build_explorer_tree("/proj", &cache, &HashSet::new(), "");
         assert!(find(&items, "/proj/dirlink").unwrap().is_folder());
         assert!(!find(&items, "/proj/filelink").unwrap().is_folder());
         assert!(!find(&items, "/proj/escape").unwrap().is_folder());

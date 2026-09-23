@@ -441,6 +441,17 @@ pub enum Message {
         request_id: String,
         entries: Vec<FsEntry>,
     },
+    /// Client → backend: rename one file or folder within its parent directory.
+    FsRename {
+        request_id: String,
+        path: String,
+        name: String,
+    },
+    /// Backend → client after a successful rename.
+    FsRenamed {
+        request_id: String,
+        entry: FsEntry,
+    },
     /// Client → backend: permanently delete one or more paths under the FS sandbox.
     FsDelete {
         request_id: String,
@@ -881,6 +892,12 @@ mod tests {
             destination: "/tmp/out".into(),
         };
         assert_eq!(Message::from_json(&mv.to_json().unwrap()).unwrap(), mv);
+        let rename = Message::FsRename {
+            request_id: "r1".into(),
+            path: "/tmp/a.txt".into(),
+            name: "b.txt".into(),
+        };
+        assert_eq!(Message::from_json(&rename.to_json().unwrap()).unwrap(), rename);
         let del = Message::FsDelete {
             request_id: "c4".into(),
             paths: vec!["/tmp/a.txt".into()],

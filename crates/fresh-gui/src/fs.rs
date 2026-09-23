@@ -269,6 +269,54 @@ impl FsRoot {
         Ok(out)
     }
 
+    /// Rename one entry without moving it or overwriting an existing entry.
+    pub async fn rename(&self, path: &str, name: &str) -> Result<FsEntry> {
+        validate_entry_name(name)?;
+        if path.is_empty() || path == "." || path == "/" {
+            bail!("cannot rename filesystem root");
+        }
+        let requested = Path::new(path);
+        let parent = requested.parent().context("source has no parent directory")?;
+        let parent_candidate = if requested.is_absolute() {
+            parent.to_path_buf()
+        } else {
+            self.root.join(parent)
+        };
+        let parent = fs::canonicalize(&parent_candidate)
+            .await
+            .with_context(|| format!("canonicalize {}", parent_candidate.display()))?;
+        if !self.is_allowed(&parent) {
+            bail!("path escapes FS root: {}", parent.display());
+        }
+        let basename = requested.file_name().context("source has no file name")?;
+        let from = parent.join(basename);
+        fs::symlink_metadata(&from)
+            .await
+            .with_context(|| format!("stat {}", from.display()))?;
+        if from == self.root
+            || self
+                .authorized
+                .lock()
+                .expect("fs authorized lock")
+                .iter()
+                .any(|root| root == &from)
+        {
+            bail!("cannot rename filesystem root: {}", from.display());
+        }
+        let to = parent.join(name);
+        ensure_child_of(&parent, &to)?;
+        if from == to {
+            return entry_for_path(&from).await;
+        }
+        if fs::symlink_metadata(&to).await.is_ok() {
+            bail!("already exists: {}", to.display());
+        }
+        fs::rename(&from, &to)
+            .await
+            .with_context(|| format!("rename {} → {}", from.display(), to.display()))?;
+        entry_for_path(&to).await
+    }
+
     /// Permanently delete each path (file, directory, or symlink). Refuses the
     /// primary FS root and any authorized cwd root.
     pub async fn delete_paths(&self, paths: &[String]) -> Result<Vec<String>> {
@@ -466,6 +514,49 @@ async fn copy_path_recursive(from: &Path, to: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs as stdfs;
+
+    #[tokio::test]
+    async fn rename_file_and_directory_rejects_collision_and_bad_names() {
+        let tmp = tempfile_dir();
+        stdfs::write(tmp.join("a.txt"), b"a").unwrap();
+        stdfs::write(tmp.join("taken.txt"), b"b").unwrap();
+        stdfs::create_dir(tmp.join("folder")).unwrap();
+        stdfs::write(tmp.join("folder/child"), b"c").unwrap();
+        let root = FsRoot::new(tmp.clone()).unwrap();
+        let file = tmp.join("a.txt").display().to_string();
+        assert!(root.rename(&file, "taken.txt").await.is_err());
+        assert!(root.rename(&file, "../outside").await.is_err());
+        assert_eq!(
+            root.rename(&file, "new.txt").await.unwrap().name,
+            "new.txt"
+        );
+        assert!(!tmp.join("a.txt").exists());
+        let folder = tmp.join("folder").display().to_string();
+        assert_eq!(
+            root.rename(&folder, "renamed").await.unwrap().kind,
+            FsKind::Dir
+        );
+        assert!(tmp.join("renamed/child").exists());
+        assert!(root.rename(&tmp.display().to_string(), "other").await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_symlink_moves_the_link_not_its_target() {
+        let tmp = tempfile_dir();
+        stdfs::write(tmp.join("target"), b"data").unwrap();
+        std::os::unix::fs::symlink("target", tmp.join("link")).unwrap();
+        let root = FsRoot::new(tmp.clone()).unwrap();
+        root.rename(&tmp.join("link").display().to_string(), "new-link")
+            .await
+            .unwrap();
+        assert!(tmp.join("target").exists());
+        assert!(!tmp.join("link").exists());
+        assert!(stdfs::symlink_metadata(tmp.join("new-link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
 
     #[tokio::test]
     async fn list_and_block_escape() {

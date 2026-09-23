@@ -526,6 +526,39 @@ impl Client {
         }
     }
 
+    pub async fn rename_path(
+        &mut self,
+        path: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Result<fresh_gui_protocol::FsEntry> {
+        let request_id = format!("fs-rename-{}", uuid_simple());
+        send_msg(
+            &mut self.sink,
+            &Message::FsRename {
+                request_id: request_id.clone(),
+                path: path.into(),
+                name: name.into(),
+            },
+        )
+        .await?;
+        loop {
+            match self.recv().await? {
+                Message::FsRenamed {
+                    request_id: rid,
+                    entry,
+                } if rid == request_id => return Ok(entry),
+                Message::Error { code, message } => {
+                    bail!("fs rename failed: {code}: {message}")
+                }
+                Message::PtyData { .. }
+                | Message::FsChanged { .. }
+                | Message::Pong { .. }
+                | Message::Ping { .. } => continue,
+                other => bail!("unexpected while renaming: {other:?}"),
+            }
+        }
+    }
+
     /// Open a path in the Fresh editor and return `(buffer_id, path, language, rev, text)`.
     pub async fn open_editor(
         &mut self,
