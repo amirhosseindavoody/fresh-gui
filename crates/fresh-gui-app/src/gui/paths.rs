@@ -25,6 +25,37 @@ pub fn display_path(path: &str) -> String {
     }
 }
 
+/// Paths entered in the host UI name directories on the daemon. Infer the
+/// daemon's path syntax from paths it supplied, never from the client's OS.
+pub fn daemon_uses_unix_paths(config_path: Option<&str>, roots: &[&str]) -> bool {
+    config_path.is_some_and(|path| path.starts_with('/'))
+        || roots.iter().any(|path| path.starts_with('/'))
+}
+
+pub fn workspace_root_for_daemon(input: &str, unix_daemon: bool) -> Result<String, &'static str> {
+    let path = input.trim();
+    let path = if path.len() >= 2
+        && ((path.starts_with('"') && path.ends_with('"'))
+            || (path.starts_with('\'') && path.ends_with('\'')))
+    {
+        &path[1..path.len() - 1]
+    } else {
+        path
+    };
+    if !unix_daemon {
+        return Ok(path.to_string());
+    }
+    let bytes = path.as_bytes();
+    let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if drive || path.starts_with("\\\\") || path.starts_with("//") {
+        return Err("This is a Windows path; the remote daemon is Linux. Use an absolute Unix path like /home/user/project");
+    }
+    if path.starts_with('\\') {
+        return Err("Use an absolute Unix path starting with /, such as /home/user/project");
+    }
+    Ok(path.replace('\\', "/"))
+}
+
 /// Replace verbatim prefixes wherever they appear, including inside a status
 /// line that quotes a path.
 pub fn strip_verbatim_prefixes(text: &str) -> String {
@@ -110,5 +141,27 @@ mod tests {
             r"root \\host\share is missing"
         );
         assert_eq!(strip_verbatim_prefixes("Online"), "Online");
+    }
+
+    #[test]
+    fn unix_daemon_path_semantics_on_any_client() {
+        assert!(daemon_uses_unix_paths(
+            Some("/home/me/.config/fresh-gui/config.json"),
+            &[]
+        ));
+        assert!(!daemon_uses_unix_paths(Some(r"C:\Users\me\config.json"), &[]));
+        assert_eq!(
+            workspace_root_for_daemon(" /home/me\\proj ", true).unwrap(),
+            "/home/me/proj"
+        );
+        assert_eq!(
+            workspace_root_for_daemon("/home/me/proj", true).unwrap(),
+            "/home/me/proj"
+        );
+        assert!(workspace_root_for_daemon(r"C:\work\proj", true)
+            .unwrap_err()
+            .contains("Windows path"));
+        assert!(workspace_root_for_daemon(r"\\server\share", true).is_err());
+        assert!(workspace_root_for_daemon(r"\home\me", true).is_err());
     }
 }

@@ -15,6 +15,8 @@ pub const CAP_PTY: &str = "pty";
 pub const CAP_FS: &str = "fs";
 pub const CAP_SESSION: &str = "session";
 pub const CAP_WORKSPACE: &str = "workspace";
+/// Changing the root of an existing workspace.
+pub const CAP_WORKSPACE_SET_ROOT: &str = "workspace_set_root";
 pub const CAP_EDITOR: &str = "editor";
 pub const CAP_SCENE: &str = "scene";
 /// Workspace git status, diff, and stage/commit/pull/push. Absent on older daemons.
@@ -272,6 +274,15 @@ pub enum Message {
     },
     /// Backend → client.
     WorkspaceRenamed {
+        workspace: WorkspaceInfo,
+    },
+    /// Client → backend: point an existing workspace at an existing directory.
+    WorkspaceSetRoot {
+        workspace_id: String,
+        root: String,
+    },
+    /// Backend → client.
+    WorkspaceRootSet {
         workspace: WorkspaceInfo,
     },
     /// Client → backend: drop a workspace and kill its PTYs.
@@ -694,6 +705,7 @@ impl Hello {
             CAP_FS.to_owned(),
             CAP_SESSION.to_owned(),
             CAP_WORKSPACE.to_owned(),
+            CAP_WORKSPACE_SET_ROOT.to_owned(),
             CAP_EDITOR.to_owned(),
             CAP_SCENE.to_owned(),
             CAP_GIT.to_owned(),
@@ -748,6 +760,13 @@ mod tests {
             pty_count: 1,
             tab_count: 2,
         };
+        let set_root = Message::WorkspaceSetRoot {
+            workspace_id: info.id.clone(),
+            root: "/tmp/beta".into(),
+        };
+        assert_eq!(Message::from_json(&set_root.to_json().unwrap()).unwrap(), set_root);
+        let root_set = Message::WorkspaceRootSet { workspace: info.clone() };
+        assert_eq!(Message::from_json(&root_set.to_json().unwrap()).unwrap(), root_set);
         let listed = Message::WorkspaceListed {
             workspaces: vec![info.clone()],
             focused_id: Some("w1".into()),

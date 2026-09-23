@@ -9,6 +9,7 @@ use fresh_gui_protocol::{
 };
 
 use super::connect::ConnectTarget;
+use super::paths::{daemon_uses_unix_paths, workspace_root_for_daemon};
 
 #[derive(Debug, Clone)]
 pub enum AdeCmd {
@@ -76,6 +77,10 @@ pub enum AdeCmd {
     RenameWorkspace {
         id: String,
         name: String,
+    },
+    SetWorkspaceRoot {
+        id: String,
+        root: String,
     },
     CloseWorkspace {
         id: String,
@@ -159,6 +164,9 @@ pub enum AdeEvent {
         workspace: WorkspaceInfo,
     },
     WorkspaceRenamed {
+        workspace: WorkspaceInfo,
+    },
+    WorkspaceRootSet {
         workspace: WorkspaceInfo,
     },
     WorkspaceClosed {
@@ -512,7 +520,8 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
             let root = if root.trim().is_empty() {
                 None
             } else {
-                Some(root)
+                let unix = daemon_uses_unix_paths(client.backend_hello.config_path.as_deref(), &[]);
+                Some(workspace_root_for_daemon(&root, unix).map_err(anyhow::Error::msg)?)
             };
             client.send(Message::WorkspaceCreate { name, root }).await?;
         }
@@ -521,6 +530,16 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
                 .send(Message::WorkspaceRename {
                     workspace_id: id,
                     name,
+                })
+                .await?;
+        }
+        AdeCmd::SetWorkspaceRoot { id, root } => {
+            let unix = daemon_uses_unix_paths(client.backend_hello.config_path.as_deref(), &[]);
+            let root = workspace_root_for_daemon(&root, unix).map_err(anyhow::Error::msg)?;
+            client
+                .send(Message::WorkspaceSetRoot {
+                    workspace_id: id,
+                    root,
                 })
                 .await?;
         }
@@ -678,8 +697,19 @@ async fn bootstrap_workspaces(
 
     client.send(Message::WorkspaceList).await?;
     let (mut workspaces, focused) = recv_workspace_list(client).await?;
+    let unix = daemon_uses_unix_paths(
+        client.backend_hello.config_path.as_deref(),
+        &workspaces
+            .iter()
+            .map(|ws| ws.root.as_str())
+            .collect::<Vec<_>>(),
+    );
+    let preferred = preferred_root
+        .map(|root| workspace_root_for_daemon(root, unix))
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
     let action =
-        super::connect::plan_workspace_boot(&workspaces, focused.as_deref(), preferred_root);
+        super::connect::plan_workspace_boot(&workspaces, focused.as_deref(), preferred.as_deref());
     let id = match action {
         super::connect::BootAction::Switch { id } => id,
         super::connect::BootAction::Create { root } => {
@@ -908,6 +938,7 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
         }),
         Message::WorkspaceCreated { workspace } => Some(AdeEvent::WorkspaceCreated { workspace }),
         Message::WorkspaceRenamed { workspace } => Some(AdeEvent::WorkspaceRenamed { workspace }),
+        Message::WorkspaceRootSet { workspace } => Some(AdeEvent::WorkspaceRootSet { workspace }),
         Message::WorkspaceClosed {
             workspace_id,
             focused_id,

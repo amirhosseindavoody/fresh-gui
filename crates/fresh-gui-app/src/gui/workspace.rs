@@ -14,8 +14,8 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fresh_gui_protocol::{
-    CAP_GIT, CAP_WORKSPACE, FsEntry, FsKind, GitFile, Hello, PtyInfo, WorkspaceInfo, WorkspaceTab,
-    WorkspaceTabKind,
+    CAP_GIT, CAP_WORKSPACE, CAP_WORKSPACE_SET_ROOT, FsEntry, FsKind, GitFile, Hello, PtyInfo,
+    WorkspaceInfo, WorkspaceTab, WorkspaceTabKind,
 };
 use gpui_kit::component::dock::{DockArea, DockEvent, DockPlacement, PanelId, panel_handle};
 use gpui_kit::component::menu::{AppMenuBar, ContextMenuExt as _, PopupMenuItem};
@@ -50,7 +50,9 @@ use super::explorer::{
 };
 use super::file_icons::explorer_glyph;
 use super::pane::{EditorPanel, TerminalPanel};
-use super::paths::{display_path, strip_verbatim_prefixes};
+use super::paths::{
+    daemon_uses_unix_paths, display_path, strip_verbatim_prefixes, workspace_root_for_daemon,
+};
 use super::rail::{
     WORKSPACE_RAIL_W, WORKSPACE_ROW_H, choose_shell_cwd, empty_workspace_name_hint,
     explorer_header_label, path_basename, show_workspace_rail, user_home, workspace_rail_hint,
@@ -252,6 +254,7 @@ pub struct Workspace {
     /// Workspace whose name is being edited in the rail. Any row, not only the
     /// active one. `None` when the inline field is closed.
     renaming_id: Option<String>,
+    relocating_id: Option<String>,
     /// Row under the pointer, so Rename / Close stay off the resting layout.
     rail_hover: Option<String>,
     create_open: bool,
@@ -326,6 +329,7 @@ pub struct Workspace {
     create_name: Entity<InputState>,
     create_root: Entity<InputState>,
     ws_rename_input: Entity<InputState>,
+    ws_root_input: Entity<InputState>,
     rename_pty: Option<String>,
     rename_input: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
@@ -343,6 +347,8 @@ impl Workspace {
         let create_root = cx.new(|cx| InputState::new(window, cx).placeholder("/absolute/path"));
         let ws_rename_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Workspace name"));
+        let ws_root_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Absolute path on daemon"));
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Terminal name"));
         let filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter files and folders"));
@@ -402,12 +408,21 @@ impl Workspace {
                 this.confirm_workspace_rename(cx);
             }
         });
+        let ws_root_sub = cx.subscribe(&ws_root_input, |this, _, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::PressEnter { .. }) && this.relocating_id.is_some() {
+                this.confirm_workspace_root(cx);
+                cx.notify();
+            }
+        });
         let create_name_sub = cx.subscribe(&create_name, |this, _, ev: &InputEvent, cx| {
             if !this.create_open {
                 return;
             }
             match ev {
-                InputEvent::PressEnter { .. } => this.confirm_create(cx),
+                InputEvent::PressEnter { .. } => {
+                    this.confirm_create(cx);
+                    cx.notify();
+                }
                 InputEvent::Change => cx.notify(),
                 _ => {}
             }
@@ -417,7 +432,10 @@ impl Workspace {
                 return;
             }
             match ev {
-                InputEvent::PressEnter { .. } => this.confirm_create(cx),
+                InputEvent::PressEnter { .. } => {
+                    this.confirm_create(cx);
+                    cx.notify();
+                }
                 InputEvent::Change => cx.notify(),
                 _ => {}
             }
@@ -466,6 +484,7 @@ impl Workspace {
             pending_editors: HashMap::new(),
             restoring: false,
             renaming_id: None,
+            relocating_id: None,
             rail_hover: None,
             create_open: false,
             capabilities: Vec::new(),
@@ -524,6 +543,7 @@ impl Workspace {
             create_name,
             create_root,
             ws_rename_input,
+            ws_root_input,
             rename_pty: None,
             rename_input,
             _subscriptions: vec![
@@ -533,6 +553,7 @@ impl Workspace {
                 filter_sub,
                 file_rename_sub,
                 ws_rename_sub,
+                ws_root_sub,
                 create_name_sub,
                 create_root_sub,
                 commit_sub,
@@ -582,6 +603,23 @@ impl Workspace {
             }
             AdeEvent::WorkspaceRenamed { workspace } => {
                 self.status = format!("Renamed to {}", workspace.name).into();
+                self.upsert_workspace(workspace);
+            }
+            AdeEvent::WorkspaceRootSet { workspace } => {
+                let active = self.active_workspace_id.as_deref() == Some(workspace.id.as_str());
+                self.status =
+                    format!("Workspace location changed to {}", display_path(&workspace.root)).into();
+                if active {
+                    self.explorer_root = workspace.root.clone();
+                    self.explorer_cache.clear();
+                    self.pending_lists.clear();
+                    self.expanded_dirs.clear();
+                    self.selection.clear();
+                    self.anchor = None;
+                    self.rebuild_tree(cx);
+                    self.list_dir(&workspace.root);
+                    self.refresh_git();
+                }
                 self.upsert_workspace(workspace);
             }
             AdeEvent::WorkspaceClosed { id, focused_id } => {
@@ -1346,6 +1384,7 @@ impl Workspace {
         self.pty_opens_pending = 0;
         self.pending_editors.clear();
         self.renaming_id = None;
+        self.relocating_id = None;
         self.rename_pty = None;
         // The window is only available from event handlers. `switch_to` is
         // called from those, but `Context` does not hand us a window here.
@@ -1521,6 +1560,7 @@ impl Workspace {
         self.goto_open = false;
         self.rename_pty = None;
         self.renaming_id = None;
+        self.relocating_id = None;
         let root = self.default_new_workspace_root();
         self.create_name.update(cx, |state, cx| {
             state.set_value("", window, cx);
@@ -1553,7 +1593,22 @@ impl Workspace {
 
     fn confirm_create(&mut self, cx: &mut Context<Self>) {
         let name = self.create_name.read(cx).value().to_string();
-        let root = self.create_root.read(cx).value().to_string();
+        let raw_root = self.create_root.read(cx).value().to_string();
+        let unix = daemon_uses_unix_paths(
+            self.config_path.as_deref(),
+            &self
+                .workspaces
+                .iter()
+                .map(|ws| ws.root.as_str())
+                .collect::<Vec<_>>(),
+        );
+        let root = match workspace_root_for_daemon(&raw_root, unix) {
+            Ok(root) => root,
+            Err(message) => {
+                self.status = message.into();
+                return;
+            }
+        };
         self.create_open = false;
         self.ade.send(AdeCmd::CreateWorkspace { name, root });
     }
@@ -1582,6 +1637,7 @@ impl Workspace {
             return;
         };
         self.renaming_id = Some(id.to_string());
+        self.relocating_id = None;
         self.rename_pty = None;
         self.palette_open = false;
         self.create_open = false;
@@ -1601,6 +1657,60 @@ impl Workspace {
             return;
         }
         self.ade.send(AdeCmd::RenameWorkspace { id, name });
+    }
+
+    fn begin_workspace_root_for(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self
+            .capabilities
+            .iter()
+            .any(|cap| cap == CAP_WORKSPACE_SET_ROOT)
+        {
+            self.status = "Upgrade the remote fresh-gui to change workspace location".into();
+            return;
+        }
+        let Some(root) = self
+            .workspaces
+            .iter()
+            .find(|ws| ws.id == id)
+            .map(|ws| display_path(&ws.root))
+        else {
+            return;
+        };
+        self.relocating_id = Some(id.to_string());
+        self.renaming_id = None;
+        self.create_open = false;
+        self.ws_root_input.update(cx, |state, cx| {
+            state.set_value(root, window, cx);
+            state.focus(window, cx);
+        });
+    }
+
+    fn confirm_workspace_root(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.relocating_id.clone() else {
+            return;
+        };
+        let root = self.ws_root_input.read(cx).value().to_string();
+        let unix = daemon_uses_unix_paths(
+            self.config_path.as_deref(),
+            &self
+                .workspaces
+                .iter()
+                .map(|ws| ws.root.as_str())
+                .collect::<Vec<_>>(),
+        );
+        let root = match workspace_root_for_daemon(&root, unix) {
+            Ok(root) if !root.is_empty() => root,
+            Ok(_) => {
+                self.status = "Workspace location is empty".into();
+                return;
+            }
+            Err(message) => {
+                self.status = message.into();
+                return;
+            }
+        };
+        self.relocating_id = None;
+        self.ade.send(AdeCmd::SetWorkspaceRoot { id, root });
     }
 
     fn close_workspace(&mut self, id: String) {
@@ -1826,6 +1936,7 @@ impl Workspace {
         self.pending_editors.clear();
         self.restoring = false;
         self.renaming_id = None;
+        self.relocating_id = None;
         self.rail_hover = None;
         self.create_open = false;
         self.explorer_cache.clear();
@@ -2893,6 +3004,7 @@ impl Workspace {
         let active = self.active_workspace_id.as_deref() == Some(workspace.id.as_str());
         let hovered = self.rail_hover.as_deref() == Some(workspace.id.as_str());
         let renaming = self.renaming_id.as_deref() == Some(workspace.id.as_str());
+        let relocating = self.relocating_id.as_deref() == Some(workspace.id.as_str());
         let can_close = self.workspaces.len() > 1;
         let name = workspace.name.clone();
         let root_label = workspace_root_label(&workspace.root, home);
@@ -2957,7 +3069,9 @@ impl Workspace {
                         )
                         .into_any_element()
                     })
-                    .child(
+                    .child(if relocating {
+                        self.render_workspace_root_editor(&id, cx).into_any_element()
+                    } else {
                         div()
                             .w_full()
                             .min_w_0()
@@ -2966,17 +3080,26 @@ impl Workspace {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()
-                            .child(root_label),
-                    ),
+                            .child(root_label)
+                            .into_any_element()
+                    }),
             )
             .context_menu(move |menu, _, _| {
                 let rename_id = menu_id.clone();
                 let close_id = menu_id.clone();
+                let relocate_id = menu_id.clone();
                 let rename_view = view.clone();
                 let close_view = view.clone();
+                let relocate_view = view.clone();
                 menu.item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
                     rename_view.update(cx, |this, cx| {
                         this.begin_workspace_rename_for(&rename_id, window, cx);
+                        cx.notify();
+                    });
+                }))
+                .item(PopupMenuItem::new("Change location…").on_click(move |_, window, cx| {
+                    relocate_view.update(cx, |this, cx| {
+                        this.begin_workspace_root_for(&relocate_id, window, cx);
                         cx.notify();
                     });
                 }))
@@ -3096,6 +3219,46 @@ impl Workspace {
                     .tooltip("Cancel")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.renaming_id = None;
+                        cx.notify();
+                    })),
+            )
+    }
+
+    fn render_workspace_root_editor(&self, id: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .items_center()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key.eq_ignore_ascii_case("escape") {
+                    this.relocating_id = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .child(div().flex_1().min_w_0().child(Input::new(&self.ws_root_input)))
+            .child(
+                Button::new(format!("ws-root-ok-{id}"))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Check)
+                    .tooltip("Change location")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.confirm_workspace_root(cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new(format!("ws-root-cancel-{id}"))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Close)
+                    .tooltip("Cancel")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.relocating_id = None;
                         cx.notify();
                     })),
             )

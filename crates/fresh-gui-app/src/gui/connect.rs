@@ -153,10 +153,11 @@ pub fn plan_workspace_boot(
 }
 
 fn roots_equal(left: &str, right: &str) -> bool {
-    normalize_root(left) == normalize_root(right)
+    let unix = left.starts_with('/') || right.starts_with('/');
+    normalize_root(left, unix) == normalize_root(right, unix)
 }
 
-fn normalize_root(path: &str) -> String {
+fn normalize_root(path: &str, unix: bool) -> String {
     let trimmed = path.trim();
     let stripped = trimmed.trim_end_matches(['/', '\\']);
     let stripped = if stripped.is_empty() {
@@ -164,13 +165,10 @@ fn normalize_root(path: &str) -> String {
     } else {
         stripped
     };
-    #[cfg(windows)]
-    {
-        stripped.to_ascii_lowercase()
-    }
-    #[cfg(not(windows))]
-    {
+    if unix {
         stripped.to_string()
+    } else {
+        stripped.replace('\\', "/").to_ascii_lowercase()
     }
 }
 
@@ -248,6 +246,12 @@ mod tests {
             plan_workspace_boot(&[], None, None),
             BootAction::Create { root: None }
         );
+    }
+
+    #[test]
+    fn unix_roots_keep_case_even_on_windows_client() {
+        assert!(!roots_equal("/Work/Project", "/work/project"));
+        assert!(roots_equal(r"C:\Work\Project", "c:/work/project/"));
     }
 
     #[test]

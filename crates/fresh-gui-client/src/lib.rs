@@ -218,6 +218,31 @@ impl Client {
         }
     }
 
+    pub async fn set_workspace_root(
+        &mut self,
+        workspace_id: impl Into<String>,
+        root: impl Into<String>,
+    ) -> Result<WorkspaceInfo> {
+        send_msg(
+            &mut self.sink,
+            &Message::WorkspaceSetRoot {
+                workspace_id: workspace_id.into(),
+                root: root.into(),
+            },
+        )
+        .await?;
+        loop {
+            match self.recv().await? {
+                Message::WorkspaceRootSet { workspace } => return Ok(workspace),
+                Message::Error { code, message } => {
+                    bail!("workspace location change failed: {code}: {message}")
+                }
+                other if ignorable_while_waiting(&other) => continue,
+                other => bail!("unexpected while changing workspace location: {other:?}"),
+            }
+        }
+    }
+
     pub async fn close_workspace(
         &mut self,
         workspace_id: impl Into<String>,
