@@ -1,7 +1,7 @@
 //! Host asset source: the default gpui-kit icon bundle plus explorer file types.
 //!
 //! [`icon_assets!`](gpui_kit::assets::icon_assets) embeds only the Lucide glyphs
-//! the explorer references. Everything else (chevrons, tab chrome, the activity
+//! the explorer and a few toolbar buttons (lock, refresh) reference. Everything else (chevrons, tab chrome, the activity
 //! rail) still comes from [`gpui_kit::assets::Assets`].
 
 use std::borrow::Cow;
@@ -28,6 +28,10 @@ gpui_kit::assets::icon_assets!(
         FolderCog,
         FolderGit,
         FolderOpen,
+        // Toolbar glyphs outside the default kit bundle.
+        Lock,
+        LockOpen,
+        RefreshCw,
     ]
 );
 
