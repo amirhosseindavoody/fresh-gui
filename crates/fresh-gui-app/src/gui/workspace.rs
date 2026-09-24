@@ -73,6 +73,32 @@ use super::tab_chrome::{TabCloseScope, TabStripMetrics, panels_for_close_scope};
 /// Limit a single parser/paint update without delaying the first PTY byte.
 const PTY_BATCH_BYTES: usize = 128 * 1024;
 const PTY_BATCH_EVENTS: usize = 32;
+const GOTO_MAX_VISIBLE: usize = 10;
+
+fn goto_match_rank(path: &str, query: &str) -> (usize, u8, usize) {
+    let lower = path.to_lowercase();
+    let index = lower.find(query).unwrap_or(usize::MAX);
+    let basename = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
+    let name_rank = if query.is_empty() || basename.starts_with(query) {
+        0
+    } else {
+        1
+    };
+    (index, name_rank, lower.len())
+}
+
+#[cfg(test)]
+mod goto_match_tests {
+    use super::goto_match_rank;
+
+    #[test]
+    fn literal_path_prefixes_rank_ahead_of_substring_matches() {
+        let query = "src/mai";
+        let prefix = goto_match_rank("/project/src/main.rs", query);
+        let later_match = goto_match_rank("/project/tests/src/main_fixture.rs", query);
+        assert!(prefix < later_match);
+    }
+}
 
 fn coalesce_pty_event(
     event: AdeEvent,
@@ -3778,10 +3804,53 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         let query = self.goto_input.read(cx).value().to_string();
         let matches = self.goto_matches(&query);
         let target = pick_goto_target(&query, &matches);
+        if !target.is_empty() && self.goto_path_is_dir(&target) {
+            // A directory is a completion target, never an openable file.
+            // Tab descends into it while Enter leaves the picker active.
+            cx.notify();
+            return;
+        }
         self.goto_open = false;
         if !target.is_empty() {
             self.open_path(target, false);
         }
+        cx.notify();
+    }
+
+    fn goto_path_is_dir(&self, path: &str) -> bool {
+        let normalized = path.trim_end_matches(['/', '\\']);
+        self.explorer_cache
+            .values()
+            .flatten()
+            .any(|entry| super::explorer::is_dir_entry(entry) && entry.path == normalized)
+    }
+
+    fn complete_goto(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.goto_input.read(cx).value().to_string();
+        let Some(path) = self.goto_matches(&query).into_iter().next() else {
+            return;
+        };
+        self.complete_goto_path(path, window, cx);
+    }
+
+    fn complete_goto_path(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        let is_dir = self.goto_path_is_dir(&path);
+        if is_dir && !self.explorer_cache.contains_key(&path) {
+            self.list_dir(&path);
+        }
+        let separator = if path.contains('\\') && !path.contains('/') {
+            '\\'
+        } else {
+            '/'
+        };
+        let path = if is_dir && !path.ends_with(['/', '\\']) {
+            format!("{path}{separator}")
+        } else {
+            path
+        };
+        self.goto_input.update(cx, |input, cx| {
+            input.set_value(path, window, cx);
+        });
         cx.notify();
     }
 
@@ -3790,7 +3859,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         let mut paths = Vec::new();
         for entries in self.explorer_cache.values() {
             for entry in entries {
-                if !matches!(entry.kind, FsKind::File | FsKind::Symlink) {
+                if !matches!(entry.kind, FsKind::File | FsKind::Symlink | FsKind::Dir) {
                     continue;
                 }
                 let path = entry.path.to_lowercase();
@@ -3800,8 +3869,12 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                 }
             }
         }
-        paths.sort();
-        paths.truncate(12);
+        paths.sort_by(|left, right| {
+            goto_match_rank(left, &query)
+                .cmp(&goto_match_rank(right, &query))
+                .then_with(|| left.cmp(right))
+        });
+        paths.dedup();
         paths
     }
 
@@ -3856,33 +3929,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         let Some(panel) = self.editors.get(path).cloned() else {
             return;
         };
-        panel.update(cx, |panel, cx| panel.commit_markdown_inline_edit(window, cx));
-        let (buffer_id, rev, text, dirty) = {
-            let panel = panel.read(cx);
-            (
-                panel.buffer_id().to_string(),
-                panel.rev(),
-                panel.current_text(cx),
-                panel.is_dirty(),
-            )
-        };
-        let base_rev = if dirty {
-            self.ade.send(AdeCmd::EditBuffer {
-                request_id: next_id("ed"),
-                buffer_id: buffer_id.clone(),
-                base_rev: rev,
-                text,
-            });
-            rev + 1
-        } else {
-            rev
-        };
-        self.ade.send(AdeCmd::FormatBuffer {
-            request_id: next_id("fmt"),
-            buffer_id,
-            base_rev,
-        });
-        self.status = "Formatting…".into();
+        panel.update(cx, |panel, cx| panel.request_format(window, cx));
         cx.notify();
     }
 
@@ -5425,6 +5472,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             .inset_0()
             .flex()
             .justify_center()
+            .items_start()
             .pt(px(80.))
             .bg(cx.theme().background.opacity(0.45))
             .on_mouse_down(
@@ -5436,6 +5484,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             )
             .child(
                 v_flex()
+                    .id("goto-dialog")
                     .w(self.ui_px(480.))
                     .gap_2()
                     .p_3()
@@ -5444,23 +5493,57 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                     .border_1()
                     .border_color(cx.theme().border)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        if event.keystroke.key.eq_ignore_ascii_case("tab") {
+                            this.complete_goto(window, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
                     .child(div().text_sm().font_bold().child("Go to File"))
                     .child(Input::new(&self.goto_input))
-                    .children(self.goto_matches(&self.goto_input.read(cx).value().to_string()).into_iter().map(|path| {
-                        let open = cx.entity();
-                        let label = display_path(&path);
-                        Button::new(SharedString::from(format!("goto-{path}")))
-                            .ghost()
-                            .label(label)
-                            .on_click(move |_, _, cx| {
-                                let path = path.clone();
-                                open.update(cx, |this, cx| {
-                                    this.goto_open = false;
-                                    this.open_path(path, false);
-                                    cx.notify();
-                                });
-                            })
-                    }))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Tab completes the first path match"),
+                    )
+                    .child(
+                        v_flex()
+                            .id("goto-results")
+                            .max_h(self.ui_px((GOTO_MAX_VISIBLE as f32) * 32.))
+                            .overflow_y_scroll()
+                            .children(
+                                self.goto_matches(&self.goto_input.read(cx).value().to_string())
+                                    .into_iter()
+                                    .map(|path| {
+                                        let open = cx.entity();
+                                        let is_dir = self.goto_path_is_dir(&path);
+                                        let label = display_path(&path);
+                                        let label = if is_dir {
+                                            format!("{label}/")
+                                        } else {
+                                            label
+                                        };
+                                        Button::new(SharedString::from(format!("goto-{path}")))
+                                            .ghost()
+                                            .h(self.ui_px(32.))
+                                            .flex_shrink_0()
+                                            .label(label)
+                                            .on_click(move |_, window, cx| {
+                                                let path = path.clone();
+                                                open.update(cx, |this, cx| {
+                                                    if is_dir {
+                                                        this.complete_goto_path(path, window, cx);
+                                                    } else {
+                                                        this.goto_open = false;
+                                                        this.open_path(path, false);
+                                                        cx.notify();
+                                                    }
+                                                });
+                                            })
+                                    }),
+                            ),
+                    )
                     .child(
                         h_flex()
                             .justify_end()
@@ -5673,6 +5756,21 @@ impl Render for Workspace {
             .find(|workspace| Some(&workspace.id) == self.active_workspace_id.as_ref())
             .map(|workspace| workspace.name.clone())
             .unwrap_or_else(|| "no workspace".into());
+        let active_editor_status = match &self.active {
+            Some(ActiveSurface::Editor(path)) => self
+                .editors
+                .get(path)
+                .map(|panel| panel.read(cx).status_summary()),
+            _ => None,
+        };
+        let status_text = strip_verbatim_prefixes(self.status.as_ref());
+        let status_text = match active_editor_status {
+            Some(editor_status) if !status_text.is_empty() => {
+                format!("{status_text} · {editor_status}")
+            }
+            Some(editor_status) => editor_status,
+            None => status_text,
+        };
         let dock = self.dock.clone();
 
         div()
@@ -5805,7 +5903,7 @@ impl Render for Workspace {
                     .py_0()
                     .px_2()
                     .gap_1()
-                    .left(strip_verbatim_prefixes(self.status.as_ref()))
+                    .left(status_text)
                     .child(self.connection_label())
                     .right(workspace_label)
                     .right(session),
