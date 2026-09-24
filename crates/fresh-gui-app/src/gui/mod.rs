@@ -9,6 +9,7 @@ mod ade;
 mod assets;
 mod chrome;
 mod connect;
+mod copilot;
 mod diff_view;
 mod dock_a11y;
 mod explorer;

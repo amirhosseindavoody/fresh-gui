@@ -128,6 +128,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     hello.config_path = Some(state.config_path.display().to_string());
     hello.defaults_path = Some(defaults_path.display().to_string());
     hello.ui = Some(ui);
+    hello.shortkeys = state.config.read().expect("config lock").shortkeys.iter().map(|key| fresh_gui_protocol::Shortkey {
+        action: key.action.clone(), shortkey: key.shortkey.clone(), when: key.when.clone(),
+    }).collect();
     let hello = Message::Hello(hello);
     if send_msg(&mut sink, &hello).await.is_err() {
         return;
@@ -812,7 +815,13 @@ async fn handle_client_msg(
                             theme = %cfg.ui.theme,
                             "reloaded config after save"
                         );
+                        let shortkeys = cfg.shortkeys.iter().map(|key| fresh_gui_protocol::Shortkey {
+                            action: key.action.clone(), shortkey: key.shortkey.clone(), when: key.when.clone(),
+                        }).collect();
                         *state.config.write().expect("config lock") = cfg;
+                        send_msg(sink, &Message::ConfigUpdated { shortkeys }).await.map_err(|_| Message::Error {
+                            code: "send_failed".into(), message: "failed to send ConfigUpdated".into(),
+                        })?;
                     }
                     Err(err) => {
                         warn!(
@@ -1164,6 +1173,7 @@ async fn handle_client_msg(
                     active_tab: focused.active_tab,
                     ptys,
                     explorer_expanded: focused.explorer_expanded,
+                    extra: focused.extra,
                 },
             )
             .await
@@ -1184,11 +1194,12 @@ async fn handle_client_msg(
             tabs,
             active_tab,
             explorer_expanded,
+            extra,
         } => {
             require_auth(*authed)?;
             let (session_for_layout, layout) = state
                 .workspaces
-                .set_layout(&workspace_id, tabs, active_tab, explorer_expanded)
+                .set_layout(&workspace_id, tabs, active_tab, explorer_expanded, extra)
                 .await
                 .map_err(|err| Message::Error {
                     code: "workspace_layout_failed".into(),

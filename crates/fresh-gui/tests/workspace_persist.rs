@@ -125,6 +125,7 @@ async fn workspaces_tabs_and_explorer_state_survive_daemon_restart() {
             ],
             active_tab: 1,
             explorer_expanded: vec![src.clone()],
+            extra: fresh_gui_protocol::WorkspaceLayoutExtra::default(),
         })
         .await
         .unwrap();

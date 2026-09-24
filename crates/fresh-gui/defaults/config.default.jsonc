@@ -35,9 +35,8 @@
     }
   },
   // action is the Rust action name to run. when is an optional GPUI focus
-  // context: null means global; Explorer and Terminal scope keys to a pane.
-  // A future Terminal Ctrl+C binding can inspect selection before choosing
-  // copy or interrupt; richer predicates are not part of this schema yet.
+  // context: null means global; Explorer, Editor, and Terminal scope keys to a pane.
+  // TerminalCopyOrInterrupt copies a selection, otherwise sends Ctrl+C to the PTY.
   "shortkeys": [
     { "action": "NewTerminal", "shortkey": "ctrl-t", "when": null },
     { "action": "CloseTab", "shortkey": "ctrl-w", "when": null },
@@ -53,9 +52,11 @@
     { "action": "CopyExplorer", "shortkey": "cmd-c", "when": "Explorer" },
     { "action": "PasteExplorer", "shortkey": "ctrl-v", "when": "Explorer" },
     { "action": "PasteExplorer", "shortkey": "cmd-v", "when": "Explorer" },
+    { "action": "DeleteExplorer", "shortkey": "delete", "when": "Explorer" },
     { "action": "FilterExplorer", "shortkey": "ctrl-f", "when": "Explorer" },
     { "action": "FilterExplorer", "shortkey": "cmd-f", "when": "Explorer" },
     { "action": "ClearExplorerInput", "shortkey": "escape", "when": "Explorer" },
+    { "action": "TerminalCopyOrInterrupt", "shortkey": "ctrl-c", "when": "Terminal" },
     { "action": "ZoomInContent", "shortkey": "ctrl-=", "when": null },
     { "action": "ZoomInContent", "shortkey": "ctrl-+", "when": null },
     { "action": "ZoomOutContent", "shortkey": "ctrl--", "when": null },

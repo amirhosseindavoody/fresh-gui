@@ -100,12 +100,14 @@ pub enum AdeCmd {
         tabs: Vec<WorkspaceTab>,
         active_tab: u32,
         explorer_expanded: Vec<String>,
+        extra: fresh_gui_protocol::WorkspaceLayoutExtra,
     },
     SetWorkspaceLayout {
         id: String,
         tabs: Vec<WorkspaceTab>,
         active_tab: u32,
         explorer_expanded: Vec<String>,
+        extra: fresh_gui_protocol::WorkspaceLayoutExtra,
     },
     GitStatus {
         request_id: String,
@@ -159,6 +161,7 @@ pub struct AttachedWorkspace {
     pub active_tab: u32,
     pub ptys: Vec<PtyInfo>,
     pub explorer_expanded: Vec<String>,
+    pub extra: fresh_gui_protocol::WorkspaceLayoutExtra,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +177,7 @@ pub enum AdeEvent {
         /// Present when the daemon advertises `workspace` and a workspace is attached.
         attached: Option<Box<AttachedWorkspace>>,
     },
+    ConfigUpdated { shortkeys: Vec<fresh_gui_protocol::Shortkey> },
     WorkspaceCreated {
         workspace: WorkspaceInfo,
     },
@@ -574,6 +578,7 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
             tabs,
             active_tab,
             explorer_expanded,
+            extra,
         } => {
             if let Some(from) = from {
                 client
@@ -582,6 +587,7 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
                         tabs,
                         active_tab,
                         explorer_expanded,
+                        extra,
                     })
                     .await?;
             }
@@ -594,6 +600,7 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
             tabs,
             active_tab,
             explorer_expanded,
+            extra,
         } => {
             client
                 .send(Message::WorkspaceLayoutSet {
@@ -601,6 +608,7 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
                     tabs,
                     active_tab,
                     explorer_expanded,
+                    extra,
                 })
                 .await?;
         }
@@ -812,6 +820,7 @@ async fn recv_workspace_switched(client: &mut Client) -> anyhow::Result<Attached
                 active_tab,
                 ptys,
                 explorer_expanded,
+                extra,
             } => {
                 return Ok(AttachedWorkspace {
                     info: workspace,
@@ -819,6 +828,7 @@ async fn recv_workspace_switched(client: &mut Client) -> anyhow::Result<Attached
                     active_tab,
                     ptys,
                     explorer_expanded,
+                    extra,
                 });
             }
             Message::Error { code, message } => {
@@ -889,6 +899,7 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             buffer_id,
             rev,
         }),
+        Message::ConfigUpdated { shortkeys } => Some(AdeEvent::ConfigUpdated { shortkeys }),
         Message::BufferSaved {
             request_id,
             buffer_id,
@@ -984,6 +995,7 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             active_tab,
             ptys,
             explorer_expanded,
+            extra,
         } => Some(AdeEvent::WorkspaceSwitched {
             attached: Box::new(AttachedWorkspace {
                 info: workspace,
@@ -991,6 +1003,7 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
                 active_tab,
                 ptys,
                 explorer_expanded,
+                extra,
             }),
         }),
         Message::Pong { .. } | Message::Ping { .. } | Message::AuthOk => None,
