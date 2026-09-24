@@ -8,6 +8,7 @@ mod actions;
 mod ade;
 mod assets;
 mod chrome;
+mod clipboard;
 mod connect;
 mod copilot;
 mod diff_view;

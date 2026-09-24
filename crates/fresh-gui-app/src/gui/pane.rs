@@ -1646,13 +1646,13 @@ mod markdown_preview_tests {
     }
 }
 
-fn note_tab_edge(metrics: &TabStripMetrics, bounds: Bounds<Pixels>) {
+pub(super) fn note_tab_edge(metrics: &TabStripMetrics, bounds: Bounds<Pixels>) {
     let top = f32::from(bounds.origin.y);
     let right = f32::from(bounds.origin.x + bounds.size.width);
     metrics.note_tab(top, right);
 }
 
-fn tab_close_button(
+pub(super) fn tab_close_button(
     id: impl Into<ElementId>,
     workspace: WeakEntity<Workspace>,
     panel_id: PanelId,
@@ -1673,7 +1673,7 @@ fn tab_close_button(
         })
 }
 
-fn new_terminal_button(
+pub(super) fn new_terminal_button(
     id: impl Into<ElementId>,
     metrics: TabStripMetrics,
     plus_shift: Rc<Cell<f32>>,
@@ -1708,7 +1708,7 @@ fn new_terminal_button(
     )
 }
 
-fn with_close_items(
+pub(super) fn with_close_items(
     menu: PopupMenu,
     workspace: WeakEntity<Workspace>,
     panel_id: PanelId,
@@ -1731,11 +1731,22 @@ fn with_close_items(
                 .ok();
         }));
     }
-    let pinned = workspace.read_with(cx, |workspace, _| workspace.tab_is_pinned(panel_id)).unwrap_or(false);
-    let pin_workspace = workspace.clone();
-    menu = menu.item(PopupMenuItem::new(if pinned { "Unpin Tab" } else { "Pin Tab" }).on_click(move |_, _, cx| {
-        pin_workspace.update(cx, |workspace, cx| workspace.toggle_pin(panel_id, cx)).ok();
-    }));
+    if let Some(pinned) = workspace
+        .read_with(cx, |workspace, _| workspace.tab_pin_state(panel_id))
+        .ok()
+        .flatten()
+    {
+        let pin_workspace = workspace.clone();
+        menu = menu.item(
+            PopupMenuItem::new(if pinned { "Unpin Tab" } else { "Pin Tab" }).on_click(
+                move |_, _, cx| {
+                    pin_workspace
+                        .update(cx, |workspace, cx| workspace.toggle_pin(panel_id, cx))
+                        .ok();
+                },
+            ),
+        );
+    }
     let workspace_others = workspace.clone();
     let workspace_right = workspace.clone();
     menu.item(

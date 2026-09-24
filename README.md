@@ -56,6 +56,7 @@ The remote daemon keeps running after you close the window. The SSH path targets
 
 - Use the left rail to create and switch workspaces. Each workspace has its own files and tabs. Right-click a workspace to rename it or choose **Change location…**. Source Control follows that folder.
 - Open files in the explorer. Use the **+** in the tab bar for a shell, and drag a tab to the edge of another pane to split the view horizontally or vertically. Terminal tabs split the same way. The last remaining tab cannot be dragged.
+- Right-click a file or folder and choose **Copy Path** to copy its absolute path as text. For SSH sessions, this is the path on the remote server.
 - `Ctrl+=` or `Ctrl++` zooms editor and terminal text. `Ctrl+-` zooms out, and `Ctrl+0` resets that zoom. `Ctrl+Shift+=` (`Ctrl+Shift++` on a US keyboard) zooms the rest of the UI text, with `Ctrl+Shift+-` and `Ctrl+Shift+0` to zoom out and reset. Those chords are in the default shortkeys list, and the command palette lists the same actions. Sidebar width and the tab strip stay a fixed size.
 - Use the Source Control icon to review changes, stage files, commit, pull, and push. The pane shows the git root for the active workspace. Git runs on the daemon's machine.
 - Open Settings from the gear icon or `Ctrl+,`. Settings live on the daemon's machine, including for remote sessions.
