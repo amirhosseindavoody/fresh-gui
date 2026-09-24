@@ -58,6 +58,11 @@ fn percent_decode(s: &str) -> String {
 /// Scan a PTY chunk for OSC 7, keeping a short carry buffer for sequences
 /// split across WebSocket frames.
 pub fn feed_osc7_chunk(carry: &mut String, chunk: &str) -> Option<String> {
+    // Most TUI frames contain no OSC at all. Avoid allocating and scanning
+    // their (often large) screen updates when there is no pending sequence.
+    if carry.is_empty() && !chunk.contains("\x1b]") {
+        return None;
+    }
     let s = format!("{carry}{chunk}");
     let mut last = None;
     let mut last_end = 0;
@@ -95,7 +100,11 @@ pub fn feed_osc7_chunk(carry: &mut String, chunk: &str) -> Option<String> {
     }
     let rest = &s[last_end..];
     let keep = 512.min(rest.len());
-    let tail = &rest[rest.len() - keep..];
+    let mut start = rest.len() - keep;
+    while !rest.is_char_boundary(start) {
+        start -= 1;
+    }
+    let tail = &rest[start..];
     if let Some(idx) = tail.rfind("\x1b]") {
         *carry = tail[idx..].to_string();
     } else {
@@ -129,5 +138,20 @@ mod tests {
             Some("/tmp/abc".into())
         );
         assert!(carry.is_empty() || !carry.contains('\x07'));
+    }
+
+    #[test]
+    fn braille_at_carry_boundary_never_panics() {
+        let mut carry = String::new();
+        let chunk = format!(
+            "\x1b]7;file://host/tmp/ok\x07⣀{}\x1b]7;file://host/tmp/",
+            "⣀".repeat(171)
+        );
+        assert_eq!(
+            feed_osc7_chunk(&mut carry, &chunk),
+            Some("/tmp/ok".into())
+        );
+        assert!(carry.starts_with("\x1b]7;"));
+        assert_eq!(feed_osc7_chunk(&mut carry, "next\x07"), Some("/tmp/next".into()));
     }
 }

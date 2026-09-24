@@ -20,6 +20,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::actions::ZoomInUi;
 use super::ade::{AdeCmd, AdeHandle};
 use super::osc7::feed_osc7_chunk;
 use super::paths::display_path;
@@ -27,6 +28,7 @@ use super::rail::path_basename;
 use super::tab_chrome::{TabCloseScope, TabStripMetrics};
 use super::terminal::{
     TermMouseButton, TermMouseKind, TermMouseMods, TermScreen, TermSpan, keystroke_to_bytes,
+    readable_light_foreground,
 };
 
 /// `text_sm` monospace cell, matching [`super::terminal`] pixel reports.
@@ -169,8 +171,12 @@ impl TerminalPanel {
                 data: replies,
             });
         }
-        let chunk = String::from_utf8_lossy(bytes);
-        let cwd = feed_osc7_chunk(&mut self.osc_carry, &chunk);
+        let cwd = if self.osc_carry.is_empty() && !bytes.windows(2).any(|pair| pair == b"\x1b]") {
+            None
+        } else {
+            let chunk = String::from_utf8_lossy(bytes);
+            feed_osc7_chunk(&mut self.osc_carry, &chunk)
+        };
         if let Some(cwd) = &cwd {
             self.cwd = Some(cwd.clone());
         }
@@ -549,6 +555,7 @@ impl Render for TerminalPanel {
         let fg_default = cx.theme().foreground;
         let bg_default = cx.theme().background;
         let accent = cx.theme().accent;
+        let light_theme = !cx.theme().is_dark();
         let pending_grid = Rc::clone(&self.pending_grid);
         let grid_origin = Rc::clone(&self.grid_origin);
         let cell_w = self.cell_w;
@@ -652,9 +659,14 @@ impl Render for TerminalPanel {
                     );
                 }),
             )
-            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                 let ks = &event.keystroke;
                 let key = ks.key.to_lowercase();
+                if is_ui_zoom_in_chord(&key, ks.key_char.as_deref(), &ks.modifiers) {
+                    cx.stop_propagation();
+                    window.dispatch_action(Box::new(ZoomInUi), cx);
+                    return;
+                }
                 let copy = (ks.modifiers.control || ks.modifiers.platform)
                     && !ks.modifiers.alt
                     && key == "c"
@@ -783,7 +795,9 @@ impl Render for TerminalPanel {
                         h_flex().h(px(cell_h)).items_center().children(
                             row.spans
                                 .into_iter()
-                                .map(|span| term_span_el(span, fg_default, bg_default, accent)),
+                                .map(|span| {
+                                    term_span_el(span, fg_default, bg_default, accent, light_theme)
+                                }),
                         )
                     }))
                     .when(focused, |this| this.opacity(1.))
@@ -840,7 +854,38 @@ fn term_rgb(rgb: [u8; 3]) -> gpui::Rgba {
     gpui::rgb((u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2]))
 }
 
-fn term_span_el(span: TermSpan, fg_default: Hsla, bg_default: Hsla, accent: Hsla) -> gpui::Div {
+fn is_ui_zoom_in_chord(key: &str, key_char: Option<&str>, modifiers: &Modifiers) -> bool {
+    modifiers.control
+        && modifiers.shift
+        && !modifiers.alt
+        && (key == "=" || key == "+" || key_char == Some("+"))
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::is_ui_zoom_in_chord;
+    use gpui_kit::Modifiers;
+
+    #[test]
+    fn shifted_plus_and_equal_reach_ui_zoom() {
+        let mods = Modifiers {
+            control: true,
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert!(is_ui_zoom_in_chord("=", Some("+"), &mods));
+        assert!(is_ui_zoom_in_chord("+", None, &mods));
+        assert!(!is_ui_zoom_in_chord("=", None, &Modifiers::default()));
+    }
+}
+
+fn term_span_el(
+    span: TermSpan,
+    fg_default: Hsla,
+    bg_default: Hsla,
+    accent: Hsla,
+    light_theme: bool,
+) -> gpui::Div {
     let text = if span.text.is_empty() {
         " ".to_string()
     } else {
@@ -848,7 +893,13 @@ fn term_span_el(span: TermSpan, fg_default: Hsla, bg_default: Hsla, accent: Hsla
     };
     let cursor = span.cursor;
     let bold = span.bold;
-    let fg = span.fg;
+    let fg = span.fg.map(|rgb| {
+        if light_theme && !span.cursor && !span.selected {
+            readable_light_foreground(rgb, span.bg)
+        } else {
+            rgb
+        }
+    });
     let bg = span.bg;
     div()
         .whitespace_nowrap()
