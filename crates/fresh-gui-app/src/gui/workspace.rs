@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use fresh_gui_protocol::{
     CAP_GIT, CAP_WORKSPACE, CAP_WORKSPACE_SET_ROOT, FsEntry, FsKind, GitFile, Hello, PtyInfo,
@@ -65,6 +66,85 @@ use super::rail::{
 };
 use super::restore::{RestoreStep, restore_plan};
 use super::tab_chrome::{TabCloseScope, TabStripMetrics, panels_for_close_scope};
+
+/// Limit a single parser/paint update without delaying the first PTY byte.
+const PTY_BATCH_BYTES: usize = 128 * 1024;
+const PTY_BATCH_EVENTS: usize = 32;
+
+fn coalesce_pty_event(
+    event: AdeEvent,
+    rx: &async_channel::Receiver<AdeEvent>,
+    pending: &mut Option<AdeEvent>,
+) -> AdeEvent {
+    let AdeEvent::PtyData { id, mut bytes } = event else {
+        return event;
+    };
+    for _ in 1..PTY_BATCH_EVENTS {
+        let Ok(next) = rx.try_recv() else { break };
+        match next {
+            AdeEvent::PtyData { id: next_id, bytes: next_bytes }
+                if next_id == id && bytes.len() + next_bytes.len() <= PTY_BATCH_BYTES =>
+            {
+                bytes.extend(next_bytes);
+            }
+            other => {
+                *pending = Some(other);
+                break;
+            }
+        }
+    }
+    AdeEvent::PtyData { id, bytes }
+}
+
+#[cfg(test)]
+mod pty_batch_tests {
+    use super::{AdeEvent, PTY_BATCH_BYTES, coalesce_pty_event};
+
+    #[test]
+    fn batches_adjacent_bytes_but_keeps_event_barriers() {
+        let (tx, rx) = async_channel::unbounded();
+        tx.try_send(AdeEvent::PtyData { id: "a".into(), bytes: b"b".to_vec() }).unwrap();
+        tx.try_send(AdeEvent::PtyData { id: "other".into(), bytes: b"c".to_vec() }).unwrap();
+        tx.try_send(AdeEvent::PtyData { id: "a".into(), bytes: b"d".to_vec() }).unwrap();
+        let mut pending = None;
+        let first = coalesce_pty_event(
+            AdeEvent::PtyData { id: "a".into(), bytes: b"a".to_vec() },
+            &rx, &mut pending,
+        );
+        assert!(matches!(first, AdeEvent::PtyData { id, bytes } if id == "a" && bytes == b"ab"));
+        assert!(matches!(pending.take(), Some(AdeEvent::PtyData { id, bytes }) if id == "other" && bytes == b"c"));
+        assert!(matches!(rx.try_recv(), Ok(AdeEvent::PtyData { id, bytes }) if id == "a" && bytes == b"d"));
+    }
+
+    #[test]
+    fn batch_byte_cap_keeps_remainder_for_next_turn() {
+        let (tx, rx) = async_channel::unbounded();
+        tx.try_send(AdeEvent::PtyData { id: "a".into(), bytes: vec![2; PTY_BATCH_BYTES] }).unwrap();
+        let mut pending = None;
+        let first = coalesce_pty_event(
+            AdeEvent::PtyData { id: "a".into(), bytes: vec![1] },
+            &rx, &mut pending,
+        );
+        assert!(matches!(first, AdeEvent::PtyData { bytes, .. } if bytes == vec![1]));
+        assert!(matches!(pending, Some(AdeEvent::PtyData { bytes, .. }) if bytes.len() == PTY_BATCH_BYTES));
+    }
+
+    #[test]
+    fn ready_eight_kib_chunks_need_one_screen_update_per_128_kib() {
+        let (tx, rx) = async_channel::unbounded();
+        for _ in 1..16 {
+            tx.try_send(AdeEvent::PtyData { id: "a".into(), bytes: vec![b'x'; 8192] }).unwrap();
+        }
+        let mut pending = None;
+        let batch = coalesce_pty_event(
+            AdeEvent::PtyData { id: "a".into(), bytes: vec![b'x'; 8192] },
+            &rx, &mut pending,
+        );
+        assert!(matches!(batch, AdeEvent::PtyData { bytes, .. } if bytes.len() == PTY_BATCH_BYTES));
+        assert!(pending.is_none());
+        assert!(rx.is_empty());
+    }
+}
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -562,7 +642,14 @@ impl Workspace {
         });
 
         let recv_task = cx.spawn_in(window, async move |this, cx| {
-            while let Ok(ev) = evt_rx.recv().await {
+            let mut pending = None;
+            let mut handled = 0;
+            loop {
+                let ev = match pending.take() {
+                    Some(ev) => ev,
+                    None => match evt_rx.recv().await { Ok(ev) => ev, Err(_) => break },
+                };
+                let ev = coalesce_pty_event(ev, &evt_rx, &mut pending);
                 if cx
                     .update(|window, app| {
                         this.update(app, |this, cx| this.handle_event(ev, window, cx))
@@ -570,6 +657,14 @@ impl Workspace {
                     .is_err()
                 {
                     break;
+                }
+                handled += 1;
+                if handled == 8 {
+                    handled = 0;
+                    if pending.is_some() || !evt_rx.is_empty() {
+                        // Let a paint/input turn run during sustained PTY output.
+                        cx.background_executor().timer(Duration::from_millis(1)).await;
+                    }
                 }
             }
         });
@@ -2278,7 +2373,14 @@ impl Workspace {
         self.git_status_req = None;
         self.git_busy = false;
         self._recv_task = cx.spawn_in(window, async move |this, cx| {
-            while let Ok(ev) = evt_rx.recv().await {
+            let mut pending = None;
+            let mut handled = 0;
+            loop {
+                let ev = match pending.take() {
+                    Some(ev) => ev,
+                    None => match evt_rx.recv().await { Ok(ev) => ev, Err(_) => break },
+                };
+                let ev = coalesce_pty_event(ev, &evt_rx, &mut pending);
                 if cx
                     .update(|window, app| {
                         this.update(app, |this, cx| this.handle_event(ev, window, cx))
@@ -2286,6 +2388,13 @@ impl Workspace {
                     .is_err()
                 {
                     break;
+                }
+                handled += 1;
+                if handled == 8 {
+                    handled = 0;
+                    if pending.is_some() || !evt_rx.is_empty() {
+                        cx.background_executor().timer(Duration::from_millis(1)).await;
+                    }
                 }
             }
         });

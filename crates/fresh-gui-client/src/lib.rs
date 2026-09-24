@@ -12,7 +12,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message as WsMessage,
+    MaybeTlsStream, WebSocketStream, connect_async_with_config, tungstenite::Message as WsMessage,
 };
 use url::Url;
 
@@ -53,7 +53,9 @@ pub struct Client {
 impl Client {
     pub async fn connect(opts: ConnectOptions) -> Result<Self> {
         let url = Url::parse(&opts.url).context("parse backend url")?;
-        let (ws, _) = connect_async(url.as_str())
+        // Terminal keystrokes are tiny frames. Disable Nagle so a pending
+        // acknowledgement does not hold the next input or echo on the wire.
+        let (ws, _) = connect_async_with_config(url.as_str(), None, true)
             .await
             .with_context(|| format!("connect {}", opts.url))?;
         let (mut sink, mut stream) = ws.split();

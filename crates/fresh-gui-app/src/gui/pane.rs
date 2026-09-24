@@ -7,6 +7,9 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::time::Instant;
+
+use alacritty_terminal::vte::ansi::CursorShape;
 
 use gpui_kit::base::ElementExt as _;
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent, PanelId};
@@ -70,6 +73,8 @@ pub struct TerminalPanel {
     cwd: Option<String>,
     osc_carry: String,
     screen: TermScreen,
+    sync_deadline: Option<Instant>,
+    sync_task: Option<Task<()>>,
     focus: FocusHandle,
     ade: AdeHandle,
     workspace: WeakEntity<Workspace>,
@@ -108,6 +113,8 @@ impl TerminalPanel {
             cwd: None,
             osc_carry: String::new(),
             screen: TermScreen::default(),
+            sync_deadline: None,
+            sync_task: None,
             focus: cx.focus_handle(),
             ade,
             workspace,
@@ -184,8 +191,38 @@ impl TerminalPanel {
         for text in self.screen.take_clipboard_stores() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
+        self.arm_sync_timeout(cx);
         cx.notify();
         cwd
+    }
+
+    fn arm_sync_timeout(&mut self, cx: &mut Context<Self>) {
+        let deadline = self.screen.sync_deadline();
+        if self.sync_deadline == deadline {
+            return;
+        }
+        self.sync_deadline = deadline;
+        self.sync_task = deadline.map(|deadline| {
+            let timer = cx
+                .background_executor()
+                .timer(deadline.saturating_duration_since(Instant::now()));
+            cx.spawn(async move |this, cx| {
+                timer.await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.sync_deadline != Some(deadline) {
+                        return;
+                    }
+                    let replies = this.screen.stop_sync_if_expired();
+                    this.write_pty(replies);
+                    for text in this.screen.take_clipboard_stores() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
+                    this.sync_deadline = None;
+                    this.arm_sync_timeout(cx);
+                    cx.notify();
+                });
+            })
+        });
     }
 
     fn cell_at(&self, position: Point<Pixels>) -> Option<(usize, usize)> {
@@ -561,6 +598,7 @@ impl Render for TerminalPanel {
         }
         let rows = self.screen.rows();
         let focused = self.focus.is_focused(window);
+        let cursor = focused.then(|| self.screen.cursor_cell()).flatten();
         let fg_default = cx.theme().foreground;
         let bg_default = cx.theme().background;
         let accent = cx.theme().accent;
@@ -713,8 +751,9 @@ impl Render for TerminalPanel {
                 );
                 if let Some(bytes) = bytes {
                     cx.stop_propagation();
-                    this.screen.clear_selection();
-                    this.screen.scroll_to_bottom();
+                    if this.screen.prepare_for_input() {
+                        cx.notify();
+                    }
                     this.ade.send(AdeCmd::WritePty {
                         id: pty_id.clone(),
                         data: bytes,
@@ -759,6 +798,7 @@ impl Render for TerminalPanel {
                 v_flex()
                     .id(format!("term-scroll-{}", self.pty_id))
                     .size_full()
+                    .relative()
                     .overflow_hidden()
                     .on_prepaint(move |bounds, window, app| {
                         grid_origin.set(Some(bounds.origin));
@@ -806,10 +846,15 @@ impl Render for TerminalPanel {
                             row.spans
                                 .into_iter()
                                 .map(|span| {
-                                    term_span_el(span, fg_default, bg_default, accent, light_theme)
+                                    term_span_el(span, cell_w, fg_default, accent, light_theme)
                                 }),
                         )
                     }))
+                    .when_some(cursor, |grid, (row, col, shape)| {
+                        grid.child(terminal_cursor_el(
+                            row, col, shape, cell_w, cell_h, fg_default,
+                        ))
+                    })
                     .when(focused, |this| this.opacity(1.))
                     .when(!focused, |this| this.opacity(0.85)),
             );
@@ -929,8 +974,8 @@ mod language_path_tests {
 
 fn term_span_el(
     span: TermSpan,
+    cell_w: f32,
     fg_default: Hsla,
-    bg_default: Hsla,
     accent: Hsla,
     light_theme: bool,
 ) -> gpui::Div {
@@ -939,10 +984,9 @@ fn term_span_el(
     } else {
         span.text
     };
-    let cursor = span.cursor;
     let bold = span.bold;
     let fg = span.fg.map(|rgb| {
-        if light_theme && !span.cursor && !span.selected {
+        if light_theme && !span.selected {
             readable_light_foreground(rgb, span.bg)
         } else {
             rgb
@@ -950,21 +994,53 @@ fn term_span_el(
     });
     let bg = span.bg;
     div()
+        .w(px(span.cells as f32 * cell_w))
+        .flex_shrink_0()
         .whitespace_nowrap()
         .when(bold, |el| el.font_semibold())
-        .when(!cursor && !span.selected, |el| match fg {
+        .when(!span.selected, |el| match fg {
             Some(fg) => el.text_color(term_rgb(fg)),
             None => el.text_color(fg_default),
         })
-        .when(!cursor && !span.selected, |el| match bg {
+        .when(!span.selected, |el| match bg {
             Some(bg) => el.bg(term_rgb(bg)),
             None => el,
         })
-        .when(span.selected && !cursor, |el| {
+        .when(span.selected, |el| {
             el.bg(accent.opacity(0.45)).text_color(fg_default)
         })
-        .when(cursor, |el| el.bg(accent).text_color(bg_default))
         .child(text)
+}
+
+fn terminal_cursor_el(
+    row: usize,
+    col: usize,
+    shape: CursorShape,
+    cell_w: f32,
+    cell_h: f32,
+    color: Hsla,
+) -> gpui::Div {
+    let (left, top, width, height) = match shape {
+        CursorShape::Beam => (col as f32 * cell_w, row as f32 * cell_h, 2., cell_h),
+        CursorShape::Underline => (
+            col as f32 * cell_w,
+            (row as f32 + 1.) * cell_h - 2.,
+            cell_w,
+            2.,
+        ),
+        _ => (col as f32 * cell_w, row as f32 * cell_h, cell_w, cell_h),
+    };
+    div()
+        .absolute()
+        .left(px(left))
+        .top(px(top))
+        .w(px(width))
+        .h(px(height))
+        .when(shape == CursorShape::Block, |el| el.bg(color.opacity(0.4)))
+        .when(shape == CursorShape::HollowBlock || shape == CursorShape::Block, |el| {
+            el.border_1().border_color(color)
+        })
+        .when(shape == CursorShape::Beam || shape == CursorShape::Underline, |el| el.bg(color))
 }
 
 struct EditorPending {

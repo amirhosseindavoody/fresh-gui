@@ -27,7 +27,8 @@ impl PtySession {
 
     /// Spawn a PTY. The shell is the client override when set, otherwise
     /// [`Config::resolve_shell`]. On Unix a command that is missing or not
-    /// executable falls back to `$SHELL`, then `bash`, then `sh`
+    /// executable falls back to `$SHELL`, then `bash`, then `sh`; Windows
+    /// tries `pwsh`, `powershell`, `%COMSPEC%`, then `cmd`
     /// ([`crate::shell_resolve`]). Empty `args` still get OSC 7 setup;
     /// non-empty `args` are passed through (Fresh-compatible).
     pub fn spawn(
@@ -259,8 +260,10 @@ fn fish_init_arg(script: &std::path::Path) -> String {
 
 /// Interactive shell args + OSC 7 hooks so the host can track cwd / tab titles.
 fn configure_shell_cmd(cmd: &mut CommandBuilder, shell: &str) {
-    match shell_basename(shell) {
-        "bash" | "sh" => {
+    let name = shell_basename(shell).to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    match name {
+        "bash" => {
             if let Some(rc) = ensure_bash_rcfile() {
                 cmd.arg("--rcfile");
                 cmd.arg(rc);
@@ -295,9 +298,9 @@ fn configure_shell_cmd(cmd: &mut CommandBuilder, shell: &str) {
         // A bare `-l` is not a login flag: `powershell.exe` runs it as the
         // command and exits, and `pwsh -l` binds to `-Login`.
         base if windows_console_shell(base) => {}
-        _ => {
-            cmd.arg("-l");
-        }
+        // An arbitrary executable may not understand shell login flags.
+        // The PTY itself makes a real shell interactive when appropriate.
+        _ => {}
     }
 }
 
@@ -311,7 +314,17 @@ fn windows_console_shell(shell: &str) -> bool {
 
 #[cfg(test)]
 mod shell_args_tests {
-    use super::windows_console_shell;
+    use super::{configure_shell_cmd, windows_console_shell};
+    use portable_pty::CommandBuilder;
+
+    #[test]
+    fn sh_and_custom_executables_do_not_get_guessed_login_flags() {
+        for shell in ["sh", "/opt/bin/my-shell"] {
+            let mut command = CommandBuilder::new(shell);
+            configure_shell_cmd(&mut command, shell);
+            assert_eq!(command.get_argv().len(), 1, "{shell}");
+        }
+    }
 
     #[test]
     fn powershell_cmd_and_pwsh_are_not_unix_login_shells() {
@@ -401,6 +414,43 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn configured_custom_shell_path_is_spawned_without_login_flags() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "fresh-gui-custom-shell-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shell = dir.join("custom-shell");
+        std::fs::write(&shell, b"#!/bin/sh\nprintf 'custom-shell-ok\\n'\n").unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = Config::default();
+        config.terminal.shell = Some(crate::config::TerminalShellConfig {
+            command: shell.display().to_string(),
+            args: Vec::new(),
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = PtySession::spawn("custom".into(), 80, 24, None, None, &config, tx)
+            .expect("spawn configured shell");
+        let start = std::time::Instant::now();
+        let mut output = String::new();
+        while start.elapsed() < std::time::Duration::from_secs(3) {
+            match rx.try_recv() {
+                Ok(bytes) => output.push_str(&String::from_utf8_lossy(&bytes)),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+            if output.contains("custom-shell-ok") {
+                break;
+            }
+        }
+        session.kill();
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(output.contains("custom-shell-ok"), "{output:?}");
+    }
 
     /// Default config asks for `zsh`. On a host where that binary is missing,
     /// spawn must still start a later candidate (`$SHELL`, `bash`, or `sh`).

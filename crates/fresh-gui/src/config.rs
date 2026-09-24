@@ -336,7 +336,7 @@ impl Config {
     /// `(command, args)` configured for a new PTY when the client did not override `shell`.
     ///
     /// Does not check that the executable exists. Spawn probes the command and,
-    /// on Unix, falls back when it is missing ([`crate::shell_resolve`]).
+    /// falls back when it is missing ([`crate::shell_resolve`]).
     pub fn resolve_shell(&self) -> (String, Vec<String>) {
         match &self.terminal.shell {
             Some(s) if !s.command.is_empty() => (s.command.clone(), s.args.clone()),
