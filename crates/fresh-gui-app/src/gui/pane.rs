@@ -587,12 +587,14 @@ impl DockPanel for TerminalPanel {
             .into_any_element()
     }
 
-    fn title_suffix(&mut self, _: &mut Window, _: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn title_suffix(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let panel_id = PanelId::from(cx.entity().entity_id());
         Some(new_terminal_button(
             format!("new-term-{}", self.pty_id),
             self.metrics.clone(),
             self.plus_shift.clone(),
             self.workspace.clone(),
+            panel_id,
         ))
     }
 
@@ -1150,6 +1152,7 @@ pub struct EditorPanel {
     font_px: f32,
     closed: bool,
     markdown_preview: bool,
+    markdown_preview_locked: bool,
     inline_markdown_edit: Option<MarkdownInlineEdit>,
     inline_markdown_subscription: Option<Subscription>,
     _subscription: Subscription,
@@ -1179,9 +1182,11 @@ impl EditorPanel {
         cx: &mut Context<Self>,
     ) -> Self {
         let editor = cx.new(|cx| {
-            let mut state = EditorState::new(window, cx)
-                .line_number(true)
-                .placeholder("Loading…");
+            let mut state = EditorState::new(window, cx).line_number(true);
+            // Untitled buffers are already empty — do not show a loading placeholder.
+            if !unsaved {
+                state = state.placeholder("Loading…");
+            }
             if let Some(lang) = language_from_path(&path, language.as_deref()) {
                 state = state.language(lang);
             }
@@ -1212,6 +1217,7 @@ impl EditorPanel {
             font_px: 14.0,
             closed: false,
             markdown_preview: false,
+            markdown_preview_locked: false,
             inline_markdown_edit: None,
             inline_markdown_subscription: None,
             _subscription: subscription,
@@ -1567,12 +1573,14 @@ impl DockPanel for EditorPanel {
             })
     }
 
-    fn title_suffix(&mut self, _: &mut Window, _: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn title_suffix(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let panel_id = PanelId::from(cx.entity().entity_id());
         Some(new_terminal_button(
             format!("new-term-ed-{}", self.buffer_id),
             self.metrics.clone(),
             self.plus_shift.clone(),
             self.workspace.clone(),
+            panel_id,
         ))
     }
 
@@ -1628,7 +1636,13 @@ impl Render for EditorPanel {
                     .items_center()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Markdown · click preview text to edit"))
+                    .child(div().text_xs().text_color(cx.theme().muted_foreground).child(
+                        if self.markdown_preview_locked {
+                            "Markdown · preview locked (view only)"
+                        } else {
+                            "Markdown · click preview text to edit"
+                        }
+                    ))
                     .child(div().flex_1())
                     .child(
                         Button::new("markdown-source")
@@ -1659,7 +1673,34 @@ impl Render for EditorPanel {
                                     cx.notify();
                                 });
                             }),
-                    ),
+                    )
+                    .child({
+                        let panel = cx.entity().clone();
+                        let locked = self.markdown_preview_locked;
+                        Button::new("markdown-preview-lock")
+                            .ghost()
+                            .xsmall()
+                            .icon(if locked {
+                                IconName::Lock
+                            } else {
+                                IconName::LockOpen
+                            })
+                            .tooltip(if locked {
+                                "Unlock preview editing"
+                            } else {
+                                "Lock preview (view only)"
+                            })
+                            .selected(locked)
+                            .on_click(move |_, window, cx| {
+                                panel.update(cx, |this, cx| {
+                                    if !this.markdown_preview_locked {
+                                        this.commit_markdown_inline_edit(window, cx);
+                                    }
+                                    this.markdown_preview_locked = !this.markdown_preview_locked;
+                                    cx.notify();
+                                });
+                            })
+                    })
             );
         }
 
@@ -1675,6 +1716,7 @@ impl Render for EditorPanel {
                 cx.theme().muted_foreground,
                 cx.entity(),
                 inline_edit,
+                self.markdown_preview_locked,
             ));
         } else {
             let panel = cx.entity();
@@ -1682,6 +1724,9 @@ impl Render for EditorPanel {
                 div()
                     .flex_1()
                     .size_full()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
                     .capture_any_mouse_down(move |event: &MouseDownEvent, _, cx| {
                         if event.button != MouseButton::Left
                             || event.modifiers.shift
@@ -1701,6 +1746,8 @@ impl Render for EditorPanel {
                             .bordered(false)
                             .p_0()
                             .flex_1()
+                            .size_full()
+                            .min_h_0()
                             .text_size(px(self.font_px))
                             .font_family(cx.theme().mono_font_family.clone()),
                     ),
@@ -1765,12 +1812,197 @@ mod lsp_position_tests {
 /// A lightweight native Markdown presentation for the first WYSIWYG pass.
 /// Source remains authoritative and editable in Source mode; Preview reflects
 /// live changes and gives block structure without a second document model.
+
+
+fn markdown_inline_elements(text: &str) -> impl IntoElement {
+    // Compose a single line from inline markdown parts without nested interactive editors.
+    let mut row = h_flex().flex_wrap().gap_0();
+    for part in parse_inline_markdown(text) {
+        row = match part {
+            InlinePart::Text(s) => row.child(s),
+            InlinePart::Bold(s) => row.child(div().font_bold().child(s)),
+            InlinePart::Italic(s) => row.child(div().italic().child(s)),
+            InlinePart::Code(s) => row.child(
+                div()
+                    .font_family("monospace")
+                    .px_1()
+                    .child(s),
+            ),
+            InlinePart::Link { text, .. } => row.child(div().underline().child(text)),
+            InlinePart::Image { alt, .. } => row.child(div().italic().child(format!("[image: {alt}]"))),
+            InlinePart::Math(s) => row.child(div().font_family("monospace").italic().child(s)),
+        };
+    }
+    row
+}
+
+#[derive(Debug, Clone)]
+enum InlinePart {
+    Text(String),
+    Bold(String),
+    Italic(String),
+    Code(String),
+    Link { text: String, href: String },
+    Image { alt: String, src: String },
+    Math(String),
+}
+
+fn parse_inline_markdown(input: &str) -> Vec<InlinePart> {
+    let mut out = Vec::new();
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    let mut buf = String::new();
+    let flush = |buf: &mut String, out: &mut Vec<InlinePart>| {
+        if !buf.is_empty() {
+            out.push(InlinePart::Text(std::mem::take(buf)));
+        }
+    };
+    while i < chars.len() {
+        if chars[i] == '!' && i + 1 < chars.len() && chars[i + 1] == '[' {
+            if let Some((alt, src, next)) = parse_link_like(&chars, i + 1) {
+                flush(&mut buf, &mut out);
+                out.push(InlinePart::Image { alt, src });
+                i = next;
+                continue;
+            }
+        }
+        if chars[i] == '[' {
+            if let Some((text, href, next)) = parse_link_like(&chars, i) {
+                flush(&mut buf, &mut out);
+                out.push(InlinePart::Link { text, href });
+                i = next;
+                continue;
+            }
+        }
+        if chars[i] == '`' {
+            if let Some(end) = chars[i + 1..].iter().position(|c| *c == '`') {
+                flush(&mut buf, &mut out);
+                let content: String = chars[i + 1..i + 1 + end].iter().collect();
+                out.push(InlinePart::Code(content));
+                i = i + 2 + end;
+                continue;
+            }
+        }
+        if chars[i] == '$' {
+            let display = i + 1 < chars.len() && chars[i + 1] == '$';
+            let start = if display { i + 2 } else { i + 1 };
+            let delim_len = if display { 2 } else { 1 };
+            let mut rel = None;
+            let mut j = start;
+            while j + delim_len - 1 < chars.len() {
+                if (0..delim_len).all(|k| chars[j + k] == '$') {
+                    rel = Some(j - start);
+                    break;
+                }
+                j += 1;
+            }
+            if let Some(rel) = rel {
+                flush(&mut buf, &mut out);
+                let content: String = chars[start..start + rel].iter().collect();
+                out.push(InlinePart::Math(content.trim().to_string()));
+                i = start + rel + delim_len;
+                continue;
+            }
+        }
+        if (chars[i] == '*' || chars[i] == '_') && i + 1 < chars.len() && chars[i + 1] == chars[i] {
+            let marker = chars[i];
+            if let Some(end) = find_closing_double(&chars, i + 2, marker) {
+                flush(&mut buf, &mut out);
+                let content: String = chars[i + 2..end].iter().collect();
+                out.push(InlinePart::Bold(content));
+                i = end + 2;
+                continue;
+            }
+        }
+        if chars[i] == '*' || chars[i] == '_' {
+            let marker = chars[i];
+            if let Some(end) = chars[i + 1..].iter().position(|c| *c == marker) {
+                if end > 0 {
+                    flush(&mut buf, &mut out);
+                    let content: String = chars[i + 1..i + 1 + end].iter().collect();
+                    out.push(InlinePart::Italic(content));
+                    i = i + 2 + end;
+                    continue;
+                }
+            }
+        }
+        buf.push(chars[i]);
+        i += 1;
+    }
+    flush(&mut buf, &mut out);
+    out
+}
+
+fn find_closing_double(chars: &[char], start: usize, marker: char) -> Option<usize> {
+    let mut i = start;
+    while i + 1 < chars.len() {
+        if chars[i] == marker && chars[i + 1] == marker {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_link_like(chars: &[char], start: usize) -> Option<(String, String, usize)> {
+    if start >= chars.len() || chars[start] != '[' {
+        return None;
+    }
+    let close = chars[start + 1..].iter().position(|c| *c == ']')? + start + 1;
+    if close + 1 >= chars.len() || chars[close + 1] != '(' {
+        return None;
+    }
+    let end = chars[close + 2..].iter().position(|c| *c == ')')? + close + 2;
+    let text: String = chars[start + 1..close].iter().collect();
+    let href: String = chars[close + 2..end].iter().collect();
+    Some((text, href, end + 1))
+}
+
+fn markdown_task_item(line: &str) -> Option<(bool, &str)> {
+    let t = line.trim_start();
+    for prefix in ["- [ ] ", "- [x] ", "- [X] ", "* [ ] ", "* [x] ", "* [X] "] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            return Some((prefix.contains('x') || prefix.contains('X'), rest));
+        }
+    }
+    None
+}
+
+fn markdown_table_row(line: &str) -> Option<Vec<String>> {
+    let t = line.trim();
+    if !t.starts_with('|') || !t.ends_with('|') {
+        return None;
+    }
+    let cells: Vec<String> = t
+        .trim_matches('|')
+        .split('|')
+        .map(|c| c.trim().to_string())
+        .collect();
+    if cells.is_empty() {
+        return None;
+    }
+    if cells
+        .iter()
+        .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':' || ch == ' '))
+    {
+        return Some(vec![]);
+    }
+    Some(cells)
+}
+
+fn list_indent_px(line: &str) -> f32 {
+    let spaces = line.chars().take_while(|c| *c == ' ').count();
+    let tabs = line.chars().take_while(|c| *c == '\t').count();
+    ((spaces / 2) + tabs) as f32 * 12.0
+}
+
 fn render_markdown_preview(
     source: &str,
     block_bg: Hsla,
     muted_fg: Hsla,
     panel: Entity<EditorPanel>,
     inline_edit: Option<(usize, Entity<EditorState>)>,
+    locked: bool,
 ) -> impl IntoElement {
     let mut in_code = false;
     let mut body = v_flex().id("markdown-preview-content").w_full().h_full().overflow_y_scroll().p_6().gap_2();
@@ -1804,6 +2036,14 @@ fn render_markdown_preview(
                 .child(display_text.clone())
         } else if trimmed.is_empty() {
             div().h_2()
+        } else if trimmed.starts_with("$$") && trimmed.ends_with("$$") && trimmed.len() > 4 {
+            div()
+                .w_full()
+                .py_2()
+                .text_center()
+                .font_family("monospace")
+                .italic()
+                .child(trimmed.trim_matches('$').trim().to_string())
         } else if let Some((level, text)) = markdown_heading(trimmed) {
             let font = match level {
                 1 => px(28.),
@@ -1811,18 +2051,61 @@ fn render_markdown_preview(
                 3 => px(20.),
                 _ => px(17.),
             };
-            div().font_semibold().text_size(font).child(text.to_string())
+            div()
+                .font_semibold()
+                .text_size(font)
+                .child(markdown_inline_elements(text))
         } else if let Some(text) = trimmed.strip_prefix("> ") {
             h_flex()
                 .gap_2()
                 .child(div().w(px(3.)).h_full().bg(block_bg))
-                .child(div().italic().text_color(muted_fg).child(text.to_string()))
+                .child(div().italic().text_color(muted_fg).child(markdown_inline_elements(text)))
+        } else if let Some((done, text)) = markdown_task_item(line) {
+            h_flex()
+                .gap_2()
+                .pl(px(16. + list_indent_px(line)))
+                .child(if done { "☑" } else { "☐" })
+                .child(markdown_inline_elements(text))
         } else if let Some(text) = markdown_list_item(trimmed) {
-            h_flex().gap_2().pl_4().child("•").child(text.to_string())
+            h_flex()
+                .gap_2()
+                .pl(px(16. + list_indent_px(line)))
+                .child("•")
+                .child(markdown_inline_elements(text))
+        } else if let Some(cells) = markdown_table_row(trimmed) {
+            if cells.is_empty() {
+                div().h_0()
+            } else {
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(block_bg)
+                    .children(cells.into_iter().map(|c| {
+                        div().flex_1().p_1().child(markdown_inline_elements(&c))
+                    }))
+            }
         } else if trimmed.starts_with("---") || trimmed.starts_with("***") {
             div().w_full().h(px(1.)).my_2().bg(block_bg)
+        } else if trimmed.starts_with('<') && trimmed.ends_with('>') {
+            // Best-effort HTML: strip tags for preview.
+            let stripped = trimmed
+                .replace("<br>", "\n")
+                .replace("<br/>", "\n")
+                .replace("<br />", "\n");
+            let mut plain = String::new();
+            let mut in_tag = false;
+            for ch in stripped.chars() {
+                match ch {
+                    '<' => in_tag = true,
+                    '>' => in_tag = false,
+                    _ if !in_tag => plain.push(ch),
+                    _ => {}
+                }
+            }
+            div().text_size(px(15.)).child(markdown_inline_elements(plain.trim()))
         } else {
-            div().text_size(px(15.)).child(trimmed.to_string())
+            div().text_size(px(15.)).child(markdown_inline_elements(trimmed))
         };
         let line_panel = panel.clone();
         let line_prefix = prefix.clone();
@@ -1833,6 +2116,9 @@ fn render_markdown_preview(
                 .id(format!("markdown-preview-line-{line_index}"))
                 .w_full()
                 .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    if locked {
+                        return;
+                    }
                     line_panel.update(cx, |this, cx| {
                         this.commit_markdown_inline_edit(window, cx);
                         this.begin_markdown_inline_edit(
@@ -1930,8 +2216,24 @@ fn replace_markdown_line(
 #[cfg(test)]
 mod markdown_preview_tests {
     use super::{
-        markdown_edit_parts, markdown_heading, markdown_list_item, replace_markdown_line,
+        InlinePart, markdown_edit_parts, markdown_heading, markdown_list_item,
+        markdown_task_item, parse_inline_markdown, replace_markdown_line,
     };
+
+    
+    #[test]
+    fn parse_inline_markdown_bold_and_code() {
+        let parts = parse_inline_markdown("a **b** and `c`");
+        assert!(parts.iter().any(|p| matches!(p, InlinePart::Bold(s) if s == "b")));
+        assert!(parts.iter().any(|p| matches!(p, InlinePart::Code(s) if s == "c")));
+    }
+
+    #[test]
+    fn task_items_and_math_markers() {
+        assert_eq!(markdown_task_item("- [x] done"), Some((true, "done")));
+        let parts = parse_inline_markdown("energy $E=mc^2$ here");
+        assert!(parts.iter().any(|p| matches!(p, InlinePart::Math(s) if s == "E=mc^2")));
+    }
 
     #[test]
     fn recognizes_heading_depth_and_list_items() {
@@ -1987,6 +2289,7 @@ pub(super) fn new_terminal_button(
     metrics: TabStripMetrics,
     plus_shift: Rc<Cell<f32>>,
     workspace: WeakEntity<Workspace>,
+    source_panel: PanelId,
 ) -> impl IntoElement {
     let shift = plus_shift.get();
     div().relative().w(px(20.)).h(px(20.)).child(
@@ -2004,14 +2307,14 @@ pub(super) fn new_terminal_button(
                     .ghost()
                     .xsmall()
                     .icon(IconName::Plus)
-                    .tooltip("New Tab or New File")
+                    .tooltip("New Terminal or New File")
                     .dropdown_menu(move |menu, _, _| {
                         let new_tab = workspace.clone();
                         let new_file = workspace.clone();
-                        menu.item(PopupMenuItem::new("New Tab").on_click(move |_, _, cx| {
+                        menu.item(PopupMenuItem::new("New Terminal").on_click(move |_, _, cx| {
                             new_tab
                                 .update(cx, |workspace, cx| {
-                                    workspace.new_terminal(cx);
+                                    workspace.new_terminal_in_group(source_panel, cx);
                                     cx.notify();
                                 })
                                 .ok();
@@ -2019,7 +2322,7 @@ pub(super) fn new_terminal_button(
                         .item(PopupMenuItem::new("New File").on_click(move |_, _, cx| {
                             new_file
                                 .update(cx, |workspace, cx| {
-                                    workspace.new_file(cx);
+                                    workspace.new_file_in_group(source_panel, cx);
                                     cx.notify();
                                 })
                                 .ok();

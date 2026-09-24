@@ -20,7 +20,7 @@ pub fn install_menus(cx: &mut App) {
 
 fn file_menu() -> Menu {
     Menu::new("File").items([
-        MenuItem::action("New Tab", NewTerminal),
+        MenuItem::action("New Terminal", NewTerminal),
         MenuItem::action("New File", NewFile),
         MenuItem::separator(),
         MenuItem::action("Save", SaveBuffer),
