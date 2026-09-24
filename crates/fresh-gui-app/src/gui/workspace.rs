@@ -75,28 +75,133 @@ const PTY_BATCH_BYTES: usize = 128 * 1024;
 const PTY_BATCH_EVENTS: usize = 32;
 const GOTO_MAX_VISIBLE: usize = 10;
 
-fn goto_match_rank(path: &str, query: &str) -> (usize, u8, usize) {
-    let lower = path.to_lowercase();
-    let index = lower.find(query).unwrap_or(usize::MAX);
-    let basename = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
-    let name_rank = if query.is_empty() || basename.starts_with(query) {
-        0
+fn goto_disk_matches(query: &str, root: Option<&str>, home: Option<&str>) -> Vec<(String, bool)> {
+    use std::path::{Path, PathBuf};
+
+    let query = query.trim();
+    if query == "~" {
+        let Some(home) = home else {
+            return Vec::new();
+        };
+        let mut entries = std::fs::read_dir(home)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let metadata = entry.metadata().ok()?;
+                if !metadata.is_dir() && !metadata.is_file() {
+                    return None;
+                }
+                Some((
+                    format!("~/{}", entry.file_name().to_string_lossy()),
+                    metadata.is_dir(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        entries.truncate(GOTO_MAX_VISIBLE);
+        return entries;
+    }
+    let (typed_parent, typed_name) = query.rsplit_once(['/', '\\']).unwrap_or(("", query));
+    let expanded = if query.starts_with("~/") || query.starts_with("~\\") {
+        let rest = &query[1..];
+        match home {
+            Some(home) => format!("{home}{rest}"),
+            None => query.to_string(),
+        }
     } else {
-        1
+        query.to_string()
     };
-    (index, name_rank, lower.len())
+    let (expanded_parent, expanded_name) = expanded
+        .rsplit_once(['/', '\\'])
+        .unwrap_or(("", expanded.as_str()));
+    let mut parent = if expanded_parent.is_empty() {
+        root.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+    } else {
+        PathBuf::from(expanded_parent)
+    };
+    if !parent.is_absolute() {
+        if let Some(root) = root {
+            parent = Path::new(root).join(parent);
+        }
+    }
+    let typed_prefix = typed_parent;
+    let mut matches = std::fs::read_dir(&parent)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.to_lowercase().starts_with(&expanded_name.to_lowercase()) {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            if !metadata.is_dir() && !metadata.is_file() {
+                return None;
+            }
+            let is_dir = metadata.is_dir();
+            let display = if typed_prefix.is_empty() {
+                name
+            } else {
+                let separator = &query[typed_prefix.len()..query.len() - typed_name.len()];
+                format!("{typed_prefix}{separator}{name}")
+            };
+            Some((display, is_dir))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    matches.truncate(GOTO_MAX_VISIBLE);
+    matches
+}
+
+fn goto_ghost_suffix<'a>(query: &str, completion: &'a str) -> Option<&'a str> {
+    let mut boundary = 0;
+    let mut prefix = String::new();
+    for ch in completion.chars().take(query.chars().count()) {
+        prefix.push(ch);
+        boundary += ch.len_utf8();
+    }
+    (prefix.to_lowercase() == query.to_lowercase() && boundary < completion.len())
+        .then_some(&completion[boundary..])
 }
 
 #[cfg(test)]
 mod goto_match_tests {
-    use super::goto_match_rank;
+    use super::{goto_disk_matches, goto_ghost_suffix};
+    use std::fs;
 
     #[test]
-    fn literal_path_prefixes_rank_ahead_of_substring_matches() {
-        let query = "src/mai";
-        let prefix = goto_match_rank("/project/src/main.rs", query);
-        let later_match = goto_match_rank("/project/tests/src/main_fixture.rs", query);
-        assert!(prefix < later_match);
+    fn disk_completion_lists_real_case_insensitive_prefix_matches() {
+        let root = std::env::temp_dir().join(format!("fresh-goto-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/Main.rs"), "").unwrap();
+        fs::write(root.join("src/other.rs"), "").unwrap();
+        let matches = goto_disk_matches("src/ma", root.to_str(), None);
+        assert_eq!(matches, vec![("src/Main.rs".to_string(), false)]);
+        let absolute = format!("{}/src/ma", root.display());
+        assert_eq!(
+            goto_disk_matches(&absolute, None, None)[0].0,
+            format!("{}/src/Main.rs", root.display())
+        );
+        assert_eq!(
+            goto_disk_matches("~/src/ma", None, root.to_str())[0].0,
+            "~/src/Main.rs"
+        );
+        assert_eq!(
+            goto_disk_matches("s", root.to_str(), None)[0],
+            ("src".to_string(), true)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ghost_suffix_is_safe_for_case_insensitive_unicode_prefixes() {
+        assert_eq!(goto_ghost_suffix("ma", "Main.rs"), Some("in.rs"));
+        assert_eq!(goto_ghost_suffix("é", "Éclair"), Some("clair"));
+        assert_eq!(goto_ghost_suffix("mainx", "Main.rs"), None);
     }
 }
 
@@ -203,15 +308,6 @@ fn split_request_message(message: &str) -> Option<(&str, &str)> {
         None
     } else {
         Some((request_id, rest))
-    }
-}
-
-fn git_lookup_key(path: &str) -> String {
-    let shown = display_path(path);
-    if cfg!(windows) {
-        shown.to_ascii_lowercase()
-    } else {
-        shown
     }
 }
 
@@ -648,6 +744,7 @@ pub struct Workspace {
     explorer_width: f32,
     resizing_rail: bool,
     resizing_explorer: bool,
+    resize_handle_hovered: Option<&'static str>,
     resize_last_x: Option<f32>,
     activity: Activity,
     dock: Entity<DockArea>,
@@ -679,8 +776,6 @@ pub struct Workspace {
     git_detail: Option<String>,
     git_busy: bool,
     git_status_req: Option<String>,
-    /// Display path and repo-relative path → repo-relative path.
-    git_paths: HashMap<String, String>,
     pending_diffs: HashMap<String, String>,
     commit_input: Entity<InputState>,
     menu_bar: Entity<AppMenuBar>,
@@ -936,6 +1031,7 @@ impl Workspace {
             explorer_width: 260.,
             resizing_rail: false,
             resizing_explorer: false,
+            resize_handle_hovered: None,
             resize_last_x: None,
             activity: Activity::Explorer,
             dock,
@@ -964,7 +1060,6 @@ impl Workspace {
             git_detail: None,
             git_busy: false,
             git_status_req: None,
-            git_paths: HashMap::new(),
             pending_diffs: HashMap::new(),
             commit_input,
             menu_bar,
@@ -2938,7 +3033,6 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.git_files.clear();
         self.git_collapsed.clear();
         self.git_detail = None;
-        self.git_paths.clear();
     }
 
     fn workspace_id_or_empty(&self) -> String {
@@ -3016,37 +3110,9 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.git_ahead = ahead;
         self.git_behind = behind;
         self.git_detail = detail;
-        self.git_paths.clear();
-        let root = if self.git_root.is_empty() {
-            self.explorer_root.clone()
-        } else {
-            self.git_root.clone()
-        };
-        for file in &files {
-            self.git_paths
-                .insert(git_lookup_key(&file.path), file.path.clone());
-            let abs = diff_view::join_repo(&root, &file.path);
-            self.git_paths
-                .insert(git_lookup_key(&abs), file.path.clone());
-            self.git_paths
-                .insert(git_lookup_key(&display_path(&abs)), file.path.clone());
-        }
         self.git_files = files;
         let present = git_dir_paths(&self.git_files);
         self.git_collapsed.retain(|dir| present.contains(dir));
-    }
-
-    fn git_rel_for(&self, path: &str) -> Option<String> {
-        if let Some(rel) = self.git_paths.get(&git_lookup_key(path)) {
-            return Some(rel.clone());
-        }
-        let root = if self.git_root.is_empty() {
-            self.explorer_root.as_str()
-        } else {
-            self.git_root.as_str()
-        };
-        let rel = diff_view::git_relative(root, path)?;
-        self.git_paths.get(&git_lookup_key(&rel)).cloned()
     }
 
     fn apply_tree_click(
@@ -3054,11 +3120,10 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         path: &str,
         is_folder: bool,
         gesture: super::explorer::SelectGesture,
-        click_count: usize,
         cx: &mut Context<Self>,
-    ) -> Option<(String, bool)> {
+    ) {
         if is_placeholder(path) {
-            return None;
+            return;
         }
         let visible = self.visible_tree_ids(cx);
         let (next, anchor) = apply_selection(
@@ -3084,12 +3149,8 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                 self.list_dir(path);
             }
         } else if gesture == super::explorer::SelectGesture::Replace {
-            if let Some(rel) = self.git_rel_for(path) {
-                return Some((rel, click_count >= 2));
-            }
             self.open_path(path.to_string(), true);
         }
-        None
     }
 
     fn open_diff(&mut self, rel: String, pin: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -3804,25 +3865,54 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         let query = self.goto_input.read(cx).value().to_string();
         let matches = self.goto_matches(&query);
         let target = pick_goto_target(&query, &matches);
-        if !target.is_empty() && self.goto_path_is_dir(&target) {
+        let (file, line, column) = parse_goto_spec(&target);
+        if !file.is_empty() && self.goto_path_is_dir(&file) {
             // A directory is a completion target, never an openable file.
             // Tab descends into it while Enter leaves the picker active.
             cx.notify();
             return;
         }
-        self.goto_open = false;
-        if !target.is_empty() {
-            self.open_path(target, false);
+        let resolved = self.resolve_goto_path(&file);
+        if file.is_empty() || !std::path::Path::new(&resolved).is_file() {
+            cx.notify();
+            return;
         }
+        self.goto_open = false;
+        let target = match (line, column) {
+            (Some(line), Some(column)) => format!("{resolved}:{line}:{column}"),
+            (Some(line), None) => format!("{resolved}:{line}"),
+            _ => resolved,
+        };
+        self.open_path(target, false);
         cx.notify();
     }
 
     fn goto_path_is_dir(&self, path: &str) -> bool {
-        let normalized = path.trim_end_matches(['/', '\\']);
-        self.explorer_cache
-            .values()
-            .flatten()
-            .any(|entry| super::explorer::is_dir_entry(entry) && entry.path == normalized)
+        std::fs::metadata(self.resolve_goto_path(path)).is_ok_and(|metadata| metadata.is_dir())
+    }
+
+    fn resolve_goto_path(&self, path: &str) -> String {
+        let expanded = if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
+            let rest = &path[1..];
+            super::rail::user_home()
+                .map(|home| format!("{home}{rest}"))
+                .unwrap_or_else(|| path.to_string())
+        } else {
+            path.to_string()
+        };
+        let path_buf = std::path::PathBuf::from(expanded);
+        if path_buf.is_absolute() {
+            path_buf.to_string_lossy().into_owned()
+        } else {
+            self.workspace_root()
+                .map(|root| {
+                    std::path::Path::new(&root)
+                        .join(path_buf)
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .unwrap_or_else(|| path.to_string())
+        }
     }
 
     fn complete_goto(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3835,9 +3925,6 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
 
     fn complete_goto_path(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
         let is_dir = self.goto_path_is_dir(&path);
-        if is_dir && !self.explorer_cache.contains_key(&path) {
-            self.list_dir(&path);
-        }
         let separator = if path.contains('\\') && !path.contains('/') {
             '\\'
         } else {
@@ -3855,27 +3942,14 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     }
 
     fn goto_matches(&self, query: &str) -> Vec<String> {
-        let query = query.trim().to_lowercase();
-        let mut paths = Vec::new();
-        for entries in self.explorer_cache.values() {
-            for entry in entries {
-                if !matches!(entry.kind, FsKind::File | FsKind::Symlink | FsKind::Dir) {
-                    continue;
-                }
-                let path = entry.path.to_lowercase();
-                let name = entry.name.to_lowercase();
-                if query.is_empty() || path.contains(&query) || name.contains(&query) {
-                    paths.push(entry.path.clone());
-                }
-            }
-        }
-        paths.sort_by(|left, right| {
-            goto_match_rank(left, &query)
-                .cmp(&goto_match_rank(right, &query))
-                .then_with(|| left.cmp(right))
-        });
-        paths.dedup();
-        paths
+        goto_disk_matches(
+            query,
+            self.workspace_root().as_deref(),
+            super::rail::user_home().as_deref(),
+        )
+        .into_iter()
+            .map(|(path, _)| path)
+            .collect()
     }
 
     pub(crate) fn open_path_link(
@@ -4276,6 +4350,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
 
         v_flex()
             .id("workspace-rail")
+            .relative()
             .w(self.ui_px(self.workspace_rail_width))
             .h_full()
             .flex_shrink_0()
@@ -4754,7 +4829,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     fn on_side_panel_drag_move(
         &mut self,
         event: &MouseMoveEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !(self.resizing_rail || self.resizing_explorer) {
@@ -4773,10 +4848,13 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         };
         let delta = x - last;
         self.resize_last_x = Some(x);
+        let max_width = f32::from(window.bounds().size.width).max(4.);
         if self.resizing_rail {
-            self.workspace_rail_width = Self::clamp_rail_width(self.workspace_rail_width + delta);
+            self.workspace_rail_width =
+                Self::clamp_panel_width(self.workspace_rail_width + delta, max_width);
         } else if self.resizing_explorer {
-            self.explorer_width = Self::clamp_explorer_width(self.explorer_width + delta);
+            self.explorer_width =
+                Self::clamp_panel_width(self.explorer_width + delta, max_width);
         }
         cx.notify();
     }
@@ -4791,10 +4869,20 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             .id(id)
             .absolute()
             .top_0()
-            .right_0()
-            .w(px(3.))
+            .right(px(-4.))
+            // Keep the visible divider at one pixel while providing a generous
+            // centered target for the pointer.
+            .w(px(8.))
             .h_full()
             .cursor(CursorStyle::ResizeColumn)
+            .on_hover(cx.listener(move |this, hovered, _, cx| {
+                if *hovered {
+                    this.resize_handle_hovered = Some(id);
+                } else if this.resize_handle_hovered == Some(id) {
+                    this.resize_handle_hovered = None;
+                }
+                cx.notify();
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -4804,14 +4892,28 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                     cx.notify();
                 }),
             )
+            .child(
+                div()
+                    .absolute()
+                    .right(px(3.5))
+                    .top_0()
+                    .w(px(1.))
+                    .h_full()
+                    .bg(
+                        if self.resize_handle_hovered == Some(id)
+                            || (rail && self.resizing_rail)
+                            || (!rail && self.resizing_explorer)
+                        {
+                            cx.theme().accent
+                        } else {
+                            cx.theme().border
+                        },
+                    ),
+            )
     }
 
-    fn clamp_rail_width(width: f32) -> f32 {
-        width.clamp(160., 360.)
-    }
-
-    fn clamp_explorer_width(width: f32) -> f32 {
-        width.clamp(180., 480.)
+    fn clamp_panel_width(width: f32, window_width: f32) -> f32 {
+        width.clamp(4., window_width.max(4.))
     }
 
     fn refresh_explorer(&mut self, cx: &mut Context<Self>) {
@@ -5088,17 +5190,10 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                                     mods.shift,
                                     mods.control || mods.platform,
                                 );
-                                let count = super::diff_view::click_count(event);
-                                let (focus, diff) = drag_view.update(cx, |this, cx| {
-                                    let diff =
-                                        this.apply_tree_click(&path, is_dir, gesture, count, cx);
-                                    (this.explorer_focus.clone(), diff)
+                                let focus = drag_view.update(cx, |this, cx| {
+                                    this.apply_tree_click(&path, is_dir, gesture, cx);
+                                    this.explorer_focus.clone()
                                 });
-                                if let Some((rel, pin)) = diff {
-                                    drag_view.update(cx, |this, cx| {
-                                        this.open_diff(rel, pin, window, cx);
-                                    });
-                                }
                                 window.focus(&focus, cx);
                             }
                         })
@@ -5216,6 +5311,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
 
         v_flex()
             .id("git-pane")
+            .relative()
             .role(Role::Group)
             .aria_label("Source Control")
             .w(self.ui_px(self.explorer_width))
@@ -5339,6 +5435,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                         }
                     })),
             )
+            .child(self.side_panel_drag_handle("resize-source-control", false, cx))
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5465,7 +5562,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         bar
     }
 
-    fn render_goto(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_goto(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("goto-overlay")
             .absolute()
@@ -5497,15 +5594,82 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                         if event.keystroke.key.eq_ignore_ascii_case("tab") {
                             this.complete_goto(window, cx);
                             cx.stop_propagation();
+                        } else if event.keystroke.key.eq_ignore_ascii_case("right")
+                            || event.keystroke.key.eq_ignore_ascii_case("arrowright")
+                        {
+                            let modifiers = &event.keystroke.modifiers;
+                            if modifiers.control
+                                || modifiers.platform
+                                || modifiers.alt
+                                || modifiers.shift
+                            {
+                                return;
+                            }
+                            let query = this.goto_input.read(cx).value().to_string();
+                            if this.goto_input.read(cx).cursor() == query.len() {
+                                if let Some(path) = this.goto_matches(&query).into_iter().next() {
+                                    if goto_ghost_suffix(&query, &path).is_some() {
+                                        this.complete_goto_path(path, window, cx);
+                                        cx.stop_propagation();
+                                    }
+                                }
+                            }
                         }
                     }))
                     .child(div().text_sm().font_bold().child("Go to File"))
-                    .child(Input::new(&self.goto_input))
+                    .child({
+                        let query = self.goto_input.read(cx).value().to_string();
+                        let text_width = if query.is_empty() {
+                            0.
+                        } else {
+                            let text = SharedString::from(query.clone());
+                            let run = TextRun {
+                                len: text.len(),
+                                font: gpui::font(cx.theme().mono_font_family.clone()),
+                                color: cx.theme().foreground,
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            };
+                            window
+                                .text_system()
+                                .shape_line(text, self.ui_px(14.), &[run], None)
+                                .width()
+                                .as_f32()
+                        };
+                        let ghost = if self.goto_input.read(cx).cursor() == query.len() {
+                            self.goto_matches(&query)
+                                .into_iter()
+                                .next()
+                                .and_then(|path| {
+                                    goto_ghost_suffix(&query, &path).map(str::to_string)
+                                })
+                        } else {
+                            None
+                        };
+                        div()
+                            .relative()
+                            .child(
+                                Input::new(&self.goto_input)
+                                    .font_family(cx.theme().mono_font_family.clone()),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top(px(8.))
+                                    .left(px(11. + text_width))
+                                    .text_sm()
+                                    .whitespace_nowrap()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .child(ghost.unwrap_or_default()),
+                            )
+                    })
                     .child(
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child("Tab completes the first path match"),
+                            .child("Tab or Right Arrow completes the first path match"),
                     )
                     .child(
                         v_flex()
@@ -5536,6 +5700,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                                                         this.complete_goto_path(path, window, cx);
                                                     } else {
                                                         this.goto_open = false;
+                                                        let path = this.resolve_goto_path(&path);
                                                         this.open_path(path, false);
                                                         cx.notify();
                                                     }
@@ -5934,7 +6099,7 @@ impl Render for Workspace {
                         ),
                 )
             })
-            .when(self.goto_open, |this| this.child(self.render_goto(cx)))
+            .when(self.goto_open, |this| this.child(self.render_goto(window, cx)))
             .when(self.copilot_open, |this| this.child(self.render_copilot(cx)))
             .when(self.create_open, |this| {
                 this.child(self.render_create_workspace(cx))

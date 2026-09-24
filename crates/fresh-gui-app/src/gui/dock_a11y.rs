@@ -15,10 +15,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, AnyView, App, AppContext as _, Axis, Div, Entity, Stateful,
-    StatefulInteractiveElement as _, Window,
+    AnyElement, AnyView, App, AppContext as _, Axis, Div, Entity, InteractiveElement as _,
+    IntoElement as _, Stateful, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use gpui_kit::Role;
+use gpui_kit::{Role, base::ResizeHandleContext};
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::dock::{
     BasePanelView, DockArea, DockAreaRenderer, DockContext, DockSkin, DropIndicator, NodeId,
     PanelState, PanelStyle, TabGroupContext, TabGroupRenderer,
@@ -77,6 +78,27 @@ impl DockAreaRenderer for A11yDockSkin {
 
     fn center_frame(&self, window: &mut Window, cx: &mut App) -> Stateful<Div> {
         DockAreaRenderer::center_frame(self.inner.as_ref(), window, cx).role(Role::Group)
+    }
+
+    fn render_split_handle(
+        &self,
+        handle: &ResizeHandleContext,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        let color = if handle.is_active() {
+            cx.theme().accent
+        } else {
+            cx.theme().border
+        };
+        let line = div()
+            .flex_none()
+            .bg(color)
+            .group_hover("handle", |line| line.bg(cx.theme().accent));
+        Some(match handle.axis() {
+            Axis::Horizontal => line.h_full().w(px(1.)).into_any_element(),
+            Axis::Vertical => line.w_full().h(px(1.)).into_any_element(),
+        })
     }
 
     fn render_dock(
