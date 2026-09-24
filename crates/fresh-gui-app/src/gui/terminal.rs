@@ -7,6 +7,7 @@
 
 use std::cell::{Cell as StdCell, RefCell};
 use std::rc::Rc;
+use std::time::Instant;
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -85,15 +86,16 @@ impl Dimensions for TermSize {
     }
 }
 
-/// One run of cells that share a color and cursor flag.
+/// One run of cells that share a color.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TermSpan {
     pub text: String,
+    /// Number of grid columns occupied, independent of glyph measurement.
+    pub cells: usize,
     /// `None` means the host theme foreground or background.
     pub fg: Option<[u8; 3]>,
     pub bg: Option<[u8; 3]>,
     pub bold: bool,
-    pub cursor: bool,
     pub selected: bool,
 }
 
@@ -157,6 +159,19 @@ impl TermScreen {
     /// attributes, cursor position, palette). ConPTY and fish both wait on these.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
         self.parser.advance(&mut self.term, bytes);
+        self.shared.replies.borrow_mut().drain(..).collect()
+    }
+
+    /// Deadline for an unfinished synchronized update (DECSET 2026).
+    pub fn sync_deadline(&self) -> Option<Instant> {
+        self.parser.sync_timeout().sync_timeout()
+    }
+
+    /// Release a stalled update and return any device replies it generated.
+    pub fn stop_sync_if_expired(&mut self) -> Vec<u8> {
+        if self.sync_deadline().is_some_and(|deadline| deadline <= Instant::now()) {
+            self.parser.stop_sync(&mut self.term);
+        }
         self.shared.replies.borrow_mut().drain(..).collect()
     }
 
@@ -248,6 +263,14 @@ impl TermScreen {
         self.term.selection = None;
     }
 
+    /// Reset view state before forwarding a key. Redraw only when it changes.
+    pub fn prepare_for_input(&mut self) -> bool {
+        let changed = self.term.selection.is_some() || self.term.grid().display_offset() != 0;
+        self.clear_selection();
+        self.scroll_to_bottom();
+        changed
+    }
+
     pub fn selection_is_empty(&self) -> bool {
         self.term.selection.as_ref().is_none_or(Selection::is_empty)
     }
@@ -268,8 +291,6 @@ impl TermScreen {
 
     pub fn rows(&self) -> Vec<TermRow> {
         let content = self.term.renderable_content();
-        let cursor_on = content.cursor.shape != CursorShape::Hidden;
-        let cursor = content.cursor.point;
         let selection = content.selection;
         let mut rows = Vec::new();
         let mut current: Option<Line> = None;
@@ -284,15 +305,20 @@ impl TermScreen {
                 current = Some(indexed.point.line);
             }
             let cell = indexed.cell;
-            if cell
-                .flags
-                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-            {
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                if let Some(last) = spans.last_mut() {
+                    last.cells += 1;
+                } else {
+                    push_cell(&mut spans, cell, content.colors, false);
+                }
                 continue;
             }
-            let is_cursor = cursor_on && indexed.point == cursor;
+            if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+                push_cell(&mut spans, cell, content.colors, false);
+                continue;
+            }
             let selected = selection.is_some_and(|range| range.contains(indexed.point));
-            push_cell(&mut spans, cell, content.colors, is_cursor, selected);
+            push_cell(&mut spans, cell, content.colors, selected);
         }
         if current.is_some() {
             rows.push(TermRow { spans });
@@ -319,19 +345,19 @@ impl TermScreen {
         self.visible_lines().join("\n")
     }
 
-    /// Visible cursor as `(row, column)` from the top-left of the screen.
-    #[cfg(test)]
-    pub fn cursor_cell(&self) -> Option<(usize, usize)> {
+    /// Visible cursor as `(row, column, shape)` in the viewport.
+    pub fn cursor_cell(&self) -> Option<(usize, usize, CursorShape)> {
         let content = self.term.renderable_content();
         if content.cursor.shape == CursorShape::Hidden {
             return None;
         }
         let top = -(content.display_offset as i32);
         let row = content.cursor.point.line.0 - top;
-        if row < 0 {
+        let col = content.cursor.point.column.0;
+        if row < 0 || row as usize >= self.rows || col >= self.cols {
             return None;
         }
-        Some((row as usize, content.cursor.point.column.0))
+        Some((row as usize, col, content.cursor.shape))
     }
 }
 
@@ -506,7 +532,6 @@ fn push_cell(
     spans: &mut Vec<TermSpan>,
     cell: &Cell,
     colors: &alacritty_terminal::term::color::Colors,
-    cursor: bool,
     selected: bool,
 ) {
     let mut text = String::new();
@@ -533,18 +558,18 @@ fn push_cell(
         && last.fg == fg
         && last.bg == bg
         && last.bold == bold
-        && last.cursor == cursor
         && last.selected == selected
     {
         last.text.push_str(&text);
+        last.cells += 1;
         return;
     }
     spans.push(TermSpan {
         text,
+        cells: 1,
         fg,
         bg,
         bold,
-        cursor,
         selected,
     });
 }
@@ -785,14 +810,43 @@ mod tests {
     fn cursor_is_visible_after_text() {
         let mut s = TermScreen::new(80, 24);
         s.feed(b"ab");
-        assert_eq!(s.cursor_cell(), Some((0, 2)));
-        assert!(
-            s.rows()
-                .iter()
-                .flat_map(|row| row.spans.iter())
-                .any(|span| span.cursor),
-            "screen rows should mark the cursor cell"
-        );
+        assert_eq!(s.cursor_cell(), Some((0, 2, CursorShape::Block)));
+        s.feed(b"\x1b[D");
+        assert_eq!(s.cursor_cell(), Some((0, 1, CursorShape::Block)));
+        s.feed(b"\x1b[?25l");
+        assert_eq!(s.cursor_cell(), None);
+        s.feed(b"\x1b[?25h\x1b[5 q");
+        assert_eq!(s.cursor_cell(), Some((0, 1, CursorShape::Beam)));
+    }
+
+    #[test]
+    fn cursor_stays_in_viewport_and_blank_cell_has_a_column() {
+        let mut s = TermScreen::new(4, 2);
+        assert_eq!(s.cursor_cell(), Some((0, 0, CursorShape::Block)));
+        assert_eq!(s.rows()[0].spans[0].cells, 4);
+        s.feed(b"one\r\ntwo\r\nthree");
+        s.scroll_by(-1);
+        assert_eq!(s.cursor_cell(), None);
+    }
+
+    #[test]
+    fn wide_glyph_uses_two_grid_columns_before_the_cursor() {
+        let mut s = TermScreen::new(8, 2);
+        s.feed("好x".as_bytes());
+        assert_eq!(s.cursor_cell(), Some((0, 3, CursorShape::Block)));
+        assert_eq!(s.rows()[0].spans.iter().map(|span| span.cells).sum::<usize>(), 8);
+    }
+
+    #[test]
+    fn stalled_synchronized_update_flushes_at_deadline() {
+        let mut s = TermScreen::new(20, 3);
+        s.feed(b"\x1b[?2026hhi\x1b[6n");
+        assert!(s.sync_deadline().is_some());
+        std::thread::sleep(std::time::Duration::from_millis(170));
+        let reply = s.stop_sync_if_expired();
+        assert!(reply.windows(6).any(|w| w == *b"\x1b[1;3R"), "{reply:?}");
+        assert!(s.visible_text().contains("hi"));
+        assert!(s.sync_deadline().is_none());
     }
 
     #[test]

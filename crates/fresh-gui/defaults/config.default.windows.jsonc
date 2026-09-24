@@ -24,10 +24,13 @@
     // Soft-wrap long lines (Fresh editor.line_wrap). Default on.
     "editorLineWrap": true
   },
-  // Default PTY shell when the client does not pass shell.
-  // Windows default is powershell. Empty args start an interactive
-  // powershell, pwsh, or cmd (no Unix -l). bash and zsh still get
-  // interactive / OSC 7 setup.
+  // Initial shell for each NEW terminal, resolved on the daemon. Save this
+  // Settings file, then open a new tab; existing terminals keep their shell.
+  // Set command to "pwsh", "powershell", "cmd", "fish", "bash", or a full
+  // executable path. This is a path, not a command line; put flags in args.
+  // If missing, Fresh logs the skipped command and falls back to pwsh,
+  // powershell, %COMSPEC%, then cmd. Empty args enable OSC 7 for known shells;
+  // nonempty args are passed directly to the executable.
   "terminal": {
     "shell": {
       "command": "powershell",

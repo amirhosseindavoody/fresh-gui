@@ -34,7 +34,6 @@ pub struct SkippedShell {
     pub problem: &'static str,
 }
 
-#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Probe {
     Usable,
@@ -42,7 +41,6 @@ enum Probe {
     NotExecutable,
 }
 
-#[cfg(unix)]
 struct Candidate {
     command: String,
     args: Vec<String>,
@@ -55,14 +53,17 @@ struct Candidate {
 ///
 /// Unix order: client override (when set) → configured command (default `zsh`)
 /// → `$SHELL` when it names a different usable binary → `bash` → `sh`.
-/// Windows keeps the configured command (default `powershell`) and does not
-/// walk that chain.
+/// Windows probes the configured command, then `pwsh`, `powershell`,
+/// `%COMSPEC%`, and `cmd`.
 pub fn resolve_for_spawn(client_shell: Option<&str>, config: &Config) -> Result<ResolvedPtyShell> {
     let (configured, args) = config.resolve_shell();
 
     #[cfg(windows)]
     {
-        return Ok(windows_shell(client_shell, &configured, &args));
+        let comspec = std::env::var("COMSPEC").ok();
+        return resolve_windows(client_shell, &configured, &args, comspec.as_deref(), |cmd| {
+            probe_windows_command(cmd, std::env::var_os("PATH").as_deref())
+        });
     }
 
     #[cfg(unix)]
@@ -120,27 +121,43 @@ pub fn spawn_failure_message(
 }
 
 #[cfg(windows)]
-fn windows_shell(
+fn resolve_windows(
     client_shell: Option<&str>,
     configured: &str,
     args: &[String],
-) -> ResolvedPtyShell {
+    comspec: Option<&str>,
+    probe: impl FnMut(&str) -> Probe,
+) -> Result<ResolvedPtyShell> {
+    let mut candidates = Vec::new();
     if let Some(command) = trimmed(client_shell) {
-        return ResolvedPtyShell {
+        push_unique(&mut candidates, Candidate {
             command,
             args: Vec::new(),
             apply_osc7: true,
-            reason: "client shell override".to_owned(),
-            skipped: Vec::new(),
-        };
+            origin: "client shell",
+            reason: "client shell override",
+        });
     }
-    ResolvedPtyShell {
+    push_unique(&mut candidates, Candidate {
         command: configured.to_owned(),
         apply_osc7: args.is_empty(),
         args: args.to_vec(),
-        reason: "configured terminal.shell.command".to_owned(),
-        skipped: Vec::new(),
+        origin: "configured shell",
+        reason: "configured terminal.shell.command",
+    });
+    for (command, origin, reason) in [
+        (Some("pwsh"), "fallback", "fallback pwsh"),
+        (Some("powershell"), "fallback", "fallback powershell"),
+        (comspec, "%COMSPEC%", "%COMSPEC%"),
+        (Some("cmd"), "fallback", "fallback cmd"),
+    ] {
+        if let Some(command) = trimmed(command) {
+            push_unique(&mut candidates, Candidate {
+                command, args: Vec::new(), apply_osc7: true, origin, reason,
+            });
+        }
     }
+    select_first_usable(candidates, probe)
 }
 
 #[cfg(unix)]
@@ -150,7 +167,7 @@ fn resolve_unix(
     configured_args: &[String],
     configured_is_explicit: bool,
     env_shell: Option<&str>,
-    mut probe: impl FnMut(&str) -> Probe,
+    probe: impl FnMut(&str) -> Probe,
 ) -> Result<ResolvedPtyShell> {
     let candidates = unix_candidates(
         client_shell,
@@ -159,6 +176,13 @@ fn resolve_unix(
         configured_is_explicit,
         env_shell,
     );
+    select_first_usable(candidates, probe)
+}
+
+fn select_first_usable(
+    candidates: Vec<Candidate>,
+    mut probe: impl FnMut(&str) -> Probe,
+) -> Result<ResolvedPtyShell> {
     let mut skipped = Vec::new();
     for candidate in candidates {
         match probe(&candidate.command) {
@@ -266,7 +290,6 @@ fn unix_candidates(
     out
 }
 
-#[cfg(unix)]
 fn push_unique(out: &mut Vec<Candidate>, candidate: Candidate) {
     if out
         .iter()
@@ -286,7 +309,6 @@ fn trimmed(value: Option<&str>) -> Option<String> {
     }
 }
 
-#[cfg(unix)]
 fn problem_label(command: &str, probe: Probe) -> &'static str {
     match probe {
         Probe::NotExecutable => "not executable",
@@ -343,7 +365,46 @@ fn probe_path(path: &Path) -> Probe {
     }
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+fn probe_windows_command(command: &str, path_env: Option<&OsStr>) -> Probe {
+    let command = command.trim();
+    if command.is_empty() {
+        return Probe::NotFound;
+    }
+    let extensions = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
+    let extensions: Vec<_> = extensions.split(';').filter(|ext| !ext.is_empty()).collect();
+    let candidates: Vec<_> = if has_path_separator(command) {
+        vec![Path::new(command).to_path_buf()]
+    } else {
+        path_env
+            .map(std::env::split_paths)
+            .into_iter()
+            .flatten()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| dir.join(command))
+            .collect()
+    };
+    let mut blocked = false;
+    for path in candidates {
+        let mut paths = vec![path.clone()];
+        if path.extension().is_none() {
+            paths.extend(extensions.iter().map(|ext| {
+                std::path::PathBuf::from(format!("{}{}", path.display(), ext))
+            }));
+        }
+        for path in paths {
+            match std::fs::metadata(&path) {
+                Ok(meta) if meta.is_file() => return Probe::Usable,
+                Ok(_) => blocked = true,
+                Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => blocked = true,
+                Err(_) => {}
+            }
+        }
+    }
+    if blocked { Probe::NotExecutable } else { Probe::NotFound }
+}
+
 fn has_path_separator(command: &str) -> bool {
     command.contains('/') || command.contains('\\')
 }
@@ -361,7 +422,6 @@ fn format_skipped(skipped: &[SkippedShell]) -> String {
         .join("; ")
 }
 
-#[cfg(unix)]
 fn no_usable_shell_message(skipped: &[SkippedShell]) -> String {
     format!(
         "no usable shell for a new terminal. Tried: {}. Set \"terminal.shell.command\" in config.json to a shell that is installed and executable",
@@ -423,6 +483,20 @@ mod tests {
         assert!(!resolved.apply_osc7);
         assert_eq!(resolved.reason, "configured terminal.shell.command");
         assert!(resolved.skipped.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_fish_bash_and_custom_path_are_honored() {
+        for command in ["fish", "bash", "/opt/tools/my-shell"] {
+            let resolved = unix(
+                None, command, &[], true, Some("/bin/sh"),
+                &[(command, Probe::Usable)],
+            ).unwrap();
+            assert_eq!(resolved.command, command);
+            assert!(resolved.apply_osc7);
+            assert!(resolved.skipped.is_empty());
+        }
     }
 
     #[cfg(unix)]
@@ -620,13 +694,27 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_keeps_powershell_without_a_unix_fallback() {
-        let cfg = Config::default();
-        let resolved = resolve_for_spawn(None, &cfg).unwrap();
-        assert_eq!(resolved.command, DEFAULT_SHELL_COMMAND);
-        assert_eq!(resolved.command, "powershell");
-        assert!(resolved.skipped.is_empty());
-        assert_eq!(resolved.reason, "configured terminal.shell.command");
+    fn windows_falls_back_from_missing_configured_shell() {
+        let resolved = resolve_windows(
+            None, "fish", &[], Some(r"C:\Windows\System32\cmd.exe"),
+            |command| if command == "pwsh" { Probe::Usable } else { Probe::NotFound },
+        ).unwrap();
+        assert_eq!(resolved.command, "pwsh");
+        assert_eq!(resolved.skipped[0].command, "fish");
+        assert_eq!(resolved.skipped[0].problem, "not found on PATH");
+        assert_eq!(resolved.reason, "fallback pwsh");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_keeps_installed_custom_path_and_args() {
+        let resolved = resolve_windows(
+            None, r"C:\Tools\fish.exe", &["--private".into()], None,
+            |command| if command == r"C:\Tools\fish.exe" { Probe::Usable } else { Probe::NotFound },
+        ).unwrap();
+        assert_eq!(resolved.command, r"C:\Tools\fish.exe");
+        assert_eq!(resolved.args, vec!["--private"]);
+        assert!(!resolved.apply_osc7);
     }
 
     #[cfg(unix)]
