@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use fresh_gui_protocol::{WorkspaceInfo, WorkspaceTab, WorkspaceTabKind};
+use fresh_gui_protocol::{WorkspaceInfo, WorkspaceTab, WorkspaceTabKind, WorkspaceLayoutExtra};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
@@ -39,10 +39,11 @@ struct Record {
     tabs: Vec<WorkspaceTab>,
     active_tab: u32,
     explorer_expanded: Vec<String>,
+    extra: WorkspaceLayoutExtra,
 }
 
 /// On-disk shape of the workspace list.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 struct SavedState {
     version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -51,7 +52,7 @@ struct SavedState {
     workspaces: Vec<SavedWorkspace>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct SavedWorkspace {
     id: String,
     name: String,
@@ -62,6 +63,8 @@ struct SavedWorkspace {
     active_tab: u32,
     #[serde(default)]
     explorer_expanded: Vec<String>,
+    #[serde(default)]
+    extra: WorkspaceLayoutExtra,
 }
 
 struct Persist {
@@ -106,6 +109,7 @@ impl Inner {
                     tabs: rec.tabs.clone(),
                     active_tab: rec.active_tab,
                     explorer_expanded: rec.explorer_expanded.clone(),
+                    extra: rec.extra.clone(),
                 })
                 .collect(),
         }
@@ -120,6 +124,7 @@ pub struct FocusedWorkspace {
     pub tabs: Vec<WorkspaceTab>,
     pub active_tab: u32,
     pub explorer_expanded: Vec<String>,
+    pub extra: WorkspaceLayoutExtra,
 }
 
 /// What [`WorkspaceStore::close`] returns so the server can destroy the session.
@@ -198,6 +203,7 @@ impl WorkspaceStore {
                 tabs,
                 active_tab,
                 explorer_expanded: sanitize_expanded(ws.explorer_expanded),
+                extra: ws.extra,
             };
             guard.by_session.insert(session_id, ws.id.clone());
             guard.order.push(ws.id.clone());
@@ -283,6 +289,7 @@ impl WorkspaceStore {
             tabs: Vec::new(),
             active_tab: 0,
             explorer_expanded: Vec::new(),
+            extra: WorkspaceLayoutExtra::default(),
         };
         let info = rec.info(0);
         let mut guard = self.inner.lock().await;
@@ -325,6 +332,7 @@ impl WorkspaceStore {
         rec.root = root;
         // Expanded folders belonged to the previous tree.
         rec.explorer_expanded.clear();
+        rec.extra.explorer_scroll = 0;
         let info = rec.info(0);
         drop(guard);
         self.mark_dirty();
@@ -340,6 +348,7 @@ impl WorkspaceStore {
         tabs: Vec<WorkspaceTab>,
         active_tab: u32,
         explorer_expanded: Vec<String>,
+        extra: WorkspaceLayoutExtra,
     ) -> Result<(String, String)> {
         let tabs = sanitize_tabs(tabs);
         let active_tab = clamp_active(active_tab, tabs.len());
@@ -351,6 +360,7 @@ impl WorkspaceStore {
         rec.tabs = tabs;
         rec.active_tab = active_tab;
         rec.explorer_expanded = sanitize_expanded(explorer_expanded);
+        rec.extra = extra;
         let json = layout_json(&rec.tabs, rec.active_tab);
         let out = (rec.session_id.clone(), json);
         drop(guard);
@@ -385,6 +395,7 @@ impl WorkspaceStore {
             tabs: rec.tabs.clone(),
             active_tab: rec.active_tab,
             explorer_expanded: rec.explorer_expanded.clone(),
+            extra: rec.extra.clone(),
         };
         drop(guard);
         if changed {
@@ -701,11 +712,12 @@ mod tests {
                 vec![term("alpha-term", "pty-a"), editor("/work/alpha/a.rs")],
                 0,
                 Vec::new(),
+                WorkspaceLayoutExtra::default(),
             )
             .await
             .unwrap();
         store
-            .set_layout(&beta.id, vec![editor("/work/beta/b.rs")], 0, Vec::new())
+            .set_layout(&beta.id, vec![editor("/work/beta/b.rs")], 0, Vec::new(), WorkspaceLayoutExtra::default())
             .await
             .unwrap();
 
@@ -776,7 +788,7 @@ mod tests {
             .create(&sessions, Some("project".into()), "/old".into())
             .await;
         store
-            .set_layout(&created.id, vec![], 0, vec!["/old/src".into()])
+            .set_layout(&created.id, vec![], 0, vec!["/old/src".into()], WorkspaceLayoutExtra::default())
             .await
             .unwrap();
         let changed = store.set_root(&created.id, "/new".into()).await.unwrap();
@@ -802,12 +814,23 @@ mod tests {
         let beta = store
             .create(&sessions, Some("beta".into()), "/work/beta".into())
             .await;
+        let extra = WorkspaceLayoutExtra {
+            explorer_scroll: 17,
+            sidebar_collapsed: true,
+            pinned: vec!["file:/work/beta/lib.rs".into()],
+            center: Some(fresh_gui_protocol::LayoutNode::Split {
+                axis: "horizontal".into(),
+                children: vec![fresh_gui_protocol::LayoutNode::Tabs { tabs: vec![0], active: 0 }, fresh_gui_protocol::LayoutNode::Tabs { tabs: vec![1], active: 0 }],
+                sizes: vec![Some(320.0), None],
+            }),
+        };
         store
             .set_layout(
                 &beta.id,
                 vec![term("2", "pty-b"), editor("/work/beta/lib.rs")],
                 1,
                 vec!["/work/beta/src".into(), "/work/beta/src/.".into()],
+                extra.clone(),
             )
             .await
             .unwrap();
@@ -847,6 +870,7 @@ mod tests {
             beta_now.explorer_expanded,
             vec!["/work/beta/src".to_string()]
         );
+        assert_eq!(beta_now.extra, extra);
 
         // The restored store keeps saving: closing a workspace sticks.
         restored.close(&alpha.id).await.unwrap();

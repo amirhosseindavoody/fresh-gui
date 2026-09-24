@@ -3,6 +3,13 @@
 use gpui_kit::component::GlobalState;
 use gpui_kit::{App, KeyBinding, Menu, MenuItem, actions};
 use serde::Deserialize;
+use fresh_gui_protocol::Shortkey;
+use std::cell::RefCell;
+
+thread_local! {
+    /// GPUI Kit's editor/menu bindings, captured before ADE adds its bindings.
+    static KIT_BINDINGS: RefCell<Vec<KeyBinding>> = const { RefCell::new(Vec::new()) };
+}
 
 /// File menu: stop the local daemon, or leave it running and close the window.
 pub fn install_menus(cx: &mut App) {
@@ -24,6 +31,10 @@ actions!(
     [
         NewTerminal,
         CloseTab,
+        CloseAllEditors,
+        CloseAllTerminals,
+        CloseAllOtherTerminals,
+        CloseAllOtherTabs,
         SaveBuffer,
         ToggleSidebar,
         ToggleCommandPalette,
@@ -36,6 +47,10 @@ actions!(
         PrevTab,
         CopyExplorer,
         PasteExplorer,
+        DeleteExplorer,
+        AskCopilot,
+        TerminalCopyOrInterrupt,
+        TogglePinTab,
         FilterExplorer,
         ClearExplorerInput,
         NewWorkspace,
@@ -57,23 +72,38 @@ pub fn init(cx: &mut App) {
     struct Defaults {
         shortkeys: Vec<Shortkey>,
     }
-    #[derive(Deserialize)]
-    struct Shortkey {
-        action: String,
-        shortkey: String,
-        when: Option<String>,
-    }
+    KIT_BINDINGS.with(|saved| *saved.borrow_mut() = cx.key_bindings().borrow().bindings().cloned().collect());
     let defaults: Defaults = jsonc_parser::parse_to_serde_value(
         include_str!("../../../fresh-gui/defaults/config.default.jsonc"),
         &jsonc_parser::ParseOptions::default(),
     )
     .expect("embedded default shortkeys must parse");
-    let bindings = defaults.shortkeys.iter().filter_map(|entry| {
+    apply_shortkeys(cx, &defaults.shortkeys);
+}
+
+/// Replace ADE bindings after Hello or a settings save while retaining GPUI Kit's
+/// built-in editor bindings. An empty list deliberately removes ADE shortcuts.
+pub fn apply_shortkeys(cx: &mut App, shortkeys: &[Shortkey]) {
+    let bindings = shortkeys.iter().filter_map(|entry| {
         let key = entry.shortkey.as_str();
-        let when = entry.when.as_deref();
+        if !key.split_whitespace().all(|part| gpui_kit::Keystroke::parse(part).is_ok()) {
+            tracing::warn!(key, "invalid shortkey");
+            return None;
+        }
+        let when = match entry.when.as_deref() {
+            None | Some("") => None,
+            Some("Explorer") => Some("Explorer"),
+            Some("Terminal") => Some("Terminal"),
+            Some("Editor") => Some("Editor"),
+            Some(other) => { tracing::warn!(when = other, "unsupported shortkey context"); return None; }
+        };
         let binding = match entry.action.as_str() {
             "NewTerminal" => KeyBinding::new(key, NewTerminal, when),
             "CloseTab" => KeyBinding::new(key, CloseTab, when),
+            "CloseAllEditors" => KeyBinding::new(key, CloseAllEditors, when),
+            "CloseAllTerminals" => KeyBinding::new(key, CloseAllTerminals, when),
+            "CloseAllOtherTerminals" => KeyBinding::new(key, CloseAllOtherTerminals, when),
+            "CloseAllOtherTabs" => KeyBinding::new(key, CloseAllOtherTabs, when),
             "SaveBuffer" => KeyBinding::new(key, SaveBuffer, when),
             "ToggleSidebar" => KeyBinding::new(key, ToggleSidebar, when),
             "ToggleCommandPalette" => KeyBinding::new(key, ToggleCommandPalette, when),
@@ -86,6 +116,10 @@ pub fn init(cx: &mut App) {
             "PrevTab" => KeyBinding::new(key, PrevTab, when),
             "CopyExplorer" => KeyBinding::new(key, CopyExplorer, when),
             "PasteExplorer" => KeyBinding::new(key, PasteExplorer, when),
+            "DeleteExplorer" => KeyBinding::new(key, DeleteExplorer, when),
+            "AskCopilot" => KeyBinding::new(key, AskCopilot, when),
+            "TerminalCopyOrInterrupt" => KeyBinding::new(key, TerminalCopyOrInterrupt, when),
+            "TogglePinTab" => KeyBinding::new(key, TogglePinTab, when),
             "FilterExplorer" => KeyBinding::new(key, FilterExplorer, when),
             "ClearExplorerInput" => KeyBinding::new(key, ClearExplorerInput, when),
             "NewWorkspace" => KeyBinding::new(key, NewWorkspace, when),
@@ -100,11 +134,14 @@ pub fn init(cx: &mut App) {
             "StopServer" => KeyBinding::new(key, StopServer, when),
             "QuitClient" => KeyBinding::new(key, QuitClient, when),
             unknown => {
-                tracing::warn!(action = unknown, "unknown default shortkey action");
+                tracing::warn!(action = unknown, "unknown shortkey action");
                 return None;
             }
         };
         Some(binding)
     });
+    let bindings: Vec<_> = bindings.collect();
+    cx.clear_key_bindings();
+    KIT_BINDINGS.with(|saved| cx.bind_keys(saved.borrow().iter().cloned()));
     cx.bind_keys(bindings);
 }

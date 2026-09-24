@@ -22,7 +22,24 @@ fresh-gui-protocol = { workspace = true }
 # Pin the same gpui-pre snapshot gpui-kit 0.6.6 / gpui-component require
 # (`=0.3.6`) so Cargo does not resolve a second gpui crate instance.
 gpui = { package = "gpui-pre", version = "=0.3.6" }
-gpui-kit = "0.6.6"
+gpui-kit = { version = "0.6.6", features = [
+    # Enable gpui-component's bundled tree-sitter grammars used by EditorPanel.
+    "tree-sitter",
+    "tree-sitter-rust",
+    "tree-sitter-python",
+    "tree-sitter-typescript",
+    "tree-sitter-tsx",
+    "tree-sitter-javascript",
+    "tree-sitter-toml",
+    "tree-sitter-markdown",
+    "tree-sitter-yaml",
+    "tree-sitter-bash",
+    "tree-sitter-html",
+    "tree-sitter-css",
+    "tree-sitter-c",
+    "tree-sitter-cpp",
+    "tree-sitter-go",
+] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 jsonc-parser = { workspace = true }

@@ -19,6 +19,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use gpui_kit::base::Selectable as _;
 
 use super::actions::ZoomInUi;
 use super::ade::{AdeCmd, AdeHandle};
@@ -393,6 +394,14 @@ impl TerminalPanel {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         cx.notify();
     }
+
+    pub fn copy_or_interrupt(&mut self, cx: &mut Context<Self>) {
+        if self.screen.selection_text().is_some() {
+            self.copy_selection(cx);
+        } else {
+            self.ade.send(AdeCmd::WritePty { id: self.pty_id.clone(), data: vec![3] });
+        }
+    }
 }
 
 impl EventEmitter<PanelEvent> for TerminalPanel {}
@@ -566,6 +575,7 @@ impl Render for TerminalPanel {
         let reporting = self.screen.mouse_tracking().active();
         let pane = div()
             .id(format!("terminal-pane-{}", self.pty_id))
+            .key_context("Terminal")
             .role(Role::Terminal)
             .aria_label("Terminal")
             .size_full()
@@ -879,6 +889,44 @@ mod zoom_tests {
     }
 }
 
+#[cfg(test)]
+mod language_path_tests {
+    use super::language_from_path;
+
+    #[test]
+    fn maps_common_editor_extensions_to_registered_language_names() {
+        for (path, expected) in [
+            ("src/lib.rs", "rust"),
+            ("main.py", "python"),
+            ("app.js", "javascript"),
+            ("app.ts", "typescript"),
+            ("view.tsx", "tsx"),
+            ("data.json", "json"),
+            ("Cargo.toml", "toml"),
+            ("README.md", "markdown"),
+            ("config.yaml", "yaml"),
+            ("script.sh", "bash"),
+            ("index.html", "html"),
+            ("site.css", "css"),
+            ("main.c", "c"),
+            ("header.h", "c"),
+            ("main.cpp", "cpp"),
+            ("header.hpp", "cpp"),
+            ("main.go", "go"),
+        ] {
+            assert_eq!(language_from_path(path, None).as_deref(), Some(expected), "{path}");
+        }
+    }
+
+    #[test]
+    fn reported_language_takes_precedence_over_extension() {
+        assert_eq!(
+            language_from_path("file.txt", Some("custom-language")).as_deref(),
+            Some("custom-language")
+        );
+    }
+}
+
 fn term_span_el(
     span: TermSpan,
     fg_default: Hsla,
@@ -937,7 +985,17 @@ pub struct EditorPanel {
     plus_shift: Rc<Cell<f32>>,
     font_px: f32,
     closed: bool,
+    markdown_preview: bool,
+    inline_markdown_edit: Option<MarkdownInlineEdit>,
+    inline_markdown_subscription: Option<Subscription>,
     _subscription: Subscription,
+}
+
+struct MarkdownInlineEdit {
+    line_index: usize,
+    editor: Entity<EditorState>,
+    prefix: String,
+    suffix: String,
 }
 
 impl EditorPanel {
@@ -982,6 +1040,9 @@ impl EditorPanel {
             plus_shift: Rc::new(Cell::new(0.0)),
             font_px: 14.0,
             closed: false,
+            markdown_preview: false,
+            inline_markdown_edit: None,
+            inline_markdown_subscription: None,
             _subscription: subscription,
         }
     }
@@ -1012,8 +1073,58 @@ impl EditorPanel {
         self.rev
     }
 
-    pub fn editor(&self) -> &Entity<EditorState> {
-        &self.editor
+    /// Full Markdown source, including an active rich-preview block edit.
+    pub fn current_text(&self, cx: &App) -> String {
+        let source = self.editor.read(cx).value().to_string();
+        let Some(edit) = &self.inline_markdown_edit else {
+            return source;
+        };
+        replace_markdown_line(
+            &source,
+            edit.line_index,
+            &edit.prefix,
+            &edit.editor.read(cx).value(),
+            &edit.suffix,
+        )
+    }
+
+    fn begin_markdown_inline_edit(
+        &mut self,
+        line_index: usize,
+        prefix: String,
+        suffix: String,
+        content: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = cx.new(|cx| EditorState::new(window, cx).line_number(false));
+        editor.update(cx, |state, cx| state.set_value(&content, window, cx));
+        let subscription = cx.subscribe(&editor, |this, _, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::Change) {
+                this.dirty = true;
+                cx.notify();
+            }
+        });
+        self.inline_markdown_edit = Some(MarkdownInlineEdit {
+            line_index,
+            editor,
+            prefix,
+            suffix,
+        });
+        self.inline_markdown_subscription = Some(subscription);
+        cx.notify();
+    }
+
+    pub fn commit_markdown_inline_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.inline_markdown_edit.is_none() {
+            return;
+        }
+        let text = self.current_text(cx);
+        self.editor.update(cx, |state, cx| state.set_value(&text, window, cx));
+        self.inline_markdown_edit = None;
+        self.inline_markdown_subscription = None;
+        self.dirty = true;
+        cx.notify();
     }
 
     pub fn note_reopen(
@@ -1039,6 +1150,8 @@ impl EditorPanel {
         self.rev = rev;
         self.path = path;
         self.dirty = false;
+        self.inline_markdown_edit = None;
+        self.inline_markdown_subscription = None;
         let jump = self.pending.take();
         self.editor.update(cx, |state, cx| {
             state.set_value(&text, window, cx);
@@ -1186,14 +1299,274 @@ impl DockPanel for EditorPanel {
 
 impl Render for EditorPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(
-            Editor::new(&self.editor)
-                .bordered(false)
-                .p_0()
-                .h(relative(1.))
-                .text_size(px(self.font_px))
-                .font_family(cx.theme().mono_font_family.clone()),
-        )
+        let markdown = matches!(
+            self.path.rsplit('.').next().map(str::to_ascii_lowercase).as_deref(),
+            Some("md" | "markdown")
+        );
+        let mut root = div().key_context("Editor").size_full().flex().flex_col();
+        if markdown {
+            let panel = cx.entity();
+            root = root.child(
+                h_flex()
+                    .w_full()
+                    .h_8()
+                    .px_2()
+                    .gap_1()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Markdown · click preview text to edit"))
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("markdown-source")
+                            .ghost()
+                            .xsmall()
+                            .label("Source")
+                            .selected(!self.markdown_preview)
+                            .on_click({
+                                let panel = panel.clone();
+                                move |_, window, cx| {
+                                    panel.update(cx, |this, cx| {
+                                        this.commit_markdown_inline_edit(window, cx);
+                                        this.markdown_preview = false;
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    )
+                    .child(
+                        Button::new("markdown-preview")
+                            .ghost()
+                            .xsmall()
+                            .label("Preview")
+                            .selected(self.markdown_preview)
+                            .on_click(move |_, _, cx| {
+                                panel.update(cx, |this, cx| {
+                                    this.markdown_preview = true;
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            );
+        }
+
+        if markdown && self.markdown_preview {
+            let content = self.editor.read(cx).value();
+            let inline_edit = self
+                .inline_markdown_edit
+                .as_ref()
+                .map(|edit| (edit.line_index, edit.editor.clone()));
+            root = root.child(render_markdown_preview(
+                &content,
+                cx.theme().muted,
+                cx.theme().muted_foreground,
+                cx.entity(),
+                inline_edit,
+            ));
+        } else {
+            root = root.child(
+                Editor::new(&self.editor)
+                    .bordered(false)
+                    .p_0()
+                    .flex_1()
+                    .text_size(px(self.font_px))
+                    .font_family(cx.theme().mono_font_family.clone()),
+            );
+        }
+        root
+    }
+}
+
+/// A lightweight native Markdown presentation for the first WYSIWYG pass.
+/// Source remains authoritative and editable in Source mode; Preview reflects
+/// live changes and gives block structure without a second document model.
+fn render_markdown_preview(
+    source: &str,
+    block_bg: Hsla,
+    muted_fg: Hsla,
+    panel: Entity<EditorPanel>,
+    inline_edit: Option<(usize, Entity<EditorState>)>,
+) -> impl IntoElement {
+    let mut in_code = false;
+    let mut body = v_flex().id("markdown-preview-content").w_full().h_full().overflow_y_scroll().p_6().gap_2();
+    for (line_index, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_code = !in_code;
+            continue;
+        }
+        let is_code = in_code;
+        let (prefix, display_text, suffix) = markdown_edit_parts(line, is_code)
+            .unwrap_or_else(|| (String::new(), line.to_string(), String::new()));
+        if inline_edit.as_ref().is_some_and(|(index, _)| *index == line_index) {
+            let editor = inline_edit.as_ref().unwrap().1.clone();
+            body = body.child(
+                Editor::new(&editor)
+                    .bordered(false)
+                    .p_1()
+                    .w_full()
+                    .text_size(px(15.)),
+            );
+            continue;
+        }
+        let rendered = if in_code {
+            div()
+                .w_full()
+                .px_3()
+                .py_1()
+                .bg(block_bg)
+                .font_family("monospace")
+                .child(display_text.clone())
+        } else if trimmed.is_empty() {
+            div().h_2()
+        } else if let Some((level, text)) = markdown_heading(trimmed) {
+            let font = match level {
+                1 => px(28.),
+                2 => px(24.),
+                3 => px(20.),
+                _ => px(17.),
+            };
+            div().font_semibold().text_size(font).child(text.to_string())
+        } else if let Some(text) = trimmed.strip_prefix("> ") {
+            h_flex()
+                .gap_2()
+                .child(div().w(px(3.)).h_full().bg(block_bg))
+                .child(div().italic().text_color(muted_fg).child(text.to_string()))
+        } else if let Some(text) = markdown_list_item(trimmed) {
+            h_flex().gap_2().pl_4().child("•").child(text.to_string())
+        } else if trimmed.starts_with("---") || trimmed.starts_with("***") {
+            div().w_full().h(px(1.)).my_2().bg(block_bg)
+        } else {
+            div().text_size(px(15.)).child(trimmed.to_string())
+        };
+        let line_panel = panel.clone();
+        let line_prefix = prefix.clone();
+        let line_suffix = suffix.clone();
+        let line_content = display_text.clone();
+        body = body.child(
+            div()
+                .id(format!("markdown-preview-line-{line_index}"))
+                .w_full()
+                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    line_panel.update(cx, |this, cx| {
+                        this.commit_markdown_inline_edit(window, cx);
+                        this.begin_markdown_inline_edit(
+                            line_index,
+                            line_prefix.clone(),
+                            line_suffix.clone(),
+                            line_content.clone(),
+                            window,
+                            cx,
+                        );
+                    });
+                })
+                .child(rendered),
+        );
+    }
+    body
+}
+
+fn markdown_heading(line: &str) -> Option<(usize, &str)> {
+    let hashes = line.chars().take_while(|ch| *ch == '#').count();
+    (1..=6)
+        .contains(&hashes)
+        .then(|| (hashes, line[hashes..].trim_start()))
+}
+
+fn markdown_list_item(line: &str) -> Option<&str> {
+    ["- ", "* ", "+ "]
+        .iter()
+        .find_map(|prefix| line.strip_prefix(prefix))
+        .or_else(|| {
+            let (number, rest) = line.split_once(". ")?;
+            (!number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit())).then_some(rest)
+        })
+}
+
+fn markdown_edit_parts(line: &str, in_code: bool) -> Option<(String, String, String)> {
+    if in_code || line.trim().is_empty() {
+        return Some((String::new(), line.to_string(), String::new()));
+    }
+
+    let indent = line.len() - line.trim_start().len();
+    let content = &line[indent..];
+    let hashes = content.chars().take_while(|ch| *ch == '#').count();
+    if (1..=6).contains(&hashes) {
+        let rest = &content[hashes..];
+        let spaces = rest.chars().take_while(|ch| ch.is_whitespace()).map(char::len_utf8).sum::<usize>();
+        if spaces > 0 {
+            let prefix_end = indent + hashes + spaces;
+            return Some((line[..prefix_end].to_string(), line[prefix_end..].to_string(), String::new()));
+        }
+    }
+
+    if content.starts_with("> ") {
+        return Some((line[..indent + 2].to_string(), content[2..].to_string(), String::new()));
+    }
+    if content.len() >= 2
+        && matches!(content.as_bytes()[0], b'-' | b'*' | b'+')
+        && content.as_bytes()[1].is_ascii_whitespace()
+    {
+        let spaces = content[1..].chars().take_while(|ch| ch.is_whitespace()).map(char::len_utf8).sum::<usize>();
+        let prefix_end = indent + 1 + spaces;
+        return Some((line[..prefix_end].to_string(), line[prefix_end..].to_string(), String::new()));
+    }
+    if let Some((number, rest)) = content.split_once(". ")
+        && !number.is_empty()
+        && number.chars().all(|ch| ch.is_ascii_digit())
+    {
+        let prefix_end = indent + number.len() + 2;
+        return Some((line[..prefix_end].to_string(), rest.to_string(), String::new()));
+    }
+
+    Some((String::new(), line.to_string(), String::new()))
+}
+
+fn replace_markdown_line(
+    source: &str,
+    line_index: usize,
+    prefix: &str,
+    content: &str,
+    suffix: &str,
+) -> String {
+    let mut lines: Vec<String> = source.split_inclusive('\n').map(str::to_string).collect();
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    let Some(line) = lines.get_mut(line_index) else {
+        return source.to_string();
+    };
+    let body_len = line.trim_end_matches(['\r', '\n']).len();
+    let ending = line[body_len..].to_string();
+    *line = format!("{prefix}{content}{suffix}{ending}");
+    lines.concat()
+}
+
+#[cfg(test)]
+mod markdown_preview_tests {
+    use super::{
+        markdown_edit_parts, markdown_heading, markdown_list_item, replace_markdown_line,
+    };
+
+    #[test]
+    fn recognizes_heading_depth_and_list_items() {
+        assert_eq!(markdown_heading("### Details"), Some((3, "Details")));
+        assert_eq!(markdown_heading("####### not a heading"), None);
+        assert_eq!(markdown_list_item("- first"), Some("first"));
+        assert_eq!(markdown_list_item("4. fourth"), Some("fourth"));
+        assert_eq!(markdown_list_item("not a list"), None);
+    }
+
+    #[test]
+    fn inline_preview_edits_preserve_markers_and_line_endings() {
+        assert_eq!(
+            markdown_edit_parts("### Old title", false),
+            Some(("### ".into(), "Old title".into(), String::new()))
+        );
+        assert_eq!(
+            replace_markdown_line("# old\r\n- item\r\n", 1, "- ", "updated", ""),
+            "# old\r\n- updated\r\n"
+        );
     }
 }
 
@@ -1282,8 +1655,13 @@ fn with_close_items(
                 .ok();
         }));
     }
+    let pinned = workspace.read_with(cx, |workspace, _| workspace.tab_is_pinned(panel_id)).unwrap_or(false);
+    let pin_workspace = workspace.clone();
+    menu = menu.item(PopupMenuItem::new(if pinned { "Unpin Tab" } else { "Pin Tab" }).on_click(move |_, _, cx| {
+        pin_workspace.update(cx, |workspace, cx| workspace.toggle_pin(panel_id, cx)).ok();
+    }));
     let workspace_others = workspace.clone();
-    let workspace_right = workspace;
+    let workspace_right = workspace.clone();
     menu.item(
         PopupMenuItem::new("Close Others")
             .disabled(!others_ok)
@@ -1311,6 +1689,27 @@ fn with_close_items(
                     .ok();
             }),
     )
+    .item({
+        let workspace = workspace.clone();
+        PopupMenuItem::new("Close All Editors").on_click(move |_, window, cx| {
+            workspace.update(cx, |workspace, cx| workspace.close_all_editors(window, cx)).ok();
+        })
+    })
+    .item({
+        let workspace = workspace.clone();
+        PopupMenuItem::new("Close All Terminals").on_click(move |_, window, cx| {
+            workspace.update(cx, |workspace, cx| workspace.close_all_terminals(window, cx)).ok();
+        })
+    })
+    .item({
+        let workspace = workspace.clone();
+        PopupMenuItem::new("Close All Other Terminals").on_click(move |_, window, cx| {
+            workspace.update(cx, |workspace, cx| workspace.close_all_other_terminals(Some(panel_id), window, cx)).ok();
+        })
+    })
+    .item(PopupMenuItem::new("Close All Other Tabs").on_click(move |_, window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.close_all_other_tabs(Some(panel_id), window, cx)).ok();
+    }))
 }
 
 pub(crate) fn language_from_path(path: &str, reported: Option<&str>) -> Option<String> {
@@ -1320,7 +1719,8 @@ pub(crate) fn language_from_path(path: &str, reported: Option<&str>) -> Option<S
     let ext = path.rsplit('.').next()?.to_ascii_lowercase();
     let name = match ext.as_str() {
         "rs" => "rust",
-        "ts" | "tsx" => "typescript",
+        "ts" => "typescript",
+        "tsx" => "tsx",
         "js" | "jsx" | "mjs" => "javascript",
         "py" => "python",
         "go" => "go",
@@ -1331,6 +1731,8 @@ pub(crate) fn language_from_path(path: &str, reported: Option<&str>) -> Option<S
         "css" => "css",
         "html" | "htm" => "html",
         "yml" | "yaml" => "yaml",
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" => "cpp",
         _ => return None,
     };
     Some(name.into())

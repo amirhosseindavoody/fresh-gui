@@ -39,6 +39,38 @@ pub struct Hello {
     /// Host UI prefs snapshot from that config (theme / fonts / webgl). Backend only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<HelloUi>,
+    /// Effective user keybindings. Older peers omit this field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shortkeys: Vec<Shortkey>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Shortkey {
+    pub action: String,
+    pub shortkey: String,
+    #[serde(default)]
+    pub when: Option<String>,
+}
+
+/// Optional native client layout details. Missing fields read as defaults for
+/// workspaces saved by older clients and daemons.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WorkspaceLayoutExtra {
+    #[serde(default)]
+    pub explorer_scroll: u32,
+    #[serde(default)]
+    pub sidebar_collapsed: bool,
+    #[serde(default)]
+    pub pinned: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub center: Option<LayoutNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LayoutNode {
+    Split { axis: String, children: Vec<LayoutNode>, sizes: Vec<Option<f32>> },
+    Tabs { tabs: Vec<u32>, active: u32 },
 }
 
 /// UI section mirrored from `config.json` → `Hello.ui`.
@@ -203,6 +235,8 @@ pub struct GitFile {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Message {
     Hello(Hello),
+    /// Backend → client after a successful settings save.
+    ConfigUpdated { shortkeys: Vec<Shortkey> },
     /// Client → backend. Required before PTY/FS ops when the backend demands a token.
     Auth {
         token: String,
@@ -317,6 +351,8 @@ pub enum Message {
         /// Explorer directories the host last had open in this workspace.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         explorer_expanded: Vec<String>,
+        #[serde(default)]
+        extra: WorkspaceLayoutExtra,
     },
     /// Client → backend: replace the workspace's tab list (any workspace id,
     /// not only the one attached on this connection).
@@ -328,6 +364,8 @@ pub enum Message {
         /// Open explorer directories (absolute paths). Replaces the stored set.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         explorer_expanded: Vec<String>,
+        #[serde(default)]
+        extra: WorkspaceLayoutExtra,
     },
     /// Client → backend: open a PTY in the attached session.
     PtyOpen {
@@ -701,6 +739,7 @@ impl Hello {
             config_path: None,
             defaults_path: None,
             ui: None,
+            shortkeys: Vec::new(),
         }
     }
 
@@ -713,6 +752,7 @@ impl Hello {
             config_path: None,
             defaults_path: None,
             ui: None,
+            shortkeys: Vec::new(),
         }
     }
 
@@ -817,6 +857,7 @@ mod tests {
                 rows: 24,
             }],
             explorer_expanded: vec!["/tmp/alpha/src".into()],
+            extra: WorkspaceLayoutExtra::default(),
         };
         let json = switched.to_json().unwrap();
         assert!(json.contains("\"workspace_switched\""));
@@ -832,6 +873,7 @@ mod tests {
             }],
             active_tab: 0,
             explorer_expanded: Vec::new(),
+            extra: WorkspaceLayoutExtra::default(),
         };
         let json = layout.to_json().unwrap();
         assert!(!json.contains("explorer_expanded"));

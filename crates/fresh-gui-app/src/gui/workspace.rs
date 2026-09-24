@@ -11,13 +11,14 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fresh_gui_protocol::{
     CAP_GIT, CAP_WORKSPACE, CAP_WORKSPACE_SET_ROOT, FsEntry, FsKind, GitFile, Hello, PtyInfo,
-    WorkspaceInfo, WorkspaceTab, WorkspaceTabKind,
+    LayoutNode, WorkspaceInfo, WorkspaceLayoutExtra, WorkspaceTab, WorkspaceTabKind,
 };
-use gpui_kit::component::dock::{DockArea, DockEvent, DockPlacement, PanelId, panel_handle};
+use gpui_kit::component::dock::{BasePanelView, DockArea, DockEvent, DockLayout, DockPlacement, PaneNode, PaneRef, PanelId, panel_handle};
 use gpui_kit::component::menu::{AppMenuBar, ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{
     ActiveTheme, Disableable as _, Icon, IconName, Root, Selectable, Sizable, StyledExt, TitleBar,
@@ -34,10 +35,11 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::actions::{
-    ClearExplorerInput, CloseTab, CloseWorkspace, CopyExplorer, Disconnect, FilterExplorer,
-    GoToFile, NewTerminal, NewWorkspace, NextTab, OpenDefaultSettings, OpenSettings, PasteExplorer,
+    ClearExplorerInput, CloseAllEditors, CloseAllOtherTabs, CloseAllOtherTerminals,
+    CloseAllTerminals, CloseTab, CloseWorkspace, CopyExplorer, DeleteExplorer, Disconnect, FilterExplorer,
+    AskCopilot, GoToFile, NewTerminal, NewWorkspace, NextTab, OpenDefaultSettings, OpenSettings, PasteExplorer,
     PrevTab, QuitClient, Reconnect, RenameWorkspace, ResetContentZoom, ResetUiZoom, SaveBuffer,
-    StopServer, ToggleCommandPalette, ToggleSidebar, ZoomInContent, ZoomInUi, ZoomOutContent,
+    StopServer, TerminalCopyOrInterrupt, TogglePinTab, ToggleCommandPalette, ToggleSidebar, ZoomInContent, ZoomInUi, ZoomOutContent,
     ZoomOutUi,
 };
 use super::ade::AttachedWorkspace;
@@ -191,6 +193,94 @@ fn display_paths(paths: &[String]) -> Vec<String> {
     paths.iter().map(|path| display_path(path)).collect()
 }
 
+fn tab_key(tab: &WorkspaceTab) -> Option<String> {
+    match tab.kind {
+        WorkspaceTabKind::Terminal => tab.pty_id.as_ref().map(|id| format!("pty:{id}")),
+        WorkspaceTabKind::Editor => tab.path.as_ref().map(|path| format!("file:{path}")),
+    }
+}
+
+fn capture_center(node: &PaneNode, indices: &HashMap<PanelId, u32>) -> Option<LayoutNode> {
+    match node.kind() {
+        PaneRef::Tabs { panels, active_ix } => {
+            let tabs: Vec<u32> = panels.iter().filter_map(|id| indices.get(id).copied()).collect();
+            (!tabs.is_empty()).then_some(LayoutNode::Tabs { tabs, active: active_ix as u32 })
+        }
+        PaneRef::Split { axis, children, sizes } => {
+            let mut kept = Vec::new();
+            let mut kept_sizes = Vec::new();
+            for (child, size) in children.iter().zip(sizes.iter()) {
+                if let Some(snapshot) = capture_center(child, indices) {
+                    kept.push(snapshot);
+                    kept_sizes.push(size.map(f32::from));
+                }
+            }
+            (!kept.is_empty()).then_some(LayoutNode::Split {
+                axis: if axis == Axis::Horizontal { "horizontal" } else { "vertical" }.into(),
+                children: kept,
+                sizes: kept_sizes,
+            })
+        }
+    }
+}
+
+fn restore_center(node: &LayoutNode, panels: &[Arc<dyn BasePanelView>], cx: &App) -> Option<DockLayout> {
+    match node {
+        LayoutNode::Tabs { tabs, active } => {
+            if tabs.is_empty() { return None; }
+            let mut layout = DockLayout::tabs();
+            for ix in tabs {
+                layout = layout.panel_view(panels.get(*ix as usize)?.clone(), cx);
+            }
+            Some(layout.active_index((*active as usize).min(tabs.len() - 1)))
+        }
+        LayoutNode::Split { axis, children, sizes } => {
+            if children.is_empty() { return None; }
+            let mut layout = match axis.as_str() {
+                "horizontal" => DockLayout::h_split(),
+                "vertical" => DockLayout::v_split(),
+                _ => return None,
+            };
+            for (ix, child) in children.iter().enumerate() {
+                let size = sizes.get(ix).and_then(|size| *size).filter(|size| size.is_finite() && *size >= 0.0 && *size <= 10000.0).map(px);
+                layout = layout.child(restore_center(child, panels, cx)?, size);
+            }
+            Some(layout)
+        }
+    }
+}
+
+fn complete_center(node: &LayoutNode, count: usize) -> bool {
+    fn collect(node: &LayoutNode, found: &mut Vec<u32>) {
+        match node {
+            LayoutNode::Tabs { tabs, .. } => found.extend(tabs),
+            LayoutNode::Split { children, .. } => for child in children { collect(child, found); },
+        }
+    }
+    let mut found = Vec::new();
+    collect(node, &mut found);
+    found.sort_unstable();
+    found == (0..count as u32).collect::<Vec<_>>()
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::complete_center;
+    use fresh_gui_protocol::LayoutNode;
+
+    #[test]
+    fn restored_split_requires_each_tab_once() {
+        let valid = LayoutNode::Split {
+            axis: "horizontal".into(),
+            children: vec![LayoutNode::Tabs { tabs: vec![0], active: 0 }, LayoutNode::Tabs { tabs: vec![1], active: 0 }],
+            sizes: vec![Some(240.0), None],
+        };
+        assert!(complete_center(&valid, 2));
+        assert!(!complete_center(&valid, 3));
+        assert!(!complete_center(&LayoutNode::Tabs { tabs: vec![0, 0], active: 0 }, 2));
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Activity {
     Explorer,
@@ -287,6 +377,10 @@ pub struct Workspace {
     diff_preview: Option<String>,
     /// Last terminal or editor panel, so a diff tab does not rewrite the saved active index.
     last_saved_panel: Option<PanelId>,
+    pinned_tabs: HashSet<String>,
+    restore_extra: Option<WorkspaceLayoutExtra>,
+    restore_tabs: Vec<WorkspaceTab>,
+    restore_scroll_index: Option<usize>,
     next_terminal_number: u32,
     active: Option<ActiveSurface>,
     git_cap: bool,
@@ -339,6 +433,10 @@ pub struct Workspace {
     file_clipboard: Option<Vec<String>>,
     pending_fs: HashMap<String, PendingFs>,
     command_state: Entity<CommandState>,
+    copilot_input: Entity<InputState>,
+    copilot_open: bool,
+    copilot_busy: bool,
+    copilot_result: Option<String>,
     palette_open: bool,
     goto_open: bool,
     goto_input: Entity<InputState>,
@@ -358,6 +456,7 @@ impl Workspace {
         let (dock, _) = install_workspace_dock(window, cx);
         let explorer = cx.new(|cx| TreeState::new(cx));
         let command_state = cx.new(|cx| CommandState::new(window, cx));
+        let copilot_input = cx.new(|cx| InputState::new(window, cx).placeholder("Ask Copilot about this project…"));
         let goto_input = cx.new(|cx| InputState::new(window, cx).placeholder("path[:line[:col]]"));
         let create_name = cx.new(|cx| InputState::new(window, cx).placeholder("Folder name"));
         let create_root = cx.new(|cx| InputState::new(window, cx).placeholder("/absolute/path"));
@@ -521,6 +620,10 @@ impl Workspace {
             binaries: HashMap::new(),
             diff_preview: None,
             last_saved_panel: None,
+            pinned_tabs: HashSet::new(),
+            restore_extra: None,
+            restore_tabs: Vec::new(),
+            restore_scroll_index: None,
             next_terminal_number: 1,
             active: None,
             git_cap: false,
@@ -559,6 +662,10 @@ impl Workspace {
             file_clipboard: None,
             pending_fs: HashMap::new(),
             command_state,
+            copilot_input,
+            copilot_open: false,
+            copilot_busy: false,
+            copilot_result: None,
             palette_open: false,
             goto_open: false,
             goto_input,
@@ -618,6 +725,10 @@ impl Workspace {
                     self.refresh_git();
                 }
             }
+            AdeEvent::ConfigUpdated { shortkeys } => {
+                super::actions::apply_shortkeys(cx, &shortkeys);
+                self.status = "Keyboard shortcuts updated".into();
+            }
             AdeEvent::WorkspaceCreated { workspace } => {
                 let id = workspace.id.clone();
                 self.upsert_workspace(workspace);
@@ -638,6 +749,7 @@ impl Workspace {
                     self.explorer_root = workspace.root.clone();
                     self.git_context_dir.clear();
                     self.explorer_cache.clear();
+                    self.restore_scroll_index = None;
                     self.pending_lists.clear();
                     self.expanded_dirs.clear();
                     self.selection.clear();
@@ -685,6 +797,9 @@ impl Workspace {
                         self.add_terminal_tab(id, window, cx);
                     }
                     self.publish_layout(cx);
+                    if self.pty_opens_pending == 0 && !self.restoring {
+                        self.apply_restored_center(window, cx);
+                    }
                 }
             }
             AdeEvent::PtyData { id, bytes } => {
@@ -715,6 +830,7 @@ impl Workspace {
                 }
                 self.explorer_cache.insert(path, entries);
                 self.rebuild_tree(cx);
+                if self.pending_lists.is_empty() { self.restore_scroll_index = None; }
             }
             AdeEvent::FsMoved {
                 request_id,
@@ -884,6 +1000,9 @@ impl Workspace {
     }
 
     fn apply_hello(&mut self, hello: &Hello, window: &mut Window, cx: &mut Context<Self>) {
+        if !hello.shortkeys.is_empty() {
+            super::actions::apply_shortkeys(cx, &hello.shortkeys);
+        }
         self.capabilities = hello.capabilities.clone();
         self.config_path = hello.config_path.clone();
         self.defaults_path = hello.defaults_path.clone();
@@ -1205,6 +1324,9 @@ impl Workspace {
         let items = build_explorer_tree(&root, &self.explorer_cache, &self.expanded_dirs, &filter);
         self.explorer.update(cx, |state, cx| {
             state.set_items(items, cx);
+            if let Some(ix) = self.restore_scroll_index {
+                state.scroll_to_item(ix, ScrollStrategy::Top);
+            }
         });
         self.sync_tree_highlight(None, cx);
     }
@@ -1409,6 +1531,7 @@ impl Workspace {
             return;
         };
         let (tabs, active_tab) = self.capture_layout(cx);
+        let extra = self.capture_extra(&tabs, cx);
         if let Some(workspace) = self
             .workspaces
             .iter_mut()
@@ -1425,7 +1548,29 @@ impl Workspace {
             tabs,
             active_tab,
             explorer_expanded: self.expanded_list(),
+            extra,
         });
+    }
+
+    fn capture_extra(&self, tabs: &[WorkspaceTab], cx: &App) -> WorkspaceLayoutExtra {
+        let ids: HashMap<PanelId, u32> = tabs.iter().enumerate().filter_map(|(ix, tab)| {
+            let panel_id = match tab.kind {
+                WorkspaceTabKind::Terminal => self.terminals.get(tab.pty_id.as_ref()?)?.entity_id(),
+                WorkspaceTabKind::Editor => self.editors.get(tab.path.as_ref()?)?.entity_id(),
+            };
+            Some((PanelId::from(panel_id), ix as u32))
+        }).collect();
+        let center = self.dock.read(cx).layout(DockPlacement::Center)
+            .and_then(|tree| capture_center(tree.root(), &ids));
+        let mut pinned: Vec<_> = self.pinned_tabs.iter().cloned().collect();
+        pinned.sort();
+        WorkspaceLayoutExtra {
+            explorer_scroll: self.restore_scroll_index.map(|ix| ix as u32).unwrap_or_else(||
+                self.explorer.read(cx).scroll_handle().0.borrow().base_handle.logical_scroll_top().0 as u32),
+            sidebar_collapsed: self.sidebar_collapsed,
+            pinned,
+            center,
+        }
     }
 
     fn expanded_list(&self) -> Vec<String> {
@@ -1468,6 +1613,7 @@ impl Workspace {
         } else {
             (Vec::new(), 0)
         };
+        let extra = self.capture_extra(&tabs, cx);
         let explorer_expanded = self.expanded_list();
         self.restoring = true;
         self.pty_opens_pending = 0;
@@ -1485,6 +1631,7 @@ impl Workspace {
             tabs,
             active_tab,
             explorer_expanded,
+            extra,
         });
     }
 
@@ -1500,7 +1647,13 @@ impl Workspace {
             active_tab,
             ptys,
             explorer_expanded,
+            extra,
         } = attached;
+        self.sidebar_collapsed = extra.sidebar_collapsed;
+        self.restore_scroll_index = Some(extra.explorer_scroll as usize);
+        self.pinned_tabs = extra.pinned.iter().cloned().collect();
+        self.restore_extra = Some(extra);
+        self.restore_tabs = tabs.clone();
         self.restoring = true;
         self.pty_opens_pending = 0;
         self.pending_editors.clear();
@@ -1577,6 +1730,7 @@ impl Workspace {
     /// have taken the selection) and publish the rebuilt tab list.
     fn finish_restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.restoring = false;
+        self.apply_restored_center(window, cx);
         if let Some(pty_id) = self.restore_focus.take()
             && let Some(panel) = self.terminals.get(&pty_id).cloned()
         {
@@ -1585,6 +1739,32 @@ impl Workspace {
         if !self.panes_empty() {
             self.publish_layout(cx);
         }
+    }
+
+    fn apply_restored_center(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(center) = self.restore_extra.as_ref().and_then(|extra| extra.center.as_ref()).cloned() else { return; };
+        // Never displace an orphan or a still-opening tab while rebuilding the split.
+        if self.panel_order(cx).len() != self.restore_tabs.len() { return; }
+        let mut panels: Vec<Arc<dyn BasePanelView>> = Vec::new();
+        for tab in &self.restore_tabs {
+            match tab.kind {
+                WorkspaceTabKind::Terminal => {
+                    let panel = tab.pty_id.as_ref().and_then(|id| self.terminals.get(id))
+                        .or_else(|| self.terminals.values().find(|panel| panel.read(cx).label() == tab.title));
+                    let Some(panel) = panel else { return; };
+                    panels.push(panel_handle(panel.clone()));
+                }
+                WorkspaceTabKind::Editor => {
+                    let Some(panel) = tab.path.as_ref().and_then(|path| self.editors.get(path)) else { return; };
+                    panels.push(panel_handle(panel.clone()));
+                }
+            }
+        }
+        if panels.iter().map(|panel| panel.panel_id(cx)).collect::<HashSet<_>>().len() != panels.len() { return; }
+        if !complete_center(&center, panels.len()) { return; }
+        let Some(layout) = restore_center(&center, &panels, cx) else { return; };
+        self.dock.update(cx, |dock, cx| dock.set_center(layout, window, cx));
+        self.restore_extra = None;
     }
 
     fn attach_terminal(
@@ -1822,6 +2002,25 @@ impl Workspace {
         self.close_panel_id(id, window, cx);
     }
 
+    fn panel_key(&self, id: PanelId) -> Option<String> {
+        if let Some((pty, _)) = self.terminals.iter().find(|(_, panel)| PanelId::from(panel.entity_id()) == id) {
+            return Some(format!("pty:{pty}"));
+        }
+        self.editors.iter().find(|(_, panel)| PanelId::from(panel.entity_id()) == id)
+            .map(|(path, _)| format!("file:{path}"))
+    }
+
+    pub(crate) fn tab_is_pinned(&self, id: PanelId) -> bool {
+        self.panel_key(id).is_some_and(|key| self.pinned_tabs.contains(&key))
+    }
+
+    pub(crate) fn toggle_pin(&mut self, id: PanelId, cx: &mut Context<Self>) {
+        let Some(key) = self.panel_key(id) else { return; };
+        if !self.pinned_tabs.remove(&key) { self.pinned_tabs.insert(key); }
+        self.publish_layout(cx);
+        cx.notify();
+    }
+
     pub(crate) fn tab_close_availability(&self, panel: PanelId, cx: &App) -> (bool, bool) {
         let order = self.panel_order(cx);
         let ix = order.iter().position(|id| *id == panel);
@@ -1848,6 +2047,30 @@ impl Workspace {
     ) {
         let order = self.panel_order(cx);
         let ids = panels_for_close_scope(&order, &id, scope);
+        self.remove_dock_ids(&ids, window, cx);
+    }
+
+    pub(crate) fn close_all_editors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids: Vec<_> = self.editors.values().map(|panel| PanelId::from(panel.entity_id()))
+            .chain(self.diffs.values().map(|panel| PanelId::from(panel.entity_id())))
+            .chain(self.binaries.values().map(|panel| PanelId::from(panel.entity_id())))
+            .collect();
+        self.remove_dock_ids(&ids, window, cx);
+    }
+
+    pub(crate) fn close_all_terminals(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids: Vec<_> = self.terminals.values().map(|panel| PanelId::from(panel.entity_id())).collect();
+        self.remove_dock_ids(&ids, window, cx);
+    }
+
+    pub(crate) fn close_all_other_terminals(&mut self, keep: Option<PanelId>, window: &mut Window, cx: &mut Context<Self>) {
+        let ids: Vec<_> = self.terminals.values().map(|panel| PanelId::from(panel.entity_id()))
+            .filter(|id| Some(*id) != keep).collect();
+        self.remove_dock_ids(&ids, window, cx);
+    }
+
+    pub(crate) fn close_all_other_tabs(&mut self, keep: Option<PanelId>, window: &mut Window, cx: &mut Context<Self>) {
+        let ids: Vec<_> = self.panel_order(cx).into_iter().filter(|id| Some(*id) != keep).collect();
         self.remove_dock_ids(&ids, window, cx);
     }
 
@@ -1921,19 +2144,20 @@ impl Workspace {
             .update(cx, |dock, cx| dock.select_panel(id, window, cx));
     }
 
-    fn save_active(&mut self, cx: &mut Context<Self>) {
+    fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ActiveSurface::Editor(path)) = &self.active else {
             return;
         };
         let Some(panel) = self.editors.get(path).cloned() else {
             return;
         };
+        panel.update(cx, |panel, cx| panel.commit_markdown_inline_edit(window, cx));
         let (buffer_id, rev, text, dirty) = {
             let panel = panel.read(cx);
             (
                 panel.buffer_id().to_string(),
                 panel.rev(),
-                panel.editor().read(cx).value().to_string(),
+                panel.current_text(cx),
                 panel.is_dirty(),
             )
         };
@@ -2634,6 +2858,21 @@ impl Workspace {
         self.arm_file_copy(self.selected_or_primary(), cx);
     }
 
+    fn delete_explorer_selection(&mut self, cx: &mut Context<Self>) {
+        let paths = self.selected_or_primary();
+        if paths.is_empty() {
+            self.status = "No selection to delete".into();
+            cx.notify();
+            return;
+        }
+        self.ade.send(AdeCmd::DeletePaths {
+            request_id: next_id("delete"),
+            paths: paths.clone(),
+        });
+        self.status = format!("Deleting {} item(s)…", paths.len()).into();
+        cx.notify();
+    }
+
     fn is_dir(&self, path: &str) -> bool {
         if self.explorer_cache.contains_key(path) {
             return true;
@@ -2810,12 +3049,30 @@ impl Workspace {
         self.close_active_tab(window, cx);
     }
 
-    fn on_save(&mut self, _: &SaveBuffer, _: &mut Window, cx: &mut Context<Self>) {
-        self.save_active(cx);
+    fn on_close_all_editors(&mut self, _: &CloseAllEditors, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_all_editors(window, cx);
+    }
+
+    fn on_close_all_terminals(&mut self, _: &CloseAllTerminals, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_all_terminals(window, cx);
+    }
+
+    fn on_close_all_other_terminals(&mut self, _: &CloseAllOtherTerminals, window: &mut Window, cx: &mut Context<Self>) {
+        let keep = self.active_panel_id().filter(|id| self.terminals.values().any(|p| PanelId::from(p.entity_id()) == *id));
+        self.close_all_other_terminals(keep, window, cx);
+    }
+
+    fn on_close_all_other_tabs(&mut self, _: &CloseAllOtherTabs, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_all_other_tabs(self.active_panel_id(), window, cx);
+    }
+
+    fn on_save(&mut self, _: &SaveBuffer, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_active(window, cx);
     }
 
     fn on_toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
+        self.publish_layout(cx);
         cx.notify();
     }
 
@@ -2967,6 +3224,68 @@ impl Workspace {
 
     fn on_copy_explorer(&mut self, _: &CopyExplorer, _: &mut Window, cx: &mut Context<Self>) {
         self.copy_explorer_selection(cx);
+    }
+
+    fn on_ask_copilot(&mut self, _: &AskCopilot, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette_open = false;
+        self.copilot_open = true;
+        self.copilot_result = super::copilot::find_cli().is_none().then(|| {
+            "GitHub Copilot CLI was not found on PATH. Install it with `npm install -g @github/copilot`, then authenticate with `copilot`.".to_owned()
+        });
+        self.copilot_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn submit_copilot(&mut self, cx: &mut Context<Self>) {
+        if self.copilot_busy {
+            return;
+        }
+        let prompt = self.copilot_input.read(cx).value().trim().to_owned();
+        if prompt.is_empty() {
+            self.copilot_result = Some("Enter a prompt for Copilot.".into());
+            cx.notify();
+            return;
+        }
+        let Some(cli) = super::copilot::find_cli() else {
+            self.copilot_result = Some("GitHub Copilot CLI was not found on PATH. Install it with `npm install -g @github/copilot`, then authenticate with `copilot`.".into());
+            cx.notify();
+            return;
+        };
+        let cwd = (!self.explorer_root.is_empty())
+            .then(|| PathBuf::from(&self.explorer_root))
+            .filter(|path| path.is_dir());
+        self.copilot_busy = true;
+        self.copilot_result = Some("Asking Copilot…".into());
+        cx.notify();
+        cx.spawn(async move |workspace, cx| {
+            let result = cx.background_executor().spawn(async move {
+                super::copilot::ask(cli, prompt, cwd)
+            }).await;
+            let _ = workspace.update(cx, |this, cx| {
+                this.copilot_busy = false;
+                this.copilot_result = Some(result.unwrap_or_else(|error| error));
+                cx.notify();
+            });
+        }).detach();
+    }
+
+
+    fn on_terminal_copy_or_interrupt(&mut self, _: &TerminalCopyOrInterrupt, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ActiveSurface::Terminal(id)) = &self.active
+            && let Some(panel) = self.terminals.get(id) {
+            panel.update(cx, |panel, cx| panel.copy_or_interrupt(cx));
+        }
+    }
+
+    fn on_toggle_pin_tab(&mut self, _: &TogglePinTab, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.active_panel_id() { self.toggle_pin(id, cx); }
+    }
+
+    fn on_delete_explorer(&mut self, _: &DeleteExplorer, _: &mut Window, cx: &mut Context<Self>) {
+        self.delete_explorer_selection(cx);
     }
 
     fn on_paste_explorer(&mut self, _: &PasteExplorer, _: &mut Window, cx: &mut Context<Self>) {
@@ -3616,6 +3935,7 @@ impl Workspace {
                             this.activity = Activity::Explorer;
                             this.sidebar_collapsed = false;
                         }
+                        this.publish_layout(cx);
                         cx.notify();
                     })),
             )
@@ -3635,6 +3955,7 @@ impl Workspace {
                                 this.sidebar_collapsed = false;
                                 this.refresh_git();
                             }
+                            this.publish_layout(cx);
                             cx.notify();
                         })),
                 )
@@ -3665,6 +3986,10 @@ impl Workspace {
 
         v_flex()
             .id("explorer-pane")
+            .on_scroll_wheel(cx.listener(|_, _, _, cx| {
+                let workspace = cx.entity();
+                cx.defer(move |cx| { workspace.update(cx, |this, cx| this.publish_layout(cx)); });
+            }))
             .role(Role::Group)
             .aria_label("Explorer")
             .key_context("Explorer")
@@ -3691,6 +4016,7 @@ impl Workspace {
                             .tooltip("Hide Explorer (Ctrl+B)")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.sidebar_collapsed = true;
+                                this.publish_layout(cx);
                                 cx.notify();
                             })),
                     ),
@@ -3899,6 +4225,7 @@ impl Workspace {
                         let can_paste = view.read(cx).file_clipboard.is_some();
                         let is_file = !entry.is_folder();
                         let copy_paths = paths.clone();
+                        let delete_paths = paths.clone();
                         let file_paths = paths;
                         let open_path = path.clone();
                         menu.when(is_file, |menu| {
@@ -3925,6 +4252,15 @@ impl Workspace {
                             move |_, window, cx| {
                                 view.update(cx, |this, cx| {
                                     this.begin_file_rename(path.clone(), window, cx);
+                                });
+                            }
+                        }))
+                        .item(PopupMenuItem::new("Delete").on_click({
+                            let view = view.clone();
+                            move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.selection = delete_paths.clone();
+                                    this.delete_explorer_selection(cx);
                                 });
                             }
                         }))
@@ -4151,11 +4487,17 @@ impl Workspace {
         let confirm = cx.entity();
         let cancel = cx.entity();
         let items = vec![
+            ("Ask Copilot…", Box::new(AskCopilot) as Box<dyn Action>),
             ("New Terminal", Box::new(NewTerminal) as Box<dyn Action>),
             ("New Workspace", Box::new(NewWorkspace)),
             ("Rename Workspace", Box::new(RenameWorkspace)),
             ("Close Workspace", Box::new(CloseWorkspace)),
             ("Close Tab", Box::new(CloseTab)),
+            ("Pin or Unpin Tab", Box::new(TogglePinTab)),
+            ("Close All Editors", Box::new(CloseAllEditors)),
+            ("Close All Terminals", Box::new(CloseAllTerminals)),
+            ("Close All Other Terminals", Box::new(CloseAllOtherTerminals)),
+            ("Close All Other Tabs", Box::new(CloseAllOtherTabs)),
             ("Save", Box::new(SaveBuffer)),
             ("Toggle Sidebar", Box::new(ToggleSidebar)),
             ("Go to File…", Box::new(GoToFile)),
@@ -4195,6 +4537,27 @@ impl Workspace {
                     cx.notify();
                 });
             })
+    }
+
+    fn render_pinned_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (tabs, _) = self.capture_layout(cx);
+        let mut bar = h_flex().id("pinned-tabs").w_full().h(self.ui_px(27.)).px_2().gap_1()
+            .items_center().border_b_1().border_color(cx.theme().border);
+        for tab in tabs {
+            let Some(key) = tab_key(&tab) else { continue; };
+            if !self.pinned_tabs.contains(&key) { continue; }
+            let id = match tab.kind {
+                WorkspaceTabKind::Terminal => tab.pty_id.as_ref().and_then(|id| self.terminals.get(id)).map(|panel| PanelId::from(panel.entity_id())),
+                WorkspaceTabKind::Editor => tab.path.as_ref().and_then(|path| self.editors.get(path)).map(|panel| PanelId::from(panel.entity_id())),
+            };
+            let Some(id) = id else { continue; };
+            let view = cx.entity();
+            bar = bar.child(Button::new(format!("pinned-{key}")).ghost().xsmall()
+                .label(format!("⌑ {}", tab.title)).on_click(move |_, window, cx| {
+                    view.update(cx, |this, cx| this.dock.update(cx, |dock, cx| dock.select_panel(id, window, cx)));
+                }));
+        }
+        bar
     }
 
     fn render_goto(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4241,6 +4604,61 @@ impl Workspace {
                                 }),
                             )),
                     ),
+            )
+    }
+
+    fn render_copilot(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let submit = cx.entity();
+        let close = cx.entity();
+        div()
+            .id("copilot-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .justify_center()
+            .pt(px(72.))
+            .bg(cx.theme().background.opacity(0.45))
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.copilot_open = false;
+                cx.notify();
+            }))
+            .child(
+                v_flex()
+                    .id("copilot-dialog")
+                    .w(self.ui_px(620.))
+                    .max_h(self.ui_px(540.))
+                    .gap_3()
+                    .p_4()
+                    .bg(cx.theme().background)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded_lg()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(div().text_lg().child("Ask GitHub Copilot"))
+                    .child(Input::new(&self.copilot_input).w_full())
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(Button::new("copilot-cancel").label("Close").on_click(move |_, _, cx| {
+                                close.update(cx, |this, cx| { this.copilot_open = false; cx.notify(); });
+                            }))
+                            .child(Button::new("copilot-ask").label(if self.copilot_busy { "Working…" } else { "Ask" }).disabled(self.copilot_busy).on_click(move |_, _, cx| {
+                                submit.update(cx, |this, cx| this.submit_copilot(cx));
+                            })),
+                    )
+                    .when_some(self.copilot_result.as_ref(), |this, result| {
+                        this.child(
+                            div()
+                                .id("copilot-result")
+                                .max_h(self.ui_px(350.))
+                                .overflow_y_scroll()
+                                .p_2()
+                                .bg(cx.theme().muted.opacity(0.2))
+                                .text_sm()
+                                .child(result.clone()),
+                        )
+                    }),
             )
     }
 
@@ -4348,7 +4766,12 @@ impl Render for Workspace {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(Self::on_new_terminal))
+            .on_action(cx.listener(Self::on_ask_copilot))
             .on_action(cx.listener(Self::on_close_tab))
+            .on_action(cx.listener(Self::on_close_all_editors))
+            .on_action(cx.listener(Self::on_close_all_terminals))
+            .on_action(cx.listener(Self::on_close_all_other_terminals))
+            .on_action(cx.listener(Self::on_close_all_other_tabs))
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_zoom_in_content))
@@ -4366,7 +4789,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_next_tab))
             .on_action(cx.listener(Self::on_prev_tab))
             .on_action(cx.listener(Self::on_copy_explorer))
+            .on_action(cx.listener(Self::on_terminal_copy_or_interrupt))
+            .on_action(cx.listener(Self::on_toggle_pin_tab))
             .on_action(cx.listener(Self::on_paste_explorer))
+            .on_action(cx.listener(Self::on_delete_explorer))
             .on_action(cx.listener(Self::on_filter_explorer))
             .on_action(cx.listener(Self::on_clear_explorer_input))
             .on_action(cx.listener(Self::on_new_workspace))
@@ -4430,13 +4856,13 @@ impl Render for Workspace {
                         })
                     })
                     .child(
-                        div()
+                        v_flex()
                             .flex_1()
                             .min_w_0()
                             .h_full()
-                            .relative()
-                            .child(dock)
-                            .when(self.panes_empty(), |this| this.child(self.render_empty(cx))),
+                            .when(!self.pinned_tabs.is_empty(), |this| this.child(self.render_pinned_bar(cx)))
+                            .child(div().flex_1().min_h_0().relative().child(dock)
+                                .when(self.panes_empty(), |this| this.child(self.render_empty(cx)))),
                     ),
             )
             .child(
@@ -4478,6 +4904,7 @@ impl Render for Workspace {
                 )
             })
             .when(self.goto_open, |this| this.child(self.render_goto(cx)))
+            .when(self.copilot_open, |this| this.child(self.render_copilot(cx)))
             .when(self.create_open, |this| {
                 this.child(self.render_create_workspace(cx))
             })

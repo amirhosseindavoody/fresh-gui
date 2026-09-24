@@ -308,6 +308,7 @@ impl Client {
                 tabs,
                 active_tab,
                 explorer_expanded: Vec::new(),
+                extra: fresh_gui_protocol::WorkspaceLayoutExtra::default(),
             },
         )
         .await
