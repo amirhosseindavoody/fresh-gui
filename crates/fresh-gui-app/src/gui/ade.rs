@@ -48,6 +48,12 @@ pub enum AdeCmd {
     NewBuffer {
         request_id: String,
     },
+    OpenLink {
+        request_id: String,
+        line_text: String,
+        column: u32,
+        cwd: Option<String>,
+    },
     EditBuffer {
         request_id: String,
         buffer_id: String,
@@ -60,6 +66,11 @@ pub enum AdeCmd {
         base_rev: u64,
         /// Empty saves the buffer's existing file.
         path: String,
+    },
+    FormatBuffer {
+        request_id: String,
+        buffer_id: String,
+        base_rev: u64,
     },
     CloseEditor {
         buffer_id: String,
@@ -250,6 +261,12 @@ pub enum AdeEvent {
         buffer_id: String,
         path: String,
         rev: u64,
+    },
+    BufferFormatted {
+        request_id: String,
+        buffer_id: String,
+        rev: u64,
+        text: String,
     },
     FsCopied {
         request_id: String,
@@ -480,6 +497,22 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
         AdeCmd::NewBuffer { request_id } => {
             client.send(Message::EditorNew { request_id }).await?;
         }
+        AdeCmd::OpenLink {
+            request_id,
+            line_text,
+            column,
+            cwd,
+        } => {
+            client
+                .send(Message::EditorOpenLink {
+                    request_id,
+                    line_text,
+                    column,
+                    preview: false,
+                    cwd,
+                })
+                .await?;
+        }
         AdeCmd::EditBuffer {
             request_id,
             buffer_id,
@@ -507,6 +540,19 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
                     buffer_id,
                     base_rev,
                     path,
+                })
+                .await?;
+        }
+        AdeCmd::FormatBuffer {
+            request_id,
+            buffer_id,
+            base_rev,
+        } => {
+            client
+                .send(Message::BufferFormat {
+                    request_id,
+                    buffer_id,
+                    base_rev,
                 })
                 .await?;
         }
@@ -935,6 +981,17 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             rev,
         }),
         Message::ConfigUpdated { shortkeys } => Some(AdeEvent::ConfigUpdated { shortkeys }),
+        Message::BufferFormatted {
+            request_id,
+            buffer_id,
+            rev,
+            text,
+        } => Some(AdeEvent::BufferFormatted {
+            request_id,
+            buffer_id,
+            rev,
+            text,
+        }),
         Message::BufferSaved {
             request_id,
             buffer_id,

@@ -19,6 +19,7 @@ use fresh_gui_protocol::{
     CAP_GIT, CAP_WORKSPACE, CAP_WORKSPACE_SET_ROOT, FsEntry, FsKind, GitFile, Hello, PtyInfo,
     LayoutNode, WorkspaceInfo, WorkspaceLayoutExtra, WorkspaceTab, WorkspaceTabKind,
 };
+use gpui_kit::base::Placement;
 use gpui_kit::component::dock::{BasePanelView, DockArea, DockEvent, DockLayout, DockPlacement, PaneNode, PaneRef, PanelId, panel_handle};
 use gpui_kit::component::menu::{AppMenuBar, ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{
@@ -38,9 +39,9 @@ use gpui_kit::*;
 use super::actions::{
     ClearExplorerInput, CloseAllEditors, CloseAllOtherTabs, CloseAllOtherTerminals,
     CloseAllTerminals, CloseTab, CloseWorkspace, CopyExplorer, DeleteExplorer, Disconnect, FilterExplorer,
-    AskCopilot, GoToFile, NewFile, NewTerminal, NewWorkspace, NextTab, OpenDefaultSettings, OpenSettings, PasteExplorer,
+    AskCopilot, FormatDocument, GoToFile, NewFile, NewTerminal, NewWorkspace, NextTab, OpenDefaultSettings, OpenSettings, PasteExplorer,
     PrevTab, QuitClient, Reconnect, RenameWorkspace, ResetContentZoom, ResetUiZoom, SaveBuffer,
-    StopServer, TerminalCopyOrInterrupt, TogglePinTab, ToggleCommandPalette, ToggleSidebar, ZoomInContent, ZoomInUi, ZoomOutContent,
+    SplitTerminal, StopServer, TerminalCopyOrInterrupt, TogglePinTab, ToggleCommandPalette, ToggleSidebar, ZoomInContent, ZoomInUi, ZoomOutContent,
     ZoomOutUi,
 };
 use super::ade::AttachedWorkspace;
@@ -52,7 +53,7 @@ use super::dock_a11y::install_workspace_dock;
 use super::explorer::{
     absolute_paths_text, apply_selection, build_explorer_tree, copyable_sources, drag_paths,
     entry_kinds, gesture_from_modifiers, is_placeholder, is_untitled_editor_key,
-    movable_sources, parent_dir, prune_expanded, real_ids, rebase_listing,
+    movable_sources, parent_dir, pick_goto_target, prune_expanded, real_ids, rebase_listing,
     record_tree_toggle, save_target_path, tree_row_indent_px, untitled_editor_key,
     unused_file_name,
 };
@@ -426,6 +427,8 @@ pub struct Workspace {
     /// `pty_open` requests this view is still waiting on. `pty_opened` for any
     /// other id is ignored so a late open from workspace A cannot appear in B.
     pty_opens_pending: u32,
+    /// Panel to split beside when the next terminal opens.
+    pending_split: Option<PanelId>,
     /// Editor opens issued by this view. Unsolicited `editor_opened` does not
     /// add a tab.
     pending_editors: HashMap<String, bool>,
@@ -646,6 +649,16 @@ impl Workspace {
                 _ => {}
             }
         });
+        let goto_sub = cx.subscribe(&goto_input, |this, _, ev: &InputEvent, cx| {
+            if !this.goto_open {
+                return;
+            }
+            match ev {
+                InputEvent::PressEnter { .. } => this.confirm_goto(cx),
+                InputEvent::Change => cx.notify(),
+                _ => {}
+            }
+        });
         let commit_sub = cx.subscribe(&commit_input, |this, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::PressEnter { .. }) {
                 this.git_commit(cx);
@@ -702,6 +715,7 @@ impl Workspace {
             workspaces: Vec::new(),
             active_workspace_id: None,
             pty_opens_pending: 0,
+            pending_split: None,
             pending_editors: HashMap::new(),
             restoring: false,
             renaming_id: None,
@@ -791,6 +805,7 @@ impl Workspace {
                 filter_sub,
                 file_rename_sub,
                 save_path_sub,
+                goto_sub,
                 ws_rename_sub,
                 ws_root_sub,
                 create_name_sub,
@@ -904,7 +919,18 @@ impl Workspace {
                     if let Some(title) = self.respawn_titles.pop_front() {
                         self.attach_terminal(id, title, window, cx);
                     } else {
-                        self.add_terminal_tab(id, window, cx);
+                        self.add_terminal_tab(id.clone(), window, cx);
+                        if let Some(beside) = self.pending_split.take()
+                            && let Some(panel) = self.terminals.get(&id)
+                        {
+                            let new_id = PanelId::from(panel.entity_id());
+                            let node = self.dock.read(cx).layout(DockPlacement::Center).and_then(|tree| tree.find_panel_node(beside));
+                            if let Some(node) = node {
+                                self.dock.update(cx, |dock, cx| {
+                                    dock.split_at(node, new_id, Placement::Right, window, cx);
+                                });
+                            }
+                        }
                     }
                     self.publish_layout(cx);
                     if self.pty_opens_pending == 0 && !self.restoring {
@@ -1007,6 +1033,27 @@ impl Workspace {
             AdeEvent::BufferChanged { buffer_id, rev, .. } => {
                 if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
                     panel.update(cx, |panel, cx| panel.set_rev(rev, cx));
+                }
+            }
+            AdeEvent::BufferFormatted {
+                buffer_id,
+                rev,
+                text,
+                ..
+            } => {
+                if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
+                    let changed = panel.read(cx).rev() != rev;
+                    panel.update(cx, |panel, cx| {
+                        panel.apply_snapshot(rev, text, String::new(), window, cx);
+                        if changed {
+                            panel.set_dirty(true, cx);
+                        }
+                    });
+                    self.status = if changed {
+                        "Formatted".into()
+                    } else {
+                        "Document unchanged".into()
+                    };
                 }
             }
             AdeEvent::BufferSaved {
@@ -2540,6 +2587,7 @@ impl Workspace {
         self.active_workspace_id = None;
         self.session_id = None;
         self.pty_opens_pending = 0;
+        self.pending_split = None;
         self.pending_editors.clear();
         self.restoring = false;
         self.renaming_id = None;
@@ -3475,8 +3523,113 @@ impl Workspace {
 
     fn confirm_goto(&mut self, cx: &mut Context<Self>) {
         let query = self.goto_input.read(cx).value().to_string();
+        let matches = self.goto_matches(&query);
+        let target = pick_goto_target(&query, &matches);
         self.goto_open = false;
-        self.open_path(query, false);
+        if !target.is_empty() {
+            self.open_path(target, false);
+        }
+        cx.notify();
+    }
+
+    fn goto_matches(&self, query: &str) -> Vec<String> {
+        let query = query.trim().to_lowercase();
+        let mut paths = Vec::new();
+        for entries in self.explorer_cache.values() {
+            for entry in entries {
+                if !matches!(entry.kind, FsKind::File | FsKind::Symlink) {
+                    continue;
+                }
+                let path = entry.path.to_lowercase();
+                let name = entry.name.to_lowercase();
+                if query.is_empty() || path.contains(&query) || name.contains(&query) {
+                    paths.push(entry.path.clone());
+                }
+            }
+        }
+        paths.sort();
+        paths.truncate(12);
+        paths
+    }
+
+    pub(crate) fn open_path_link(
+        &mut self,
+        line: String,
+        column: u32,
+        cwd: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(self.connection, ConnectionState::Online) {
+            self.status = "Not connected".into();
+            cx.notify();
+            return;
+        }
+        let cwd = cwd.filter(|path| !path.is_empty()).or_else(|| {
+            self.last_cwd
+                .clone()
+                .or_else(|| self.workspace_root())
+        });
+        let request_id = next_id("link");
+        self.pending_editors.insert(request_id.clone(), true);
+        self.ade.send(AdeCmd::OpenLink {
+            request_id,
+            line_text: line,
+            column,
+            cwd,
+        });
+    }
+
+    fn split_terminal_vertical(&mut self, cx: &mut Context<Self>) {
+        let Some(ActiveSurface::Terminal(id)) = &self.active else {
+            self.status = "No terminal to split".into();
+            cx.notify();
+            return;
+        };
+        let Some(panel) = self.terminals.get(id) else {
+            return;
+        };
+        self.pending_split = Some(PanelId::from(panel.entity_id()));
+        self.new_terminal(cx);
+        self.status = "Splitting terminal…".into();
+        cx.notify();
+    }
+
+    fn format_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ActiveSurface::Editor(path)) = &self.active else {
+            self.status = "No document to format".into();
+            cx.notify();
+            return;
+        };
+        let Some(panel) = self.editors.get(path).cloned() else {
+            return;
+        };
+        panel.update(cx, |panel, cx| panel.commit_markdown_inline_edit(window, cx));
+        let (buffer_id, rev, text, dirty) = {
+            let panel = panel.read(cx);
+            (
+                panel.buffer_id().to_string(),
+                panel.rev(),
+                panel.current_text(cx),
+                panel.is_dirty(),
+            )
+        };
+        let base_rev = if dirty {
+            self.ade.send(AdeCmd::EditBuffer {
+                request_id: next_id("ed"),
+                buffer_id: buffer_id.clone(),
+                base_rev: rev,
+                text,
+            });
+            rev + 1
+        } else {
+            rev
+        };
+        self.ade.send(AdeCmd::FormatBuffer {
+            request_id: next_id("fmt"),
+            buffer_id,
+            base_rev,
+        });
+        self.status = "Formatting…".into();
         cx.notify();
     }
 
@@ -3587,6 +3740,14 @@ impl Workspace {
 
     fn on_new_file(&mut self, _: &NewFile, _: &mut Window, cx: &mut Context<Self>) {
         self.new_file(cx);
+    }
+
+    fn on_split_terminal(&mut self, _: &SplitTerminal, _: &mut Window, cx: &mut Context<Self>) {
+        self.split_terminal_vertical(cx);
+    }
+
+    fn on_format_document(&mut self, _: &FormatDocument, window: &mut Window, cx: &mut Context<Self>) {
+        self.format_active(window, cx);
     }
 
     fn on_toggle_pin_tab(&mut self, _: &TogglePinTab, _: &mut Window, cx: &mut Context<Self>) {
@@ -4804,6 +4965,9 @@ impl Workspace {
         let items = vec![
             ("Ask Copilot…", Box::new(AskCopilot) as Box<dyn Action>),
             ("New Terminal", Box::new(NewTerminal) as Box<dyn Action>),
+            ("New File", Box::new(NewFile)),
+            ("Split Terminal Vertically", Box::new(SplitTerminal)),
+            ("Format Document", Box::new(FormatDocument)),
             ("New Workspace", Box::new(NewWorkspace)),
             ("Rename Workspace", Box::new(RenameWorkspace)),
             ("Close Workspace", Box::new(CloseWorkspace)),
@@ -4903,6 +5067,21 @@ impl Workspace {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(div().text_sm().font_bold().child("Go to File"))
                     .child(Input::new(&self.goto_input))
+                    .children(self.goto_matches(&self.goto_input.read(cx).value().to_string()).into_iter().map(|path| {
+                        let open = cx.entity();
+                        let label = display_path(&path);
+                        Button::new(SharedString::from(format!("goto-{path}")))
+                            .ghost()
+                            .label(label)
+                            .on_click(move |_, _, cx| {
+                                let path = path.clone();
+                                open.update(cx, |this, cx| {
+                                    this.goto_open = false;
+                                    this.open_path(path, false);
+                                    cx.notify();
+                                });
+                            })
+                    }))
                     .child(
                         h_flex()
                             .justify_end()
@@ -5156,6 +5335,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_filter_explorer))
             .on_action(cx.listener(Self::on_clear_explorer_input))
             .on_action(cx.listener(Self::on_new_file))
+            .on_action(cx.listener(Self::on_split_terminal))
+            .on_action(cx.listener(Self::on_format_document))
             .on_action(cx.listener(Self::on_new_workspace))
             .on_action(cx.listener(Self::on_rename_workspace))
             .on_action(cx.listener(Self::on_close_workspace))

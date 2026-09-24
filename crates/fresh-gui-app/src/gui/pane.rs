@@ -28,6 +28,7 @@ use super::actions::{TerminalInputBacktab, TerminalInputTab, ZoomInUi};
 use super::ade::{AdeCmd, AdeHandle};
 use super::clipboard;
 use super::osc7::feed_osc7_chunk;
+use super::explorer::parent_dir;
 use super::paths::display_path;
 use super::rail::path_basename;
 use super::tab_chrome::{TabCloseScope, TabStripMetrics};
@@ -302,6 +303,22 @@ impl TerminalPanel {
         cx.stop_propagation();
         if down {
             window.focus(&self.focus, cx);
+        }
+        if down
+            && button == TermMouseButton::Left
+            && (modifiers.control || modifiers.platform)
+            && !modifiers.shift
+            && let Some((col, row)) = self.cell_at(position)
+            && let Some(line) = self.screen.line_text(row)
+        {
+            let cwd = self.cwd();
+            let workspace = self.workspace.clone();
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.open_path_link(line, col as u32, cwd, cx);
+                })
+                .ok();
+            return;
         }
         if down && self.host_selects(button, modifiers) {
             self.pressed = None;
@@ -1220,6 +1237,34 @@ impl EditorPanel {
         self.unsaved
     }
 
+    pub fn set_dirty(&mut self, dirty: bool, cx: &mut Context<Self>) {
+        self.dirty = dirty;
+        cx.notify();
+    }
+
+    /// Ctrl+click a path in the buffer. The click lands first so the cursor
+    /// is on the path, then Fresh's link detector opens it.
+    fn open_link_at_cursor(&mut self, cx: &mut Context<Self>) {
+        let position = self.editor.read(cx).cursor_position();
+        let text = self.current_text(cx);
+        let Some(line) = text.lines().nth(position.line as usize) else {
+            return;
+        };
+        let line = line.to_string();
+        let column = position.character;
+        let cwd = if self.unsaved {
+            None
+        } else {
+            parent_dir(&self.path)
+        };
+        let workspace = self.workspace.clone();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.open_path_link(line, column, cwd, cx);
+            })
+            .ok();
+    }
+
     pub fn rev(&self) -> u64 {
         self.rev
     }
@@ -1527,13 +1572,33 @@ impl Render for EditorPanel {
                 inline_edit,
             ));
         } else {
+            let panel = cx.entity();
             root = root.child(
-                Editor::new(&self.editor)
-                    .bordered(false)
-                    .p_0()
+                div()
                     .flex_1()
-                    .text_size(px(self.font_px))
-                    .font_family(cx.theme().mono_font_family.clone()),
+                    .size_full()
+                    .capture_any_mouse_down(move |event: &MouseDownEvent, _, cx| {
+                        if event.button != MouseButton::Left
+                            || event.modifiers.shift
+                            || !(event.modifiers.control || event.modifiers.platform)
+                        {
+                            return;
+                        }
+                        let panel = panel.clone();
+                        // The editor moves the cursor on this click. Read it
+                        // after that handler returns.
+                        cx.defer(move |cx| {
+                            panel.update(cx, |this, cx| this.open_link_at_cursor(cx));
+                        });
+                    })
+                    .child(
+                        Editor::new(&self.editor)
+                            .bordered(false)
+                            .p_0()
+                            .flex_1()
+                            .text_size(px(self.font_px))
+                            .font_family(cx.theme().mono_font_family.clone()),
+                    ),
             );
         }
         root

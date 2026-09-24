@@ -36,6 +36,8 @@ actions!(
     [
         NewTerminal,
         NewFile,
+        SplitTerminal,
+        FormatDocument,
         TerminalInputTab,
         TerminalInputBacktab,
         CloseTab,
@@ -108,6 +110,8 @@ pub fn apply_shortkeys(cx: &mut App, shortkeys: &[Shortkey]) {
         let binding = match entry.action.as_str() {
             "NewTerminal" => KeyBinding::new(key, NewTerminal, when),
             "NewFile" => KeyBinding::new(key, NewFile, when),
+            "SplitTerminal" => KeyBinding::new(key, SplitTerminal, when),
+            "FormatDocument" => KeyBinding::new(key, FormatDocument, when),
             "CloseTab" => KeyBinding::new(key, CloseTab, when),
             "CloseAllEditors" => KeyBinding::new(key, CloseAllEditors, when),
             "CloseAllTerminals" => KeyBinding::new(key, CloseAllTerminals, when),
