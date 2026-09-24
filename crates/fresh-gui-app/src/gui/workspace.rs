@@ -51,8 +51,9 @@ use super::diff_view::{self, BinaryPanel, DiffPanel};
 use super::dock_a11y::install_workspace_dock;
 use super::explorer::{
     absolute_paths_text, apply_selection, build_explorer_tree, copyable_sources, drag_paths,
-    entry_kinds, gesture_from_modifiers, is_placeholder, movable_sources, parent_dir,
-    prune_expanded, real_ids, rebase_listing, record_tree_toggle, tree_row_indent_px,
+    entry_kinds, gesture_from_modifiers, is_placeholder, is_untitled_editor_key,
+    movable_sources, parent_dir, prune_expanded, real_ids, rebase_listing,
+    record_tree_toggle, save_target_path, tree_row_indent_px, untitled_editor_key,
     unused_file_name,
 };
 use super::file_icons::explorer_glyph;
@@ -506,6 +507,8 @@ pub struct Workspace {
     filter_input: Entity<InputState>,
     renaming_path: Option<String>,
     file_rename_input: Entity<InputState>,
+    save_open: bool,
+    save_path_input: Entity<InputState>,
     pending_renames: HashMap<String, String>,
     pending_creates: HashSet<String>,
     /// Selected absolute paths. The last entry is the primary row.
@@ -550,6 +553,7 @@ impl Workspace {
         let filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter files and folders"));
         let file_rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("New name"));
+        let save_path_input = cx.new(|cx| InputState::new(window, cx).placeholder("/path/to/file"));
         let commit_input = cx.new(|cx| InputState::new(window, cx).placeholder("Commit message"));
         let menu_bar = AppMenuBar::new(cx);
         let tree_sub = cx.subscribe(&explorer, |this, _, ev: &TreeEvent, cx| {
@@ -598,6 +602,11 @@ impl Workspace {
         let file_rename_sub = cx.subscribe(&file_rename_input, |this, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::PressEnter { .. }) && this.renaming_path.is_some() {
                 this.confirm_file_rename(cx);
+            }
+        });
+        let save_path_sub = cx.subscribe(&save_path_input, |this, _, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::PressEnter { .. }) && this.save_open {
+                this.confirm_save(cx);
             }
         });
         let ws_rename_sub = cx.subscribe(&ws_rename_input, |this, _, ev: &InputEvent, cx| {
@@ -753,6 +762,8 @@ impl Workspace {
             filter_input,
             renaming_path: None,
             file_rename_input,
+            save_open: false,
+            save_path_input,
             pending_renames: HashMap::new(),
             pending_creates: HashSet::new(),
             selection: Vec::new(),
@@ -779,6 +790,7 @@ impl Workspace {
                 rename_sub,
                 filter_sub,
                 file_rename_sub,
+                save_path_sub,
                 ws_rename_sub,
                 ws_root_sub,
                 create_name_sub,
@@ -1218,6 +1230,13 @@ impl Workspace {
             }
             return;
         }
+        let unsaved = path.is_empty();
+        let path = if unsaved {
+            untitled_editor_key(&buffer_id)
+        } else {
+            path
+        };
+        let unsaved_title = unsaved.then(|| self.untitled_title(cx));
         let workspace = cx.weak_entity();
         let ade = self.ade.clone();
         let panel = cx.new(|cx| {
@@ -1227,6 +1246,8 @@ impl Workspace {
                 language,
                 line,
                 column,
+                unsaved,
+                unsaved_title,
                 ade,
                 workspace,
                 self.tab_metrics.clone(),
@@ -1287,10 +1308,28 @@ impl Workspace {
             self.editors.insert(path.clone(), entity);
             if matches!(&self.active, Some(ActiveSurface::Editor(current)) if current == &previous)
             {
-                self.active = Some(ActiveSurface::Editor(path));
+                self.active = Some(ActiveSurface::Editor(path.clone()));
+            }
+            if let Some(parent) = parent_dir(&path) {
+                self.relist(&parent);
+                self.selection = vec![path.clone()];
+                self.anchor = Some(path.clone());
             }
         }
         self.status = "Saved".into();
+    }
+
+    fn untitled_title(&self, cx: &App) -> String {
+        let n = self
+            .editors
+            .values()
+            .filter(|panel| panel.read(cx).is_unsaved())
+            .count();
+        if n == 0 {
+            "Untitled".to_string()
+        } else {
+            format!("Untitled {}", n + 1)
+        }
     }
 
     fn editor_by_buffer(&self, buffer_id: &str, cx: &App) -> Option<Entity<EditorPanel>> {
@@ -1346,7 +1385,9 @@ impl Workspace {
             .values()
             .any(|panel| PanelId::from(panel.entity_id()) == id)
             || self.editors.iter().any(|(path, panel)| {
-                Some(path) != self.defaults_path.as_ref() && PanelId::from(panel.entity_id()) == id
+                Some(path) != self.defaults_path.as_ref()
+                    && !is_untitled_editor_key(path)
+                    && PanelId::from(panel.entity_id()) == id
             })
     }
 
@@ -1465,34 +1506,17 @@ impl Workspace {
         });
     }
 
-    /// Create an empty file under the selected folder (or the file's parent)
-    /// and open it. The name is `untitled`, then `untitled-2`, and so on.
+    /// Open an empty unsaved buffer. Ctrl+S or File → Save writes it later.
     pub(crate) fn new_file(&mut self, cx: &mut Context<Self>) {
         if !matches!(self.connection, ConnectionState::Online) {
             self.status = "Not connected".into();
             cx.notify();
             return;
         }
-        let Some(parent) = self.create_parent() else {
-            self.status = "No folder for a new file".into();
-            cx.notify();
-            return;
-        };
-        let existing = self
-            .explorer_cache
-            .get(&parent)
-            .map(|entries| entries.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>())
-            .unwrap_or_default();
-        let name = unused_file_name(&existing);
-        let request_id = next_id("create");
-        self.pending_creates.insert(request_id.clone());
-        self.ade.send(AdeCmd::CreatePath {
-            request_id,
-            parent,
-            name,
-            kind: FsKind::File,
-        });
-        self.status = "Creating file…".into();
+        let request_id = next_id("new");
+        self.pending_editors.insert(request_id.clone(), true);
+        self.ade.send(AdeCmd::NewBuffer { request_id });
+        self.status = "New file".into();
         cx.notify();
     }
 
@@ -1629,7 +1653,9 @@ impl Workspace {
                     path: None,
                 });
             } else if let Some((path, _)) = self.editors.iter().find(|(path, panel)| {
-                Some(*path) != self.defaults_path.as_ref() && PanelId::from(panel.entity_id()) == id
+                Some(*path) != self.defaults_path.as_ref()
+                    && !is_untitled_editor_key(path)
+                    && PanelId::from(panel.entity_id()) == id
             }) {
                 seen_path.insert(path.clone());
                 let title = path
@@ -1656,7 +1682,7 @@ impl Workspace {
             }
         }
         for path in self.editors.keys() {
-            if Some(path) == self.defaults_path.as_ref() {
+            if Some(path) == self.defaults_path.as_ref() || is_untitled_editor_key(path) {
                 continue;
             }
             if seen_path.insert(path.clone()) {
@@ -2319,6 +2345,91 @@ impl Workspace {
             return;
         };
         panel.update(cx, |panel, cx| panel.commit_markdown_inline_edit(window, cx));
+        let (buffer_id, rev, text, dirty, unsaved) = {
+            let panel = panel.read(cx);
+            (
+                panel.buffer_id().to_string(),
+                panel.rev(),
+                panel.current_text(cx),
+                panel.is_dirty(),
+                panel.is_unsaved(),
+            )
+        };
+        if unsaved {
+            self.open_save_dialog(window, cx);
+            return;
+        }
+        if !dirty {
+            self.status = "No changes".into();
+            cx.notify();
+            return;
+        }
+        self.write_buffer(&buffer_id, rev, &text, dirty, String::new());
+        self.status = "Saving…".into();
+        cx.notify();
+    }
+
+    fn open_save_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let parent = self.create_parent().unwrap_or_default();
+        let existing = self
+            .explorer_cache
+            .get(&parent)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let suggestion = save_target_path(&parent, &unused_file_name(&existing));
+        self.save_open = true;
+        self.palette_open = false;
+        self.goto_open = false;
+        self.rename_pty = None;
+        self.renaming_id = None;
+        self.save_path_input.update(cx, |state, cx| {
+            state.set_value(suggestion, window, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn confirm_save(&mut self, cx: &mut Context<Self>) {
+        let raw = self.save_path_input.read(cx).value().to_string();
+        let raw = raw.trim().to_string();
+        if raw.is_empty() {
+            self.status = "Path cannot be empty".into();
+            cx.notify();
+            return;
+        }
+        let unix = daemon_uses_unix_paths(
+            self.config_path.as_deref(),
+            &self
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.root.as_str())
+                .collect::<Vec<_>>(),
+        );
+        let normalized = match workspace_root_for_daemon(&raw, unix) {
+            Ok(path) => path,
+            Err(message) => {
+                self.status = message.into();
+                cx.notify();
+                return;
+            }
+        };
+        let parent = self.create_parent().unwrap_or_default();
+        let path = save_target_path(&parent, &normalized);
+        let Some(ActiveSurface::Editor(key)) = &self.active else {
+            self.save_open = false;
+            cx.notify();
+            return;
+        };
+        let Some(panel) = self.editors.get(key).cloned() else {
+            self.save_open = false;
+            cx.notify();
+            return;
+        };
         let (buffer_id, rev, text, dirty) = {
             let panel = panel.read(cx);
             (
@@ -2328,24 +2439,30 @@ impl Workspace {
                 panel.is_dirty(),
             )
         };
-        if !dirty {
-            self.status = "No changes".into();
-            cx.notify();
-            return;
-        }
-        self.ade.send(AdeCmd::EditBuffer {
-            request_id: next_id("ed"),
-            buffer_id: buffer_id.clone(),
-            base_rev: rev,
-            text,
-        });
-        self.ade.send(AdeCmd::SaveBuffer {
-            request_id: next_id("sv"),
-            buffer_id,
-            base_rev: rev + 1,
-        });
+        self.save_open = false;
+        self.write_buffer(&buffer_id, rev, &text, dirty, path);
         self.status = "Saving…".into();
         cx.notify();
+    }
+
+    fn write_buffer(&mut self, buffer_id: &str, rev: u64, text: &str, dirty: bool, path: String) {
+        let base_rev = if dirty {
+            self.ade.send(AdeCmd::EditBuffer {
+                request_id: next_id("ed"),
+                buffer_id: buffer_id.to_string(),
+                base_rev: rev,
+                text: text.to_string(),
+            });
+            rev + 1
+        } else {
+            rev
+        };
+        self.ade.send(AdeCmd::SaveBuffer {
+            request_id: next_id("sv"),
+            buffer_id: buffer_id.to_string(),
+            base_rev,
+            path,
+        });
     }
 
     fn open_path(&mut self, path: String, preview: bool) {
@@ -4860,6 +4977,56 @@ impl Workspace {
             )
     }
 
+    fn render_save(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("save-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .justify_center()
+            .pt(px(80.))
+            .bg(cx.theme().background.opacity(0.45))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.save_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                v_flex()
+                    .w(self.ui_px(480.))
+                    .gap_2()
+                    .p_3()
+                    .rounded(cx.theme().radius)
+                    .bg(cx.theme().background)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(div().text_sm().font_bold().child("Save File"))
+                    .child(Input::new(&self.save_path_input))
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("save-cancel")
+                                    .ghost()
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.save_open = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(Button::new("save-ok").primary().label("Save").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.confirm_save(cx);
+                                }),
+                            )),
+                    ),
+            )
+    }
+
     fn render_rename(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("rename-overlay")
@@ -5104,6 +5271,7 @@ impl Render for Workspace {
             .when(self.rename_pty.is_some(), |this| {
                 this.child(self.render_rename(cx))
             })
+            .when(self.save_open, |this| this.child(self.render_save(cx)))
             .children(dialog_layer)
             .children(notification_layer)
     }

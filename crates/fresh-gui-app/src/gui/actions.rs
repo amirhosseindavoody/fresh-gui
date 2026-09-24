@@ -23,6 +23,8 @@ fn file_menu() -> Menu {
         MenuItem::action("New Tab", NewTerminal),
         MenuItem::action("New File", NewFile),
         MenuItem::separator(),
+        MenuItem::action("Save", SaveBuffer),
+        MenuItem::separator(),
         MenuItem::action("Stop Server", StopServer),
         MenuItem::separator(),
         MenuItem::action("Quit Client", QuitClient),
