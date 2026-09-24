@@ -3,16 +3,23 @@
 //! A changed file opens here instead of being decoded into the text editor.
 //! One unpinned diff is the preview; a double-click pins it like any other tab.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
+use gpui_kit::base::ElementExt as _;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelEvent};
+use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelEvent, PanelId};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _, StyledExt as _, button::Button, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::pane::{new_terminal_button, note_tab_edge, tab_close_button, with_close_items};
 use super::paths::display_path;
 use super::rail::path_basename;
+use super::tab_chrome::TabStripMetrics;
 use super::workspace::Workspace;
 
 const MAX_DIFF_LINES: usize = 2000;
@@ -218,6 +225,8 @@ pub struct DiffPanel {
     note: String,
     focus: FocusHandle,
     workspace: WeakEntity<Workspace>,
+    metrics: TabStripMetrics,
+    plus_shift: Rc<Cell<f32>>,
     closed: bool,
 }
 
@@ -227,6 +236,7 @@ impl DiffPanel {
         title_path: String,
         pinned: bool,
         workspace: WeakEntity<Workspace>,
+        metrics: TabStripMetrics,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
@@ -237,6 +247,8 @@ impl DiffPanel {
             note: "Loading diff…".into(),
             focus: cx.focus_handle(),
             workspace,
+            metrics,
+            plus_shift: Rc::new(Cell::new(0.0)),
             closed: false,
         }
     }
@@ -333,32 +345,54 @@ impl BasePanel for DiffPanel {
 }
 
 impl DockPanel for DiffPanel {
-    fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rel = self.rel.clone();
         let workspace = self.workspace.clone();
+        let pin_workspace = workspace.clone();
+        let panel_id = PanelId::from(cx.entity().entity_id());
+        let metrics = self.metrics.clone();
         h_flex()
             .id(format!("diff-title-{}", self.rel))
             .gap_1()
             .items_center()
             .min_w_0()
+            .on_prepaint(move |bounds, _, _| note_tab_edge(&metrics, bounds))
             .on_click(move |event, _, cx| {
                 if click_count(event) >= 2 {
-                    workspace
+                    pin_workspace
                         .update(cx, |workspace, cx| workspace.pin_diff(&rel, cx))
                         .ok();
                 }
             })
             .child(Icon::new(IconName::FileDiff).small())
             .child(div().text_ellipsis().child(self.label()))
+            .child(tab_close_button(
+                format!("close-diff-{}", self.rel),
+                workspace.clone(),
+                panel_id,
+            ))
+            .context_menu(move |menu, _, cx| {
+                with_close_items(menu, workspace.clone(), panel_id, true, cx)
+            })
+    }
+
+    fn title_suffix(&mut self, _: &mut Window, _: &mut Context<Self>) -> Option<impl IntoElement> {
+        Some(new_terminal_button(
+            format!("new-term-diff-{}", self.rel),
+            self.metrics.clone(),
+            self.plus_shift.clone(),
+            self.workspace.clone(),
+        ))
     }
 
     fn dropdown_menu(
         &mut self,
         menu: gpui_kit::component::menu::PopupMenu,
         _: &mut Window,
-        _: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> gpui_kit::component::menu::PopupMenu {
-        menu
+        let panel_id = PanelId::from(cx.entity().entity_id());
+        with_close_items(menu, self.workspace.clone(), panel_id, false, cx)
     }
 
     fn zoom_control(&self, _: &App) -> Option<gpui_kit::component::dock::PanelControl> {
@@ -455,15 +489,24 @@ pub struct BinaryPanel {
     path: String,
     focus: FocusHandle,
     workspace: WeakEntity<Workspace>,
+    metrics: TabStripMetrics,
+    plus_shift: Rc<Cell<f32>>,
     closed: bool,
 }
 
 impl BinaryPanel {
-    pub fn new(path: String, workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        path: String,
+        workspace: WeakEntity<Workspace>,
+        metrics: TabStripMetrics,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             path,
             focus: cx.focus_handle(),
             workspace,
+            metrics,
+            plus_shift: Rc::new(Cell::new(0.0)),
             closed: false,
         }
     }
@@ -526,22 +569,45 @@ impl BasePanel for BinaryPanel {
 }
 
 impl DockPanel for BinaryPanel {
-    fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let workspace = self.workspace.clone();
+        let panel_id = PanelId::from(cx.entity().entity_id());
+        let metrics = self.metrics.clone();
         h_flex()
+            .id(format!("binary-title-{}", self.path))
             .gap_1()
             .items_center()
             .min_w_0()
+            .on_prepaint(move |bounds, _, _| note_tab_edge(&metrics, bounds))
             .child(Icon::new(IconName::File).small())
             .child(div().text_ellipsis().child(self.label()))
+            .child(tab_close_button(
+                format!("close-binary-{}", self.path),
+                workspace.clone(),
+                panel_id,
+            ))
+            .context_menu(move |menu, _, cx| {
+                with_close_items(menu, workspace.clone(), panel_id, true, cx)
+            })
+    }
+
+    fn title_suffix(&mut self, _: &mut Window, _: &mut Context<Self>) -> Option<impl IntoElement> {
+        Some(new_terminal_button(
+            format!("new-term-binary-{}", self.path),
+            self.metrics.clone(),
+            self.plus_shift.clone(),
+            self.workspace.clone(),
+        ))
     }
 
     fn dropdown_menu(
         &mut self,
         menu: gpui_kit::component::menu::PopupMenu,
         _: &mut Window,
-        _: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> gpui_kit::component::menu::PopupMenu {
-        menu
+        let panel_id = PanelId::from(cx.entity().entity_id());
+        with_close_items(menu, self.workspace.clone(), panel_id, false, cx)
     }
 
     fn zoom_control(&self, _: &App) -> Option<gpui_kit::component::dock::PanelControl> {

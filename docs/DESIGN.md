@@ -14,6 +14,8 @@ A local `fresh-gui` command attaches to or starts the daemon and opens the windo
 
 The GPUI window follows the daemon's theme setting (`system`, `light`, or `dark`). On a light theme the client darkens borders and split handles so they stay visible on a bright background. The split git diff draws a center rule with that same border color.
 
+The title bar shows the SSH destination for remote sessions, or a short local/direct host label. The status bar shows connection state and the active workspace; protocol capability names remain internal feature gates. Explorer **Copy Path** puts the daemon's absolute path on the client's text clipboard, including when a Windows client is connected to a Linux daemon.
+
 `Ctrl+=` / `Ctrl+-` / `Ctrl+0` zoom editor and terminal text. `Ctrl+Shift+=` / `Ctrl+Shift+-` / `Ctrl+Shift+0` zoom rem-based UI text; panel text follows both scales. Those chords are default shortkeys in the daemon config. Fixed pixel chrome, including the sidebar width and dock tab strip, does not scale.
 
 Windows embeds `assets/fresh-gui.ico` as icon resource 1. Linux sets the X11 window icon from `assets/fresh-gui.png` and writes a user desktop entry so a Wayland dock can resolve the `fresh-gui` app id.

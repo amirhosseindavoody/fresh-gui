@@ -29,11 +29,27 @@ pub fn parse_connect_target(backend: &str, cli_token: Option<String>) -> Connect
 }
 
 impl ConnectTarget {
-    /// Title-bar text. SSH sessions show the destination next to the tunnel URL.
+    /// Title-bar text. SSH sessions show the destination, never the local tunnel.
     pub fn chrome_label(&self) -> String {
         match &self.label {
-            Some(label) if !label.is_empty() => format!("{label}  {}", self.ws_url),
-            _ => self.ws_url.clone(),
+            Some(label) if !label.trim().is_empty() => label.trim().to_string(),
+            _ => {
+                let authority = self
+                    .ws_url
+                    .split_once("://")
+                    .map_or(self.ws_url.as_str(), |(_, rest)| rest)
+                    .split('/')
+                    .next()
+                    .unwrap_or_default();
+                if authority.starts_with("127.0.0.1:")
+                    || authority.starts_with("localhost:")
+                    || authority.starts_with("[::1]:")
+                {
+                    "Local".into()
+                } else {
+                    authority.to_string()
+                }
+            }
         }
     }
 }
@@ -215,6 +231,16 @@ mod tests {
         let t = parse_connect_target("127.0.0.1:7420", None);
         assert_eq!(t.ws_url, "ws://127.0.0.1:7420/ws");
         assert!(t.preferred_root.is_none());
+    }
+
+    #[test]
+    fn chrome_uses_destination_or_host_without_websocket_url() {
+        let mut t = parse_connect_target("ws://127.0.0.1:49315/ws", None);
+        assert_eq!(t.chrome_label(), "Local");
+        t.label = Some("user@linux-host".into());
+        assert_eq!(t.chrome_label(), "user@linux-host");
+        let direct = parse_connect_target("wss://example.org:7420/ws", None);
+        assert_eq!(direct.chrome_label(), "example.org:7420");
     }
 
     #[test]

@@ -2105,8 +2105,8 @@ impl Workspace {
             .map(|(path, _)| format!("file:{path}"))
     }
 
-    pub(crate) fn tab_is_pinned(&self, id: PanelId) -> bool {
-        self.panel_key(id).is_some_and(|key| self.pinned_tabs.contains(&key))
+    pub(crate) fn tab_pin_state(&self, id: PanelId) -> Option<bool> {
+        self.panel_key(id).map(|key| self.pinned_tabs.contains(&key))
     }
 
     pub(crate) fn toggle_pin(&mut self, id: PanelId, cx: &mut Context<Self>) {
@@ -2615,7 +2615,8 @@ impl Workspace {
         };
         let title = diff_view::join_repo(&root, &rel);
         let workspace = cx.weak_entity();
-        let panel = cx.new(|cx| DiffPanel::new(rel.clone(), title, pin, workspace, cx));
+        let metrics = self.tab_metrics.clone();
+        let panel = cx.new(|cx| DiffPanel::new(rel.clone(), title, pin, workspace, metrics, cx));
         self.dock.update(cx, |dock, cx| {
             dock.add_panel_view(
                 panel_handle(panel.clone()),
@@ -2719,7 +2720,8 @@ impl Workspace {
             return;
         }
         let workspace = cx.weak_entity();
-        let panel = cx.new(|cx| BinaryPanel::new(path.clone(), workspace, cx));
+        let metrics = self.tab_metrics.clone();
+        let panel = cx.new(|cx| BinaryPanel::new(path.clone(), workspace, metrics, cx));
         self.dock.update(cx, |dock, cx| {
             dock.add_panel_view(
                 panel_handle(panel.clone()),
@@ -2922,19 +2924,17 @@ impl Workspace {
         cx.notify();
     }
 
-    fn copy_path_text(&mut self, paths: &[String], cx: &mut Context<Self>) {
+    fn copy_path_text(&mut self, paths: &[String], window: &Window, cx: &mut Context<Self>) {
         if paths.is_empty() {
             self.status = "No selection".into();
             cx.notify();
             return;
         }
-        cx.write_to_clipboard(ClipboardItem::new_string(absolute_paths_text(
-            &display_paths(paths),
-        )));
-        self.status = if paths.len() == 1 {
-            "Copied path".into()
-        } else {
-            format!("Copied {} paths", paths.len()).into()
+        let text = absolute_paths_text(&display_paths(paths));
+        self.status = match super::clipboard::write_text(window, cx, &text) {
+            Ok(()) if paths.len() == 1 => "Copied path".into(),
+            Ok(()) => format!("Copied {} paths", paths.len()).into(),
+            Err(error) => error.into(),
         };
         cx.notify();
     }
@@ -4351,8 +4351,10 @@ impl Workspace {
                         })
                         .item(PopupMenuItem::new("Copy Path").on_click({
                             let view = view.clone();
-                            move |_, _, cx| {
-                                view.update(cx, |this, cx| this.copy_path_text(&copy_paths, cx));
+                            move |_, window, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.copy_path_text(&copy_paths, window, cx)
+                                });
                             }
                         }))
                         .item(PopupMenuItem::new("Rename").on_click({
@@ -4859,11 +4861,6 @@ impl Render for Workspace {
             .find(|workspace| Some(&workspace.id) == self.active_workspace_id.as_ref())
             .map(|workspace| workspace.name.clone())
             .unwrap_or_else(|| "no workspace".into());
-        let caps = if self.capabilities.is_empty() {
-            "—".into()
-        } else {
-            self.capabilities.join(" · ")
-        };
         let dock = self.dock.clone();
 
         div()
@@ -4982,7 +4979,6 @@ impl Render for Workspace {
                     .gap_1()
                     .left(strip_verbatim_prefixes(self.status.as_ref()))
                     .child(self.connection_label())
-                    .right(caps)
                     .right(workspace_label)
                     .right(session),
             )
