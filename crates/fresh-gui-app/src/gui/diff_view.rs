@@ -161,6 +161,7 @@ pub fn click_count(event: &ClickEvent) -> usize {
 }
 
 /// Absolute explorer path → repo-relative path, when `path` is inside `root`.
+#[cfg(test)]
 pub fn git_relative(root: &str, path: &str) -> Option<String> {
     let root = display_path(root);
     let path = display_path(path);
