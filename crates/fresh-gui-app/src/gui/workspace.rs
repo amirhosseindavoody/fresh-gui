@@ -5795,8 +5795,8 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                                 }),
                             ))
                             .child(Button::new("goto-open").primary().label("Open").on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.confirm_goto(cx);
+                                cx.listener(|this, _, window, cx| {
+                                    this.confirm_goto(window, cx);
                                 }),
                             )),
                     ),
