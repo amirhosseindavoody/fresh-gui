@@ -283,6 +283,28 @@ pub fn is_untitled_editor_key(path: &str) -> bool {
     path.starts_with(UNTITLED_PREFIX)
 }
 
+/// Path Ctrl+P should open. A unique or name-only match wins; a typed path
+/// that already contains a separator is opened as written.
+pub fn pick_goto_target(query: &str, matches: &[impl AsRef<str>]) -> String {
+    let query = query.trim();
+    if query.is_empty() {
+        return String::new();
+    }
+    if let Some(exact) = matches.iter().find(|path| {
+        let path = path.as_ref();
+        path == query || path.ends_with(&format!("/{query}")) || path.ends_with(&format!("\\{query}"))
+    }) {
+        return exact.as_ref().to_string();
+    }
+    let typed_path = query.contains('/') || query.contains('\\') || query.contains(':');
+    if !typed_path
+        && let Some(first) = matches.first()
+    {
+        return first.as_ref().to_string();
+    }
+    query.to_string()
+}
+
 /// Absolute save path. A bare name or relative path is placed under `parent`.
 pub fn save_target_path(parent: &str, input: &str) -> String {
     let input = input.trim();
@@ -629,6 +651,14 @@ mod tests {
             "/tmp/other.rs"
         );
         assert_eq!(save_target_path(r"C:\work", "a.txt"), r"C:\work\a.txt");
+        assert_eq!(
+            pick_goto_target("lib.rs", &["/proj/src/lib.rs", "/proj/src/main.rs"]),
+            "/proj/src/lib.rs"
+        );
+        assert_eq!(
+            pick_goto_target("src/main.rs:12", &["/proj/src/main.rs"]),
+            "src/main.rs:12"
+        );
     }
 
     #[test]

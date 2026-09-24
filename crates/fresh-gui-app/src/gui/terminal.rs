@@ -330,17 +330,20 @@ impl TermScreen {
         rows
     }
 
+    /// Viewport row text, trailing spaces removed. `row` is 0 at the top.
+    pub fn line_text(&self, row: usize) -> Option<String> {
+        let row = self.rows().into_iter().nth(row)?;
+        let mut text = String::new();
+        for span in row.spans {
+            text.push_str(&span.text);
+        }
+        Some(text.trim_end().to_string())
+    }
+
     #[cfg(test)]
     pub fn visible_lines(&self) -> Vec<String> {
-        self.rows()
-            .into_iter()
-            .map(|row| {
-                let mut text = String::new();
-                for span in row.spans {
-                    text.push_str(&span.text);
-                }
-                text.trim_end().to_string()
-            })
+        (0..self.rows)
+            .filter_map(|row| self.line_text(row))
             .collect()
     }
 

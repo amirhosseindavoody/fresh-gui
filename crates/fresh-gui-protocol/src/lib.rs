@@ -604,6 +604,20 @@ pub enum Message {
         path: String,
         rev: u64,
     },
+    /// Client → backend: format the buffer with Fresh's formatter.
+    BufferFormat {
+        request_id: String,
+        buffer_id: String,
+        base_rev: u64,
+    },
+    /// Backend → client: formatted text. `rev` is unchanged when the formatter
+    /// left the buffer alone.
+    BufferFormatted {
+        request_id: String,
+        buffer_id: String,
+        rev: u64,
+        text: String,
+    },
     /// Client → backend: close an editor buffer.
     EditorClose {
         buffer_id: String,

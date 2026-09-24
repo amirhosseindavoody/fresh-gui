@@ -779,6 +779,41 @@ async fn handle_client_msg(
             })?;
             Ok(())
         }
+        Message::BufferFormat {
+            request_id,
+            buffer_id,
+            base_rev,
+        } => {
+            require_auth(*authed)?;
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: format!("{request_id}: editor capability not available"),
+                });
+            };
+            let (text, rev) = editor
+                .format(buffer_id.clone(), base_rev)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "buffer_format_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
+            send_msg(
+                sink,
+                &Message::BufferFormatted {
+                    request_id,
+                    buffer_id,
+                    rev,
+                    text,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send BufferFormatted".into(),
+            })?;
+            Ok(())
+        }
         Message::EditorClose { buffer_id } => {
             require_auth(*authed)?;
             let Some(editor) = state.editor.as_ref() else {

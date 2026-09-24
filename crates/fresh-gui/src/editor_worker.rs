@@ -64,6 +64,11 @@ enum Cmd {
         path: Option<PathBuf>,
         reply: oneshot::Sender<Result<(String, u64)>>,
     },
+    Format {
+        buffer_id: String,
+        base_rev: u64,
+        reply: oneshot::Sender<Result<(String, u64)>>,
+    },
     Close {
         buffer_id: String,
         reply: oneshot::Sender<Result<()>>,
@@ -174,6 +179,20 @@ impl EditorHandle {
             .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
     }
 
+    pub async fn format(&self, buffer_id: String, base_rev: u64) -> Result<(String, u64)> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::Format {
+                buffer_id,
+                base_rev,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+    }
+
     pub async fn close(&self, buffer_id: String) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -269,6 +288,14 @@ fn run_loop(mut editor: Editor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 } => {
                     let result =
                         save_buffer(&mut editor, &mut tracked, &buffer_id, base_rev, path.as_deref());
+                    let _ = reply.send(result);
+                }
+                Cmd::Format {
+                    buffer_id,
+                    base_rev,
+                    reply,
+                } => {
+                    let result = format_tracked(&mut editor, &mut tracked, &buffer_id, base_rev);
                     let _ = reply.send(result);
                 }
                 Cmd::Close { buffer_id, reply } => {
@@ -464,6 +491,41 @@ fn create_untitled(
         rev: 0,
         text,
     })
+}
+
+fn format_tracked(
+    editor: &mut Editor,
+    tracked: &mut HashMap<String, TrackedBuffer>,
+    buffer_id: &str,
+    base_rev: u64,
+) -> Result<(String, u64)> {
+    let current = tracked
+        .get(buffer_id)
+        .with_context(|| format!("unknown buffer_id {buffer_id}"))?
+        .rev;
+    if current != base_rev {
+        bail!("revision conflict: base_rev={base_rev} current={current}");
+    }
+    activate_tracked(editor, tracked, buffer_id)?;
+    let before = editor
+        .active_state()
+        .buffer
+        .to_string()
+        .context("buffer has unloaded regions")?;
+    editor
+        .format_buffer()
+        .map_err(|err| anyhow::anyhow!(err))?;
+    let after = editor
+        .active_state()
+        .buffer
+        .to_string()
+        .context("buffer has unloaded regions")?;
+    let entry = tracked.get_mut(buffer_id).expect("tracked");
+    if after != before {
+        entry.rev += 1;
+        entry.dirty = true;
+    }
+    Ok((after, entry.rev))
 }
 
 fn save_buffer(
