@@ -46,6 +46,15 @@ pub enum AdeCmd {
         line: Option<u32>,
         column: Option<u32>,
     },
+    NewBuffer {
+        request_id: String,
+    },
+    OpenLink {
+        request_id: String,
+        line_text: String,
+        column: u32,
+        cwd: Option<String>,
+    },
     EditBuffer {
         request_id: String,
         buffer_id: String,
@@ -56,6 +65,8 @@ pub enum AdeCmd {
         request_id: String,
         buffer_id: String,
         base_rev: u64,
+        /// Empty saves the buffer's existing file.
+        path: String,
     },
     FormatBuffer {
         request_id: String,
@@ -83,6 +94,12 @@ pub enum AdeCmd {
         request_id: String,
         path: String,
         name: String,
+    },
+    CreatePath {
+        request_id: String,
+        parent: String,
+        name: String,
+        kind: fresh_gui_protocol::FsKind,
     },
     CreateWorkspace {
         name: String,
@@ -125,6 +142,12 @@ pub enum AdeCmd {
         workspace_id: String,
         directory: String,
         path: String,
+    },
+    GitRestore {
+        request_id: String,
+        workspace_id: String,
+        directory: String,
+        paths: Vec<String>,
     },
     GitStage {
         request_id: String,
@@ -268,6 +291,10 @@ pub enum AdeEvent {
         entries: Vec<FsEntry>,
     },
     FsRenamed {
+        request_id: String,
+        entry: FsEntry,
+    },
+    FsCreated {
         request_id: String,
         entry: FsEntry,
     },
@@ -511,6 +538,25 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
                 })
                 .await?;
         }
+        AdeCmd::NewBuffer { request_id } => {
+            client.send(Message::EditorNew { request_id }).await?;
+        }
+        AdeCmd::OpenLink {
+            request_id,
+            line_text,
+            column,
+            cwd,
+        } => {
+            client
+                .send(Message::EditorOpenLink {
+                    request_id,
+                    line_text,
+                    column,
+                    preview: false,
+                    cwd,
+                })
+                .await?;
+        }
         AdeCmd::EditBuffer {
             request_id,
             buffer_id,
@@ -530,17 +576,29 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
             request_id,
             buffer_id,
             base_rev,
+            path,
         } => {
             client
                 .send(Message::BufferSave {
                     request_id,
                     buffer_id,
                     base_rev,
+                    path,
                 })
                 .await?;
         }
-        AdeCmd::FormatBuffer { request_id, buffer_id, base_rev } => {
-            client.send(Message::BufferFormat { request_id, buffer_id, base_rev }).await?;
+        AdeCmd::FormatBuffer {
+            request_id,
+            buffer_id,
+            base_rev,
+        } => {
+            client
+                .send(Message::BufferFormat {
+                    request_id,
+                    buffer_id,
+                    base_rev,
+                })
+                .await?;
         }
         AdeCmd::CloseEditor { buffer_id } => {
             client.send(Message::EditorClose { buffer_id }).await?;
@@ -584,6 +642,21 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
                     request_id,
                     path,
                     name,
+                })
+                .await?;
+        }
+        AdeCmd::CreatePath {
+            request_id,
+            parent,
+            name,
+            kind,
+        } => {
+            client
+                .send(Message::FsCreate {
+                    request_id,
+                    parent,
+                    name,
+                    kind,
                 })
                 .await?;
         }
@@ -693,6 +766,21 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
                     workspace_id,
                     directory,
                     path,
+                })
+                .await?;
+        }
+        AdeCmd::GitRestore {
+            request_id,
+            workspace_id,
+            directory,
+            paths,
+        } => {
+            client
+                .send(Message::GitRestore {
+                    request_id,
+                    workspace_id,
+                    directory,
+                    paths,
                 })
                 .await?;
         }
@@ -982,6 +1070,7 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             entries,
         }),
         Message::FsRenamed { request_id, entry } => Some(AdeEvent::FsRenamed { request_id, entry }),
+        Message::FsCreated { request_id, entry } => Some(AdeEvent::FsCreated { request_id, entry }),
         Message::Error { code, message } => Some(AdeEvent::Error { code, message }),
         Message::GitStatusResult {
             request_id,

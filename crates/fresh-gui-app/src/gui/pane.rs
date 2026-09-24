@@ -15,7 +15,7 @@ use fresh_gui_protocol::BufferDiagnostic;
 use gpui_kit::base::ElementExt as _;
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent, PanelId};
 use gpui_kit::component::input::{Editor, EditorState, InputEvent, Position};
-use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
     button::{Button, ButtonVariants as _},
@@ -25,15 +25,17 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use gpui_kit::base::Selectable as _;
 
-use super::actions::ZoomInUi;
+use super::actions::{TerminalInputBacktab, TerminalInputTab, ZoomInUi};
 use super::ade::{AdeCmd, AdeHandle};
+use super::clipboard;
 use super::osc7::feed_osc7_chunk;
+use super::explorer::parent_dir;
 use super::paths::display_path;
 use super::rail::path_basename;
 use super::tab_chrome::{TabCloseScope, TabStripMetrics};
 use super::terminal::{
     TermMouseButton, TermMouseKind, TermMouseMods, TermScreen, TermSpan, keystroke_to_bytes,
-    readable_light_foreground,
+    paste_payload, readable_light_foreground,
 };
 
 /// `text_sm` monospace cell, matching [`super::terminal`] pixel reports.
@@ -97,6 +99,8 @@ pub struct TerminalPanel {
     cell_h: f32,
     font_px: f32,
     closed: bool,
+    /// OSC 52 text that arrived without a window handle (sync-update flush).
+    pending_clipboard: Vec<String>,
 }
 
 impl TerminalPanel {
@@ -130,6 +134,7 @@ impl TerminalPanel {
             cell_h: TERM_CELL_H,
             font_px: 14.0,
             closed: false,
+            pending_clipboard: Vec::new(),
         }
     }
 
@@ -172,7 +177,12 @@ impl TerminalPanel {
 
     /// Feed PTY bytes. Returns a new OSC 7 cwd when one was parsed.
     /// The numeric (or renamed) title is left alone.
-    pub fn push_bytes(&mut self, bytes: &[u8], cx: &mut Context<Self>) -> Option<String> {
+    pub fn push_bytes(
+        &mut self,
+        bytes: &[u8],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
         let replies = self.screen.feed(bytes);
         if !replies.is_empty() {
             self.ade.send(AdeCmd::WritePty {
@@ -190,7 +200,9 @@ impl TerminalPanel {
             self.cwd = Some(cwd.clone());
         }
         for text in self.screen.take_clipboard_stores() {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            if let Err(error) = clipboard::write_text(window, cx, &text) {
+                tracing::warn!(%error, "terminal clipboard copy failed");
+            }
         }
         self.arm_sync_timeout(cx);
         cx.notify();
@@ -215,9 +227,8 @@ impl TerminalPanel {
                     }
                     let replies = this.screen.stop_sync_if_expired();
                     this.write_pty(replies);
-                    for text in this.screen.take_clipboard_stores() {
-                        cx.write_to_clipboard(ClipboardItem::new_string(text));
-                    }
+                    this.pending_clipboard
+                        .extend(this.screen.take_clipboard_stores());
                     this.sync_deadline = None;
                     this.arm_sync_timeout(cx);
                     cx.notify();
@@ -293,6 +304,22 @@ impl TerminalPanel {
         cx.stop_propagation();
         if down {
             window.focus(&self.focus, cx);
+        }
+        if down
+            && button == TermMouseButton::Left
+            && (modifiers.control || modifiers.platform)
+            && !modifiers.shift
+            && let Some((col, row)) = self.cell_at(position)
+            && let Some(line) = self.screen.line_text(row)
+        {
+            let cwd = self.cwd();
+            let workspace = self.workspace.clone();
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.open_path_link(line, col as u32, cwd, cx);
+                })
+                .ok();
+            return;
         }
         if down && self.host_selects(button, modifiers) {
             self.pressed = None;
@@ -425,17 +452,42 @@ impl TerminalPanel {
         cx.notify();
     }
 
-    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+    fn copy_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(text) = self.screen.selection_text() else {
             return;
         };
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        if let Err(error) = clipboard::write_text(window, cx, &text) {
+            tracing::warn!(%error, "terminal copy failed");
+        }
         cx.notify();
     }
 
-    pub fn copy_or_interrupt(&mut self, cx: &mut Context<Self>) {
+    fn paste_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = match clipboard::read_text(window, cx) {
+            Ok(text) => text,
+            Err(error) => {
+                tracing::warn!(%error, "terminal paste failed");
+                return;
+            }
+        };
+        let data = paste_payload(&text, self.screen.bracketed_paste());
+        cx.stop_propagation();
+        if self.screen.prepare_for_input() {
+            cx.notify();
+        }
+        self.write_pty(data);
+    }
+
+    fn write_keys(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        if self.screen.prepare_for_input() {
+            cx.notify();
+        }
+        self.write_pty(bytes.to_vec());
+    }
+
+    pub fn copy_or_interrupt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.screen.selection_text().is_some() {
-            self.copy_selection(cx);
+            self.copy_selection(window, cx);
         } else {
             self.ade.send(AdeCmd::WritePty { id: self.pty_id.clone(), data: vec![3] });
         }
@@ -557,9 +609,9 @@ impl DockPanel for TerminalPanel {
         let menu = menu
             .item(PopupMenuItem::new("Copy").on_click({
                 let copy_from = copy_from.clone();
-                move |_, _, cx| {
+                move |_, window, cx| {
                     copy_from
-                        .update(cx, |panel, cx| panel.copy_selection(cx))
+                        .update(cx, |panel, cx| panel.copy_selection(window, cx))
                         .ok();
                 }
             }))
@@ -598,6 +650,13 @@ impl Render for TerminalPanel {
             });
         }
         let rows = self.screen.rows();
+        if !self.pending_clipboard.is_empty() {
+            for text in std::mem::take(&mut self.pending_clipboard) {
+                if let Err(error) = clipboard::write_text(window, cx, &text) {
+                    tracing::warn!(%error, "terminal clipboard copy failed");
+                }
+            }
+        }
         let focused = self.focus.is_focused(window);
         let cursor = focused.then(|| self.screen.cursor_cell()).flatten();
         let fg_default = cx.theme().foreground;
@@ -708,6 +767,14 @@ impl Render for TerminalPanel {
                     );
                 }),
             )
+            .on_action(cx.listener(|this, _: &TerminalInputTab, _, cx| {
+                cx.stop_propagation();
+                this.write_keys(b"\t", cx);
+            }))
+            .on_action(cx.listener(|this, _: &TerminalInputBacktab, _, cx| {
+                cx.stop_propagation();
+                this.write_keys(b"\x1b[Z", cx);
+            }))
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                 let ks = &event.keystroke;
                 let key = ks.key.to_lowercase();
@@ -722,7 +789,14 @@ impl Render for TerminalPanel {
                     && this.screen.selection_text().is_some();
                 if copy {
                     cx.stop_propagation();
-                    this.copy_selection(cx);
+                    this.copy_selection(window, cx);
+                    return;
+                }
+                let paste = !ks.modifiers.alt
+                    && ((ks.modifiers.control || ks.modifiers.platform) && key == "v"
+                        || ks.modifiers.shift && key == "insert");
+                if paste {
+                    this.paste_clipboard(window, cx);
                     return;
                 }
                 if ks.modifiers.shift && !ks.modifiers.control && !ks.modifiers.alt {
@@ -868,9 +942,15 @@ impl Render for TerminalPanel {
             let menu_entity = cx.entity().downgrade();
             pane.context_menu(move |menu, _, _| {
                 let menu_entity = menu_entity.clone();
-                menu.item(PopupMenuItem::new("Copy").on_click(move |_, _, cx| {
+                let paste_entity = menu_entity.clone();
+                menu.item(PopupMenuItem::new("Copy").on_click(move |_, window, cx| {
                     menu_entity
-                        .update(cx, |panel, cx| panel.copy_selection(cx))
+                        .update(cx, |panel, cx| panel.copy_selection(window, cx))
+                        .ok();
+                }))
+                .item(PopupMenuItem::new("Paste").on_click(move |_, window, cx| {
+                    paste_entity
+                        .update(cx, |panel, cx| panel.paste_clipboard(window, cx))
                         .ok();
                 }))
             })
@@ -1052,6 +1132,10 @@ struct EditorPending {
 pub struct EditorPanel {
     buffer_id: String,
     path: String,
+    /// Buffer has no file yet. `path` is a client key, not a disk path.
+    unsaved: bool,
+    /// Tab title while `unsaved` (`Untitled`, `Untitled 2`, …).
+    unsaved_title: Option<String>,
     dirty: bool,
     diagnostics: Vec<BufferDiagnostic>,
     lsp_status: Option<String>,
@@ -1086,6 +1170,8 @@ impl EditorPanel {
         language: Option<String>,
         line: Option<u32>,
         column: Option<u32>,
+        unsaved: bool,
+        unsaved_title: Option<String>,
         ade: AdeHandle,
         workspace: WeakEntity<Workspace>,
         metrics: TabStripMetrics,
@@ -1110,6 +1196,8 @@ impl EditorPanel {
         Self {
             buffer_id,
             path,
+            unsaved,
+            unsaved_title,
             dirty: false,
             diagnostics: Vec::new(),
             lsp_status: None,
@@ -1150,6 +1238,38 @@ impl EditorPanel {
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    pub fn is_unsaved(&self) -> bool {
+        self.unsaved
+    }
+
+    pub fn set_dirty(&mut self, dirty: bool, cx: &mut Context<Self>) {
+        self.dirty = dirty;
+        cx.notify();
+    }
+
+    /// Ctrl+click a path in the buffer. The click lands first so the cursor
+    /// is on the path, then Fresh's link detector opens it.
+    fn open_link_at_cursor(&mut self, cx: &mut Context<Self>) {
+        let position = self.editor.read(cx).cursor_position();
+        let text = self.current_text(cx);
+        let Some(line) = text.lines().nth(position.line as usize) else {
+            return;
+        };
+        let line = line.to_string();
+        let column = position.character;
+        let cwd = if self.unsaved {
+            None
+        } else {
+            parent_dir(&self.path)
+        };
+        let workspace = self.workspace.clone();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.open_path_link(line, column, cwd, cx);
+            })
+            .ok();
     }
 
     pub fn rev(&self) -> u64 {
@@ -1231,7 +1351,9 @@ impl EditorPanel {
         cx: &mut Context<Self>,
     ) {
         self.rev = rev;
-        self.path = path;
+        if !path.is_empty() {
+            self.path = path;
+        }
         self.dirty = false;
         self.diagnostics.clear();
         self.inline_markdown_edit = None;
@@ -1344,6 +1466,8 @@ impl EditorPanel {
     pub fn mark_saved(&mut self, path: String, rev: u64, cx: &mut Context<Self>) -> Option<String> {
         let previous = (self.path != path).then(|| self.path.clone());
         self.path = path;
+        self.unsaved = false;
+        self.unsaved_title = None;
         self.rev = rev;
         self.dirty = false;
         cx.notify();
@@ -1351,12 +1475,20 @@ impl EditorPanel {
     }
 
     fn label(&self) -> String {
-        let shown = display_path(&self.path);
-        let name = path_basename(&shown).unwrap_or(shown.as_str());
+        let name = if self.unsaved {
+            self.unsaved_title
+                .clone()
+                .unwrap_or_else(|| "Untitled".to_string())
+        } else {
+            let shown = display_path(&self.path);
+            path_basename(&shown)
+                .unwrap_or(shown.as_str())
+                .to_string()
+        };
         if self.dirty {
             format!("• {name}")
         } else {
-            name.to_string()
+            name
         }
     }
 }
@@ -1545,13 +1677,33 @@ impl Render for EditorPanel {
                 inline_edit,
             ));
         } else {
+            let panel = cx.entity();
             root = root.child(
-                Editor::new(&self.editor)
-                    .bordered(false)
-                    .p_0()
+                div()
                     .flex_1()
-                    .text_size(px(self.font_px))
-                    .font_family(cx.theme().mono_font_family.clone()),
+                    .size_full()
+                    .capture_any_mouse_down(move |event: &MouseDownEvent, _, cx| {
+                        if event.button != MouseButton::Left
+                            || event.modifiers.shift
+                            || !(event.modifiers.control || event.modifiers.platform)
+                        {
+                            return;
+                        }
+                        let panel = panel.clone();
+                        // The editor moves the cursor on this click. Read it
+                        // after that handler returns.
+                        cx.defer(move |cx| {
+                            panel.update(cx, |this, cx| this.open_link_at_cursor(cx));
+                        });
+                    })
+                    .child(
+                        Editor::new(&self.editor)
+                            .bordered(false)
+                            .p_0()
+                            .flex_1()
+                            .text_size(px(self.font_px))
+                            .font_family(cx.theme().mono_font_family.clone()),
+                    ),
             );
         }
         if !self.diagnostics.is_empty() {
@@ -1852,14 +2004,26 @@ pub(super) fn new_terminal_button(
                     .ghost()
                     .xsmall()
                     .icon(IconName::Plus)
-                    .tooltip("New Terminal (Ctrl+T)")
-                    .on_click(move |_, _, cx| {
-                        workspace
-                            .update(cx, |workspace, cx| {
-                                workspace.new_terminal(cx);
-                                cx.notify();
-                            })
-                            .ok();
+                    .tooltip("New Tab or New File")
+                    .dropdown_menu(move |menu, _, _| {
+                        let new_tab = workspace.clone();
+                        let new_file = workspace.clone();
+                        menu.item(PopupMenuItem::new("New Tab").on_click(move |_, _, cx| {
+                            new_tab
+                                .update(cx, |workspace, cx| {
+                                    workspace.new_terminal(cx);
+                                    cx.notify();
+                                })
+                                .ok();
+                        }))
+                        .item(PopupMenuItem::new("New File").on_click(move |_, _, cx| {
+                            new_file
+                                .update(cx, |workspace, cx| {
+                                    workspace.new_file(cx);
+                                    cx.notify();
+                                })
+                                .ok();
+                        }))
                     }),
             ),
     )

@@ -189,6 +189,39 @@ impl FsRoot {
         entry_for_path(&path).await
     }
 
+    /// Absolute path for a file that may not exist yet. The parent directory
+    /// must already be inside the sandbox; the file name is one path segment.
+    pub async fn resolve_new_file(&self, path: &str) -> Result<PathBuf> {
+        let path = path.trim();
+        if path.is_empty() {
+            bail!("save path is empty");
+        }
+        let raw = Path::new(path);
+        let joined = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            self.root.join(raw)
+        };
+        let name = joined
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .ok_or_else(|| anyhow::anyhow!("path has no file name"))?;
+        validate_entry_name(&name)?;
+        let parent = joined
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("path has no parent directory"))?;
+        let parent_dir = self.resolve(&parent.display().to_string()).await?;
+        let target = parent_dir.join(&name);
+        ensure_child_of(&parent_dir, &target)?;
+        if let Ok(meta) = fs::symlink_metadata(&target).await
+            && meta.is_dir()
+        {
+            bail!("path is a directory: {}", target.display());
+        }
+        Ok(target)
+    }
+
     /// Create an empty file or directory named `name` under `parent`.
     pub async fn create(&self, parent: &str, name: &str, kind: FsKind) -> Result<FsEntry> {
         validate_entry_name(name)?;
@@ -691,6 +724,25 @@ mod tests {
         assert_eq!(moved.len(), 1);
         assert!(!tmp.join("hello.txt").exists());
         assert!(tmp.join("nested/hello copy.txt").is_file() || moved[0].name.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn resolve_new_file_allows_a_missing_file_inside_the_root() {
+        let tmp = tempfile_dir();
+        stdfs::create_dir(tmp.join("src")).unwrap();
+        let root = FsRoot::new(tmp.clone()).unwrap();
+        let created = root
+            .resolve_new_file(&tmp.join("src/new.rs").display().to_string())
+            .await
+            .unwrap();
+        assert_eq!(created, tmp.join("src/new.rs"));
+        assert!(!created.exists());
+        assert!(root.resolve_new_file("../outside.rs").await.is_err());
+        assert!(
+            root.resolve_new_file(&tmp.join("missing-dir/a.rs").display().to_string())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

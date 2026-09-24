@@ -263,6 +263,87 @@ fn build_tree_layer(
         .collect()
 }
 
+/// Chevron column width. A child row indents by one full column so its icon
+/// lines up under the parent’s label, not under the parent row itself.
+pub const TREE_GUTTER_PX: f32 = 16.;
+
+/// Left padding for an explorer row at `depth` (0 is a root child).
+pub fn tree_row_indent_px(depth: usize) -> f32 {
+    TREE_GUTTER_PX * depth as f32 + 4.
+}
+
+/// Editor-map key for a buffer that has not been saved yet.
+pub const UNTITLED_PREFIX: &str = "untitled:";
+
+pub fn untitled_editor_key(buffer_id: &str) -> String {
+    format!("{UNTITLED_PREFIX}{buffer_id}")
+}
+
+pub fn is_untitled_editor_key(path: &str) -> bool {
+    path.starts_with(UNTITLED_PREFIX)
+}
+
+/// Path Ctrl+P should open. A unique or name-only match wins; a typed path
+/// that already contains a separator is opened as written.
+pub fn pick_goto_target(query: &str, matches: &[impl AsRef<str>]) -> String {
+    let query = query.trim();
+    if query.is_empty() {
+        return String::new();
+    }
+    if let Some(exact) = matches.iter().find(|path| {
+        let path = path.as_ref();
+        path == query || path.ends_with(&format!("/{query}")) || path.ends_with(&format!("\\{query}"))
+    }) {
+        return exact.as_ref().to_string();
+    }
+    let typed_path = query.contains('/') || query.contains('\\') || query.contains(':');
+    if !typed_path
+        && let Some(first) = matches.first()
+    {
+        return first.as_ref().to_string();
+    }
+    query.to_string()
+}
+
+/// Absolute save path. A bare name or relative path is placed under `parent`.
+pub fn save_target_path(parent: &str, input: &str) -> String {
+    let input = input.trim();
+    if input.is_empty() {
+        return String::new();
+    }
+    let bytes = input.as_bytes();
+    let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if input.starts_with('/') || input.starts_with('\\') || drive {
+        return input.to_string();
+    }
+    let parent = parent.trim_end_matches(['/', '\\']);
+    if parent.is_empty() {
+        return input.to_string();
+    }
+    let sep = if parent.contains('\\') && !parent.contains('/') {
+        '\\'
+    } else {
+        '/'
+    };
+    format!("{parent}{sep}{input}")
+}
+
+/// Name for a new file in `existing` names. `untitled`, then `untitled-2`, …
+pub fn unused_file_name(existing: &[impl AsRef<str>]) -> String {
+    let taken: HashSet<&str> = existing.iter().map(|name| name.as_ref()).collect();
+    if !taken.contains("untitled") {
+        return "untitled".to_string();
+    }
+    let mut n = 2u32;
+    loop {
+        let name = format!("untitled-{n}");
+        if !taken.contains(name.as_str()) {
+            return name;
+        }
+        n += 1;
+    }
+}
+
 /// Flat visible ids, skipping lazy placeholders.
 pub fn real_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     ids.into_iter()
@@ -542,6 +623,42 @@ mod tests {
         assert_eq!(entries[0].path, child.path);
         let (key, _) = rebase_listing("", "/root", vec![]);
         assert_eq!(key, "/root");
+    }
+
+    #[test]
+    fn nested_rows_indent_by_a_full_gutter() {
+        assert_eq!(tree_row_indent_px(0), 4.);
+        assert_eq!(tree_row_indent_px(1) - tree_row_indent_px(0), TREE_GUTTER_PX);
+        assert!(tree_row_indent_px(1) > TREE_GUTTER_PX);
+    }
+
+    #[test]
+    fn new_file_names_skip_names_already_present() {
+        assert_eq!(unused_file_name(&["readme"]), "untitled");
+        assert_eq!(
+            unused_file_name(&["untitled", "untitled-2"]),
+            "untitled-3"
+        );
+        assert_eq!(untitled_editor_key("7"), "untitled:7");
+        assert!(is_untitled_editor_key("untitled:7"));
+        assert!(!is_untitled_editor_key("/tmp/untitled"));
+        assert_eq!(
+            save_target_path("/work/proj", "notes.rs"),
+            "/work/proj/notes.rs"
+        );
+        assert_eq!(
+            save_target_path("/work/proj", "/tmp/other.rs"),
+            "/tmp/other.rs"
+        );
+        assert_eq!(save_target_path(r"C:\work", "a.txt"), r"C:\work\a.txt");
+        assert_eq!(
+            pick_goto_target("lib.rs", &["/proj/src/lib.rs", "/proj/src/main.rs"]),
+            "/proj/src/lib.rs"
+        );
+        assert_eq!(
+            pick_goto_target("src/main.rs:12", &["/proj/src/main.rs"]),
+            "src/main.rs:12"
+        );
     }
 
     #[test]

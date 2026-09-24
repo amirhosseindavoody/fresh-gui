@@ -8,7 +8,7 @@
 //! switching swaps this dock for that workspace's session without closing
 //! its PTYs.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -19,6 +19,7 @@ use fresh_gui_protocol::{
     CAP_GIT, CAP_WORKSPACE, CAP_WORKSPACE_SET_ROOT, FsEntry, FsKind, GitFile, Hello, PtyInfo,
     LayoutNode, WorkspaceInfo, WorkspaceLayoutExtra, WorkspaceTab, WorkspaceTabKind,
 };
+use gpui_kit::base::Placement;
 use gpui_kit::component::dock::{BasePanelView, DockArea, DockEvent, DockLayout, DockPlacement, PaneNode, PaneRef, PanelId, panel_handle};
 use gpui_kit::component::menu::{AppMenuBar, ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{
@@ -38,9 +39,9 @@ use gpui_kit::*;
 use super::actions::{
     ClearExplorerInput, CloseAllEditors, CloseAllOtherTabs, CloseAllOtherTerminals,
     CloseAllTerminals, CloseTab, CloseWorkspace, CopyExplorer, DeleteExplorer, Disconnect, FilterExplorer,
-    AskCopilot, GoToFile, NewTerminal, NewWorkspace, NextTab, OpenDefaultSettings, OpenSettings, PasteExplorer,
+    AskCopilot, FormatDocument, GoToFile, NewFile, NewTerminal, NewWorkspace, NextTab, OpenDefaultSettings, OpenSettings, PasteExplorer,
     PrevTab, QuitClient, Reconnect, RenameWorkspace, ResetContentZoom, ResetUiZoom, SaveBuffer,
-    StopServer, TerminalCopyOrInterrupt, TogglePinTab, ToggleCommandPalette, ToggleSidebar, ZoomInContent, ZoomInUi, ZoomOutContent,
+    SplitTerminal, StopServer, TerminalCopyOrInterrupt, TogglePinTab, ToggleCommandPalette, ToggleSidebar, ZoomInContent, ZoomInUi, ZoomOutContent,
     ZoomOutUi,
 };
 use super::ade::AttachedWorkspace;
@@ -51,8 +52,10 @@ use super::diff_view::{self, BinaryPanel, DiffPanel};
 use super::dock_a11y::install_workspace_dock;
 use super::explorer::{
     absolute_paths_text, apply_selection, build_explorer_tree, copyable_sources, drag_paths,
-    entry_kinds, gesture_from_modifiers, is_placeholder, movable_sources, parent_dir,
-    prune_expanded, real_ids, rebase_listing, record_tree_toggle,
+    entry_kinds, gesture_from_modifiers, is_placeholder, is_untitled_editor_key,
+    movable_sources, parent_dir, pick_goto_target, prune_expanded, real_ids, rebase_listing,
+    record_tree_toggle, save_target_path, tree_row_indent_px, untitled_editor_key,
+    unused_file_name,
 };
 use super::file_icons::explorer_glyph;
 use super::pane::{EditorPanel, TerminalPanel};
@@ -186,9 +189,130 @@ fn git_lookup_key(path: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GitTreeRow {
+    Dir { path: String, depth: usize, name: String },
+    File { file: GitFile, depth: usize, name: String },
+}
+
+struct GitTreeNode {
+    dirs: BTreeMap<String, GitTreeNode>,
+    files: BTreeMap<String, GitFile>,
+}
+
+impl GitTreeNode {
+    fn new() -> Self {
+        Self { dirs: BTreeMap::new(), files: BTreeMap::new() }
+    }
+}
+
+fn git_path_parts(path: &str) -> Vec<&str> {
+    path.split(['/', '\\']).filter(|seg| !seg.is_empty()).collect()
+}
+
+/// Directory paths that contain at least one changed file, using `/`.
+fn git_dir_paths(files: &[GitFile]) -> HashSet<String> {
+    let mut dirs = HashSet::new();
+    for file in files {
+        let parts = git_path_parts(&file.path);
+        if parts.len() <= 1 {
+            continue;
+        }
+        let mut acc = String::new();
+        for seg in &parts[..parts.len() - 1] {
+            if !acc.is_empty() {
+                acc.push('/');
+            }
+            acc.push_str(seg);
+            dirs.insert(acc.clone());
+        }
+    }
+    dirs
+}
+
+/// Changed files grouped by directory. Directories absent from `collapsed` are open.
+fn git_change_rows(files: &[GitFile], collapsed: &HashSet<String>) -> Vec<GitTreeRow> {
+    let mut root = GitTreeNode::new();
+    for file in files {
+        let parts = git_path_parts(&file.path);
+        if parts.is_empty() {
+            continue;
+        }
+        let mut node = &mut root;
+        for seg in &parts[..parts.len() - 1] {
+            node = node.dirs.entry((*seg).to_string()).or_insert_with(GitTreeNode::new);
+        }
+        let name = parts[parts.len() - 1].to_string();
+        node.files.insert(name, file.clone());
+    }
+    let mut rows = Vec::new();
+    walk_git_tree(&root, "", 0, collapsed, &mut rows);
+    rows
+}
+
+fn walk_git_tree(
+    node: &GitTreeNode,
+    prefix: &str,
+    depth: usize,
+    collapsed: &HashSet<String>,
+    rows: &mut Vec<GitTreeRow>,
+) {
+    for (name, child) in &node.dirs {
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        rows.push(GitTreeRow::Dir { path: path.clone(), depth, name: name.clone() });
+        if !collapsed.contains(&path) {
+            walk_git_tree(child, &path, depth + 1, collapsed, rows);
+        }
+    }
+    for (name, file) in &node.files {
+        rows.push(GitTreeRow::File { file: file.clone(), depth, name: name.clone() });
+    }
+}
+
+fn git_dir_row(
+    ix: usize,
+    path: String,
+    name: String,
+    depth: usize,
+    open: bool,
+    view: Entity<Workspace>,
+    zoom: f32,
+) -> impl IntoElement {
+    let chevron = if open { IconName::ChevronDown } else { IconName::ChevronRight };
+    h_flex()
+        .id(format!("git-dir-{ix}"))
+        .w_full()
+        .h(px(TREE_ROW_H * zoom))
+        .pl(px(tree_row_indent_px(depth) * zoom))
+        .pr_1()
+        .gap_1()
+        .items_center()
+        .cursor_pointer()
+        .on_click({
+            let view = view.clone();
+            move |_, _, cx| {
+                let dir = path.clone();
+                view.update(cx, |this, cx| {
+                    if !this.git_collapsed.remove(&dir) {
+                        this.git_collapsed.insert(dir);
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .child(div().w(px(16. * zoom)).flex_shrink_0().flex().justify_center().child(Icon::new(chevron).xsmall()))
+        .child(div().flex_1().min_w_0().text_sm().text_ellipsis().child(name))
+}
+
 fn git_file_row(
     ix: usize,
     file: GitFile,
+    name: String,
+    depth: usize,
     busy: bool,
     view: Entity<Workspace>,
     zoom: f32,
@@ -198,26 +322,18 @@ fn git_file_row(
     let work = chars.next().unwrap_or(' ');
     let unstaged = work != ' ' || index == '?';
     let staged = index != ' ' && index != '?';
-    let name = file
-        .path
-        .rsplit(['/', '\\'])
-        .find(|seg| !seg.is_empty())
-        .unwrap_or(file.path.as_str())
-        .to_string();
-    let xy = if file.xy.is_empty() {
-        "  ".to_string()
-    } else {
-        file.xy.clone()
-    };
+    let xy = if file.xy.is_empty() { "  ".to_string() } else { file.xy.clone() };
     let open_rel = file.path.clone();
     let stage_rel = file.path.clone();
-    let unstage_rel = file.path;
+    let unstage_rel = file.path.clone();
+    let revert_rel = file.path;
 
     h_flex()
         .id(format!("git-file-{ix}"))
         .w_full()
         .h(px(TREE_ROW_H * zoom))
-        .px_1()
+        .pl(px(tree_row_indent_px(depth) * zoom))
+        .pr_1()
         .gap_1()
         .items_center()
         .cursor_pointer()
@@ -230,14 +346,7 @@ fn git_file_row(
             }
         })
         .child(div().w(px(20. * zoom)).flex_shrink_0().text_xs().child(xy))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .text_sm()
-                .text_ellipsis()
-                .child(name),
-        )
+        .child(div().flex_1().min_w_0().text_sm().text_ellipsis().child(name))
         .when(unstaged, |row| {
             let view = view.clone();
             row.child(
@@ -254,6 +363,7 @@ fn git_file_row(
             )
         })
         .when(staged, |row| {
+            let view = view.clone();
             row.child(
                 Button::new(format!("git-unstage-{ix}"))
                     .ghost()
@@ -267,6 +377,64 @@ fn git_file_row(
                     }),
             )
         })
+        .child(
+            Button::new(format!("git-revert-{ix}"))
+                .ghost()
+                .xsmall()
+                .label("Revert")
+                .disabled(busy)
+                .on_click(move |_, _, cx| {
+                    let rel = revert_rel.clone();
+                    view.update(cx, |this, cx| this.git_restore(vec![rel], cx));
+                    cx.stop_propagation();
+                }),
+        )
+}
+
+#[cfg(test)]
+mod git_tree_tests {
+    use super::{git_change_rows, git_dir_paths, GitTreeRow};
+    use fresh_gui_protocol::GitFile;
+    use std::collections::HashSet;
+
+    fn file(path: &str) -> GitFile {
+        GitFile { path: path.into(), xy: " M".into() }
+    }
+
+    #[test]
+    fn groups_files_under_directories_and_hides_collapsed_children() {
+        let files = vec![
+            file("src/gui/workspace.rs"),
+            file("src/main.rs"),
+            file("README.md"),
+        ];
+        let rows = git_change_rows(&files, &HashSet::new());
+        let labels: Vec<String> = rows
+            .iter()
+            .map(|row| match row {
+                GitTreeRow::Dir { path, depth, .. } => format!("d{depth}:{path}"),
+                GitTreeRow::File { file, depth, name } => format!("f{depth}:{name}:{}", file.path),
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "d0:src",
+                "d1:src/gui",
+                "f2:workspace.rs:src/gui/workspace.rs",
+                "f1:main.rs:src/main.rs",
+                "f0:README.md:README.md",
+            ]
+        );
+        let mut collapsed = HashSet::new();
+        collapsed.insert("src".into());
+        let collapsed_rows = git_change_rows(&files, &collapsed);
+        assert!(collapsed_rows.iter().all(|row| !matches!(
+            row,
+            GitTreeRow::File { file, .. } if file.path.starts_with("src/")
+        )));
+        assert!(git_dir_paths(&files).contains("src/gui"));
+    }
 }
 
 fn display_paths(paths: &[String]) -> Vec<String> {
@@ -424,6 +592,8 @@ pub struct Workspace {
     /// `pty_open` requests this view is still waiting on. `pty_opened` for any
     /// other id is ignored so a late open from workspace A cannot appear in B.
     pty_opens_pending: u32,
+    /// Panel to split beside when the next terminal opens.
+    pending_split: Option<PanelId>,
     /// Editor opens issued by this view. Unsolicited `editor_opened` does not
     /// add a tab.
     pending_editors: HashMap<String, bool>,
@@ -471,6 +641,8 @@ pub struct Workspace {
     git_ahead: u32,
     git_behind: u32,
     git_files: Vec<GitFile>,
+    /// Directory paths (relative, `/`-separated) the user has collapsed.
+    git_collapsed: HashSet<String>,
     git_detail: Option<String>,
     git_busy: bool,
     git_status_req: Option<String>,
@@ -505,7 +677,10 @@ pub struct Workspace {
     filter_input: Entity<InputState>,
     renaming_path: Option<String>,
     file_rename_input: Entity<InputState>,
+    save_open: bool,
+    save_path_input: Entity<InputState>,
     pending_renames: HashMap<String, String>,
+    pending_creates: HashSet<String>,
     /// Selected absolute paths. The last entry is the primary row.
     selection: Vec<String>,
     anchor: Option<String>,
@@ -548,6 +723,7 @@ impl Workspace {
         let filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter files and folders"));
         let file_rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("New name"));
+        let save_path_input = cx.new(|cx| InputState::new(window, cx).placeholder("/path/to/file"));
         let commit_input = cx.new(|cx| InputState::new(window, cx).placeholder("Commit message"));
         let menu_bar = AppMenuBar::new(cx);
         let tree_sub = cx.subscribe(&explorer, |this, _, ev: &TreeEvent, cx| {
@@ -598,6 +774,11 @@ impl Workspace {
                 this.confirm_file_rename(cx);
             }
         });
+        let save_path_sub = cx.subscribe(&save_path_input, |this, _, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::PressEnter { .. }) && this.save_open {
+                this.confirm_save(cx);
+            }
+        });
         let ws_rename_sub = cx.subscribe(&ws_rename_input, |this, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::PressEnter { .. }) && this.renaming_id.is_some() {
                 this.confirm_workspace_rename(cx);
@@ -631,6 +812,16 @@ impl Workspace {
                     this.confirm_create(cx);
                     cx.notify();
                 }
+                InputEvent::Change => cx.notify(),
+                _ => {}
+            }
+        });
+        let goto_sub = cx.subscribe(&goto_input, |this, _, ev: &InputEvent, cx| {
+            if !this.goto_open {
+                return;
+            }
+            match ev {
+                InputEvent::PressEnter { .. } => this.confirm_goto(cx),
                 InputEvent::Change => cx.notify(),
                 _ => {}
             }
@@ -691,6 +882,7 @@ impl Workspace {
             workspaces: Vec::new(),
             active_workspace_id: None,
             pty_opens_pending: 0,
+            pending_split: None,
             pending_editors: HashMap::new(),
             restoring: false,
             renaming_id: None,
@@ -729,6 +921,7 @@ impl Workspace {
             git_ahead: 0,
             git_behind: 0,
             git_files: Vec::new(),
+            git_collapsed: HashSet::new(),
             git_detail: None,
             git_busy: false,
             git_status_req: None,
@@ -751,7 +944,10 @@ impl Workspace {
             filter_input,
             renaming_path: None,
             file_rename_input,
+            save_open: false,
+            save_path_input,
             pending_renames: HashMap::new(),
+            pending_creates: HashSet::new(),
             selection: Vec::new(),
             anchor: None,
             file_clipboard: None,
@@ -776,6 +972,8 @@ impl Workspace {
                 rename_sub,
                 filter_sub,
                 file_rename_sub,
+                save_path_sub,
+                goto_sub,
                 ws_rename_sub,
                 ws_root_sub,
                 create_name_sub,
@@ -889,7 +1087,18 @@ impl Workspace {
                     if let Some(title) = self.respawn_titles.pop_front() {
                         self.attach_terminal(id, title, window, cx);
                     } else {
-                        self.add_terminal_tab(id, window, cx);
+                        self.add_terminal_tab(id.clone(), window, cx);
+                        if let Some(beside) = self.pending_split.take()
+                            && let Some(panel) = self.terminals.get(&id)
+                        {
+                            let new_id = PanelId::from(panel.entity_id());
+                            let node = self.dock.read(cx).layout(DockPlacement::Center).and_then(|tree| tree.find_panel_node(beside));
+                            if let Some(node) = node {
+                                self.dock.update(cx, |dock, cx| {
+                                    dock.split_at(node, new_id, Placement::Right, window, cx);
+                                });
+                            }
+                        }
                     }
                     self.publish_layout(cx);
                     if self.pty_opens_pending == 0 && !self.restoring {
@@ -900,7 +1109,7 @@ impl Workspace {
             AdeEvent::PtyData { id, bytes } => {
                 // The terminal panel notifies itself. Redrawing the whole
                 // workspace (rail, explorer, dock, status) per chunk is waste.
-                self.on_pty_data(&id, &bytes, cx);
+                self.on_pty_data(&id, &bytes, window, cx);
                 return;
             }
             AdeEvent::PtyClosed { id, reason } => {
@@ -932,6 +1141,19 @@ impl Workspace {
                 entries,
             } => {
                 self.finish_fs(&request_id, entries, true, cx);
+            }
+            AdeEvent::FsCreated { request_id, entry } => {
+                if self.pending_creates.remove(&request_id) {
+                    let path = entry.path.clone();
+                    if let Some(parent) = parent_dir(&path) {
+                        self.relist(&parent);
+                    }
+                    self.selection = vec![path.clone()];
+                    self.anchor = Some(path.clone());
+                    self.status = format!("Created {}", entry.name).into();
+                    self.open_path(path.clone(), false);
+                    self.begin_file_rename(path, window, cx);
+                }
             }
             AdeEvent::FsRenamed { request_id, entry } => {
                 if let Some(old_path) = self.pending_renames.remove(&request_id) {
@@ -981,6 +1203,27 @@ impl Workspace {
                     panel.update(cx, |panel, cx| panel.set_rev(rev, cx));
                 }
             }
+            AdeEvent::BufferFormatted {
+                buffer_id,
+                rev,
+                text,
+                ..
+            } => {
+                if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
+                    let changed = panel.read(cx).rev() != rev;
+                    panel.update(cx, |panel, cx| {
+                        panel.apply_snapshot(rev, text, String::new(), window, cx);
+                        if changed {
+                            panel.set_dirty(true, cx);
+                        }
+                    });
+                    self.status = if changed {
+                        "Formatted".into()
+                    } else {
+                        "Document unchanged".into()
+                    };
+                }
+            }
             AdeEvent::BufferSaved {
                 buffer_id,
                 path,
@@ -1010,6 +1253,9 @@ impl Workspace {
                     && let Some(panel) = self.editor_by_buffer(buffer_id, cx)
                 {
                     panel.update(cx, |panel, cx| panel.set_format_error(detail.to_string(), cx));
+                }
+                if code == "fs_create_failed" {
+                    self.pending_creates.clear();
                 }
                 if code == "fs_rename_failed" {
                     if let Some((request_id, _)) = split_request_message(&message) {
@@ -1178,12 +1424,18 @@ impl Workspace {
         self.apply_zoom(window, cx);
     }
 
-    fn on_pty_data(&mut self, pty_id: &str, bytes: &[u8], cx: &mut Context<Self>) {
+    fn on_pty_data(
+        &mut self,
+        pty_id: &str,
+        bytes: &[u8],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(panel) = self.terminals.get(pty_id).cloned() else {
             return;
         };
         let previous_cwd = panel.read(cx).cwd();
-        let cwd = panel.update(cx, |panel, cx| panel.push_bytes(bytes, cx));
+        let cwd = panel.update(cx, |panel, cx| panel.push_bytes(bytes, window, cx));
         if let Some(cwd) = cwd {
             self.last_cwd = Some(cwd.clone());
             if previous_cwd.as_deref() != Some(cwd.as_str())
@@ -1215,6 +1467,13 @@ impl Workspace {
             }
             return;
         }
+        let unsaved = path.is_empty();
+        let path = if unsaved {
+            untitled_editor_key(&buffer_id)
+        } else {
+            path
+        };
+        let unsaved_title = unsaved.then(|| self.untitled_title(cx));
         let workspace = cx.weak_entity();
         let ade = self.ade.clone();
         let panel = cx.new(|cx| {
@@ -1224,6 +1483,8 @@ impl Workspace {
                 language,
                 line,
                 column,
+                unsaved,
+                unsaved_title,
                 ade,
                 workspace,
                 self.tab_metrics.clone(),
@@ -1284,10 +1545,28 @@ impl Workspace {
             self.editors.insert(path.clone(), entity);
             if matches!(&self.active, Some(ActiveSurface::Editor(current)) if current == &previous)
             {
-                self.active = Some(ActiveSurface::Editor(path));
+                self.active = Some(ActiveSurface::Editor(path.clone()));
+            }
+            if let Some(parent) = parent_dir(&path) {
+                self.relist(&parent);
+                self.selection = vec![path.clone()];
+                self.anchor = Some(path.clone());
             }
         }
         self.status = "Saved".into();
+    }
+
+    fn untitled_title(&self, cx: &App) -> String {
+        let n = self
+            .editors
+            .values()
+            .filter(|panel| panel.read(cx).is_unsaved())
+            .count();
+        if n == 0 {
+            "Untitled".to_string()
+        } else {
+            format!("Untitled {}", n + 1)
+        }
     }
 
     fn editor_by_buffer(&self, buffer_id: &str, cx: &App) -> Option<Entity<EditorPanel>> {
@@ -1343,7 +1622,9 @@ impl Workspace {
             .values()
             .any(|panel| PanelId::from(panel.entity_id()) == id)
             || self.editors.iter().any(|(path, panel)| {
-                Some(path) != self.defaults_path.as_ref() && PanelId::from(panel.entity_id()) == id
+                Some(path) != self.defaults_path.as_ref()
+                    && !is_untitled_editor_key(path)
+                    && PanelId::from(panel.entity_id()) == id
             })
     }
 
@@ -1460,6 +1741,35 @@ impl Workspace {
             rows: 24,
             cwd,
         });
+    }
+
+    /// Open an empty unsaved buffer. Ctrl+S or File → Save writes it later.
+    pub(crate) fn new_file(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.connection, ConnectionState::Online) {
+            self.status = "Not connected".into();
+            cx.notify();
+            return;
+        }
+        let request_id = next_id("new");
+        self.pending_editors.insert(request_id.clone(), true);
+        self.ade.send(AdeCmd::NewBuffer { request_id });
+        self.status = "New file".into();
+        cx.notify();
+    }
+
+    fn create_parent(&self) -> Option<String> {
+        let root = self.explorer_root.clone();
+        if root.is_empty() {
+            return None;
+        }
+        let Some(path) = self.selection.last() else {
+            return Some(root);
+        };
+        if self.is_dir(path) {
+            Some(path.clone())
+        } else {
+            parent_dir(path).or(Some(root))
+        }
     }
 
     /// OSC 7 cwd of the focused shell, otherwise the workspace or session root.
@@ -1580,7 +1890,9 @@ impl Workspace {
                     path: None,
                 });
             } else if let Some((path, _)) = self.editors.iter().find(|(path, panel)| {
-                Some(*path) != self.defaults_path.as_ref() && PanelId::from(panel.entity_id()) == id
+                Some(*path) != self.defaults_path.as_ref()
+                    && !is_untitled_editor_key(path)
+                    && PanelId::from(panel.entity_id()) == id
             }) {
                 seen_path.insert(path.clone());
                 let title = path
@@ -1607,7 +1919,7 @@ impl Workspace {
             }
         }
         for path in self.editors.keys() {
-            if Some(path) == self.defaults_path.as_ref() {
+            if Some(path) == self.defaults_path.as_ref() || is_untitled_editor_key(path) {
                 continue;
             }
             if seen_path.insert(path.clone()) {
@@ -1783,6 +2095,7 @@ impl Workspace {
         self.filter_open = false;
         self.renaming_path = None;
         self.pending_renames.clear();
+        self.pending_creates.clear();
         self.pending_lists.clear();
         self.expanded_dirs = explorer_expanded.into_iter().collect();
         self.selection.clear();
@@ -2269,6 +2582,91 @@ impl Workspace {
             return;
         };
         panel.update(cx, |panel, cx| panel.commit_markdown_inline_edit(window, cx));
+        let (buffer_id, rev, text, dirty, unsaved) = {
+            let panel = panel.read(cx);
+            (
+                panel.buffer_id().to_string(),
+                panel.rev(),
+                panel.current_text(cx),
+                panel.is_dirty(),
+                panel.is_unsaved(),
+            )
+        };
+        if unsaved {
+            self.open_save_dialog(window, cx);
+            return;
+        }
+        if !dirty {
+            self.status = "No changes".into();
+            cx.notify();
+            return;
+        }
+        self.write_buffer(&buffer_id, rev, &text, dirty, String::new());
+        self.status = "Saving…".into();
+        cx.notify();
+    }
+
+    fn open_save_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let parent = self.create_parent().unwrap_or_default();
+        let existing = self
+            .explorer_cache
+            .get(&parent)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let suggestion = save_target_path(&parent, &unused_file_name(&existing));
+        self.save_open = true;
+        self.palette_open = false;
+        self.goto_open = false;
+        self.rename_pty = None;
+        self.renaming_id = None;
+        self.save_path_input.update(cx, |state, cx| {
+            state.set_value(suggestion, window, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn confirm_save(&mut self, cx: &mut Context<Self>) {
+        let raw = self.save_path_input.read(cx).value().to_string();
+        let raw = raw.trim().to_string();
+        if raw.is_empty() {
+            self.status = "Path cannot be empty".into();
+            cx.notify();
+            return;
+        }
+        let unix = daemon_uses_unix_paths(
+            self.config_path.as_deref(),
+            &self
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.root.as_str())
+                .collect::<Vec<_>>(),
+        );
+        let normalized = match workspace_root_for_daemon(&raw, unix) {
+            Ok(path) => path,
+            Err(message) => {
+                self.status = message.into();
+                cx.notify();
+                return;
+            }
+        };
+        let parent = self.create_parent().unwrap_or_default();
+        let path = save_target_path(&parent, &normalized);
+        let Some(ActiveSurface::Editor(key)) = &self.active else {
+            self.save_open = false;
+            cx.notify();
+            return;
+        };
+        let Some(panel) = self.editors.get(key).cloned() else {
+            self.save_open = false;
+            cx.notify();
+            return;
+        };
         let (buffer_id, rev, text, dirty) = {
             let panel = panel.read(cx);
             (
@@ -2278,24 +2676,30 @@ impl Workspace {
                 panel.is_dirty(),
             )
         };
-        if !dirty {
-            self.status = "No changes".into();
-            cx.notify();
-            return;
-        }
-        self.ade.send(AdeCmd::EditBuffer {
-            request_id: next_id("ed"),
-            buffer_id: buffer_id.clone(),
-            base_rev: rev,
-            text,
-        });
-        self.ade.send(AdeCmd::SaveBuffer {
-            request_id: next_id("sv"),
-            buffer_id,
-            base_rev: rev + 1,
-        });
+        self.save_open = false;
+        self.write_buffer(&buffer_id, rev, &text, dirty, path);
         self.status = "Saving…".into();
         cx.notify();
+    }
+
+    fn write_buffer(&mut self, buffer_id: &str, rev: u64, text: &str, dirty: bool, path: String) {
+        let base_rev = if dirty {
+            self.ade.send(AdeCmd::EditBuffer {
+                request_id: next_id("ed"),
+                buffer_id: buffer_id.to_string(),
+                base_rev: rev,
+                text: text.to_string(),
+            });
+            rev + 1
+        } else {
+            rev
+        };
+        self.ade.send(AdeCmd::SaveBuffer {
+            request_id: next_id("sv"),
+            buffer_id: buffer_id.to_string(),
+            base_rev,
+            path,
+        });
     }
 
     fn open_path(&mut self, path: String, preview: bool) {
@@ -2373,6 +2777,7 @@ impl Workspace {
         self.active_workspace_id = None;
         self.session_id = None;
         self.pty_opens_pending = 0;
+        self.pending_split = None;
         self.pending_editors.clear();
         self.restoring = false;
         self.renaming_id = None;
@@ -2383,6 +2788,7 @@ impl Workspace {
         self.filter_open = false;
         self.renaming_path = None;
         self.pending_renames.clear();
+        self.pending_creates.clear();
         self.expanded_dirs.clear();
         self.explorer_kinds = Rc::default();
         self.pending_lists.clear();
@@ -2459,6 +2865,7 @@ impl Workspace {
         self.git_ahead = 0;
         self.git_behind = 0;
         self.git_files.clear();
+        self.git_collapsed.clear();
         self.git_detail = None;
         self.git_paths.clear();
     }
@@ -2554,6 +2961,8 @@ impl Workspace {
                 .insert(git_lookup_key(&display_path(&abs)), file.path.clone());
         }
         self.git_files = files;
+        let present = git_dir_paths(&self.git_files);
+        self.git_collapsed.retain(|dir| present.contains(dir));
     }
 
     fn git_rel_for(&self, path: &str) -> Option<String> {
@@ -2782,6 +3191,21 @@ impl Workspace {
             path,
         });
         self.status = "Opening externally…".into();
+        cx.notify();
+    }
+
+    fn git_restore(&mut self, paths: Vec<String>, cx: &mut Context<Self>) {
+        if paths.is_empty() || !self.git_cap || self.git_busy {
+            return;
+        }
+        self.git_busy = true;
+        self.status = "Reverting…".into();
+        self.ade.send(AdeCmd::GitRestore {
+            request_id: next_id("git"),
+            workspace_id: self.workspace_id_or_empty(),
+            directory: self.git_context_dir.clone(),
+            paths,
+        });
         cx.notify();
     }
 
@@ -3307,8 +3731,113 @@ impl Workspace {
 
     fn confirm_goto(&mut self, cx: &mut Context<Self>) {
         let query = self.goto_input.read(cx).value().to_string();
+        let matches = self.goto_matches(&query);
+        let target = pick_goto_target(&query, &matches);
         self.goto_open = false;
-        self.open_path(query, false);
+        if !target.is_empty() {
+            self.open_path(target, false);
+        }
+        cx.notify();
+    }
+
+    fn goto_matches(&self, query: &str) -> Vec<String> {
+        let query = query.trim().to_lowercase();
+        let mut paths = Vec::new();
+        for entries in self.explorer_cache.values() {
+            for entry in entries {
+                if !matches!(entry.kind, FsKind::File | FsKind::Symlink) {
+                    continue;
+                }
+                let path = entry.path.to_lowercase();
+                let name = entry.name.to_lowercase();
+                if query.is_empty() || path.contains(&query) || name.contains(&query) {
+                    paths.push(entry.path.clone());
+                }
+            }
+        }
+        paths.sort();
+        paths.truncate(12);
+        paths
+    }
+
+    pub(crate) fn open_path_link(
+        &mut self,
+        line: String,
+        column: u32,
+        cwd: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(self.connection, ConnectionState::Online) {
+            self.status = "Not connected".into();
+            cx.notify();
+            return;
+        }
+        let cwd = cwd.filter(|path| !path.is_empty()).or_else(|| {
+            self.last_cwd
+                .clone()
+                .or_else(|| self.workspace_root())
+        });
+        let request_id = next_id("link");
+        self.pending_editors.insert(request_id.clone(), true);
+        self.ade.send(AdeCmd::OpenLink {
+            request_id,
+            line_text: line,
+            column,
+            cwd,
+        });
+    }
+
+    fn split_terminal_vertical(&mut self, cx: &mut Context<Self>) {
+        let Some(ActiveSurface::Terminal(id)) = &self.active else {
+            self.status = "No terminal to split".into();
+            cx.notify();
+            return;
+        };
+        let Some(panel) = self.terminals.get(id) else {
+            return;
+        };
+        self.pending_split = Some(PanelId::from(panel.entity_id()));
+        self.new_terminal(cx);
+        self.status = "Splitting terminal…".into();
+        cx.notify();
+    }
+
+    fn format_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ActiveSurface::Editor(path)) = &self.active else {
+            self.status = "No document to format".into();
+            cx.notify();
+            return;
+        };
+        let Some(panel) = self.editors.get(path).cloned() else {
+            return;
+        };
+        panel.update(cx, |panel, cx| panel.commit_markdown_inline_edit(window, cx));
+        let (buffer_id, rev, text, dirty) = {
+            let panel = panel.read(cx);
+            (
+                panel.buffer_id().to_string(),
+                panel.rev(),
+                panel.current_text(cx),
+                panel.is_dirty(),
+            )
+        };
+        let base_rev = if dirty {
+            self.ade.send(AdeCmd::EditBuffer {
+                request_id: next_id("ed"),
+                buffer_id: buffer_id.clone(),
+                base_rev: rev,
+                text,
+            });
+            rev + 1
+        } else {
+            rev
+        };
+        self.ade.send(AdeCmd::FormatBuffer {
+            request_id: next_id("fmt"),
+            buffer_id,
+            base_rev,
+        });
+        self.status = "Formatting…".into();
         cx.notify();
     }
 
@@ -3404,11 +3933,29 @@ impl Workspace {
     }
 
 
-    fn on_terminal_copy_or_interrupt(&mut self, _: &TerminalCopyOrInterrupt, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_terminal_copy_or_interrupt(
+        &mut self,
+        _: &TerminalCopyOrInterrupt,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(ActiveSurface::Terminal(id)) = &self.active
-            && let Some(panel) = self.terminals.get(id) {
-            panel.update(cx, |panel, cx| panel.copy_or_interrupt(cx));
+            && let Some(panel) = self.terminals.get(id)
+        {
+            panel.update(cx, |panel, cx| panel.copy_or_interrupt(window, cx));
         }
+    }
+
+    fn on_new_file(&mut self, _: &NewFile, _: &mut Window, cx: &mut Context<Self>) {
+        self.new_file(cx);
+    }
+
+    fn on_split_terminal(&mut self, _: &SplitTerminal, _: &mut Window, cx: &mut Context<Self>) {
+        self.split_terminal_vertical(cx);
+    }
+
+    fn on_format_document(&mut self, _: &FormatDocument, window: &mut Window, cx: &mut Context<Self>) {
+        self.format_active(window, cx);
     }
 
     fn on_toggle_pin_tab(&mut self, _: &TogglePinTab, _: &mut Window, cx: &mut Context<Self>) {
@@ -4208,7 +4755,7 @@ impl Workspace {
                         .rounded(cx.theme().radius)
                         .py_0()
                         .px_1()
-                        .pl(px(8.) * entry.depth() + px(4.))
+                        .pl(px(tree_row_indent_px(entry.depth())))
                         .child(
                             h_flex()
                                 .w_full()
@@ -4217,7 +4764,7 @@ impl Workspace {
                                 .when(in_selection, |this| {
                                     this.bg(cx.theme().accent.opacity(0.28))
                                 })
-                                .child(div().w(px(14.)).flex().justify_center().when(
+                                .child(div().w(px(16.)).flex_shrink_0().flex().justify_center().when(
                                     can_expand,
                                     |this| {
                                         let chevron = if entry.is_expanded() {
@@ -4235,7 +4782,11 @@ impl Workspace {
                                         entry.is_expanded(),
                                     );
                                     this.child(
-                                        Icon::new(glyph.icon).small().text_color(glyph.color(dark)),
+                                        div().flex_shrink_0().child(
+                                            Icon::new(glyph.icon)
+                                                .small()
+                                                .text_color(glyph.color(dark)),
+                                        ),
                                     )
                                 })
                                 .when(renaming_path.as_deref() == Some(path.as_str()), |this| {
@@ -4440,7 +4991,7 @@ impl Workspace {
             }
             label
         };
-        let files = self.git_files.clone();
+        let rows = git_change_rows(&self.git_files, &self.git_collapsed);
         let busy = self.git_busy;
         let repo = self.git_repo;
         let root_label = if !self.git_root.is_empty() {
@@ -4563,12 +5114,18 @@ impl Workspace {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .children(
-                        files
-                            .into_iter()
-                            .enumerate()
-                            .map(|(ix, file)| git_file_row(ix, file, busy, view.clone(), zoom)),
-                    ),
+                    .children(rows.into_iter().enumerate().map(|(ix, row)| {
+                        let view = view.clone();
+                        match row {
+                            GitTreeRow::Dir { path, depth, name } => {
+                                let open = !self.git_collapsed.contains(&path);
+                                git_dir_row(ix, path, name, depth, open, view, zoom).into_any_element()
+                            }
+                            GitTreeRow::File { file, depth, name } => {
+                                git_file_row(ix, file, name, depth, busy, view, zoom).into_any_element()
+                            }
+                        }
+                    })),
             )
     }
 
@@ -4622,6 +5179,9 @@ impl Workspace {
         let items = vec![
             ("Ask Copilot…", Box::new(AskCopilot) as Box<dyn Action>),
             ("New Terminal", Box::new(NewTerminal) as Box<dyn Action>),
+            ("New File", Box::new(NewFile)),
+            ("Split Terminal Vertically", Box::new(SplitTerminal)),
+            ("Format Document", Box::new(FormatDocument)),
             ("New Workspace", Box::new(NewWorkspace)),
             ("Rename Workspace", Box::new(RenameWorkspace)),
             ("Close Workspace", Box::new(CloseWorkspace)),
@@ -4721,6 +5281,21 @@ impl Workspace {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(div().text_sm().font_bold().child("Go to File"))
                     .child(Input::new(&self.goto_input))
+                    .children(self.goto_matches(&self.goto_input.read(cx).value().to_string()).into_iter().map(|path| {
+                        let open = cx.entity();
+                        let label = display_path(&path);
+                        Button::new(SharedString::from(format!("goto-{path}")))
+                            .ghost()
+                            .label(label)
+                            .on_click(move |_, _, cx| {
+                                let path = path.clone();
+                                open.update(cx, |this, cx| {
+                                    this.goto_open = false;
+                                    this.open_path(path, false);
+                                    cx.notify();
+                                });
+                            })
+                    }))
                     .child(
                         h_flex()
                             .justify_end()
@@ -4792,6 +5367,56 @@ impl Workspace {
                                 .child(result.clone()),
                         )
                     }),
+            )
+    }
+
+    fn render_save(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("save-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .justify_center()
+            .pt(px(80.))
+            .bg(cx.theme().background.opacity(0.45))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.save_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                v_flex()
+                    .w(self.ui_px(480.))
+                    .gap_2()
+                    .p_3()
+                    .rounded(cx.theme().radius)
+                    .bg(cx.theme().background)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(div().text_sm().font_bold().child("Save File"))
+                    .child(Input::new(&self.save_path_input))
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("save-cancel")
+                                    .ghost()
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.save_open = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(Button::new("save-ok").primary().label("Save").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.confirm_save(cx);
+                                }),
+                            )),
+                    ),
             )
     }
 
@@ -4923,6 +5548,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_delete_explorer))
             .on_action(cx.listener(Self::on_filter_explorer))
             .on_action(cx.listener(Self::on_clear_explorer_input))
+            .on_action(cx.listener(Self::on_new_file))
+            .on_action(cx.listener(Self::on_split_terminal))
+            .on_action(cx.listener(Self::on_format_document))
             .on_action(cx.listener(Self::on_new_workspace))
             .on_action(cx.listener(Self::on_rename_workspace))
             .on_action(cx.listener(Self::on_close_workspace))
@@ -5038,6 +5666,7 @@ impl Render for Workspace {
             .when(self.rename_pty.is_some(), |this| {
                 this.child(self.render_rename(cx))
             })
+            .when(self.save_open, |this| this.child(self.render_save(cx)))
             .children(dialog_layer)
             .children(notification_layer)
     }

@@ -528,6 +528,14 @@ pub enum Message {
         request_id: String,
         paths: Vec<String>,
     },
+    /// Client → backend: open an empty unsaved buffer (capability `editor`).
+    ///
+    /// The reply is [`Message::EditorOpened`] plus [`Message::BufferSnapshot`]
+    /// with an empty `path`. The buffer is written only by a later
+    /// [`Message::BufferSave`] that includes a destination path.
+    EditorNew {
+        request_id: String,
+    },
     /// Client → backend: open a path in the Fresh editor (capability `editor`).
     ///
     /// `path` may include a Fresh-style `:line` / `:line:col` suffix. Optional
@@ -593,10 +601,15 @@ pub enum Message {
         rev: u64,
     },
     /// Client → backend: save buffer to disk when `base_rev` matches.
+    ///
+    /// `path` is the destination for an unsaved buffer. Empty saves the
+    /// buffer's existing file.
     BufferSave {
         request_id: String,
         buffer_id: String,
         base_rev: u64,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        path: String,
     },
     /// Backend → client.
     BufferSaved {
@@ -621,13 +634,14 @@ pub enum Message {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
     },
-    /// Client → backend: format a clean, revision-matched document.
+    /// Client → backend: format the buffer with Fresh's formatter.
     BufferFormat {
         request_id: String,
         buffer_id: String,
         base_rev: u64,
     },
-    /// Backend → client: formatting completed or timed out; changed text is authoritative.
+    /// Backend → client: formatted text. `rev` is unchanged when the formatter
+    /// left the buffer alone.
     BufferFormatted {
         request_id: String,
         buffer_id: String,
@@ -694,6 +708,18 @@ pub enum Message {
         #[serde(default)]
         truncated: bool,
     },
+    /// Client → backend: discard local changes.
+    ///
+    /// Tracked paths are restored to `HEAD` in the index and worktree.
+    /// Untracked files are removed. Paths are relative to the repository.
+    GitRestore {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        workspace_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        directory: String,
+        paths: Vec<String>,
+    },
     /// Client → backend: `git add` (`stage`) or `git restore --staged`.
     GitStage {
         request_id: String,
@@ -729,7 +755,7 @@ pub enum Message {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         directory: String,
     },
-    /// Backend → client: result of stage, commit, pull, or push.
+    /// Backend → client: result of restore, stage, commit, pull, or push.
     GitOpResult {
         request_id: String,
         ok: bool,
@@ -954,6 +980,30 @@ mod tests {
         assert_eq!(
             Message::from_json(&saved.to_json().unwrap()).unwrap(),
             saved
+        );
+
+        let save_as = Message::BufferSave {
+            request_id: "r3".into(),
+            buffer_id: "2".into(),
+            base_rev: 0,
+            path: "/tmp/new.rs".into(),
+        };
+        assert_eq!(
+            Message::from_json(&save_as.to_json().unwrap()).unwrap(),
+            save_as
+        );
+        let old = r#"{"type":"buffer_save","request_id":"r4","buffer_id":"1","base_rev":3}"#;
+        assert!(matches!(
+            Message::from_json(old).unwrap(),
+            Message::BufferSave { path, .. } if path.is_empty()
+        ));
+
+        let fresh = Message::EditorNew {
+            request_id: "n1".into(),
+        };
+        assert_eq!(
+            Message::from_json(&fresh.to_json().unwrap()).unwrap(),
+            fresh
         );
     }
 

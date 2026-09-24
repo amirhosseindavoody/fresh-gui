@@ -735,6 +735,50 @@ async fn handle_client_msg(
             )
             .await
         }
+        Message::EditorNew { request_id } => {
+            require_auth(*authed)?;
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: format!("{request_id}: editor capability not available"),
+                });
+            };
+            let opened = editor.new_buffer().await.map_err(|err| Message::Error {
+                code: "editor_new_failed".into(),
+                message: format!("{request_id}: {err:#}"),
+            })?;
+            send_msg(
+                sink,
+                &Message::EditorOpened {
+                    request_id,
+                    buffer_id: opened.buffer_id.clone(),
+                    path: opened.path.clone(),
+                    language: opened.language,
+                    line: None,
+                    column: None,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send EditorOpened".into(),
+            })?;
+            send_msg(
+                sink,
+                &Message::BufferSnapshot {
+                    buffer_id: opened.buffer_id,
+                    rev: opened.rev,
+                    text: opened.text,
+                    path: opened.path,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send BufferSnapshot".into(),
+            })?;
+            Ok(())
+        }
         Message::EditorClose { buffer_id } => {
             require_auth(*authed)?;
             let Some(editor) = state.editor.as_ref() else {
@@ -791,6 +835,7 @@ async fn handle_client_msg(
             request_id,
             buffer_id,
             base_rev,
+            path,
         } => {
             require_auth(*authed)?;
             let Some(editor) = state.editor.as_ref() else {
@@ -799,8 +844,18 @@ async fn handle_client_msg(
                     message: format!("{request_id}: editor capability not available"),
                 });
             };
+            let dest = if path.is_empty() {
+                None
+            } else {
+                Some(state.fs_root.resolve_new_file(&path).await.map_err(|err| {
+                    Message::Error {
+                        code: "buffer_save_failed".into(),
+                        message: format!("{request_id}: {err:#}"),
+                    }
+                })?)
+            };
             let (path, rev) = editor
-                .save(buffer_id.clone(), base_rev)
+                .save(buffer_id.clone(), base_rev, dest)
                 .await
                 .map_err(|err| Message::Error {
                     code: "buffer_save_failed".into(),
@@ -949,6 +1004,18 @@ async fn handle_client_msg(
         } => {
             require_auth(*authed)?;
             git_diff(state, sink, request_id, workspace_id, directory, path).await
+        }
+        Message::GitRestore {
+            request_id,
+            workspace_id,
+            directory,
+            paths,
+        } => {
+            require_auth(*authed)?;
+            git_op(state, sink, request_id, workspace_id, directory, move |dir| {
+                crate::git::restore(&dir, &paths)
+            })
+            .await
         }
         Message::GitStage {
             request_id,
