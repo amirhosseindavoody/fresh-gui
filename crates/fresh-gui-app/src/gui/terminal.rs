@@ -86,7 +86,7 @@ impl Dimensions for TermSize {
     }
 }
 
-/// One run of cells that share a color.
+/// One visible terminal glyph or a run of blank grid cells.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TermSpan {
     pub text: String,
@@ -561,16 +561,25 @@ fn push_cell(
         bg = Some(fg_c);
     }
     let bold = cell.flags.contains(Flags::BOLD);
-    if let Some(last) = spans.last_mut()
+    // Blank cells can share a span: their measured glyph advance is invisible,
+    // while the span still occupies their exact grid width. This keeps large
+    // empty terminal areas cheap to render.
+    if text == " "
+        && let Some(last) = spans.last_mut()
+        && last.text.starts_with(' ')
+        && last.text.len() == last.cells
         && last.fg == fg
         && last.bg == bg
         && last.bold == bold
         && last.selected == selected
     {
-        last.text.push_str(&text);
+        last.text.push(' ');
         last.cells += 1;
         return;
     }
+    // Render visible glyphs one cell at a time. Grouping them into a text run
+    // lets font shaping accumulate fractional or fallback-font advances, so
+    // content drifts away from the terminal cursor's grid column.
     spans.push(TermSpan {
         text,
         cells: 1,
@@ -1027,6 +1036,23 @@ mod tests {
         s.clear_selection();
         assert!(s.selection_text().is_none());
         assert!(s.selection_is_empty());
+    }
+
+    #[test]
+    fn glyph_spans_preserve_grid_columns() {
+        let mut screen = TermScreen::new(20, 2);
+        screen.feed("a界b││".as_bytes());
+        let row = &screen.rows()[0];
+        let glyphs: Vec<_> = row
+            .spans
+            .iter()
+            .take(5)
+            .map(|span| (span.text.as_str(), span.cells))
+            .collect();
+        assert_eq!(
+            glyphs,
+            [("a", 1), ("界", 2), ("b", 1), ("│", 1), ("│", 1)]
+        );
     }
 
     #[test]

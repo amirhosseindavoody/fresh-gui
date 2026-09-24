@@ -1079,6 +1079,10 @@ fn term_span_el(
     div()
         .w(px(span.cells as f32 * cell_w))
         .flex_shrink_0()
+        // Each terminal cell has an explicit grid width. Center the glyph
+        // within that box so fallback glyphs and fractional font advances do
+        // not shift later characters away from the PTY's cursor columns.
+        .text_center()
         .whitespace_nowrap()
         .when(bold, |el| el.font_semibold())
         .when(!span.selected, |el| match fg {
@@ -1234,6 +1238,15 @@ impl EditorPanel {
 
     pub fn buffer_id(&self) -> &str {
         &self.buffer_id
+    }
+
+    /// Compact file-scoped information for the workspace status bar.
+    pub fn status_summary(&self) -> String {
+        let mut parts = vec![format!("{} problems", self.diagnostics.len())];
+        if let Some(status) = self.lsp_status.as_deref() {
+            parts.push(status.to_string());
+        }
+        parts.join(" · ")
     }
 
     /// Drop the panel without sending `editor_close`. The Fresh buffer stays
@@ -1443,7 +1456,7 @@ impl EditorPanel {
         cx.notify();
     }
 
-    fn request_format(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn request_format(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_markdown_inline_edit(window, cx);
         let text = self.current_text(cx);
         let base_rev = if self.dirty {
@@ -1610,21 +1623,6 @@ impl Render for EditorPanel {
             Some("md" | "markdown")
         );
         let mut root = div().key_context("Editor").size_full().flex().flex_col();
-        let panel = cx.entity();
-        root = root.child(
-            h_flex().w_full().h_7().px_2().gap_2().items_center()
-                .border_b_1().border_color(cx.theme().border)
-                .child(Button::new("format-buffer").ghost().xsmall().label("Format")
-                    .on_click(move |_, window, cx| {
-                        panel.update(cx, |this, cx| this.request_format(window, cx));
-                    }))
-                .child(div().text_xs().text_color(cx.theme().muted_foreground)
-                    .child(format!("{} problems", self.diagnostics.len())))
-                .when_some(self.lsp_status.clone(), |row, status| {
-                    row.child(div().min_w_0().text_ellipsis().text_xs()
-                        .text_color(cx.theme().danger).child(status))
-                }),
-        );
         if markdown {
             let panel = cx.entity();
             root = root.child(
