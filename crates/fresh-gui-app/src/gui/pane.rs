@@ -327,7 +327,7 @@ impl TerminalPanel {
             return;
         }
         if !down {
-            self.release_mouse(button, position, modifiers, cx);
+            self.release_mouse(button, position, modifiers, window, cx);
             return;
         }
         let tracking = self.screen.mouse_tracking();
@@ -347,10 +347,11 @@ impl TerminalPanel {
         button: TermMouseButton,
         position: Point<Pixels>,
         modifiers: &Modifiers,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.selecting && button == TermMouseButton::Left {
-            self.finish_select(cx);
+            self.finish_select(window, cx);
             return;
         }
         if self.pressed == Some(button) {
@@ -441,13 +442,15 @@ impl TerminalPanel {
         cx.notify();
     }
 
-    fn finish_select(&mut self, cx: &mut Context<Self>) {
+    fn finish_select(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.selecting {
             return;
         }
         self.selecting = false;
         if self.screen.selection_is_empty() {
             self.screen.clear_selection();
+        } else {
+            self.copy_selection(window, cx);
         }
         cx.notify();
     }
@@ -899,7 +902,7 @@ impl Render for TerminalPanel {
                                 .ok();
                         });
                         let released = select_entity.clone();
-                        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, app| {
+                        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, app| {
                             if phase.capture() {
                                 return;
                             }
@@ -912,6 +915,7 @@ impl Render for TerminalPanel {
                                         button,
                                         event.position,
                                         &event.modifiers,
+                                        window,
                                         cx,
                                     );
                                 })
@@ -990,6 +994,23 @@ fn scroll_lines(delta: ScrollDelta, cell_h: f32) -> f32 {
 
 fn term_rgb(rgb: [u8; 3]) -> gpui::Rgba {
     gpui::rgb((u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2]))
+}
+
+fn terminal_selection_foreground(background: Hsla) -> gpui::Rgba {
+    let rgb = background.to_rgb();
+    let linear = |channel: f32| {
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance = 0.2126 * linear(rgb.r) + 0.7152 * linear(rgb.g) + 0.0722 * linear(rgb.b);
+    if luminance > 0.179 {
+        term_rgb([0x10, 0x10, 0x10])
+    } else {
+        term_rgb([0xff, 0xff, 0xff])
+    }
 }
 
 fn is_ui_zoom_in_chord(key: &str, key_char: Option<&str>, modifiers: &Modifiers) -> bool {
@@ -1094,7 +1115,11 @@ fn term_span_el(
             None => el,
         })
         .when(span.selected, |el| {
-            el.bg(accent.opacity(0.45)).text_color(fg_default)
+            // Keep the selection background opaque. Semi-transparent accents
+            // let terminal cell colors bleed through and made selected text
+            // nearly indistinguishable in several themes.
+            let selected_fg = terminal_selection_foreground(accent);
+            el.bg(accent.opacity(1.)).text_color(selected_fg)
         })
         .child(text)
 }
