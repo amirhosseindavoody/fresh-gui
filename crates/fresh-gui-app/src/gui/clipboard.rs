@@ -64,8 +64,11 @@ pub fn read_text(window: &Window, _: &App) -> Result<String, String> {
         }
     }
     let _guard = ClipboardGuard;
-    let text = clipboard_win::raw::get_string()
+    // clipboard-win 5.4 writes UTF-8 into the buffer and returns the byte count.
+    let mut bytes = Vec::new();
+    clipboard_win::raw::get_string(&mut bytes)
         .map_err(|error| format!("Cannot read clipboard: {error}"))?;
+    let text = String::from_utf8(bytes).map_err(|error| format!("Clipboard text is not UTF-8: {error}"))?;
     if text.is_empty() {
         Err("Clipboard has no text".into())
     } else {
