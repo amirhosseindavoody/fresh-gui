@@ -1203,27 +1203,6 @@ impl Workspace {
                     panel.update(cx, |panel, cx| panel.set_rev(rev, cx));
                 }
             }
-            AdeEvent::BufferFormatted {
-                buffer_id,
-                rev,
-                text,
-                ..
-            } => {
-                if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
-                    let changed = panel.read(cx).rev() != rev;
-                    panel.update(cx, |panel, cx| {
-                        panel.apply_snapshot(rev, text, String::new(), window, cx);
-                        if changed {
-                            panel.set_dirty(true, cx);
-                        }
-                    });
-                    self.status = if changed {
-                        "Formatted".into()
-                    } else {
-                        "Document unchanged".into()
-                    };
-                }
-            }
             AdeEvent::BufferSaved {
                 buffer_id,
                 path,
