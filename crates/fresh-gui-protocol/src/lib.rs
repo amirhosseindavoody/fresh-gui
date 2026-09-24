@@ -675,6 +675,18 @@ pub enum Message {
         #[serde(default)]
         truncated: bool,
     },
+    /// Client → backend: discard local changes.
+    ///
+    /// Tracked paths are restored to `HEAD` in the index and worktree.
+    /// Untracked files are removed. Paths are relative to the repository.
+    GitRestore {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        workspace_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        directory: String,
+        paths: Vec<String>,
+    },
     /// Client → backend: `git add` (`stage`) or `git restore --staged`.
     GitStage {
         request_id: String,
@@ -710,7 +722,7 @@ pub enum Message {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         directory: String,
     },
-    /// Backend → client: result of stage, commit, pull, or push.
+    /// Backend → client: result of restore, stage, commit, pull, or push.
     GitOpResult {
         request_id: String,
         ok: bool,

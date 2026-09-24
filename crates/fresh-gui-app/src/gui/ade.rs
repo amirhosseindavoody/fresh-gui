@@ -142,6 +142,12 @@ pub enum AdeCmd {
         directory: String,
         path: String,
     },
+    GitRestore {
+        request_id: String,
+        workspace_id: String,
+        directory: String,
+        paths: Vec<String>,
+    },
     GitStage {
         request_id: String,
         workspace_id: String,
@@ -722,6 +728,21 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
                     workspace_id,
                     directory,
                     path,
+                })
+                .await?;
+        }
+        AdeCmd::GitRestore {
+            request_id,
+            workspace_id,
+            directory,
+            paths,
+        } => {
+            client
+                .send(Message::GitRestore {
+                    request_id,
+                    workspace_id,
+                    directory,
+                    paths,
                 })
                 .await?;
         }

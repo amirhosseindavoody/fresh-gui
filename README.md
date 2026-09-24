@@ -59,7 +59,7 @@ The remote daemon keeps running after you close the window. The SSH path targets
 - In a terminal, Tab and Shift-Tab go to the shell (completion), not the File menu. Ctrl+C copies a selection, Ctrl+V and Shift+Insert paste, and Ctrl+letter chords such as Ctrl+E and Ctrl+F reach the shell.
 - Right-click a file or folder and choose **Copy Path** to copy its absolute path as text. For SSH sessions, this is the path on the remote server.
 - `Ctrl+=` or `Ctrl++` zooms editor and terminal text. `Ctrl+-` zooms out, and `Ctrl+0` resets that zoom. `Ctrl+Shift+=` (`Ctrl+Shift++` on a US keyboard) zooms the rest of the UI text, with `Ctrl+Shift+-` and `Ctrl+Shift+0` to zoom out and reset. Those chords are in the default shortkeys list, and the command palette lists the same actions. Sidebar width and the tab strip stay a fixed size.
-- Use the Source Control icon to review changes, stage files, commit, pull, and push. The pane shows the git root for the active workspace. Git runs on the daemon's machine.
+- Use the Source Control icon to review changes, stage files, commit, pull, and push. Changed files are grouped in a tree by directory. **Revert** on a file restores a tracked file to HEAD, or removes an untracked file. The pane shows the git root for the active workspace. Git runs on the daemon's machine.
 - Open Settings from the gear icon or `Ctrl+,`. Settings live on the daemon's machine, including for remote sessions.
 - Use **Quit Client** to close the window or **Stop Server** to end a local daemon session.
 
