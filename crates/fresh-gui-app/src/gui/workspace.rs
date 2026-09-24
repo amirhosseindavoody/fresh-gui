@@ -8,7 +8,7 @@
 //! switching swaps this dock for that workspace's session without closing
 //! its PTYs.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -189,9 +189,130 @@ fn git_lookup_key(path: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GitTreeRow {
+    Dir { path: String, depth: usize, name: String },
+    File { file: GitFile, depth: usize, name: String },
+}
+
+struct GitTreeNode {
+    dirs: BTreeMap<String, GitTreeNode>,
+    files: BTreeMap<String, GitFile>,
+}
+
+impl GitTreeNode {
+    fn new() -> Self {
+        Self { dirs: BTreeMap::new(), files: BTreeMap::new() }
+    }
+}
+
+fn git_path_parts(path: &str) -> Vec<&str> {
+    path.split(['/', '\\']).filter(|seg| !seg.is_empty()).collect()
+}
+
+/// Directory paths that contain at least one changed file, using `/`.
+fn git_dir_paths(files: &[GitFile]) -> HashSet<String> {
+    let mut dirs = HashSet::new();
+    for file in files {
+        let parts = git_path_parts(&file.path);
+        if parts.len() <= 1 {
+            continue;
+        }
+        let mut acc = String::new();
+        for seg in &parts[..parts.len() - 1] {
+            if !acc.is_empty() {
+                acc.push('/');
+            }
+            acc.push_str(seg);
+            dirs.insert(acc.clone());
+        }
+    }
+    dirs
+}
+
+/// Changed files grouped by directory. Directories absent from `collapsed` are open.
+fn git_change_rows(files: &[GitFile], collapsed: &HashSet<String>) -> Vec<GitTreeRow> {
+    let mut root = GitTreeNode::new();
+    for file in files {
+        let parts = git_path_parts(&file.path);
+        if parts.is_empty() {
+            continue;
+        }
+        let mut node = &mut root;
+        for seg in &parts[..parts.len() - 1] {
+            node = node.dirs.entry((*seg).to_string()).or_insert_with(GitTreeNode::new);
+        }
+        let name = parts[parts.len() - 1].to_string();
+        node.files.insert(name, file.clone());
+    }
+    let mut rows = Vec::new();
+    walk_git_tree(&root, "", 0, collapsed, &mut rows);
+    rows
+}
+
+fn walk_git_tree(
+    node: &GitTreeNode,
+    prefix: &str,
+    depth: usize,
+    collapsed: &HashSet<String>,
+    rows: &mut Vec<GitTreeRow>,
+) {
+    for (name, child) in &node.dirs {
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        rows.push(GitTreeRow::Dir { path: path.clone(), depth, name: name.clone() });
+        if !collapsed.contains(&path) {
+            walk_git_tree(child, &path, depth + 1, collapsed, rows);
+        }
+    }
+    for (name, file) in &node.files {
+        rows.push(GitTreeRow::File { file: file.clone(), depth, name: name.clone() });
+    }
+}
+
+fn git_dir_row(
+    ix: usize,
+    path: String,
+    name: String,
+    depth: usize,
+    open: bool,
+    view: Entity<Workspace>,
+    zoom: f32,
+) -> impl IntoElement {
+    let chevron = if open { IconName::ChevronDown } else { IconName::ChevronRight };
+    h_flex()
+        .id(format!("git-dir-{ix}"))
+        .w_full()
+        .h(px(TREE_ROW_H * zoom))
+        .pl(px(tree_row_indent_px(depth) * zoom))
+        .pr_1()
+        .gap_1()
+        .items_center()
+        .cursor_pointer()
+        .on_click({
+            let view = view.clone();
+            move |_, _, cx| {
+                let dir = path.clone();
+                view.update(cx, |this, cx| {
+                    if !this.git_collapsed.remove(&dir) {
+                        this.git_collapsed.insert(dir);
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .child(div().w(px(16. * zoom)).flex_shrink_0().flex().justify_center().child(Icon::new(chevron).xsmall()))
+        .child(div().flex_1().min_w_0().text_sm().text_ellipsis().child(name))
+}
+
 fn git_file_row(
     ix: usize,
     file: GitFile,
+    name: String,
+    depth: usize,
     busy: bool,
     view: Entity<Workspace>,
     zoom: f32,
@@ -201,26 +322,18 @@ fn git_file_row(
     let work = chars.next().unwrap_or(' ');
     let unstaged = work != ' ' || index == '?';
     let staged = index != ' ' && index != '?';
-    let name = file
-        .path
-        .rsplit(['/', '\\'])
-        .find(|seg| !seg.is_empty())
-        .unwrap_or(file.path.as_str())
-        .to_string();
-    let xy = if file.xy.is_empty() {
-        "  ".to_string()
-    } else {
-        file.xy.clone()
-    };
+    let xy = if file.xy.is_empty() { "  ".to_string() } else { file.xy.clone() };
     let open_rel = file.path.clone();
     let stage_rel = file.path.clone();
-    let unstage_rel = file.path;
+    let unstage_rel = file.path.clone();
+    let revert_rel = file.path;
 
     h_flex()
         .id(format!("git-file-{ix}"))
         .w_full()
         .h(px(TREE_ROW_H * zoom))
-        .px_1()
+        .pl(px(tree_row_indent_px(depth) * zoom))
+        .pr_1()
         .gap_1()
         .items_center()
         .cursor_pointer()
@@ -233,14 +346,7 @@ fn git_file_row(
             }
         })
         .child(div().w(px(20. * zoom)).flex_shrink_0().text_xs().child(xy))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .text_sm()
-                .text_ellipsis()
-                .child(name),
-        )
+        .child(div().flex_1().min_w_0().text_sm().text_ellipsis().child(name))
         .when(unstaged, |row| {
             let view = view.clone();
             row.child(
@@ -257,6 +363,7 @@ fn git_file_row(
             )
         })
         .when(staged, |row| {
+            let view = view.clone();
             row.child(
                 Button::new(format!("git-unstage-{ix}"))
                     .ghost()
@@ -270,6 +377,64 @@ fn git_file_row(
                     }),
             )
         })
+        .child(
+            Button::new(format!("git-revert-{ix}"))
+                .ghost()
+                .xsmall()
+                .label("Revert")
+                .disabled(busy)
+                .on_click(move |_, _, cx| {
+                    let rel = revert_rel.clone();
+                    view.update(cx, |this, cx| this.git_restore(vec![rel], cx));
+                    cx.stop_propagation();
+                }),
+        )
+}
+
+#[cfg(test)]
+mod git_tree_tests {
+    use super::{git_change_rows, git_dir_paths, GitTreeRow};
+    use fresh_gui_protocol::GitFile;
+    use std::collections::HashSet;
+
+    fn file(path: &str) -> GitFile {
+        GitFile { path: path.into(), xy: " M".into() }
+    }
+
+    #[test]
+    fn groups_files_under_directories_and_hides_collapsed_children() {
+        let files = vec![
+            file("src/gui/workspace.rs"),
+            file("src/main.rs"),
+            file("README.md"),
+        ];
+        let rows = git_change_rows(&files, &HashSet::new());
+        let labels: Vec<String> = rows
+            .iter()
+            .map(|row| match row {
+                GitTreeRow::Dir { path, depth, .. } => format!("d{depth}:{path}"),
+                GitTreeRow::File { file, depth, name } => format!("f{depth}:{name}:{}", file.path),
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "d0:src",
+                "d1:src/gui",
+                "f2:workspace.rs:src/gui/workspace.rs",
+                "f1:main.rs:src/main.rs",
+                "f0:README.md:README.md",
+            ]
+        );
+        let mut collapsed = HashSet::new();
+        collapsed.insert("src".into());
+        let collapsed_rows = git_change_rows(&files, &collapsed);
+        assert!(collapsed_rows.iter().all(|row| !matches!(
+            row,
+            GitTreeRow::File { file, .. } if file.path.starts_with("src/")
+        )));
+        assert!(git_dir_paths(&files).contains("src/gui"));
+    }
 }
 
 fn display_paths(paths: &[String]) -> Vec<String> {
@@ -476,6 +641,8 @@ pub struct Workspace {
     git_ahead: u32,
     git_behind: u32,
     git_files: Vec<GitFile>,
+    /// Directory paths (relative, `/`-separated) the user has collapsed.
+    git_collapsed: HashSet<String>,
     git_detail: Option<String>,
     git_busy: bool,
     git_status_req: Option<String>,
@@ -754,6 +921,7 @@ impl Workspace {
             git_ahead: 0,
             git_behind: 0,
             git_files: Vec::new(),
+            git_collapsed: HashSet::new(),
             git_detail: None,
             git_busy: false,
             git_status_req: None,
@@ -2675,6 +2843,7 @@ impl Workspace {
         self.git_ahead = 0;
         self.git_behind = 0;
         self.git_files.clear();
+        self.git_collapsed.clear();
         self.git_detail = None;
         self.git_paths.clear();
     }
@@ -2770,6 +2939,8 @@ impl Workspace {
                 .insert(git_lookup_key(&display_path(&abs)), file.path.clone());
         }
         self.git_files = files;
+        let present = git_dir_paths(&self.git_files);
+        self.git_collapsed.retain(|dir| present.contains(dir));
     }
 
     fn git_rel_for(&self, path: &str) -> Option<String> {
@@ -2998,6 +3169,21 @@ impl Workspace {
             path,
         });
         self.status = "Opening externally…".into();
+        cx.notify();
+    }
+
+    fn git_restore(&mut self, paths: Vec<String>, cx: &mut Context<Self>) {
+        if paths.is_empty() || !self.git_cap || self.git_busy {
+            return;
+        }
+        self.git_busy = true;
+        self.status = "Reverting…".into();
+        self.ade.send(AdeCmd::GitRestore {
+            request_id: next_id("git"),
+            workspace_id: self.workspace_id_or_empty(),
+            directory: self.git_context_dir.clone(),
+            paths,
+        });
         cx.notify();
     }
 
@@ -4783,7 +4969,7 @@ impl Workspace {
             }
             label
         };
-        let files = self.git_files.clone();
+        let rows = git_change_rows(&self.git_files, &self.git_collapsed);
         let busy = self.git_busy;
         let repo = self.git_repo;
         let root_label = if !self.git_root.is_empty() {
@@ -4906,12 +5092,18 @@ impl Workspace {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .children(
-                        files
-                            .into_iter()
-                            .enumerate()
-                            .map(|(ix, file)| git_file_row(ix, file, busy, view.clone(), zoom)),
-                    ),
+                    .children(rows.into_iter().enumerate().map(|(ix, row)| {
+                        let view = view.clone();
+                        match row {
+                            GitTreeRow::Dir { path, depth, name } => {
+                                let open = !self.git_collapsed.contains(&path);
+                                git_dir_row(ix, path, name, depth, open, view, zoom).into_any_element()
+                            }
+                            GitTreeRow::File { file, depth, name } => {
+                                git_file_row(ix, file, name, depth, busy, view, zoom).into_any_element()
+                            }
+                        }
+                    })),
             )
     }
 

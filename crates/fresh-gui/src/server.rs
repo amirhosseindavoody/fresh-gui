@@ -1004,6 +1004,18 @@ async fn handle_client_msg(
             require_auth(*authed)?;
             git_diff(state, sink, request_id, workspace_id, directory, path).await
         }
+        Message::GitRestore {
+            request_id,
+            workspace_id,
+            directory,
+            paths,
+        } => {
+            require_auth(*authed)?;
+            git_op(state, sink, request_id, workspace_id, directory, move |dir| {
+                crate::git::restore(&dir, &paths)
+            })
+            .await
+        }
         Message::GitStage {
             request_id,
             workspace_id,

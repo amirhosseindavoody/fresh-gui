@@ -86,6 +86,65 @@ pub fn diff(workspace: &Path, rel: &str) -> Result<DiffSides> {
     Ok(combine_sides(old, new))
 }
 
+/// Discard local changes for `paths`.
+///
+/// A tracked path is restored to `HEAD` in both the index and the worktree.
+/// A path that exists only in the index (`A`) is removed with `git rm -f`.
+/// An untracked file is removed with `git clean -f` (no `-d`, so directories
+/// are left alone). Paths are relative to the repo and cannot climb out of it.
+pub fn restore(workspace: &Path, paths: &[String]) -> Result<Op> {
+    let root = repo_root(workspace)?;
+    let rels: Vec<&str> = paths
+        .iter()
+        .map(|path| safe_rel(path))
+        .collect::<Result<_>>()?;
+    if rels.is_empty() {
+        bail!("no paths");
+    }
+    let current = status(&root)?;
+    let known: std::collections::HashMap<&str, &str> = current
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file.xy.as_str()))
+        .collect();
+    let mut tracked = Vec::new();
+    let mut added = Vec::new();
+    let mut untracked = Vec::new();
+    for rel in rels {
+        let index = known
+            .get(rel)
+            .copied()
+            .unwrap_or("")
+            .chars()
+            .next()
+            .unwrap_or(' ');
+        if index == '?' {
+            untracked.push(rel);
+        } else if index == 'A' {
+            added.push(rel);
+        } else {
+            tracked.push(rel);
+        }
+    }
+    let mut ops = Vec::new();
+    if !tracked.is_empty() {
+        let mut args = vec!["restore", "--source=HEAD", "--staged", "--worktree", "--"];
+        args.extend(tracked);
+        ops.push(op_from(git(&root, &args, OP_TIMEOUT)?));
+    }
+    if !added.is_empty() {
+        let mut args = vec!["rm", "-f", "--"];
+        args.extend(added);
+        ops.push(op_from(git(&root, &args, OP_TIMEOUT)?));
+    }
+    if !untracked.is_empty() {
+        let mut args = vec!["clean", "-f", "--"];
+        args.extend(untracked);
+        ops.push(op_from(git(&root, &args, OP_TIMEOUT)?));
+    }
+    Ok(merge_ops(ops))
+}
+
 pub fn stage(workspace: &Path, paths: &[String], stage: bool) -> Result<Op> {
     let root = repo_root(workspace)?;
     let rels: Vec<&str> = paths
@@ -207,6 +266,24 @@ fn side_text(side: Side) -> String {
     match side {
         Side::Missing | Side::Binary => String::new(),
         Side::Truncated(text) | Side::Text(text) => text,
+    }
+}
+
+fn merge_ops(ops: Vec<Op>) -> Op {
+    let ok = ops.iter().all(|op| op.ok);
+    let output = ops
+        .into_iter()
+        .map(|op| op.output)
+        .filter(|text| !text.is_empty() && text != "ok")
+        .collect::<Vec<_>>()
+        .join("\n");
+    Op {
+        ok,
+        output: if output.is_empty() {
+            "ok".into()
+        } else {
+            output
+        },
     }
 }
 
@@ -545,6 +622,57 @@ mod tests {
             both.files.iter().any(|file| file.path == "note.txt" && file.xy == "AM"),
             "{both:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_restore_reverts_tracked_and_removes_untracked() {
+        let git = Command::new("git").arg("--version").output();
+        if git.is_err() || !git.unwrap().status.success() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "fresh-gui-git-restore-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&dir)
+                    .args(args)
+                    .env("GIT_AUTHOR_NAME", "Test")
+                    .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                    .env("GIT_COMMITTER_NAME", "Test")
+                    .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                    .status()
+                    .unwrap()
+                    .success(),
+                "{args:?}"
+            );
+        };
+        run(&["init", "-q"]);
+        std::fs::write(dir.join("src/a.rs"), "one\n").unwrap();
+        run(&["add", "--", "src/a.rs"]);
+        run(&["commit", "-q", "-m", "init"]);
+        std::fs::write(dir.join("src/a.rs"), "two\n").unwrap();
+        std::fs::write(dir.join("src/new.rs"), "extra\n").unwrap();
+        let before = status(&dir).unwrap();
+        assert!(before.files.iter().any(|file| file.path == "src/a.rs"));
+        assert!(before.files.iter().any(|file| file.path == "src/new.rs" && file.xy == "??"));
+        assert!(restore(&dir, &["../outside".into()]).is_err());
+        let reverted = restore(
+            &dir,
+            &["src/a.rs".into(), "src/new.rs".into()],
+        )
+        .unwrap();
+        assert!(reverted.ok, "{reverted:?}");
+        assert_eq!(std::fs::read_to_string(dir.join("src/a.rs")).unwrap(), "one\n");
+        assert!(!dir.join("src/new.rs").exists());
+        let after = status(&dir).unwrap();
+        assert!(after.files.is_empty(), "{after:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
