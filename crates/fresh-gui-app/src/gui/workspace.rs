@@ -20,7 +20,7 @@ use fresh_gui_protocol::{
     LayoutNode, WorkspaceInfo, WorkspaceLayoutExtra, WorkspaceTab, WorkspaceTabKind,
 };
 use gpui_kit::base::Placement;
-use gpui_kit::component::dock::{BasePanelView, DockArea, DockEvent, DockLayout, DockPlacement, PaneNode, PaneRef, PanelId, panel_handle};
+use gpui_kit::component::dock::{BasePanelView, DockArea, DockEvent, DockLayout, DockPlacement, InsertTarget, PaneNode, PaneRef, PanelId, panel_handle};
 use gpui_kit::component::menu::{AppMenuBar, ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{
     ActiveTheme, Disableable as _, Icon, IconName, Root, Selectable, Sizable, StyledExt, TitleBar,
@@ -594,6 +594,8 @@ pub struct Workspace {
     pty_opens_pending: u32,
     /// Panel to split beside when the next terminal opens.
     pending_split: Option<PanelId>,
+    /// Tab group (any panel in it) that should receive the next + New Terminal/File.
+    pending_tab_group: Option<PanelId>,
     /// Editor opens issued by this view. Unsolicited `editor_opened` does not
     /// add a tab.
     pending_editors: HashMap<String, bool>,
@@ -616,6 +618,11 @@ pub struct Workspace {
     terminal_font_base: f32,
     status: SharedString,
     sidebar_collapsed: bool,
+    workspace_rail_width: f32,
+    explorer_width: f32,
+    resizing_rail: bool,
+    resizing_explorer: bool,
+    resize_last_x: Option<f32>,
     activity: Activity,
     dock: Entity<DockArea>,
     tab_metrics: TabStripMetrics,
@@ -883,6 +890,7 @@ impl Workspace {
             active_workspace_id: None,
             pty_opens_pending: 0,
             pending_split: None,
+            pending_tab_group: None,
             pending_editors: HashMap::new(),
             restoring: false,
             renaming_id: None,
@@ -898,6 +906,11 @@ impl Workspace {
             terminal_font_base: 14.0,
             status: "Connecting…".into(),
             sidebar_collapsed: false,
+            workspace_rail_width: WORKSPACE_RAIL_W,
+            explorer_width: 260.,
+            resizing_rail: false,
+            resizing_explorer: false,
+            resize_last_x: None,
             activity: Activity::Explorer,
             dock,
             tab_metrics: TabStripMetrics::default(),
@@ -1390,6 +1403,7 @@ impl Workspace {
             cx.new(|cx| TerminalPanel::new(pty_id.clone(), number, ade, workspace, metrics, cx));
         let workspace_id = self.active_workspace_id.clone();
         panel.update(cx, |panel, _| panel.bind_workspace(workspace_id));
+        let panel_id = PanelId::from(panel.entity_id());
         self.dock.update(cx, |dock, cx| {
             dock.add_panel_view(
                 panel_handle(panel.clone()),
@@ -1400,6 +1414,7 @@ impl Workspace {
             );
         });
         self.terminals.insert(pty_id, panel);
+        self.place_in_pending_tab_group(panel_id, window, cx);
         self.apply_zoom(window, cx);
     }
 
@@ -1471,6 +1486,7 @@ impl Workspace {
                 cx,
             )
         });
+        let panel_id = PanelId::from(panel.entity_id());
         self.dock.update(cx, |dock, cx| {
             dock.add_panel_view(
                 panel_handle(panel.clone()),
@@ -1481,6 +1497,7 @@ impl Workspace {
             );
         });
         self.editors.insert(path, panel.clone());
+        self.place_in_pending_tab_group(panel_id, window, cx);
         self.apply_zoom(window, cx);
         if activate {
             self.select_entity(&panel, window, cx);
@@ -1708,7 +1725,55 @@ impl Workspace {
         self.sync_tree_highlight(None, cx);
     }
 
-    pub(crate) fn new_terminal(&mut self, cx: &App) {
+    
+    fn set_pending_tab_group(&mut self, source: PanelId) {
+        self.pending_tab_group = Some(source);
+    }
+
+    /// Open a terminal and place it in the tab group that owns `source`.
+    pub(crate) fn new_terminal_in_group(&mut self, source: PanelId, cx: &App) {
+        self.set_pending_tab_group(source);
+        self.new_terminal(cx);
+    }
+
+    /// Open a new file and place it in the tab group that owns `source`.
+    pub(crate) fn new_file_in_group(&mut self, source: PanelId, cx: &mut Context<Self>) {
+        self.set_pending_tab_group(source);
+        self.new_file(cx);
+    }
+
+    fn place_in_pending_tab_group(
+        &mut self,
+        panel_id: PanelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source) = self.pending_tab_group.take() else {
+            return;
+        };
+        let node = self
+            .dock
+            .read(cx)
+            .layout(DockPlacement::Center)
+            .and_then(|tree| tree.find_panel_node(source));
+        let Some(node) = node else {
+            return;
+        };
+        self.dock.update(cx, |dock, cx| {
+            dock.move_panel(
+                panel_id,
+                InsertTarget::Tabs {
+                    node,
+                    ix: None,
+                    activate: true,
+                },
+                window,
+                cx,
+            );
+        });
+    }
+
+pub(crate) fn new_terminal(&mut self, cx: &App) {
         if !matches!(self.connection, ConnectionState::Online) {
             self.status = "Not connected".into();
             return;
@@ -2757,6 +2822,7 @@ impl Workspace {
         self.session_id = None;
         self.pty_opens_pending = 0;
         self.pending_split = None;
+        self.pending_tab_group = None;
         self.pending_editors.clear();
         self.restoring = false;
         self.renaming_id = None;
@@ -4057,7 +4123,8 @@ impl Workspace {
 
         v_flex()
             .id("workspace-rail")
-            .w(self.ui_px(WORKSPACE_RAIL_W))
+            .relative()
+            .w(self.ui_px(self.workspace_rail_width))
             .h_full()
             .flex_shrink_0()
             .bg(cx.theme().sidebar)
@@ -4142,6 +4209,8 @@ impl Workspace {
                         "This daemon has no workspace list. Upgrade and restart it to add projects.",
                     ),
             )
+            .child(self.side_panel_drag_handle("resize-session-rail", true, cx))
+
     }
 
     fn render_workspace_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4160,7 +4229,7 @@ impl Workspace {
 
         v_flex()
             .id("workspace-rail")
-            .w(self.ui_px(WORKSPACE_RAIL_W))
+            .w(self.ui_px(self.workspace_rail_width))
             .h_full()
             .flex_shrink_0()
             .bg(cx.theme().sidebar)
@@ -4215,6 +4284,8 @@ impl Workspace {
                         .child(hint),
                 )
             })
+            .child(self.side_panel_drag_handle("resize-workspace-rail", true, cx))
+
     }
 
     fn render_workspace_row(
@@ -4630,6 +4701,104 @@ impl Workspace {
             )
     }
 
+
+
+
+    fn on_side_panel_drag_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !(self.resizing_rail || self.resizing_explorer) {
+            return;
+        }
+        if !event.dragging() {
+            self.resizing_rail = false;
+            self.resizing_explorer = false;
+            self.resize_last_x = None;
+            return;
+        }
+        let x = f32::from(event.position.x);
+        let Some(last) = self.resize_last_x else {
+            self.resize_last_x = Some(x);
+            return;
+        };
+        let delta = x - last;
+        self.resize_last_x = Some(x);
+        if self.resizing_rail {
+            self.workspace_rail_width = Self::clamp_rail_width(self.workspace_rail_width + delta);
+        } else if self.resizing_explorer {
+            self.explorer_width = Self::clamp_explorer_width(self.explorer_width + delta);
+        }
+        cx.notify();
+    }
+
+    fn side_panel_drag_handle(
+        &self,
+        id: &'static str,
+        rail: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .absolute()
+            .top_0()
+            .right_0()
+            .w(px(3.))
+            .h_full()
+            .cursor(CursorStyle::ResizeColumn)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.resizing_rail = rail;
+                    this.resizing_explorer = !rail;
+                    this.resize_last_x = Some(f32::from(event.position.x));
+                    cx.notify();
+                }),
+            )
+    }
+
+    fn clamp_rail_width(width: f32) -> f32 {
+        width.clamp(160., 360.)
+    }
+
+    fn clamp_explorer_width(width: f32) -> f32 {
+        width.clamp(180., 480.)
+    }
+
+    fn refresh_explorer(&mut self, cx: &mut Context<Self>) {
+        let root = self.explorer_root.clone();
+        if root.is_empty() {
+            self.status = "No explorer root".into();
+            cx.notify();
+            return;
+        }
+        let expanded: Vec<String> = self.expanded_dirs.iter().cloned().collect();
+        self.relist(&root);
+        for dir in expanded {
+            self.relist(&dir);
+        }
+        // Reload open editors that map to real paths.
+        for (path, panel) in self.editors.clone() {
+            if path.is_empty() || is_untitled_editor_key(&path) {
+                continue;
+            }
+            let request_id = next_id("reload");
+            self.pending_editors.insert(request_id.clone(), false);
+            self.ade.send(AdeCmd::OpenEditor {
+                request_id,
+                path: path.clone(),
+                preview: false,
+                line: None,
+                column: None,
+            });
+            let _ = panel;
+        }
+        self.status = "Explorer refreshed".into();
+        cx.notify();
+    }
+
     fn render_explorer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         let root_label = explorer_header_label(&self.explorer_root);
@@ -4643,6 +4812,7 @@ impl Workspace {
 
         v_flex()
             .id("explorer-pane")
+            .relative()
             .on_scroll_wheel(cx.listener(|_, _, _, cx| {
                 let workspace = cx.entity();
                 cx.defer(move |cx| { workspace.update(cx, |this, cx| this.publish_layout(cx)); });
@@ -4651,7 +4821,7 @@ impl Workspace {
             .aria_label("Explorer")
             .key_context("Explorer")
             .track_focus(&self.explorer_focus)
-            .w(self.ui_px(260.))
+            .w(self.ui_px(self.explorer_width))
             .h_full()
             .flex_shrink_0()
             .bg(cx.theme().sidebar)
@@ -4666,16 +4836,30 @@ impl Workspace {
                     .justify_between()
                     .child(div().text_xs().font_semibold().child(root_label))
                     .child(
-                        Button::new("collapse-sidebar")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::PanelLeftClose)
-                            .tooltip("Hide Explorer (Ctrl+B)")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.sidebar_collapsed = true;
-                                this.publish_layout(cx);
-                                cx.notify();
-                            })),
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new("refresh-explorer")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(gpui_kit::assets::IconName::RefreshCw)
+                                    .tooltip("Refresh")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.refresh_explorer(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("collapse-sidebar")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::PanelLeftClose)
+                                    .tooltip("Hide Explorer (Ctrl+B)")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.sidebar_collapsed = true;
+                                        this.publish_layout(cx);
+                                        cx.notify();
+                                    })),
+                            ),
                     ),
             )
             .when(self.filter_open, |this| {
@@ -4951,6 +5135,8 @@ impl Workspace {
                 .flex_1()
                 .min_h_0()
             })
+            .child(self.side_panel_drag_handle("resize-explorer", false, cx))
+
     }
 
     fn render_git(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4985,7 +5171,7 @@ impl Workspace {
             .id("git-pane")
             .role(Role::Group)
             .aria_label("Source Control")
-            .w(self.ui_px(260.))
+            .w(self.ui_px(self.explorer_width))
             .h_full()
             .flex_shrink_0()
             .bg(cx.theme().sidebar)
@@ -5491,6 +5677,19 @@ impl Render for Workspace {
 
         div()
             .id("workspace")
+            .on_mouse_move(cx.listener(Self::on_side_panel_drag_move))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.resizing_rail || this.resizing_explorer {
+                        this.resizing_rail = false;
+                        this.resizing_explorer = false;
+                        this.resize_last_x = None;
+                        this.publish_layout(cx);
+                        cx.notify();
+                    }
+                }),
+            )
             .relative()
             .size_full()
             .flex()
