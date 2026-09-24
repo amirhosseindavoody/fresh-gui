@@ -202,6 +202,10 @@ impl TermScreen {
         self.term.mode().contains(TermMode::APP_CURSOR)
     }
 
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
     pub fn alt_screen(&self) -> bool {
         self.term.mode().contains(TermMode::ALT_SCREEN)
     }
@@ -687,6 +691,47 @@ pub fn readable_light_foreground(rgb: [u8; 3], background: Option<[u8; 3]>) -> [
     rgb.map(|v| (f32::from(v) * lo).floor() as u8)
 }
 
+fn normalize_key(key: &str) -> String {
+    match key.to_lowercase().as_str() {
+        "arrowup" => "up".to_string(),
+        "arrowdown" => "down".to_string(),
+        "arrowleft" => "left".to_string(),
+        "arrowright" => "right".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Ctrl-Left is `\x1b[1;5D`, Alt-Right is `\x1b[1;3C`. Fish and readline use these.
+fn modified_arrow(key: &str, ctrl: bool, alt: bool) -> Option<Vec<u8>> {
+    let letter = match key {
+        "up" => b'A',
+        "down" => b'B',
+        "right" => b'C',
+        "left" => b'D',
+        _ => return None,
+    };
+    let modifier = match (ctrl, alt) {
+        (true, false) => b'5',
+        (false, true) => b'3',
+        _ => return None,
+    };
+    Some(vec![0x1b, b'[', b'1', b';', modifier, letter])
+}
+
+/// Bytes for a clipboard paste. Bracketed mode wraps the text so fish and
+/// readline insert it literally instead of running completions.
+pub fn paste_payload(text: &str, bracketed: bool) -> Vec<u8> {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let text = text.replace('\u{1b}', "");
+    if !bracketed {
+        return text.into_bytes();
+    }
+    let mut out = b"\x1b[200~".to_vec();
+    out.extend(text.into_bytes());
+    out.extend_from_slice(b"\x1b[201~");
+    out
+}
+
 /// Map a GPUI keystroke to PTY bytes. Returns `None` for chords the host owns.
 ///
 /// `app_cursor` is the terminal's application-cursor mode (fish, vim, less).
@@ -698,27 +743,47 @@ pub fn keystroke_to_bytes(
     shift: bool,
     app_cursor: bool,
 ) -> Option<Vec<u8>> {
-    let key = key.to_lowercase();
+    let key = normalize_key(key);
     if matches!(
         key.as_str(),
         "control" | "shift" | "alt" | "meta" | "win" | "super"
     ) {
         return None;
     }
+    let key = key.as_str();
 
-    if ctrl {
-        return match key.as_str() {
-            "c" => Some(vec![0x03]),
-            "d" => Some(vec![0x04]),
-            "z" => Some(vec![0x1a]),
-            "l" => Some(vec![0x0c]),
-            "u" => Some(vec![0x15]),
-            "w" | "s" | "t" | "p" | "b" | "tab" => None, // host shortcuts
-            _ => None,
-        };
+    // Host chords. Everything else with Ctrl is a terminal control character
+    // (fish Ctrl-E / Ctrl-F / Ctrl-A) or a modified cursor key.
+    if ctrl && !alt && matches!(key, "w" | "s" | "t" | "p" | "b" | "tab" | "v") {
+        return None;
+    }
+    if ctrl && !alt {
+        if let Some(bytes) = modified_arrow(key, true, false) {
+            return Some(bytes);
+        }
+        if key.len() == 1 {
+            let c = key.as_bytes()[0];
+            if c.is_ascii_lowercase() {
+                return Some(vec![c & 0x1f]);
+            }
+        }
+        return None;
     }
 
-    if alt {
+    if alt && !ctrl {
+        if let Some(bytes) = modified_arrow(key, false, true) {
+            return Some(bytes);
+        }
+        if let Some(ch) = key_char.filter(|s| !s.is_empty()) {
+            let mut bytes = vec![0x1b];
+            bytes.extend(ch.as_bytes());
+            return Some(bytes);
+        }
+        if key.len() == 1 {
+            let mut bytes = vec![0x1b];
+            bytes.push(key.as_bytes()[0]);
+            return Some(bytes);
+        }
         return None;
     }
 
@@ -730,7 +795,7 @@ pub fn keystroke_to_bytes(
         })
     };
 
-    match key.as_str() {
+    match key {
         "enter" | "return" => Some(vec![b'\r']),
         "tab" => Some(vec![b'\t']),
         "escape" => Some(vec![0x1b]),
@@ -912,6 +977,33 @@ mod tests {
             keystroke_to_bytes("w", None, true, false, false, false),
             None
         );
+        assert_eq!(
+            keystroke_to_bytes("e", None, true, false, false, false),
+            Some(vec![0x05])
+        );
+        assert_eq!(
+            keystroke_to_bytes("f", None, true, false, false, false),
+            Some(vec![0x06])
+        );
+        assert_eq!(
+            keystroke_to_bytes("right", None, false, false, false, false),
+            Some(b"\x1b[C".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes("arrowright", None, false, false, false, false),
+            Some(b"\x1b[C".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes("right", None, true, false, false, false),
+            Some(b"\x1b[1;5C".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes("tab", None, false, false, false, false),
+            Some(vec![b'\t'])
+        );
+        assert_eq!(keystroke_to_bytes("v", None, true, false, false, false), None);
+        assert_eq!(paste_payload("a\r\nb", false), b"a\nb".to_vec());
+        assert_eq!(paste_payload("hi", true), b"\x1b[200~hi\x1b[201~".to_vec());
     }
 
     #[test]

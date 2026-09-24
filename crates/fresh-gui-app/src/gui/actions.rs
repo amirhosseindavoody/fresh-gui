@@ -20,6 +20,9 @@ pub fn install_menus(cx: &mut App) {
 
 fn file_menu() -> Menu {
     Menu::new("File").items([
+        MenuItem::action("New Tab", NewTerminal),
+        MenuItem::action("New File", NewFile),
+        MenuItem::separator(),
         MenuItem::action("Stop Server", StopServer),
         MenuItem::separator(),
         MenuItem::action("Quit Client", QuitClient),
@@ -30,6 +33,9 @@ actions!(
     fresh_gui,
     [
         NewTerminal,
+        NewFile,
+        TerminalInputTab,
+        TerminalInputBacktab,
         CloseTab,
         CloseAllEditors,
         CloseAllTerminals,
@@ -99,6 +105,7 @@ pub fn apply_shortkeys(cx: &mut App, shortkeys: &[Shortkey]) {
         };
         let binding = match entry.action.as_str() {
             "NewTerminal" => KeyBinding::new(key, NewTerminal, when),
+            "NewFile" => KeyBinding::new(key, NewFile, when),
             "CloseTab" => KeyBinding::new(key, CloseTab, when),
             "CloseAllEditors" => KeyBinding::new(key, CloseAllEditors, when),
             "CloseAllTerminals" => KeyBinding::new(key, CloseAllTerminals, when),
@@ -144,4 +151,10 @@ pub fn apply_shortkeys(cx: &mut App, shortkeys: &[Shortkey]) {
     cx.clear_key_bindings();
     KIT_BINDINGS.with(|saved| cx.bind_keys(saved.borrow().iter().cloned()));
     cx.bind_keys(bindings);
+    // The window Root binds Tab to focus-next, which lands on the File menu.
+    // A Terminal-context binding is more specific and wins while the shell is focused.
+    cx.bind_keys([
+        KeyBinding::new("tab", TerminalInputTab, Some("Terminal")),
+        KeyBinding::new("shift-tab", TerminalInputBacktab, Some("Terminal")),
+    ]);
 }

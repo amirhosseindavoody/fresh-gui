@@ -263,6 +263,31 @@ fn build_tree_layer(
         .collect()
 }
 
+/// Chevron column width. A child row indents by one full column so its icon
+/// lines up under the parent’s label, not under the parent row itself.
+pub const TREE_GUTTER_PX: f32 = 16.;
+
+/// Left padding for an explorer row at `depth` (0 is a root child).
+pub fn tree_row_indent_px(depth: usize) -> f32 {
+    TREE_GUTTER_PX * depth as f32 + 4.
+}
+
+/// Name for a new file in `existing` names. `untitled`, then `untitled-2`, …
+pub fn unused_file_name(existing: &[impl AsRef<str>]) -> String {
+    let taken: HashSet<&str> = existing.iter().map(|name| name.as_ref()).collect();
+    if !taken.contains("untitled") {
+        return "untitled".to_string();
+    }
+    let mut n = 2u32;
+    loop {
+        let name = format!("untitled-{n}");
+        if !taken.contains(name.as_str()) {
+            return name;
+        }
+        n += 1;
+    }
+}
+
 /// Flat visible ids, skipping lazy placeholders.
 pub fn real_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     ids.into_iter()
@@ -542,6 +567,22 @@ mod tests {
         assert_eq!(entries[0].path, child.path);
         let (key, _) = rebase_listing("", "/root", vec![]);
         assert_eq!(key, "/root");
+    }
+
+    #[test]
+    fn nested_rows_indent_by_a_full_gutter() {
+        assert_eq!(tree_row_indent_px(0), 4.);
+        assert_eq!(tree_row_indent_px(1) - tree_row_indent_px(0), TREE_GUTTER_PX);
+        assert!(tree_row_indent_px(1) > TREE_GUTTER_PX);
+    }
+
+    #[test]
+    fn new_file_names_skip_names_already_present() {
+        assert_eq!(unused_file_name(&["readme"]), "untitled");
+        assert_eq!(
+            unused_file_name(&["untitled", "untitled-2"]),
+            "untitled-3"
+        );
     }
 
     #[test]

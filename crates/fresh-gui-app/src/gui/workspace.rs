@@ -38,7 +38,7 @@ use gpui_kit::*;
 use super::actions::{
     ClearExplorerInput, CloseAllEditors, CloseAllOtherTabs, CloseAllOtherTerminals,
     CloseAllTerminals, CloseTab, CloseWorkspace, CopyExplorer, DeleteExplorer, Disconnect, FilterExplorer,
-    AskCopilot, GoToFile, NewTerminal, NewWorkspace, NextTab, OpenDefaultSettings, OpenSettings, PasteExplorer,
+    AskCopilot, GoToFile, NewFile, NewTerminal, NewWorkspace, NextTab, OpenDefaultSettings, OpenSettings, PasteExplorer,
     PrevTab, QuitClient, Reconnect, RenameWorkspace, ResetContentZoom, ResetUiZoom, SaveBuffer,
     StopServer, TerminalCopyOrInterrupt, TogglePinTab, ToggleCommandPalette, ToggleSidebar, ZoomInContent, ZoomInUi, ZoomOutContent,
     ZoomOutUi,
@@ -52,7 +52,8 @@ use super::dock_a11y::install_workspace_dock;
 use super::explorer::{
     absolute_paths_text, apply_selection, build_explorer_tree, copyable_sources, drag_paths,
     entry_kinds, gesture_from_modifiers, is_placeholder, movable_sources, parent_dir,
-    prune_expanded, real_ids, rebase_listing, record_tree_toggle,
+    prune_expanded, real_ids, rebase_listing, record_tree_toggle, tree_row_indent_px,
+    unused_file_name,
 };
 use super::file_icons::explorer_glyph;
 use super::pane::{EditorPanel, TerminalPanel};
@@ -506,6 +507,7 @@ pub struct Workspace {
     renaming_path: Option<String>,
     file_rename_input: Entity<InputState>,
     pending_renames: HashMap<String, String>,
+    pending_creates: HashSet<String>,
     /// Selected absolute paths. The last entry is the primary row.
     selection: Vec<String>,
     anchor: Option<String>,
@@ -752,6 +754,7 @@ impl Workspace {
             renaming_path: None,
             file_rename_input,
             pending_renames: HashMap::new(),
+            pending_creates: HashSet::new(),
             selection: Vec::new(),
             anchor: None,
             file_clipboard: None,
@@ -900,7 +903,7 @@ impl Workspace {
             AdeEvent::PtyData { id, bytes } => {
                 // The terminal panel notifies itself. Redrawing the whole
                 // workspace (rail, explorer, dock, status) per chunk is waste.
-                self.on_pty_data(&id, &bytes, cx);
+                self.on_pty_data(&id, &bytes, window, cx);
                 return;
             }
             AdeEvent::PtyClosed { id, reason } => {
@@ -932,6 +935,19 @@ impl Workspace {
                 entries,
             } => {
                 self.finish_fs(&request_id, entries, true, cx);
+            }
+            AdeEvent::FsCreated { request_id, entry } => {
+                if self.pending_creates.remove(&request_id) {
+                    let path = entry.path.clone();
+                    if let Some(parent) = parent_dir(&path) {
+                        self.relist(&parent);
+                    }
+                    self.selection = vec![path.clone()];
+                    self.anchor = Some(path.clone());
+                    self.status = format!("Created {}", entry.name).into();
+                    self.open_path(path.clone(), false);
+                    self.begin_file_rename(path, window, cx);
+                }
             }
             AdeEvent::FsRenamed { request_id, entry } => {
                 if let Some(old_path) = self.pending_renames.remove(&request_id) {
@@ -989,6 +1005,9 @@ impl Workspace {
             } => self.on_buffer_saved(&buffer_id, path, rev, cx),
             AdeEvent::Error { code, message } => {
                 self.pending_fs.clear();
+                if code == "fs_create_failed" {
+                    self.pending_creates.clear();
+                }
                 if code == "fs_rename_failed" {
                     if let Some((request_id, _)) = split_request_message(&message) {
                         self.pending_renames.remove(request_id);
@@ -1156,12 +1175,18 @@ impl Workspace {
         self.apply_zoom(window, cx);
     }
 
-    fn on_pty_data(&mut self, pty_id: &str, bytes: &[u8], cx: &mut Context<Self>) {
+    fn on_pty_data(
+        &mut self,
+        pty_id: &str,
+        bytes: &[u8],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(panel) = self.terminals.get(pty_id).cloned() else {
             return;
         };
         let previous_cwd = panel.read(cx).cwd();
-        let cwd = panel.update(cx, |panel, cx| panel.push_bytes(bytes, cx));
+        let cwd = panel.update(cx, |panel, cx| panel.push_bytes(bytes, window, cx));
         if let Some(cwd) = cwd {
             self.last_cwd = Some(cwd.clone());
             if previous_cwd.as_deref() != Some(cwd.as_str())
@@ -1438,6 +1463,52 @@ impl Workspace {
             rows: 24,
             cwd,
         });
+    }
+
+    /// Create an empty file under the selected folder (or the file's parent)
+    /// and open it. The name is `untitled`, then `untitled-2`, and so on.
+    pub(crate) fn new_file(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.connection, ConnectionState::Online) {
+            self.status = "Not connected".into();
+            cx.notify();
+            return;
+        }
+        let Some(parent) = self.create_parent() else {
+            self.status = "No folder for a new file".into();
+            cx.notify();
+            return;
+        };
+        let existing = self
+            .explorer_cache
+            .get(&parent)
+            .map(|entries| entries.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let name = unused_file_name(&existing);
+        let request_id = next_id("create");
+        self.pending_creates.insert(request_id.clone());
+        self.ade.send(AdeCmd::CreatePath {
+            request_id,
+            parent,
+            name,
+            kind: FsKind::File,
+        });
+        self.status = "Creating file…".into();
+        cx.notify();
+    }
+
+    fn create_parent(&self) -> Option<String> {
+        let root = self.explorer_root.clone();
+        if root.is_empty() {
+            return None;
+        }
+        let Some(path) = self.selection.last() else {
+            return Some(root);
+        };
+        if self.is_dir(path) {
+            Some(path.clone())
+        } else {
+            parent_dir(path).or(Some(root))
+        }
     }
 
     /// OSC 7 cwd of the focused shell, otherwise the workspace or session root.
@@ -1761,6 +1832,7 @@ impl Workspace {
         self.filter_open = false;
         self.renaming_path = None;
         self.pending_renames.clear();
+        self.pending_creates.clear();
         self.pending_lists.clear();
         self.expanded_dirs = explorer_expanded.into_iter().collect();
         self.selection.clear();
@@ -2361,6 +2433,7 @@ impl Workspace {
         self.filter_open = false;
         self.renaming_path = None;
         self.pending_renames.clear();
+        self.pending_creates.clear();
         self.expanded_dirs.clear();
         self.explorer_kinds = Rc::default();
         self.pending_lists.clear();
@@ -3382,11 +3455,21 @@ impl Workspace {
     }
 
 
-    fn on_terminal_copy_or_interrupt(&mut self, _: &TerminalCopyOrInterrupt, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_terminal_copy_or_interrupt(
+        &mut self,
+        _: &TerminalCopyOrInterrupt,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(ActiveSurface::Terminal(id)) = &self.active
-            && let Some(panel) = self.terminals.get(id) {
-            panel.update(cx, |panel, cx| panel.copy_or_interrupt(cx));
+            && let Some(panel) = self.terminals.get(id)
+        {
+            panel.update(cx, |panel, cx| panel.copy_or_interrupt(window, cx));
         }
+    }
+
+    fn on_new_file(&mut self, _: &NewFile, _: &mut Window, cx: &mut Context<Self>) {
+        self.new_file(cx);
     }
 
     fn on_toggle_pin_tab(&mut self, _: &TogglePinTab, _: &mut Window, cx: &mut Context<Self>) {
@@ -4186,7 +4269,7 @@ impl Workspace {
                         .rounded(cx.theme().radius)
                         .py_0()
                         .px_1()
-                        .pl(px(8.) * entry.depth() + px(4.))
+                        .pl(px(tree_row_indent_px(entry.depth())))
                         .child(
                             h_flex()
                                 .w_full()
@@ -4195,7 +4278,7 @@ impl Workspace {
                                 .when(in_selection, |this| {
                                     this.bg(cx.theme().accent.opacity(0.28))
                                 })
-                                .child(div().w(px(14.)).flex().justify_center().when(
+                                .child(div().w(px(16.)).flex_shrink_0().flex().justify_center().when(
                                     can_expand,
                                     |this| {
                                         let chevron = if entry.is_expanded() {
@@ -4213,7 +4296,11 @@ impl Workspace {
                                         entry.is_expanded(),
                                     );
                                     this.child(
-                                        Icon::new(glyph.icon).small().text_color(glyph.color(dark)),
+                                        div().flex_shrink_0().child(
+                                            Icon::new(glyph.icon)
+                                                .small()
+                                                .text_color(glyph.color(dark)),
+                                        ),
                                     )
                                 })
                                 .when(renaming_path.as_deref() == Some(path.as_str()), |this| {
@@ -4901,6 +4988,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_delete_explorer))
             .on_action(cx.listener(Self::on_filter_explorer))
             .on_action(cx.listener(Self::on_clear_explorer_input))
+            .on_action(cx.listener(Self::on_new_file))
             .on_action(cx.listener(Self::on_new_workspace))
             .on_action(cx.listener(Self::on_rename_workspace))
             .on_action(cx.listener(Self::on_close_workspace))
