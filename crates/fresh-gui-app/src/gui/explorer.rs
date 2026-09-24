@@ -283,8 +283,8 @@ pub fn is_untitled_editor_key(path: &str) -> bool {
     path.starts_with(UNTITLED_PREFIX)
 }
 
-/// Path Ctrl+P should open. A unique or name-only match wins; a typed path
-/// that already contains a separator is opened as written.
+/// Path Ctrl+P should open. An exact spelling wins; otherwise the first
+/// completion wins, including for a partially typed directory path.
 pub fn pick_goto_target(query: &str, matches: &[impl AsRef<str>]) -> String {
     let query = query.trim();
     if query.is_empty() {
@@ -296,10 +296,7 @@ pub fn pick_goto_target(query: &str, matches: &[impl AsRef<str>]) -> String {
     }) {
         return exact.as_ref().to_string();
     }
-    let typed_path = query.contains('/') || query.contains('\\') || query.contains(':');
-    if !typed_path
-        && let Some(first) = matches.first()
-    {
+    if let Some(first) = matches.first() {
         return first.as_ref().to_string();
     }
     query.to_string()
@@ -656,8 +653,8 @@ mod tests {
             "/proj/src/lib.rs"
         );
         assert_eq!(
-            pick_goto_target("src/main.rs:12", &["/proj/src/main.rs"]),
-            "src/main.rs:12"
+            pick_goto_target("src/ma", &["src/main.rs"]),
+            "src/main.rs"
         );
     }
 

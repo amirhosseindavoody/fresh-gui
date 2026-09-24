@@ -4,6 +4,8 @@
 pub struct ConnectTarget {
     pub ws_url: String,
     pub token: Option<String>,
+    /// True only for a daemon started or found by the local launcher.
+    pub local_daemon: bool,
     /// Shown in the title bar (SSH destination). The WebSocket URL stays local.
     pub label: Option<String>,
     /// Absolute project directory to focus or create after connect.
@@ -23,6 +25,7 @@ pub fn parse_connect_target(backend: &str, cli_token: Option<String>) -> Connect
     ConnectTarget {
         ws_url,
         token,
+        local_daemon: false,
         label: None,
         preferred_root: None,
     }

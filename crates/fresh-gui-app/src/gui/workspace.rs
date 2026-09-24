@@ -52,7 +52,7 @@ use super::diff_view::{self, BinaryPanel, DiffPanel};
 use super::dock_a11y::install_workspace_dock;
 use super::explorer::{
     absolute_paths_text, apply_selection, build_explorer_tree, copyable_sources, drag_paths,
-    entry_kinds, gesture_from_modifiers, is_placeholder, is_untitled_editor_key,
+    entry_kinds, gesture_from_modifiers, is_dir_entry, is_placeholder, is_untitled_editor_key,
     movable_sources, parent_dir, pick_goto_target, prune_expanded, real_ids, rebase_listing,
     record_tree_toggle, save_target_path, tree_row_indent_px, untitled_editor_key,
     unused_file_name,
@@ -75,85 +75,91 @@ const PTY_BATCH_BYTES: usize = 128 * 1024;
 const PTY_BATCH_EVENTS: usize = 32;
 const GOTO_MAX_VISIBLE: usize = 10;
 
-fn goto_disk_matches(query: &str, root: Option<&str>, home: Option<&str>) -> Vec<(String, bool)> {
-    use std::path::{Path, PathBuf};
+#[derive(Debug, PartialEq, Eq)]
+struct GotoParts {
+    /// Directory to ask the daemon to list.
+    parent: String,
+    /// The user's spelling, including the final separator.
+    display_prefix: String,
+    name_prefix: String,
+}
 
-    let query = query.trim();
+fn goto_is_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || path.starts_with("\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
+}
+
+fn goto_separator(root: &str) -> char {
+    if root.starts_with("\\\\")
+        || root.as_bytes().get(1) == Some(&b':')
+    {
+        '\\'
+    } else {
+        '/'
+    }
+}
+
+fn goto_join(root: &str, path: &str) -> String {
+    if path.is_empty() {
+        return root.to_string();
+    }
+    let separator = goto_separator(root);
+    format!("{}{separator}{path}", root.trim_end_matches(['/', '\\']))
+}
+
+/// Split a path using daemon path syntax, without changing its displayed spelling.
+/// Unknown home directories cannot be listed: `FsList` does not expand `~`.
+fn split_goto_query(query: &str, root: Option<&str>, home: Option<&str>) -> Option<GotoParts> {
     if query == "~" {
-        let Some(home) = home else {
-            return Vec::new();
-        };
-        let mut entries = std::fs::read_dir(home)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let metadata = entry.metadata().ok()?;
-                if !metadata.is_dir() && !metadata.is_file() {
-                    return None;
-                }
-                Some((
-                    format!("~/{}", entry.file_name().to_string_lossy()),
-                    metadata.is_dir(),
-                ))
-            })
-            .collect::<Vec<_>>();
-        entries.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
-        entries.truncate(GOTO_MAX_VISIBLE);
-        return entries;
+        return Some(GotoParts {
+            parent: home?.to_string(),
+            display_prefix: "~/".into(),
+            name_prefix: String::new(),
+        });
     }
-    let (typed_parent, typed_name) = query.rsplit_once(['/', '\\']).unwrap_or(("", query));
-    let expanded = if query.starts_with("~/") || query.starts_with("~\\") {
-        let rest = &query[1..];
-        match home {
-            Some(home) => format!("{home}{rest}"),
-            None => query.to_string(),
+    let (display_prefix, name_prefix) = match query.rfind(['/', '\\']) {
+        Some(ix) => (query[..=ix].to_string(), query[ix + 1..].to_string()),
+        None => (String::new(), query.to_string()),
+    };
+    let parent = if query.starts_with("~/") || query.starts_with("~\\") {
+        let home = home?;
+        let relative_parent = display_prefix[2..].trim_end_matches(['/', '\\']);
+        goto_join(home, relative_parent)
+    } else if goto_is_absolute(query) {
+        let trimmed = display_prefix.trim_end_matches(['/', '\\']);
+        if trimmed.is_empty() {
+            "/".to_string()
+        } else if trimmed.len() == 2 && trimmed.as_bytes()[1] == b':' {
+            display_prefix.clone()
+        } else {
+            trimmed.to_string()
         }
     } else {
-        query.to_string()
+        let root = root?;
+        goto_join(root, display_prefix.trim_end_matches(['/', '\\']))
     };
-    let (expanded_parent, expanded_name) = expanded
-        .rsplit_once(['/', '\\'])
-        .unwrap_or(("", expanded.as_str()));
-    let mut parent = if expanded_parent.is_empty() {
-        root.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
-    } else {
-        PathBuf::from(expanded_parent)
-    };
-    if !parent.is_absolute() {
-        if let Some(root) = root {
-            parent = Path::new(root).join(parent);
-        }
-    }
-    let typed_prefix = typed_parent;
-    let mut matches = std::fs::read_dir(&parent)
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.to_lowercase().starts_with(&expanded_name.to_lowercase()) {
-                return None;
-            }
-            let metadata = entry.metadata().ok()?;
-            if !metadata.is_dir() && !metadata.is_file() {
-                return None;
-            }
-            let is_dir = metadata.is_dir();
-            let display = if typed_prefix.is_empty() {
-                name
-            } else {
-                let separator = &query[typed_prefix.len()..query.len() - typed_name.len()];
-                format!("{typed_prefix}{separator}{name}")
-            };
-            Some((display, is_dir))
-        })
+    Some(GotoParts { parent, display_prefix, name_prefix })
+}
+
+fn goto_list_matches(parts: &GotoParts, entries: &[FsEntry]) -> Vec<String> {
+    let prefix = parts.name_prefix.to_lowercase();
+    let mut matches = entries.iter()
+        .filter(|entry| entry.kind != FsKind::Other && entry.name.to_lowercase().starts_with(&prefix))
+        .map(|entry| entry.name.as_str())
         .collect::<Vec<_>>();
-    matches.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    matches.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b)));
     matches.truncate(GOTO_MAX_VISIBLE);
-    matches
+    matches.into_iter().map(|name| format!("{}{name}", parts.display_prefix)).collect()
+}
+
+fn goto_completion_path(query: &str) -> String {
+    let (path, line, column) = parse_goto_spec(query);
+    if line.is_some() || column.is_some() { path } else { query.to_string() }
 }
 
 fn goto_ghost_suffix<'a>(query: &str, completion: &'a str) -> Option<&'a str> {
@@ -169,32 +175,60 @@ fn goto_ghost_suffix<'a>(query: &str, completion: &'a str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod goto_match_tests {
-    use super::{goto_disk_matches, goto_ghost_suffix};
-    use std::fs;
+    use super::{goto_completion_path, goto_ghost_suffix, goto_list_matches, split_goto_query};
+    use crate::gui::connect::parse_goto_spec;
+    use crate::gui::explorer::pick_goto_target;
+    use fresh_gui_protocol::{FsEntry, FsKind};
 
     #[test]
-    fn disk_completion_lists_real_case_insensitive_prefix_matches() {
-        let root = std::env::temp_dir().join(format!("fresh-goto-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(root.join("src/Main.rs"), "").unwrap();
-        fs::write(root.join("src/other.rs"), "").unwrap();
-        let matches = goto_disk_matches("src/ma", root.to_str(), None);
-        assert_eq!(matches, vec![("src/Main.rs".to_string(), false)]);
-        let absolute = format!("{}/src/ma", root.display());
-        assert_eq!(
-            goto_disk_matches(&absolute, None, None)[0].0,
-            format!("{}/src/Main.rs", root.display())
-        );
-        assert_eq!(
-            goto_disk_matches("~/src/ma", None, root.to_str())[0].0,
-            "~/src/Main.rs"
-        );
-        assert_eq!(
-            goto_disk_matches("s", root.to_str(), None)[0],
-            ("src".to_string(), true)
-        );
-        fs::remove_dir_all(root).unwrap();
+    fn completion_uses_daemon_paths_and_preserves_typed_prefix() {
+        let parts = split_goto_query("src/ma", Some("/project"), None).unwrap();
+        assert_eq!(parts.parent, "/project/src");
+        let entries = ["Main.rs", "many.rs", "other.rs"].map(|name| FsEntry {
+            name: name.into(), path: format!("/project/src/{name}"), kind: FsKind::File,
+            size: None, target_kind: None,
+        });
+        assert_eq!(goto_list_matches(&parts, &entries), vec!["src/Main.rs", "src/many.rs"]);
+        let absolute = split_goto_query("/project/src/ma", None, None).unwrap();
+        assert_eq!(absolute.parent, "/project/src");
+        assert_eq!(goto_list_matches(&absolute, &entries)[0], "/project/src/Main.rs");
+        let home = split_goto_query("~/src/ma", None, Some("/home/ada")).unwrap();
+        assert_eq!(home.parent, "/home/ada/src");
+        assert_eq!(goto_list_matches(&home, &entries)[0], "~/src/Main.rs");
+        assert!(split_goto_query("~/src/ma", Some("/project"), None).is_none());
+        let windows = split_goto_query(r"src\ma", Some(r"C:\project"), None).unwrap();
+        assert_eq!(windows.parent, r"C:\project\src");
+        assert_eq!(windows.display_prefix, "src\\");
+        assert_eq!(split_goto_query(r"C:\src\ma", None, None).unwrap().parent, r"C:\src");
+        assert_eq!(split_goto_query("src/ma", Some("C:/project"), None).unwrap().parent, "C:/project\\src");
+        assert_eq!(split_goto_query("/ma", None, None).unwrap().parent, "/");
+        assert_eq!(split_goto_query("ma", Some("/"), None).unwrap().parent, "/");
+        assert_eq!(goto_completion_path("src/ma "), "src/ma ");
+        assert_eq!(goto_completion_path("src/ma:12:3"), "src/ma");
+        let (path, line, column) = parse_goto_spec("src/ma:12:3");
+        assert_eq!(pick_goto_target(&path, &["src/Main.rs"]), "src/Main.rs");
+        assert_eq!((line, column), (Some(12), Some(3)));
+    }
+
+    #[test]
+    fn completion_includes_directory_symlinks_and_limits_results() {
+        let parts = split_goto_query("a", Some("/project"), None).unwrap();
+        let mut entries = (0..12).map(|n| FsEntry {
+            name: format!("a{n:02}"), path: format!("/project/a{n:02}"),
+            kind: FsKind::File, size: None, target_kind: None,
+        }).collect::<Vec<_>>();
+        entries.push(FsEntry {
+            name: "a-dir".into(), path: "/project/a-dir".into(), kind: FsKind::Dir,
+            size: None, target_kind: None,
+        });
+        entries.push(FsEntry {
+            name: "a-link".into(), path: "/project/a-link".into(), kind: FsKind::Symlink,
+            size: None, target_kind: Some(FsKind::Dir),
+        });
+        let matches = goto_list_matches(&parts, &entries);
+        assert_eq!(matches.len(), 10);
+        assert_eq!(matches[0], "a-dir");
+        assert!(matches.contains(&"a-link".to_string()));
     }
 
     #[test]
@@ -949,8 +983,10 @@ impl Workspace {
                 return;
             }
             match ev {
-                InputEvent::PressEnter { .. } => this.confirm_goto(cx),
-                InputEvent::Change => cx.notify(),
+                InputEvent::Change => {
+                    this.request_goto_listing(cx);
+                    cx.notify();
+                }
                 _ => {}
             }
         });
@@ -1261,13 +1297,17 @@ impl Workspace {
                 path,
                 entries,
             } => {
+                let goto_listing = request_id.starts_with("goto-");
                 let requested = self.pending_lists.remove(&request_id).unwrap_or_default();
                 let (path, entries) = rebase_listing(&requested, &path, entries);
-                if self.explorer_root.is_empty() {
+                if self.explorer_root.is_empty() && !goto_listing {
                     self.explorer_root = path.clone();
                 }
                 self.explorer_cache.insert(path, entries);
                 self.rebuild_tree(cx);
+                if self.goto_open {
+                    self.request_goto_listing(cx);
+                }
                 if self.pending_lists.is_empty() { self.restore_scroll_index = None; }
             }
             AdeEvent::FsMoved {
@@ -1359,6 +1399,11 @@ impl Workspace {
             }
             AdeEvent::Error { code, message } => {
                 self.pending_fs.clear();
+                if code == "fs_list_failed"
+                    && let Some((request_id, _)) = split_request_message(&message)
+                {
+                    self.pending_lists.remove(request_id);
+                }
                 if code == "buffer_format_failed"
                     && let Some((request_id, detail)) = split_request_message(&message)
                     && let Some(buffer_id) = request_id.strip_prefix("fmt-")
@@ -3711,16 +3756,28 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.list_dir(dir);
     }
 
-    /// `fs_list` for `path`, remembered so the reply is keyed by the path the
-    /// tree asked for (see [`rebase_listing`]). A listing already in flight
-    /// for the same path is not sent twice.
+    /// `fs_list` for `path`, remembered so the reply is keyed by the requested
+    /// path (see [`rebase_listing`]). A listing already in flight for the same
+    /// path is not sent twice.
     fn list_dir(&mut self, path: &str) {
+        self.send_dir_listing(path, "ex");
+    }
+
+    fn send_dir_listing(&mut self, path: &str, prefix: &str) {
         if self.pending_lists.values().any(|pending| pending == path) {
             return;
         }
-        let request_id = next_id("ex");
+        let request_id = next_id(prefix);
         self.pending_lists
             .insert(request_id.clone(), path.to_string());
+        if prefix == "goto" {
+            // The daemon permits editor opens outside the workspace root. Give
+            // explicitly typed completion parents the same directory access.
+            self.ade.send(AdeCmd::AuthorizeDir {
+                request_id: next_id("goto-auth"),
+                path: path.to_string(),
+            });
+        }
         self.ade.send(AdeCmd::ListDir {
             request_id,
             path: path.to_string(),
@@ -3854,6 +3911,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         if self.goto_open {
             self.palette_open = false;
             self.rename_pty = None;
+            self.request_goto_listing(cx);
             self.goto_input.update(cx, |state, cx| {
                 state.focus(window, cx);
             });
@@ -3861,22 +3919,41 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         cx.notify();
     }
 
-    fn confirm_goto(&mut self, cx: &mut Context<Self>) {
+    fn goto_home(&self) -> Option<String> {
+        self.target.local_daemon.then(super::rail::user_home).flatten()
+    }
+
+    fn goto_parts(&self, query: &str) -> Option<GotoParts> {
+        split_goto_query(query, self.workspace_root().as_deref(), self.goto_home().as_deref())
+    }
+
+    fn request_goto_listing(&mut self, cx: &App) {
         let query = self.goto_input.read(cx).value().to_string();
-        let matches = self.goto_matches(&query);
-        let target = pick_goto_target(&query, &matches);
-        let (file, line, column) = parse_goto_spec(&target);
-        if !file.is_empty() && self.goto_path_is_dir(&file) {
-            // A directory is a completion target, never an openable file.
-            // Tab descends into it while Enter leaves the picker active.
-            cx.notify();
+        let path = goto_completion_path(&query);
+        if let Some(parts) = self.goto_parts(&path)
+            && !self.explorer_cache.contains_key(&parts.parent)
+        {
+            self.send_dir_listing(&parts.parent, "goto");
+        }
+    }
+
+    fn confirm_goto(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.goto_input.read(cx).value().to_string();
+        let (file, line, column) = parse_goto_spec(&query);
+        if file.is_empty() {
             return;
         }
-        let resolved = self.resolve_goto_path(&file);
-        if file.is_empty() || !std::path::Path::new(&resolved).is_file() {
-            cx.notify();
+        if self.goto_path_is_dir(&file) {
+            self.complete_goto_path(file, window, cx);
             return;
         }
+        let matches = self.goto_matches(&file);
+        let target = pick_goto_target(&file, &matches);
+        if self.goto_path_is_dir(&target) {
+            self.complete_goto_path(target, window, cx);
+            return;
+        }
+        let resolved = self.resolve_goto_path(&target);
         self.goto_open = false;
         let target = match (line, column) {
             (Some(line), Some(column)) => format!("{resolved}:{line}:{column}"),
@@ -3888,31 +3965,28 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     }
 
     fn goto_path_is_dir(&self, path: &str) -> bool {
-        std::fs::metadata(self.resolve_goto_path(path)).is_ok_and(|metadata| metadata.is_dir())
+        let path = path.trim_end_matches(['/', '\\']);
+        let resolved = self.resolve_goto_path(path);
+        if self.explorer_cache.contains_key(&resolved) {
+            return true;
+        }
+        self.goto_parts(path)
+            .and_then(|parts| self.explorer_cache.get(&parts.parent).map(|entries| (parts, entries)))
+            .is_some_and(|(parts, entries)| {
+                entries.iter().any(|entry| entry.name == parts.name_prefix && is_dir_entry(entry))
+            })
     }
 
     fn resolve_goto_path(&self, path: &str) -> String {
-        let expanded = if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
-            let rest = &path[1..];
-            super::rail::user_home()
-                .map(|home| format!("{home}{rest}"))
-                .unwrap_or_else(|| path.to_string())
-        } else {
-            path.to_string()
-        };
-        let path_buf = std::path::PathBuf::from(expanded);
-        if path_buf.is_absolute() {
-            path_buf.to_string_lossy().into_owned()
-        } else {
-            self.workspace_root()
-                .map(|root| {
-                    std::path::Path::new(&root)
-                        .join(path_buf)
-                        .to_string_lossy()
-                        .into_owned()
-                })
-                .unwrap_or_else(|| path.to_string())
+        if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
+            return self.goto_home().map(|home| {
+                if path == "~" { home.clone() } else { goto_join(&home, &path[2..]) }
+            }).unwrap_or_else(|| path.to_string());
         }
+        if goto_is_absolute(path) {
+            return path.to_string();
+        }
+        self.workspace_root().map(|root| goto_join(&root, path)).unwrap_or_else(|| path.to_string())
     }
 
     fn complete_goto(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3938,18 +4012,16 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.goto_input.update(cx, |input, cx| {
             input.set_value(path, window, cx);
         });
+        self.request_goto_listing(cx);
         cx.notify();
     }
 
     fn goto_matches(&self, query: &str) -> Vec<String> {
-        goto_disk_matches(
-            query,
-            self.workspace_root().as_deref(),
-            super::rail::user_home().as_deref(),
-        )
-        .into_iter()
-            .map(|(path, _)| path)
-            .collect()
+        let path = goto_completion_path(query);
+        let Some(parts) = self.goto_parts(&path) else { return Vec::new() };
+        self.explorer_cache.get(&parts.parent)
+            .map(|entries| goto_list_matches(&parts, entries))
+            .unwrap_or_default()
     }
 
     pub(crate) fn open_path_link(
@@ -5591,7 +5663,10 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                     .border_color(cx.theme().border)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                        if event.keystroke.key.eq_ignore_ascii_case("tab") {
+                        if event.keystroke.key.eq_ignore_ascii_case("enter") {
+                            this.confirm_goto(window, cx);
+                            cx.stop_propagation();
+                        } else if event.keystroke.key.eq_ignore_ascii_case("tab") {
                             this.complete_goto(window, cx);
                             cx.stop_propagation();
                         } else if event.keystroke.key.eq_ignore_ascii_case("right")
