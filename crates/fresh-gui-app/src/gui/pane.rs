@@ -1114,6 +1114,10 @@ struct EditorPending {
 pub struct EditorPanel {
     buffer_id: String,
     path: String,
+    /// Buffer has no file yet. `path` is a client key, not a disk path.
+    unsaved: bool,
+    /// Tab title while `unsaved` (`Untitled`, `Untitled 2`, …).
+    unsaved_title: Option<String>,
     dirty: bool,
     rev: u64,
     pending: Option<EditorPending>,
@@ -1145,6 +1149,8 @@ impl EditorPanel {
         language: Option<String>,
         line: Option<u32>,
         column: Option<u32>,
+        unsaved: bool,
+        unsaved_title: Option<String>,
         ade: AdeHandle,
         workspace: WeakEntity<Workspace>,
         metrics: TabStripMetrics,
@@ -1169,6 +1175,8 @@ impl EditorPanel {
         Self {
             buffer_id,
             path,
+            unsaved,
+            unsaved_title,
             dirty: false,
             rev: 0,
             pending: Some(EditorPending { line, column }),
@@ -1206,6 +1214,10 @@ impl EditorPanel {
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    pub fn is_unsaved(&self) -> bool {
+        self.unsaved
     }
 
     pub fn rev(&self) -> u64 {
@@ -1287,7 +1299,9 @@ impl EditorPanel {
         cx: &mut Context<Self>,
     ) {
         self.rev = rev;
-        self.path = path;
+        if !path.is_empty() {
+            self.path = path;
+        }
         self.dirty = false;
         self.inline_markdown_edit = None;
         self.inline_markdown_subscription = None;
@@ -1317,6 +1331,8 @@ impl EditorPanel {
     pub fn mark_saved(&mut self, path: String, rev: u64, cx: &mut Context<Self>) -> Option<String> {
         let previous = (self.path != path).then(|| self.path.clone());
         self.path = path;
+        self.unsaved = false;
+        self.unsaved_title = None;
         self.rev = rev;
         self.dirty = false;
         cx.notify();
@@ -1324,12 +1340,20 @@ impl EditorPanel {
     }
 
     fn label(&self) -> String {
-        let shown = display_path(&self.path);
-        let name = path_basename(&shown).unwrap_or(shown.as_str());
+        let name = if self.unsaved {
+            self.unsaved_title
+                .clone()
+                .unwrap_or_else(|| "Untitled".to_string())
+        } else {
+            let shown = display_path(&self.path);
+            path_basename(&shown)
+                .unwrap_or(shown.as_str())
+                .to_string()
+        };
         if self.dirty {
             format!("• {name}")
         } else {
-            name.to_string()
+            name
         }
     }
 }

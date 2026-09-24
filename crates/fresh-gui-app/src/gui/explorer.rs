@@ -272,6 +272,40 @@ pub fn tree_row_indent_px(depth: usize) -> f32 {
     TREE_GUTTER_PX * depth as f32 + 4.
 }
 
+/// Editor-map key for a buffer that has not been saved yet.
+pub const UNTITLED_PREFIX: &str = "untitled:";
+
+pub fn untitled_editor_key(buffer_id: &str) -> String {
+    format!("{UNTITLED_PREFIX}{buffer_id}")
+}
+
+pub fn is_untitled_editor_key(path: &str) -> bool {
+    path.starts_with(UNTITLED_PREFIX)
+}
+
+/// Absolute save path. A bare name or relative path is placed under `parent`.
+pub fn save_target_path(parent: &str, input: &str) -> String {
+    let input = input.trim();
+    if input.is_empty() {
+        return String::new();
+    }
+    let bytes = input.as_bytes();
+    let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if input.starts_with('/') || input.starts_with('\\') || drive {
+        return input.to_string();
+    }
+    let parent = parent.trim_end_matches(['/', '\\']);
+    if parent.is_empty() {
+        return input.to_string();
+    }
+    let sep = if parent.contains('\\') && !parent.contains('/') {
+        '\\'
+    } else {
+        '/'
+    };
+    format!("{parent}{sep}{input}")
+}
+
 /// Name for a new file in `existing` names. `untitled`, then `untitled-2`, …
 pub fn unused_file_name(existing: &[impl AsRef<str>]) -> String {
     let taken: HashSet<&str> = existing.iter().map(|name| name.as_ref()).collect();
@@ -583,6 +617,18 @@ mod tests {
             unused_file_name(&["untitled", "untitled-2"]),
             "untitled-3"
         );
+        assert_eq!(untitled_editor_key("7"), "untitled:7");
+        assert!(is_untitled_editor_key("untitled:7"));
+        assert!(!is_untitled_editor_key("/tmp/untitled"));
+        assert_eq!(
+            save_target_path("/work/proj", "notes.rs"),
+            "/work/proj/notes.rs"
+        );
+        assert_eq!(
+            save_target_path("/work/proj", "/tmp/other.rs"),
+            "/tmp/other.rs"
+        );
+        assert_eq!(save_target_path(r"C:\work", "a.txt"), r"C:\work\a.txt");
     }
 
     #[test]

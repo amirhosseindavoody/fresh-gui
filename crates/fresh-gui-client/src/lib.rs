@@ -706,6 +706,7 @@ impl Client {
                 request_id: request_id.clone(),
                 buffer_id: buffer_id.clone(),
                 base_rev,
+                path: String::new(),
             },
         )
         .await?;

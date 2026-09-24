@@ -45,6 +45,9 @@ pub enum AdeCmd {
         line: Option<u32>,
         column: Option<u32>,
     },
+    NewBuffer {
+        request_id: String,
+    },
     EditBuffer {
         request_id: String,
         buffer_id: String,
@@ -55,6 +58,8 @@ pub enum AdeCmd {
         request_id: String,
         buffer_id: String,
         base_rev: u64,
+        /// Empty saves the buffer's existing file.
+        path: String,
     },
     CloseEditor {
         buffer_id: String,
@@ -472,6 +477,9 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
                 })
                 .await?;
         }
+        AdeCmd::NewBuffer { request_id } => {
+            client.send(Message::EditorNew { request_id }).await?;
+        }
         AdeCmd::EditBuffer {
             request_id,
             buffer_id,
@@ -491,12 +499,14 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
             request_id,
             buffer_id,
             base_rev,
+            path,
         } => {
             client
                 .send(Message::BufferSave {
                     request_id,
                     buffer_id,
                     base_rev,
+                    path,
                 })
                 .await?;
         }

@@ -55,7 +55,7 @@ The remote daemon keeps running after you close the window. The SSH path targets
 ## Everyday use
 
 - Use the left rail to create and switch workspaces. Each workspace has its own files and tabs. Right-click a workspace to rename it or choose **Change location…**. Source Control follows that folder.
-- Open files in the explorer. The **+** in the tab bar, and **File → New Tab** / **File → New File**, create a shell or an empty file named `untitled`. Drag a tab to the edge of another pane to split the view horizontally or vertically. Terminal tabs split the same way. The last remaining tab cannot be dragged.
+- Open files in the explorer. The **+** in the tab bar, and **File → New Tab** / **File → New File**, create a shell or an unsaved editor buffer. **File → Save** or Ctrl+S writes the buffer; an unsaved buffer asks for a path first. Drag a tab to the edge of another pane to split the view horizontally or vertically. Terminal tabs split the same way. The last remaining tab cannot be dragged.
 - In a terminal, Tab and Shift-Tab go to the shell (completion), not the File menu. Ctrl+C copies a selection, Ctrl+V and Shift+Insert paste, and Ctrl+letter chords such as Ctrl+E and Ctrl+F reach the shell.
 - Right-click a file or folder and choose **Copy Path** to copy its absolute path as text. For SSH sessions, this is the path on the remote server.
 - `Ctrl+=` or `Ctrl++` zooms editor and terminal text. `Ctrl+-` zooms out, and `Ctrl+0` resets that zoom. `Ctrl+Shift+=` (`Ctrl+Shift++` on a US keyboard) zooms the rest of the UI text, with `Ctrl+Shift+-` and `Ctrl+Shift+0` to zoom out and reset. Those chords are in the default shortkeys list, and the command palette lists the same actions. Sidebar width and the tab strip stay a fixed size.
