@@ -78,6 +78,12 @@ pub enum AdeCmd {
         path: String,
         name: String,
     },
+    CreatePath {
+        request_id: String,
+        parent: String,
+        name: String,
+        kind: fresh_gui_protocol::FsKind,
+    },
     CreateWorkspace {
         name: String,
         root: String,
@@ -249,6 +255,10 @@ pub enum AdeEvent {
         entries: Vec<FsEntry>,
     },
     FsRenamed {
+        request_id: String,
+        entry: FsEntry,
+    },
+    FsCreated {
         request_id: String,
         entry: FsEntry,
     },
@@ -532,6 +542,21 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
                     request_id,
                     path,
                     name,
+                })
+                .await?;
+        }
+        AdeCmd::CreatePath {
+            request_id,
+            parent,
+            name,
+            kind,
+        } => {
+            client
+                .send(Message::FsCreate {
+                    request_id,
+                    parent,
+                    name,
+                    kind,
                 })
                 .await?;
         }
@@ -926,6 +951,7 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             entries,
         }),
         Message::FsRenamed { request_id, entry } => Some(AdeEvent::FsRenamed { request_id, entry }),
+        Message::FsCreated { request_id, entry } => Some(AdeEvent::FsCreated { request_id, entry }),
         Message::Error { code, message } => Some(AdeEvent::Error { code, message }),
         Message::GitStatusResult {
             request_id,
