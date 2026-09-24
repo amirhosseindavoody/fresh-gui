@@ -18,6 +18,7 @@ pub const CAP_WORKSPACE: &str = "workspace";
 /// Changing the root of an existing workspace.
 pub const CAP_WORKSPACE_SET_ROOT: &str = "workspace_set_root";
 pub const CAP_EDITOR: &str = "editor";
+pub const CAP_LSP: &str = "lsp";
 pub const CAP_SCENE: &str = "scene";
 /// Workspace git status, diff, and stage/commit/pull/push. Absent on older daemons.
 pub const CAP_GIT: &str = "git";
@@ -218,6 +219,19 @@ pub struct SceneBuffer {
     pub dirty: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+}
+
+/// LSP diagnostic positions are zero-based UTF-16 columns, as in LSP.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BufferDiagnostic {
+    pub start_line: u32,
+    pub start_character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
+    pub severity: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// One changed path from `git status --porcelain`.
@@ -604,6 +618,22 @@ pub enum Message {
         path: String,
         rev: u64,
     },
+    /// Client → backend: fetch the latest LSP state for an open buffer.
+    /// The backend also includes a snapshot when asynchronous formatting changed it.
+    BufferLspGet {
+        buffer_id: String,
+        known_rev: u64,
+    },
+    /// Backend → client. An empty diagnostic list clears earlier problems.
+    BufferLspState {
+        buffer_id: String,
+        rev: u64,
+        diagnostics: Vec<BufferDiagnostic>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
     /// Client → backend: format the buffer with Fresh's formatter.
     BufferFormat {
         request_id: String,
@@ -616,7 +646,10 @@ pub enum Message {
         request_id: String,
         buffer_id: String,
         rev: u64,
-        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
     },
     /// Client → backend: close an editor buffer.
     EditorClose {
@@ -804,6 +837,7 @@ impl Hello {
             CAP_WORKSPACE.to_owned(),
             CAP_WORKSPACE_SET_ROOT.to_owned(),
             CAP_EDITOR.to_owned(),
+            CAP_LSP.to_owned(),
             CAP_SCENE.to_owned(),
             CAP_GIT.to_owned(),
         ]
@@ -817,6 +851,7 @@ impl Hello {
             CAP_SESSION.to_owned(),
             CAP_WORKSPACE.to_owned(),
             CAP_EDITOR.to_owned(),
+            CAP_LSP.to_owned(),
             CAP_SCENE.to_owned(),
             CAP_GIT.to_owned(),
         ]
@@ -1121,5 +1156,33 @@ mod tests {
                 directory: String::new()
             }
         );
+    }
+
+    #[test]
+    fn lsp_diagnostics_and_format_roundtrip() {
+        let state = Message::BufferLspState {
+            buffer_id: "42".into(),
+            rev: 3,
+            diagnostics: vec![BufferDiagnostic {
+                start_line: 1,
+                start_character: 3,
+                end_line: 1,
+                end_character: 5,
+                severity: "error".into(),
+                message: "bad value".into(),
+                source: Some("Ruff".into()),
+            }],
+            status: None,
+            text: None,
+        };
+        assert_eq!(Message::from_json(&state.to_json().unwrap()).unwrap(), state);
+        let formatted = Message::BufferFormatted {
+            request_id: "format-1".into(),
+            buffer_id: "42".into(),
+            rev: 4,
+            text: Some("value = 1\n".into()),
+            status: None,
+        };
+        assert_eq!(Message::from_json(&formatted.to_json().unwrap()).unwrap(), formatted);
     }
 }

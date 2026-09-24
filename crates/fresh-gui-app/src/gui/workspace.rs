@@ -1203,35 +1203,36 @@ impl Workspace {
                     panel.update(cx, |panel, cx| panel.set_rev(rev, cx));
                 }
             }
-            AdeEvent::BufferFormatted {
-                buffer_id,
-                rev,
-                text,
-                ..
-            } => {
-                if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
-                    let changed = panel.read(cx).rev() != rev;
-                    panel.update(cx, |panel, cx| {
-                        panel.apply_snapshot(rev, text, String::new(), window, cx);
-                        if changed {
-                            panel.set_dirty(true, cx);
-                        }
-                    });
-                    self.status = if changed {
-                        "Formatted".into()
-                    } else {
-                        "Document unchanged".into()
-                    };
-                }
-            }
             AdeEvent::BufferSaved {
                 buffer_id,
                 path,
                 rev,
                 ..
             } => self.on_buffer_saved(&buffer_id, path, rev, cx),
+            AdeEvent::BufferLspState { buffer_id, rev, text, diagnostics, status } => {
+                if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
+                    panel.update(cx, |panel, cx| {
+                        panel.set_lsp_state(rev, text, diagnostics, status, window, cx);
+                    });
+                }
+            }
+            AdeEvent::BufferFormatted { buffer_id, rev, text, status } => {
+                if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
+                    panel.update(cx, |panel, cx| {
+                        panel.apply_formatted(rev, text, status, window, cx);
+                    });
+                }
+            }
             AdeEvent::Error { code, message } => {
                 self.pending_fs.clear();
+                if code == "buffer_format_failed"
+                    && let Some((request_id, detail)) = split_request_message(&message)
+                    && let Some(buffer_id) = request_id.strip_prefix("fmt-")
+                        .and_then(|value| value.rsplit_once('-').map(|(id, _)| id))
+                    && let Some(panel) = self.editor_by_buffer(buffer_id, cx)
+                {
+                    panel.update(cx, |panel, cx| panel.set_format_error(detail.to_string(), cx));
+                }
                 if code == "fs_create_failed" {
                     self.pending_creates.clear();
                 }

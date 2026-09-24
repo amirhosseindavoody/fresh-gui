@@ -39,6 +39,17 @@
       "args": []
     }
   },
+  // Language servers are launched by the daemon, on the machine where files live.
+  // Add entries here or in Settings. Paths can be absolute or resolved through PATH.
+  // TOML (Tombi): { "command": "tombi", "args": ["lsp"] }
+  // Python (Ruff): { "command": "ruff", "args": ["server"], "only_features": ["diagnostics", "format"] }
+  // Python (TY): { "command": "ty", "args": ["server"], "only_features": ["diagnostics"] }
+  // Python accepts multiple servers; use an array to run Ruff and TY together.
+  // Empty by default so no server binary is started until configured.
+  "lsp": {},
+  // Optional Fresh language associations, for example:
+  // "languages": { "my_lang": { "extensions": ["ml"] } }
+  "languages": {},
   // action is the Rust action name to run. when is an optional GPUI focus
   // context: null means global; Explorer, Editor, and Terminal scope keys to a pane.
   // TerminalCopyOrInterrupt copies a selection, otherwise sends Ctrl+C to the PTY.

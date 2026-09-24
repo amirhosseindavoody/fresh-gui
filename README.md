@@ -65,6 +65,39 @@ The remote daemon keeps running after you close the window. The SSH path targets
 
 Workspaces and tabs come back when the daemon restarts. Shell tabs reopen as new shells; running shell processes do not survive a daemon restart. See [workspaces](docs/WORKSPACES.md) for details.
 
+## Language servers
+
+Fresh GUI uses Fresh's configurable language server support. Set `lsp` in Settings (`config.json`) to start user-installed servers for a language. The command is resolved on the daemon host, so for an SSH workspace install the server on the remote Linux machine. `command` may be an absolute path or a command found on that host's `PATH`; `args` are passed as separate arguments. Servers default to enabled and start for matching files. Set `enabled` to `false` to disable one. `only_features` / `except_features` can route features such as diagnostics and formatting when multiple servers share a language.
+
+Diagnostics appear in the editor's Problems list, with a click taking you to the reported line. Use **Format** above the editor to request LSP formatting, then save the result. A missing server command appears in the editor status and daemon log.
+
+For example, Tombi provides TOML diagnostics and formatting, while Ruff and TY can run together for Python:
+
+```jsonc
+{
+  "lsp": {
+    "toml": {
+      "command": "tombi",
+      "args": ["lsp"]
+    },
+    "python": [
+      {
+        "command": "ruff",
+        "args": ["server"],
+        "only_features": ["diagnostics", "format"]
+      },
+      {
+        "command": "ty",
+        "args": ["server"],
+        "only_features": ["diagnostics"]
+      }
+    ]
+  }
+}
+```
+
+Language keys use Fresh language IDs (`toml`, `python`). To associate a custom language ID with file extensions or filename globs, add a Fresh language definition under `languages`, for example `"languages": { "my_lang": { "extensions": ["ml"], "filenames": ["*.myconfig"] } }`, then place its LSP entry under `lsp.my_lang`. Fresh retains its built-in associations for TOML and Python. After changing a server entry in Settings, reopen affected files to start the new server. See the [Tombi installation guide](https://tombi-toml.github.io/tombi/docs/installation/), [Ruff editor guide](https://docs.astral.sh/ruff/editors/), and [TY editor guide](https://docs.astral.sh/ty/editors/) for installing the server binaries.
+
 ## Daemon-only and development
 
 For a headless Linux server, install only the daemon:

@@ -18,4 +18,6 @@ To update the pin, check out the desired commit in `vendor/fresh` and update `ve
 
 Fresh provides the editor buffer and save behavior. `fresh-gui` provides the ADE protocol, client connection, PTYs, file explorer sandbox, workspace state, and GPUI rendering. The client sends full buffer edits with a revision token; the daemon applies them to Fresh and saves through Fresh.
 
+Language servers use the same daemon-side Fresh `LspManager` and its local Authority. The worker pumps Fresh's editor tick, applies ADE edits through Fresh events so servers receive `didChange`, and closes Fresh buffers so they receive `didClose`. The GUI's `lsp` configuration is passed into Fresh before editor construction; the ADE bridge polls merged diagnostics and carries explicit format requests/results. Server commands resolve on the daemon host, including when a Windows GUI connects to a Linux daemon. Built-in Fresh LSP defaults are not started by Fresh GUI unless configured in its `config.json`.
+
 The daemon can run without the editor using `--no-editor`; terminal and filesystem features remain available. See [Architecture](./DESIGN.md) for process boundaries and [WORKSPACES.md](./WORKSPACES.md) for workspace behavior.

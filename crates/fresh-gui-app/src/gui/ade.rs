@@ -2,10 +2,11 @@
 
 use std::thread;
 use std::time::Duration;
+use std::collections::HashMap;
 
 use fresh_gui_client::{Client, ConnectOptions};
 use fresh_gui_protocol::{
-    CAP_WORKSPACE, FsEntry, GitFile, Hello, Message, PtyInfo, WorkspaceInfo, WorkspaceTab,
+    CAP_LSP, CAP_WORKSPACE, BufferDiagnostic, FsEntry, GitFile, Hello, Message, PtyInfo, WorkspaceInfo, WorkspaceTab,
 };
 
 use super::connect::ConnectTarget;
@@ -268,11 +269,18 @@ pub enum AdeEvent {
         path: String,
         rev: u64,
     },
-    BufferFormatted {
-        request_id: String,
+    BufferLspState {
         buffer_id: String,
         rev: u64,
-        text: String,
+        text: Option<String>,
+        diagnostics: Vec<BufferDiagnostic>,
+        status: Option<String>,
+    },
+    BufferFormatted {
+        buffer_id: String,
+        rev: u64,
+        text: Option<String>,
+        status: Option<String>,
     },
     FsCopied {
         request_id: String,
@@ -408,6 +416,7 @@ async fn ade_loop(
         }
     };
 
+    let lsp_enabled = hello.capabilities.iter().any(|cap| cap == CAP_LSP);
     let _ = evt_tx
         .send(AdeEvent::Connected {
             hello: Box::new(hello),
@@ -417,12 +426,29 @@ async fn ade_loop(
         })
         .await;
 
+    let mut open_buffers: HashMap<String, u64> = HashMap::new();
+    let mut lsp_tick = tokio::time::interval(Duration::from_millis(750));
+    lsp_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            _ = lsp_tick.tick(), if lsp_enabled => {
+                for (buffer_id, known_rev) in &open_buffers {
+                    if let Err(err) = client.send(Message::BufferLspGet {
+                        buffer_id: buffer_id.clone(), known_rev: *known_rev,
+                    }).await {
+                        let _ = evt_tx.send(AdeEvent::Error {
+                            code: "lsp".into(), message: format!("{err:#}"),
+                        }).await;
+                    }
+                }
+            }
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Ok(AdeCmd::Disconnect) | Err(_) => break,
                     Ok(cmd) => {
+                        if let AdeCmd::CloseEditor { buffer_id } = &cmd {
+                            open_buffers.remove(buffer_id);
+                        }
                         if let Err(err) = dispatch_cmd(&mut client, cmd).await {
                             let _ = evt_tx.send(AdeEvent::Error {
                                 code: "ade".into(),
@@ -437,6 +463,18 @@ async fn ade_loop(
                     Ok(message) => {
                         if let Message::WorkspaceSwitched { ref workspace, .. } = message {
                             client.session_id = Some(workspace.session_id.clone());
+                            open_buffers.clear();
+                        }
+                        match &message {
+                            Message::EditorOpened { buffer_id, .. } => { open_buffers.insert(buffer_id.clone(), 0); }
+                            Message::BufferSnapshot { buffer_id, rev, .. }
+                            | Message::BufferChanged { buffer_id, rev, .. }
+                            | Message::BufferSaved { buffer_id, rev, .. }
+                            | Message::BufferFormatted { buffer_id, rev, .. }
+                            | Message::BufferLspState { buffer_id, rev, .. } => {
+                                if let Some(known) = open_buffers.get_mut(buffer_id) { *known = *rev; }
+                            }
+                            _ => {}
                         }
                         if let Some(ev) = event_from_message(message)
                             && evt_tx.send(ev).await.is_err() {
@@ -1002,17 +1040,6 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             rev,
         }),
         Message::ConfigUpdated { shortkeys } => Some(AdeEvent::ConfigUpdated { shortkeys }),
-        Message::BufferFormatted {
-            request_id,
-            buffer_id,
-            rev,
-            text,
-        } => Some(AdeEvent::BufferFormatted {
-            request_id,
-            buffer_id,
-            rev,
-            text,
-        }),
         Message::BufferSaved {
             request_id,
             buffer_id,
@@ -1024,6 +1051,10 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             path,
             rev,
         }),
+        Message::BufferLspState { buffer_id, rev, text, diagnostics, status } =>
+            Some(AdeEvent::BufferLspState { buffer_id, rev, text, diagnostics, status }),
+        Message::BufferFormatted { buffer_id, rev, text, status, .. } =>
+            Some(AdeEvent::BufferFormatted { buffer_id, rev, text, status }),
         Message::FsCopied {
             request_id,
             entries,

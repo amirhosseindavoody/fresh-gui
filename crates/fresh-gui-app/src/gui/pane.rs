@@ -10,6 +10,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use alacritty_terminal::vte::ansi::CursorShape;
+use fresh_gui_protocol::BufferDiagnostic;
 
 use gpui_kit::base::ElementExt as _;
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent, PanelId};
@@ -1136,6 +1137,9 @@ pub struct EditorPanel {
     /// Tab title while `unsaved` (`Untitled`, `Untitled 2`, …).
     unsaved_title: Option<String>,
     dirty: bool,
+    diagnostics: Vec<BufferDiagnostic>,
+    lsp_status: Option<String>,
+    format_pending_text: Option<String>,
     rev: u64,
     pending: Option<EditorPending>,
     editor: Entity<EditorState>,
@@ -1195,6 +1199,9 @@ impl EditorPanel {
             unsaved,
             unsaved_title,
             dirty: false,
+            diagnostics: Vec::new(),
+            lsp_status: None,
+            format_pending_text: None,
             rev: 0,
             pending: Some(EditorPending { line, column }),
             editor,
@@ -1348,6 +1355,7 @@ impl EditorPanel {
             self.path = path;
         }
         self.dirty = false;
+        self.diagnostics.clear();
         self.inline_markdown_edit = None;
         self.inline_markdown_subscription = None;
         let jump = self.pending.take();
@@ -1368,6 +1376,88 @@ impl EditorPanel {
 
     pub fn set_rev(&mut self, rev: u64, cx: &mut Context<Self>) {
         self.rev = rev;
+        cx.notify();
+    }
+
+    pub fn set_lsp_state(
+        &mut self,
+        rev: u64,
+        text: Option<String>,
+        diagnostics: Vec<BufferDiagnostic>,
+        status: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(text) = text {
+            if !self.dirty && rev > self.rev {
+                self.editor.update(cx, |state, cx| state.set_value(&text, window, cx));
+                self.rev = rev;
+                self.dirty = true;
+            } else if rev > self.rev {
+                self.lsp_status = Some("Formatting changed the server buffer while local edits are open; save to resolve".into());
+            }
+        }
+        self.diagnostics = diagnostics;
+        if status.is_some() {
+            self.lsp_status = status;
+        } else if self.lsp_status.as_deref().is_some_and(|s| s.starts_with("LSP")) {
+            self.lsp_status = None;
+        }
+        cx.notify();
+    }
+
+    pub fn apply_formatted(
+        &mut self,
+        rev: u64,
+        text: Option<String>,
+        status: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let safe = self.format_pending_text.take()
+            .is_some_and(|expected| expected == self.current_text(cx));
+        self.rev = rev;
+        if let Some(text) = text {
+            if safe {
+                self.editor.update(cx, |state, cx| state.set_value(&text, window, cx));
+                self.dirty = true;
+                self.lsp_status = Some("Formatted; save to write changes".into());
+            } else {
+                self.lsp_status = Some("Formatting finished after further local edits; those edits were kept".into());
+            }
+        } else {
+            self.lsp_status = status.or_else(|| Some("No formatting changes".into()));
+        }
+        cx.notify();
+    }
+
+    pub fn set_format_error(&mut self, message: String, cx: &mut Context<Self>) {
+        self.format_pending_text = None;
+        self.lsp_status = Some(message);
+        cx.notify();
+    }
+
+    fn request_format(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_markdown_inline_edit(window, cx);
+        let text = self.current_text(cx);
+        let base_rev = if self.dirty {
+            self.ade.send(AdeCmd::EditBuffer {
+                request_id: format!("fmt-edit-{}-{}", self.buffer_id, self.rev),
+                buffer_id: self.buffer_id.clone(),
+                base_rev: self.rev,
+                text: text.clone(),
+            });
+            self.rev + 1
+        } else {
+            self.rev
+        };
+        self.format_pending_text = Some(text);
+        self.ade.send(AdeCmd::FormatBuffer {
+            request_id: format!("fmt-{}-{base_rev}", self.buffer_id),
+            buffer_id: self.buffer_id.clone(),
+            base_rev,
+        });
+        self.lsp_status = Some("Formatting…".into());
         cx.notify();
     }
 
@@ -1512,6 +1602,21 @@ impl Render for EditorPanel {
             Some("md" | "markdown")
         );
         let mut root = div().key_context("Editor").size_full().flex().flex_col();
+        let panel = cx.entity();
+        root = root.child(
+            h_flex().w_full().h_7().px_2().gap_2().items_center()
+                .border_b_1().border_color(cx.theme().border)
+                .child(Button::new("format-buffer").ghost().xsmall().label("Format")
+                    .on_click(move |_, window, cx| {
+                        panel.update(cx, |this, cx| this.request_format(window, cx));
+                    }))
+                .child(div().text_xs().text_color(cx.theme().muted_foreground)
+                    .child(format!("{} problems", self.diagnostics.len())))
+                .when_some(self.lsp_status.clone(), |row, status| {
+                    row.child(div().min_w_0().text_ellipsis().text_xs()
+                        .text_color(cx.theme().danger).child(status))
+                }),
+        );
         if markdown {
             let panel = cx.entity();
             root = root.child(
@@ -1601,7 +1706,59 @@ impl Render for EditorPanel {
                     ),
             );
         }
+        if !self.diagnostics.is_empty() {
+            let mut problems = v_flex().id("editor-problems").w_full().h(px(112.))
+                .overflow_y_scroll().border_t_1().border_color(cx.theme().border);
+            for (index, diagnostic) in self.diagnostics.iter().enumerate() {
+                let row_panel = cx.entity();
+                let line = diagnostic.start_line;
+                let utf16_col = diagnostic.start_character;
+                let source = diagnostic.source.as_deref().unwrap_or("LSP");
+                let label = format!("{}:{} {}: {}", line + 1, utf16_col + 1,
+                    source, diagnostic.message.replace('\n', " "));
+                problems = problems.child(
+                    div().id(format!("problem-{index}")).px_2().py_1()
+                        .text_xs().text_color(if diagnostic.severity == "error" {
+                            cx.theme().danger
+                        } else { cx.theme().muted_foreground })
+                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                            row_panel.update(cx, |this, cx| {
+                                let source = this.current_text(cx);
+                                let col = utf16_to_scalar_column(&source, line, utf16_col);
+                                this.editor.update(cx, |state, cx| {
+                                    state.set_cursor_position(Position::new(line, col), window, cx);
+                                });
+                            });
+                        })
+                        .child(label),
+                );
+            }
+            root = root.child(problems);
+        }
         root
+    }
+}
+
+fn utf16_to_scalar_column(text: &str, line: u32, utf16_col: u32) -> u32 {
+    let Some(content) = text.lines().nth(line as usize) else { return 0 };
+    let mut units = 0;
+    let mut scalars = 0;
+    for ch in content.chars() {
+        if units + ch.len_utf16() as u32 > utf16_col { break; }
+        units += ch.len_utf16() as u32;
+        scalars += 1;
+    }
+    scalars
+}
+
+#[cfg(test)]
+mod lsp_position_tests {
+    use super::utf16_to_scalar_column;
+
+    #[test]
+    fn diagnostic_columns_after_non_bmp_characters() {
+        assert_eq!(utf16_to_scalar_column("first\na😀b\n", 1, 3), 2);
+        assert_eq!(utf16_to_scalar_column("first\na😀b\n", 1, 4), 3);
     }
 }
 
