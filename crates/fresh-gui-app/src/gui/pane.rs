@@ -1681,9 +1681,9 @@ impl Render for EditorPanel {
                             .ghost()
                             .xsmall()
                             .icon(if locked {
-                                IconName::Lock
+                                gpui_kit::assets::IconName::Lock
                             } else {
-                                IconName::LockOpen
+                                gpui_kit::assets::IconName::LockOpen
                             })
                             .tooltip(if locked {
                                 "Unlock preview editing"

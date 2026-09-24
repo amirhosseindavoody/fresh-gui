@@ -4842,7 +4842,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                                 Button::new("refresh-explorer")
                                     .ghost()
                                     .xsmall()
-                                    .icon(IconName::RefreshCw)
+                                    .icon(gpui_kit::assets::IconName::RefreshCw)
                                     .tooltip("Refresh")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.refresh_explorer(cx);

@@ -376,12 +376,14 @@ impl DockPanel for DiffPanel {
             })
     }
 
-    fn title_suffix(&mut self, _: &mut Window, _: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn title_suffix(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let panel_id = PanelId::from(cx.entity().entity_id());
         Some(new_terminal_button(
             format!("new-term-diff-{}", self.rel),
             self.metrics.clone(),
             self.plus_shift.clone(),
             self.workspace.clone(),
+            panel_id,
         ))
     }
 
@@ -591,12 +593,14 @@ impl DockPanel for BinaryPanel {
             })
     }
 
-    fn title_suffix(&mut self, _: &mut Window, _: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn title_suffix(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let panel_id = PanelId::from(cx.entity().entity_id());
         Some(new_terminal_button(
             format!("new-term-binary-{}", self.path),
             self.metrics.clone(),
             self.plus_shift.clone(),
             self.workspace.clone(),
+            panel_id,
         ))
     }
 
