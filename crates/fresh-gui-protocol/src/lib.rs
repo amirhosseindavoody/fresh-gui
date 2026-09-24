@@ -563,6 +563,9 @@ pub enum Message {
         /// Daemon workspace id. Empty uses the daemon FS root.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         workspace_id: String,
+        /// Active terminal cwd or selected file directory, when available.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        directory: String,
     },
     /// Backend → client.
     GitStatusResult {
@@ -589,6 +592,8 @@ pub enum Message {
         request_id: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         workspace_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        directory: String,
         path: String,
     },
     /// Backend → client: both sides of the file, or `binary` when either side
@@ -610,6 +615,8 @@ pub enum Message {
         request_id: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         workspace_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        directory: String,
         paths: Vec<String>,
         stage: bool,
     },
@@ -618,6 +625,8 @@ pub enum Message {
         request_id: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         workspace_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        directory: String,
         message: String,
     },
     /// Client → backend: `git pull --no-edit`.
@@ -625,12 +634,16 @@ pub enum Message {
         request_id: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         workspace_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        directory: String,
     },
     /// Client → backend: `git push`.
     GitPush {
         request_id: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         workspace_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        directory: String,
     },
     /// Backend → client: result of stage, commit, pull, or push.
     GitOpResult {
@@ -985,6 +998,23 @@ mod tests {
         assert_eq!(
             Message::from_json(&status.to_json().unwrap()).unwrap(),
             status
+        );
+        let request = Message::GitStatus {
+            request_id: "g2".into(),
+            workspace_id: "w1".into(),
+            directory: "/tmp/other-repo".into(),
+        };
+        assert_eq!(
+            Message::from_json(&request.to_json().unwrap()).unwrap(),
+            request
+        );
+        assert_eq!(
+            Message::from_json(r#"{"type":"git_status","request_id":"g3","workspace_id":"w1"}"#).unwrap(),
+            Message::GitStatus {
+                request_id: "g3".into(),
+                workspace_id: "w1".into(),
+                directory: String::new()
+            }
         );
     }
 }

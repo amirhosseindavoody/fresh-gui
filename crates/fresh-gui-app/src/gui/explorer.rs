@@ -38,12 +38,13 @@ pub fn is_placeholder(id: &str) -> bool {
 
 /// Parent directory of an absolute path. `/` has none.
 pub fn parent_dir(path: &str) -> Option<String> {
-    let path = path.trim_end_matches('/');
+    let path = path.trim_end_matches(['/', '\\']);
     if path.is_empty() || path == "/" {
         return None;
     }
-    match path.rfind('/') {
-        Some(0) => Some("/".to_string()),
+    match path.rfind(['/', '\\']) {
+        Some(0) => Some(path[..1].to_string()),
+        Some(2) if path.as_bytes().get(1) == Some(&b':') => Some(path[..3].to_string()),
         Some(ix) => Some(path[..ix].to_string()),
         None => None,
     }
@@ -273,6 +274,15 @@ pub fn real_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_windows_file_has_a_directory() {
+        assert_eq!(
+            parent_dir("C:\\work\\project\\file.rs"),
+            Some("C:\\work\\project".into())
+        );
+        assert_eq!(parent_dir("C:\\file.rs"), Some("C:\\".into()));
+    }
 
     #[test]
     fn plain_click_replaces_selection() {

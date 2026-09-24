@@ -629,6 +629,39 @@ fn indexed_color(index: u8) -> [u8; 3] {
     [level(r), level(g), level(b)]
 }
 
+/// ANSI yellow, bright colors and OSC palette colors can disappear on the
+/// light terminal canvas. Darken only explicit foregrounds painted on a light
+/// background, preserving the palette and hue on dark surfaces.
+pub fn readable_light_foreground(rgb: [u8; 3], background: Option<[u8; 3]>) -> [u8; 3] {
+    fn luminance(rgb: [u8; 3]) -> f32 {
+        let channel = |value: u8| {
+            let c = f32::from(value) / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(rgb[0]) + 0.7152 * channel(rgb[1]) + 0.0722 * channel(rgb[2])
+    }
+    let bg = background.unwrap_or([0xf7, 0xf7, 0xf7]);
+    let bg_l = luminance(bg);
+    if bg_l < 0.5 || (bg_l + 0.05) / (luminance(rgb) + 0.05) >= 4.5 {
+        return rgb;
+    }
+    let (mut lo, mut hi) = (0.0_f32, 1.0_f32);
+    for _ in 0..8 {
+        let scale = (lo + hi) / 2.0;
+        let candidate = rgb.map(|v| (f32::from(v) * scale).round() as u8);
+        if (bg_l + 0.05) / (luminance(candidate) + 0.05) >= 4.5 {
+            lo = scale;
+        } else {
+            hi = scale;
+        }
+    }
+    rgb.map(|v| (f32::from(v) * lo).floor() as u8)
+}
+
 /// Map a GPUI keystroke to PTY bytes. Returns `None` for chords the host owns.
 ///
 /// `app_cursor` is the terminal's application-cursor mode (fish, vim, less).
@@ -707,6 +740,20 @@ pub fn keystroke_to_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn light_theme_foregrounds_keep_ansi_yellow_readable() {
+        let yellow = readable_light_foreground(ansi16(11), None);
+        assert!(yellow[0] < 0xb0 && yellow[1] < 0xb0);
+        assert_eq!(
+            readable_light_foreground(ansi16(11), Some([0x1e; 3])),
+            ansi16(11)
+        );
+        assert_eq!(
+            readable_light_foreground([0x20, 0x30, 0x40], None),
+            [0x20, 0x30, 0x40]
+        );
+    }
 
     #[test]
     fn prints_and_newlines() {

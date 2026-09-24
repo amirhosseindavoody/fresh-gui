@@ -34,6 +34,10 @@ pub enum AdeCmd {
         request_id: String,
         path: String,
     },
+    AuthorizeDir {
+        request_id: String,
+        path: String,
+    },
     OpenEditor {
         request_id: String,
         path: String,
@@ -106,30 +110,36 @@ pub enum AdeCmd {
     GitStatus {
         request_id: String,
         workspace_id: String,
+        directory: String,
     },
     GitDiff {
         request_id: String,
         workspace_id: String,
+        directory: String,
         path: String,
     },
     GitStage {
         request_id: String,
         workspace_id: String,
+        directory: String,
         paths: Vec<String>,
         stage: bool,
     },
     GitCommit {
         request_id: String,
         workspace_id: String,
+        directory: String,
         message: String,
     },
     GitPull {
         request_id: String,
         workspace_id: String,
+        directory: String,
     },
     GitPush {
         request_id: String,
         workspace_id: String,
+        directory: String,
     },
     OpenExternal {
         request_id: String,
@@ -427,6 +437,9 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
         AdeCmd::ListDir { request_id, path } => {
             client.send(Message::FsList { request_id, path }).await?;
         }
+        AdeCmd::AuthorizeDir { request_id, path } => {
+            client.send(Message::FsAuthorize { request_id, path }).await?;
+        }
         AdeCmd::OpenEditor {
             request_id,
             path,
@@ -598,23 +611,27 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
         AdeCmd::GitStatus {
             request_id,
             workspace_id,
+            directory,
         } => {
             client
                 .send(Message::GitStatus {
                     request_id,
                     workspace_id,
+                    directory,
                 })
                 .await?;
         }
         AdeCmd::GitDiff {
             request_id,
             workspace_id,
+            directory,
             path,
         } => {
             client
                 .send(Message::GitDiff {
                     request_id,
                     workspace_id,
+                    directory,
                     path,
                 })
                 .await?;
@@ -622,6 +639,7 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
         AdeCmd::GitStage {
             request_id,
             workspace_id,
+            directory,
             paths,
             stage,
         } => {
@@ -629,6 +647,7 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
                 .send(Message::GitStage {
                     request_id,
                     workspace_id,
+                    directory,
                     paths,
                     stage,
                 })
@@ -637,12 +656,14 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
         AdeCmd::GitCommit {
             request_id,
             workspace_id,
+            directory,
             message,
         } => {
             client
                 .send(Message::GitCommit {
                     request_id,
                     workspace_id,
+                    directory,
                     message,
                 })
                 .await?;
@@ -650,22 +671,26 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
         AdeCmd::GitPull {
             request_id,
             workspace_id,
+            directory,
         } => {
             client
                 .send(Message::GitPull {
                     request_id,
                     workspace_id,
+                    directory,
                 })
                 .await?;
         }
         AdeCmd::GitPush {
             request_id,
             workspace_id,
+            directory,
         } => {
             client
                 .send(Message::GitPush {
                     request_id,
                     workspace_id,
+                    directory,
                 })
                 .await?;
         }

@@ -2,8 +2,7 @@
 //!
 //! gpui-component's default light border is about `#e5e5e5` on white, so a
 //! one-pixel split handle disappears. Content zoom scales editor and terminal
-//! text. UI zoom scales rem-based chrome text the way a page zoom does.
-//! gpui-kit still sizes some shells in absolute pixels, so those stay put.
+//! text. UI zoom scales rem-based chrome text and workspace shell dimensions.
 
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{App, Window, px};
@@ -17,9 +16,8 @@ pub const UI_ZOOM_MIN: f32 = 0.8;
 pub const UI_ZOOM_MAX: f32 = 2.0;
 const ZOOM_STEP: f32 = 0.1;
 
-/// Lightness gap that keeps a 1px line readable on a bright surface.
-/// 0.36 below white is about `#a3a3a3`, the same gray as the scrollbar thumb.
-const LIGHT_LINE_GAP: f32 = 0.36;
+/// Keep light-theme dividers visible without the heavy gray from #104.
+const LIGHT_LINE_GAP: f32 = 0.20;
 
 /// `steps` is positive to zoom in.
 pub fn step_zoom(current: f32, steps: i32, min: f32, max: f32) -> f32 {
@@ -54,7 +52,7 @@ pub fn light_line_lightness(surface_l: f32, line_l: f32) -> f32 {
     if surface_l - line_l >= LIGHT_LINE_GAP {
         return line_l;
     }
-    (surface_l - LIGHT_LINE_GAP).clamp(0.35, 0.72)
+    (surface_l - LIGHT_LINE_GAP).clamp(0.35, 0.82)
 }
 
 /// Follow the OS until a daemon config says light or dark.
@@ -109,7 +107,7 @@ mod tests {
         // neutral-200 on white: the gap is about 0.10 and the line vanishes.
         let line = light_line_lightness(1.0, 0.898);
         assert!(1.0 - line >= LIGHT_LINE_GAP - 0.001);
-        assert!(line < 0.7);
+        assert!(line > 0.75 && line <= 0.82);
     }
 
     #[test]

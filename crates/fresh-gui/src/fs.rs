@@ -14,6 +14,24 @@ pub struct FsRoot {
     authorized: Arc<Mutex<Vec<PathBuf>>>,
 }
 
+/// Explorer visibility is a daemon setting; filter before sending listings.
+pub fn visible_entries(
+    entries: Vec<FsEntry>,
+    show_dotfiles: bool,
+    show_git_dirs: bool,
+) -> Vec<FsEntry> {
+    entries
+        .into_iter()
+        .filter(|entry| {
+            if entry.name == ".git" && entry.kind == FsKind::Dir {
+                show_git_dirs
+            } else {
+                show_dotfiles || !entry.name.starts_with('.')
+            }
+        })
+        .collect()
+}
+
 impl FsRoot {
     pub fn new(root: PathBuf) -> Result<Self> {
         let root = root
@@ -580,6 +598,28 @@ mod tests {
 
         let escape = root.resolve("../").await;
         assert!(escape.is_err());
+    }
+
+    #[tokio::test]
+    async fn explorer_hides_git_directory_by_default() {
+        let tmp = tempfile_dir();
+        stdfs::create_dir(tmp.join(".git")).unwrap();
+        stdfs::write(tmp.join(".env"), b"x").unwrap();
+        stdfs::write(tmp.join("visible"), b"x").unwrap();
+        let (_, entries) = FsRoot::new(tmp).unwrap().list("").await.unwrap();
+        let default = visible_entries(entries.clone(), false, false);
+        assert_eq!(
+            default
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["visible"]
+        );
+        let dotfiles = visible_entries(entries.clone(), true, false);
+        assert!(dotfiles.iter().any(|entry| entry.name == ".env"));
+        assert!(!dotfiles.iter().any(|entry| entry.name == ".git"));
+        let git = visible_entries(entries, false, true);
+        assert!(git.iter().any(|entry| entry.name == ".git"));
     }
 
     #[cfg(unix)]

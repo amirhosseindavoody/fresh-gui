@@ -456,6 +456,12 @@ async fn handle_client_msg(
             require_auth(*authed)?;
             match state.fs_root.list(&path).await {
                 Ok((resolved, entries)) => {
+                    let (show_dotfiles, show_git_dirs) = {
+                        let config = state.config.read().expect("config lock");
+                        (config.ui.show_dotfiles, config.ui.show_git_dirs)
+                    };
+                    let entries =
+                        crate::fs::visible_entries(entries, show_dotfiles, show_git_dirs);
                     send_msg(
                         sink,
                         &Message::FsListed {
@@ -885,26 +891,29 @@ async fn handle_client_msg(
         Message::GitStatus {
             request_id,
             workspace_id,
+            directory,
         } => {
             require_auth(*authed)?;
-            git_status(state, sink, request_id, workspace_id).await
+            git_status(state, sink, request_id, workspace_id, directory).await
         }
         Message::GitDiff {
             request_id,
             workspace_id,
+            directory,
             path,
         } => {
             require_auth(*authed)?;
-            git_diff(state, sink, request_id, workspace_id, path).await
+            git_diff(state, sink, request_id, workspace_id, directory, path).await
         }
         Message::GitStage {
             request_id,
             workspace_id,
+            directory,
             paths,
             stage,
         } => {
             require_auth(*authed)?;
-            git_op(state, sink, request_id, workspace_id, move |dir| {
+            git_op(state, sink, request_id, workspace_id, directory, move |dir| {
                 crate::git::stage(&dir, &paths, stage)
             })
             .await
@@ -912,10 +921,11 @@ async fn handle_client_msg(
         Message::GitCommit {
             request_id,
             workspace_id,
+            directory,
             message,
         } => {
             require_auth(*authed)?;
-            git_op(state, sink, request_id, workspace_id, move |dir| {
+            git_op(state, sink, request_id, workspace_id, directory, move |dir| {
                 crate::git::commit(&dir, &message)
             })
             .await
@@ -923,9 +933,10 @@ async fn handle_client_msg(
         Message::GitPull {
             request_id,
             workspace_id,
+            directory,
         } => {
             require_auth(*authed)?;
-            git_op(state, sink, request_id, workspace_id, |dir| {
+            git_op(state, sink, request_id, workspace_id, directory, |dir| {
                 crate::git::pull(&dir)
             })
             .await
@@ -933,9 +944,10 @@ async fn handle_client_msg(
         Message::GitPush {
             request_id,
             workspace_id,
+            directory,
         } => {
             require_auth(*authed)?;
-            git_op(state, sink, request_id, workspace_id, |dir| {
+            git_op(state, sink, request_id, workspace_id, directory, |dir| {
                 crate::git::push(&dir)
             })
             .await
@@ -1438,6 +1450,20 @@ async fn workspace_dir(state: &AppState, workspace_id: &str) -> Result<PathBuf, 
     Ok(path)
 }
 
+async fn git_dir(state: &AppState, workspace_id: &str, directory: &str) -> Result<PathBuf, Message> {
+    if directory.is_empty() {
+        return workspace_dir(state, workspace_id).await;
+    }
+    state
+        .fs_root
+        .authorize(directory)
+        .await
+        .map_err(|err| Message::Error {
+            code: "git_failed".into(),
+            message: err.to_string(),
+        })
+}
+
 fn git_err(request_id: &str, err: impl std::fmt::Display) -> Message {
     Message::Error {
         code: "git_failed".into(),
@@ -1450,8 +1476,9 @@ async fn git_status(
     sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
     request_id: String,
     workspace_id: String,
+    directory: String,
 ) -> Result<(), Message> {
-    let dir = workspace_dir(state, &workspace_id).await?;
+    let dir = git_dir(state, &workspace_id, &directory).await?;
     let request = request_id.clone();
     let status = tokio::task::spawn_blocking(move || crate::git::status(&dir))
         .await
@@ -1493,9 +1520,10 @@ async fn git_diff(
     sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
     request_id: String,
     workspace_id: String,
+    directory: String,
     path: String,
 ) -> Result<(), Message> {
-    let dir = workspace_dir(state, &workspace_id).await?;
+    let dir = git_dir(state, &workspace_id, &directory).await?;
     let request = request_id.clone();
     let rel = path.clone();
     let sides = tokio::task::spawn_blocking(move || crate::git::diff(&dir, &rel))
@@ -1526,12 +1554,13 @@ async fn git_op<F>(
     sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
     request_id: String,
     workspace_id: String,
+    directory: String,
     op: F,
 ) -> Result<(), Message>
 where
     F: FnOnce(PathBuf) -> anyhow::Result<crate::git::Op> + Send + 'static,
 {
-    let dir = workspace_dir(state, &workspace_id).await?;
+    let dir = git_dir(state, &workspace_id, &directory).await?;
     let request = request_id.clone();
     let result = tokio::task::spawn_blocking(move || op(dir))
         .await

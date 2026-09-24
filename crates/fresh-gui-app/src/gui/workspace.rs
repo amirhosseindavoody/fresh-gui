@@ -109,7 +109,7 @@ fn git_file_row(
     file: GitFile,
     busy: bool,
     view: Entity<Workspace>,
-    _cx: &App,
+    zoom: f32,
 ) -> impl IntoElement {
     let mut chars = file.xy.chars();
     let index = chars.next().unwrap_or(' ');
@@ -134,7 +134,7 @@ fn git_file_row(
     h_flex()
         .id(format!("git-file-{ix}"))
         .w_full()
-        .h(px(TREE_ROW_H))
+        .h(px(TREE_ROW_H * zoom))
         .px_1()
         .gap_1()
         .items_center()
@@ -147,7 +147,7 @@ fn git_file_row(
                 view.update(cx, |this, cx| this.open_diff(rel, pin, window, cx));
             }
         })
-        .child(div().w(px(20.)).flex_shrink_0().text_xs().child(xy))
+        .child(div().w(px(20. * zoom)).flex_shrink_0().text_xs().child(xy))
         .child(
             div()
                 .flex_1()
@@ -306,6 +306,8 @@ pub struct Workspace {
     commit_input: Entity<InputState>,
     menu_bar: Entity<AppMenuBar>,
     last_cwd: Option<String>,
+    /// Directory whose repository is shown in the Git panel.
+    git_context_dir: String,
     explorer: Entity<TreeState>,
     explorer_root: String,
     explorer_cache: HashMap<String, Vec<FsEntry>>,
@@ -537,6 +539,7 @@ impl Workspace {
             commit_input,
             menu_bar,
             last_cwd: None,
+            git_context_dir: String::new(),
             explorer,
             explorer_root: String::new(),
             explorer_cache: HashMap::new(),
@@ -633,6 +636,7 @@ impl Workspace {
                 .into();
                 if active {
                     self.explorer_root = workspace.root.clone();
+                    self.git_context_dir.clear();
                     self.explorer_cache.clear();
                     self.pending_lists.clear();
                     self.expanded_dirs.clear();
@@ -911,6 +915,10 @@ impl Workspace {
         window.refresh();
     }
 
+    fn ui_px(&self, base: f32) -> Pixels {
+        px(base * self.ui_zoom)
+    }
+
     fn add_terminal_tab(&mut self, pty_id: String, window: &mut Window, cx: &mut Context<Self>) {
         let number = self.next_terminal_number;
         self.next_terminal_number = self.next_terminal_number.saturating_add(1);
@@ -938,9 +946,15 @@ impl Workspace {
         let Some(panel) = self.terminals.get(pty_id).cloned() else {
             return;
         };
+        let previous_cwd = panel.read(cx).cwd();
         let cwd = panel.update(cx, |panel, cx| panel.push_bytes(bytes, cx));
         if let Some(cwd) = cwd {
-            self.last_cwd = Some(cwd);
+            self.last_cwd = Some(cwd.clone());
+            if previous_cwd.as_deref() != Some(cwd.as_str())
+                && matches!(&self.active, Some(ActiveSurface::Terminal(id)) if id == pty_id)
+            {
+                self.follow_directory(&cwd, cx);
+            }
         }
     }
 
@@ -1105,6 +1119,9 @@ impl Workspace {
     ) {
         if active {
             self.active = Some(ActiveSurface::Terminal(pty_id.to_string()));
+            if let Some(cwd) = self.terminals.get(pty_id).and_then(|panel| panel.read(cx).cwd()) {
+                self.follow_directory(&cwd, cx);
+            }
             if let Some(id) = self.active_panel_id() {
                 self.last_saved_panel = Some(id);
             }
@@ -1128,6 +1145,11 @@ impl Workspace {
     pub(crate) fn note_editor_active(&mut self, path: &str, active: bool, cx: &mut Context<Self>) {
         if active {
             self.active = Some(ActiveSurface::Editor(path.to_string()));
+            if self.defaults_path.as_deref() != Some(path)
+                && let Some(dir) = parent_dir(path)
+            {
+                self.follow_directory(&dir, cx);
+            }
             if let Some(id) = self.active_panel_id() {
                 self.last_saved_panel = Some(id);
             }
@@ -1206,14 +1228,22 @@ impl Workspace {
     /// A missing cwd used to leave the PTY in the daemon's process directory,
     /// which for an SSH session is `$HOME` even when the remote root is set.
     fn shell_cwd(&self, cx: &App) -> Option<String> {
-        let from_terminal = if let Some(ActiveSurface::Terminal(id)) = &self.active {
-            self.terminals
+        let from_active = match &self.active {
+            Some(ActiveSurface::Terminal(id)) => self
+                .terminals
                 .get(id)
-                .and_then(|panel| panel.read(cx).cwd())
-        } else {
-            None
+                .and_then(|panel| panel.read(cx).cwd()),
+            Some(ActiveSurface::Editor(path)) => parent_dir(path),
+            _ => None,
         };
-        let explicit = from_terminal.or(self.last_cwd.clone());
+        let selected_dir = self.selection.last().and_then(|path| {
+            if self.is_dir(path) {
+                Some(path.clone())
+            } else {
+                parent_dir(path)
+            }
+        });
+        let explicit = selected_dir.or(from_active).or(self.last_cwd.clone());
         choose_shell_cwd(explicit.as_deref(), self.workspace_root().as_deref())
     }
 
@@ -1289,6 +1319,7 @@ impl Workspace {
         self.next_terminal_number = 1;
         // A shell cwd from the workspace we just left must not follow the next one.
         self.last_cwd = None;
+        self.git_context_dir.clear();
         self.clear_git_view();
     }
 
@@ -1487,6 +1518,7 @@ impl Workspace {
         self.selection.clear();
         self.anchor = None;
         self.explorer_root = info.root.clone();
+        self.git_context_dir.clear();
         let root = info.root.clone();
         self.upsert_workspace(info);
         self.rebuild_tree(cx);
@@ -2016,6 +2048,7 @@ impl Workspace {
         self.respawn_titles.clear();
         self.restore_focus = None;
         self.explorer_root.clear();
+        self.git_context_dir.clear();
         self.selection.clear();
         self.anchor = None;
         self.git_status_req = None;
@@ -2088,7 +2121,47 @@ impl Workspace {
         self.ade.send(AdeCmd::GitStatus {
             request_id,
             workspace_id: self.workspace_id_or_empty(),
+            directory: self.git_context_dir.clone(),
         });
+    }
+
+    /// Change explorer and Git context only when the focused directory changes.
+    /// Repeated OSC 7 reports during TUI frames then cost no FS or Git request.
+    fn follow_directory(&mut self, directory: &str, cx: &mut Context<Self>) {
+        let directory = if directory == "/"
+            || directory.ends_with(":/")
+            || directory.ends_with(":\\")
+        {
+            directory
+        } else {
+            directory.trim_end_matches(['/', '\\'])
+        };
+        let directory = if directory.is_empty() { "/" } else { directory };
+        if !std::path::Path::new(directory).is_absolute() {
+            return;
+        }
+        let mut changed = false;
+        if self.explorer_root != directory {
+            changed = true;
+            self.explorer_root = directory.to_string();
+            self.explorer_cache.clear();
+            self.pending_lists.clear();
+            self.expanded_dirs.clear();
+            self.ade.send(AdeCmd::AuthorizeDir {
+                request_id: next_id("auth"),
+                path: directory.to_string(),
+            });
+            self.list_dir(directory);
+            self.rebuild_tree(cx);
+        }
+        if self.git_context_dir != directory {
+            changed = true;
+            self.git_context_dir = directory.to_string();
+            self.refresh_git();
+        }
+        if changed {
+            cx.notify();
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2162,6 +2235,12 @@ impl Workspace {
         );
         self.selection = next;
         self.anchor = anchor;
+        if !is_folder
+            && gesture == super::explorer::SelectGesture::Replace
+            && let Some(dir) = parent_dir(path)
+        {
+            self.follow_directory(&dir, cx);
+        }
         let highlight =
             (gesture == super::explorer::SelectGesture::Range).then(|| path.to_string());
         self.sync_tree_highlight(highlight, cx);
@@ -2252,6 +2331,7 @@ impl Workspace {
         self.ade.send(AdeCmd::GitDiff {
             request_id,
             workspace_id: self.workspace_id_or_empty(),
+            directory: self.git_context_dir.clone(),
             path: rel.to_string(),
         });
     }
@@ -2361,6 +2441,7 @@ impl Workspace {
         self.ade.send(AdeCmd::GitStage {
             request_id: next_id("git"),
             workspace_id: self.workspace_id_or_empty(),
+            directory: self.git_context_dir.clone(),
             paths,
             stage,
         });
@@ -2382,6 +2463,7 @@ impl Workspace {
         self.ade.send(AdeCmd::GitCommit {
             request_id: next_id("git"),
             workspace_id: self.workspace_id_or_empty(),
+            directory: self.git_context_dir.clone(),
             message,
         });
         cx.notify();
@@ -2411,11 +2493,13 @@ impl Workspace {
             self.ade.send(AdeCmd::GitPull {
                 request_id,
                 workspace_id,
+                directory: self.git_context_dir.clone(),
             });
         } else {
             self.ade.send(AdeCmd::GitPush {
                 request_id,
                 workspace_id,
+                directory: self.git_context_dir.clone(),
             });
         }
         cx.notify();
@@ -2997,7 +3081,7 @@ impl Workspace {
 
         v_flex()
             .id("workspace-rail")
-            .w(px(WORKSPACE_RAIL_W))
+            .w(self.ui_px(WORKSPACE_RAIL_W))
             .h_full()
             .flex_shrink_0()
             .bg(cx.theme().sidebar)
@@ -3006,7 +3090,7 @@ impl Workspace {
             .child(
                 h_flex()
                     .w_full()
-                    .h(px(SIDEBAR_HEADER_H))
+                    .h(self.ui_px(SIDEBAR_HEADER_H))
                     .px_2()
                     .items_center()
                     .justify_between()
@@ -3033,13 +3117,13 @@ impl Workspace {
                 h_flex()
                     .id("session-root-row")
                     .w_full()
-                    .min_h(px(WORKSPACE_ROW_H))
+                    .min_h(self.ui_px(WORKSPACE_ROW_H))
                     .items_stretch()
                     .bg(cx.theme().accent.opacity(0.20))
                     .child(
                         div()
                             .w(px(3.))
-                            .min_h(px(WORKSPACE_ROW_H))
+                            .min_h(self.ui_px(WORKSPACE_ROW_H))
                             .flex_shrink_0()
                             .bg(cx.theme().accent),
                     )
@@ -3100,7 +3184,7 @@ impl Workspace {
 
         v_flex()
             .id("workspace-rail")
-            .w(px(WORKSPACE_RAIL_W))
+            .w(self.ui_px(WORKSPACE_RAIL_W))
             .h_full()
             .flex_shrink_0()
             .bg(cx.theme().sidebar)
@@ -3109,7 +3193,7 @@ impl Workspace {
             .child(
                 h_flex()
                     .w_full()
-                    .h(px(SIDEBAR_HEADER_H))
+                    .h(self.ui_px(SIDEBAR_HEADER_H))
                     .px_2()
                     .items_center()
                     .justify_between()
@@ -3189,7 +3273,7 @@ impl Workspace {
         h_flex()
             .id(row_id)
             .w_full()
-            .min_h(px(WORKSPACE_ROW_H))
+            .min_h(self.ui_px(WORKSPACE_ROW_H))
             .items_stretch()
             .cursor_pointer()
             .when_some(fill, |row, color| row.bg(color))
@@ -3206,7 +3290,7 @@ impl Workspace {
             .child(
                 div()
                     .w(px(3.))
-                    .min_h(px(WORKSPACE_ROW_H))
+                    .min_h(self.ui_px(WORKSPACE_ROW_H))
                     .flex_shrink_0()
                     .bg(accent),
             )
@@ -3461,8 +3545,8 @@ impl Workspace {
                 v_flex()
                     .absolute()
                     .left(px(8.))
-                    .top(px(TITLE_BAR_H + SIDEBAR_HEADER_H + 4.))
-                    .w(px(320.))
+                    .top(self.ui_px(TITLE_BAR_H + SIDEBAR_HEADER_H + 4.))
+                    .w(self.ui_px(320.))
                     .gap_2()
                     .p_3()
                     .rounded(cx.theme().radius)
@@ -3509,7 +3593,7 @@ impl Workspace {
 
     fn render_activity_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
-            .w(px(ACTIVITY_RAIL_W))
+            .w(self.ui_px(ACTIVITY_RAIL_W))
             .h_full()
             .flex_shrink_0()
             .items_center()
@@ -3577,6 +3661,7 @@ impl Workspace {
         let dark = cx.theme().is_dark();
         let renaming_path = self.renaming_path.clone();
         let file_rename_input = self.file_rename_input.clone();
+        let tree_row_height = self.ui_px(TREE_ROW_H);
 
         v_flex()
             .id("explorer-pane")
@@ -3584,7 +3669,7 @@ impl Workspace {
             .aria_label("Explorer")
             .key_context("Explorer")
             .track_focus(&self.explorer_focus)
-            .w(px(260.))
+            .w(self.ui_px(260.))
             .h_full()
             .flex_shrink_0()
             .bg(cx.theme().sidebar)
@@ -3593,7 +3678,7 @@ impl Workspace {
             .child(
                 h_flex()
                     .w_full()
-                    .h(px(SIDEBAR_HEADER_H))
+                    .h(self.ui_px(SIDEBAR_HEADER_H))
                     .px_2()
                     .items_center()
                     .justify_between()
@@ -3661,7 +3746,7 @@ impl Workspace {
                     let selected_now: Vec<String> = selected.iter().cloned().collect();
                     ListItem::new(ix)
                         .w_full()
-                        .h(px(TREE_ROW_H))
+                        .h(tree_row_height)
                         .text_sm()
                         .rounded(cx.theme().radius)
                         .py_0()
@@ -3871,6 +3956,7 @@ impl Workspace {
 
     fn render_git(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
+        let zoom = self.ui_zoom;
         let branch = if !self.git_repo {
             "Not a Git repository".to_string()
         } else if self.git_branch.is_empty() {
@@ -3900,7 +3986,7 @@ impl Workspace {
             .id("git-pane")
             .role(Role::Group)
             .aria_label("Source Control")
-            .w(px(260.))
+            .w(self.ui_px(260.))
             .h_full()
             .flex_shrink_0()
             .bg(cx.theme().sidebar)
@@ -3909,7 +3995,7 @@ impl Workspace {
             .child(
                 h_flex()
                     .w_full()
-                    .h(px(SIDEBAR_HEADER_H))
+                    .h(self.ui_px(SIDEBAR_HEADER_H))
                     .px_2()
                     .items_center()
                     .justify_between()
@@ -4012,7 +4098,7 @@ impl Workspace {
                         files
                             .into_iter()
                             .enumerate()
-                            .map(|(ix, file)| git_file_row(ix, file, busy, view.clone(), cx)),
+                            .map(|(ix, file)| git_file_row(ix, file, busy, view.clone(), zoom)),
                     ),
             )
     }
@@ -4089,7 +4175,7 @@ impl Workspace {
         Command::new(&self.command_state)
             .placeholder("Type a command…")
             .bordered(true)
-            .w(px(520.))
+            .w(self.ui_px(520.))
             .group(
                 CommandGroup::new().label("Commands").items(
                     items
@@ -4129,7 +4215,7 @@ impl Workspace {
             )
             .child(
                 v_flex()
-                    .w(px(480.))
+                    .w(self.ui_px(480.))
                     .gap_2()
                     .p_3()
                     .rounded(cx.theme().radius)
@@ -4176,7 +4262,7 @@ impl Workspace {
             )
             .child(
                 v_flex()
-                    .w(px(420.))
+                    .w(self.ui_px(420.))
                     .gap_2()
                     .p_3()
                     .rounded(cx.theme().radius)
@@ -4290,7 +4376,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_quit_client))
             .child(
                 TitleBar::new()
-                    .h(px(TITLE_BAR_H))
+                    .h(self.ui_px(TITLE_BAR_H))
                     // Linux draws its own close button, which removes the
                     // window without the platform should-close hook.
                     .on_close_window(cx.listener(|this, _, window, cx| {
@@ -4308,7 +4394,7 @@ impl Render for Workspace {
                                 div()
                                     .id("app-menu-host")
                                     .h_full()
-                                    .w(px(72.))
+                                    .w(self.ui_px(72.))
                                     .flex_shrink_0()
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                         cx.stop_propagation();
@@ -4355,7 +4441,7 @@ impl Render for Workspace {
             )
             .child(
                 StatusBar::new()
-                    .h(px(STATUS_BAR_H))
+                    .h(self.ui_px(STATUS_BAR_H))
                     .py_0()
                     .px_2()
                     .gap_1()
