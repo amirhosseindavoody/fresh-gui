@@ -229,6 +229,7 @@ fn open_local(root: Option<&std::path::Path>, token: Option<String>, no_ui: bool
         return Ok(());
     }
     let mut target = gui::parse_connect_target(&session.ws_url, token.or(session.token));
+    target.local_daemon = true;
     target.preferred_root = session.preferred_root;
     gui::run_target(target)
 }
@@ -261,6 +262,7 @@ fn open_bootstrapped(target: &SshTarget, daemon: &DaemonSource) -> Result<()> {
     let gui_target = gui::ConnectTarget {
         ws_url: session.ws_url.clone(),
         token: session.token.clone(),
+        local_daemon: false,
         label: Some(session.destination.clone()),
         preferred_root: target.remote_root.clone(),
     };
