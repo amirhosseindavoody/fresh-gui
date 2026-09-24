@@ -37,6 +37,16 @@
       "args": []
     }
   },
+  // Language servers launch on the daemon host, where workspace files live.
+  // Paths may be absolute or resolved through PATH. Configure only servers you installed.
+  // TOML: { "command": "tombi", "args": ["lsp"] }
+  // Python: Ruff { "command": "ruff", "args": ["server"], "only_features": ["diagnostics", "format"] }
+  // Python: TY { "command": "ty", "args": ["server"], "only_features": ["diagnostics"] }
+  // Use an array under lsp.python to run Ruff and TY together. Empty by default.
+  "lsp": {},
+  // Optional Fresh language associations. For custom languages, provide extensions
+  // or exact filenames, for example: "my_lang": { "extensions": ["ml"] }.
+  "languages": {},
   // action is the Rust action name to run. when is an optional GPUI focus
   // context: null means global; Explorer, Editor, and Terminal scope keys to a pane.
   // TerminalCopyOrInterrupt copies a selection, otherwise sends Ctrl+C to the PTY.

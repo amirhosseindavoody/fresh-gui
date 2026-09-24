@@ -43,14 +43,33 @@ const KNOWN_PALETTES: &[&str] = &[
 ];
 
 /// Top-level config file.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub ui: UiConfig,
     #[serde(default)]
     pub terminal: TerminalConfig,
+    /// Fresh-compatible LSP server configuration keyed by Fresh language name.
+    /// Each value accepts either one server object or an array of servers.
+    #[serde(default)]
+    pub lsp: std::collections::HashMap<String, fresh::types::LspLanguageConfig>,
+    /// Fresh language definitions / file associations keyed by language id.
+    /// These can add extensions or exact filenames for custom language ids.
+    #[serde(default)]
+    pub languages: std::collections::HashMap<String, fresh::config::LanguageConfig>,
     #[serde(default)]
     pub shortkeys: Vec<ShortkeyEntry>,
+}
+
+impl PartialEq for Config {
+    fn eq(&self, other: &Self) -> bool {
+        self.ui == other.ui
+            && self.terminal == other.terminal
+            && self.shortkeys == other.shortkeys
+            && serde_json::to_value(&self.lsp).ok() == serde_json::to_value(&other.lsp).ok()
+            && serde_json::to_value(&self.languages).ok()
+                == serde_json::to_value(&other.languages).ok()
+    }
 }
 
 /// A GPUI action name, keystroke, and optional focus context.
@@ -797,6 +816,50 @@ mod tests {
     fn unknown_palette_falls_back_to_primer() {
         let cfg = Config::parse(r#"{"ui":{"palette":"octarine"}}"#).unwrap();
         assert_eq!(cfg.ui.palette, "primer");
+    }
+
+    #[test]
+    fn parses_single_and_multiple_fresh_lsp_servers_and_language_associations() {
+        let cfg = Config::parse(
+            r#"{
+              "lsp": {
+                "toml": { "command": "/opt/bin/tombi", "args": ["lsp"] },
+                "python": [
+                  { "command": "ruff", "args": ["server"], "only_features": ["diagnostics", "format"] },
+                  { "command": "ty", "args": ["server"], "only_features": ["diagnostics"] }
+                ]
+              },
+              "languages": {
+                "my_lang": { "extensions": ["ml"], "filenames": ["Build.my"] }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let toml = cfg.lsp.get("toml").unwrap().as_slice();
+        assert_eq!(toml.len(), 1);
+        assert_eq!(toml[0].command, "/opt/bin/tombi");
+        assert_eq!(toml[0].args(), ["lsp"]);
+        assert!(toml[0].enabled);
+
+        let python = cfg.lsp.get("python").unwrap().as_slice();
+        assert_eq!(python.len(), 2);
+        assert_eq!(python[0].command, "ruff");
+        assert_eq!(python[0].args(), ["server"]);
+        assert_eq!(python[1].command, "ty");
+        assert_eq!(python[1].args(), ["server"]);
+        assert_eq!(python[0].only_features.as_ref().unwrap().len(), 2);
+
+        let custom_language = cfg.languages.get("my_lang").unwrap();
+        assert_eq!(custom_language.extensions, ["ml"]);
+        assert_eq!(custom_language.filenames, ["Build.my"]);
+    }
+
+    #[test]
+    fn default_config_does_not_start_any_lsp_server() {
+        let cfg = Config::default();
+        assert!(cfg.lsp.is_empty());
+        assert!(cfg.languages.is_empty());
     }
 
     fn tempfile_dir() -> PathBuf {

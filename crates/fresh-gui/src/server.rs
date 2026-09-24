@@ -12,7 +12,7 @@ use axum::extract::{State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use base64::Engine;
-use fresh_gui_protocol::{CAP_EDITOR, CAP_SCENE, Hello, HelloUi, Message, PROTOCOL_VERSION};
+use fresh_gui_protocol::{CAP_EDITOR, CAP_LSP, CAP_SCENE, Hello, HelloUi, Message, PROTOCOL_VERSION};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -104,7 +104,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     let mut caps = Hello::default_backend_caps();
     if state.editor.is_none() {
-        caps.retain(|c| c != CAP_EDITOR && c != CAP_SCENE);
+        caps.retain(|c| c != CAP_EDITOR && c != CAP_LSP && c != CAP_SCENE);
     }
     let ui = {
         let cfg = state.config.read().expect("config lock");
@@ -818,6 +818,10 @@ async fn handle_client_msg(
                         let shortkeys = cfg.shortkeys.iter().map(|key| fresh_gui_protocol::Shortkey {
                             action: key.action.clone(), shortkey: key.shortkey.clone(), when: key.when.clone(),
                         }).collect();
+                        if let Some(editor) = state.editor.as_ref()
+                            && let Err(err) = editor.reconfigure(cfg.clone()).await {
+                                warn!(%err, "failed to apply language-server config to Fresh editor");
+                            }
                         *state.config.write().expect("config lock") = cfg;
                         send_msg(sink, &Message::ConfigUpdated { shortkeys }).await.map_err(|_| Message::Error {
                             code: "send_failed".into(), message: "failed to send ConfigUpdated".into(),
@@ -845,6 +849,38 @@ async fn handle_client_msg(
             .map_err(|_| Message::Error {
                 code: "send_failed".into(),
                 message: "failed to send BufferSaved".into(),
+            })?;
+            Ok(())
+        }
+        Message::BufferLspGet { buffer_id, known_rev } => {
+            require_auth(*authed)?;
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error { code: "editor_unavailable".into(), message: "editor capability not available".into() });
+            };
+            let lsp = editor.lsp_get(buffer_id.clone(), known_rev).await.map_err(|err| Message::Error {
+                code: "lsp_failed".into(), message: format!("{buffer_id}: {err:#}"),
+            })?;
+            send_msg(sink, &Message::BufferLspState {
+                buffer_id, rev: lsp.rev, text: lsp.text,
+                diagnostics: lsp.diagnostics, status: lsp.status,
+            }).await.map_err(|_| Message::Error {
+                code: "send_failed".into(), message: "failed to send BufferLspState".into(),
+            })?;
+            Ok(())
+        }
+        Message::BufferFormat { request_id, buffer_id, base_rev } => {
+            require_auth(*authed)?;
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error { code: "editor_unavailable".into(), message: format!("{request_id}: editor capability not available") });
+            };
+            let formatted = editor.format(buffer_id.clone(), base_rev).await.map_err(|err| Message::Error {
+                code: "buffer_format_failed".into(), message: format!("{request_id}: {err:#}"),
+            })?;
+            send_msg(sink, &Message::BufferFormatted {
+                request_id, buffer_id, rev: formatted.rev,
+                text: formatted.text, status: formatted.status,
+            }).await.map_err(|_| Message::Error {
+                code: "send_failed".into(), message: "failed to send BufferFormatted".into(),
             })?;
             Ok(())
         }

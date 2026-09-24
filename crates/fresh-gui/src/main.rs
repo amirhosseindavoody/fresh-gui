@@ -291,7 +291,7 @@ async fn run_server_foreground(args: ServeArgs, write_session_meta: bool) -> Res
         info!("Fresh editor disabled (--no-editor)");
         None
     } else {
-        EditorHandle::spawn(fs_root.root_path().to_path_buf())
+        EditorHandle::spawn(fs_root.root_path().to_path_buf(), config.read().expect("config lock").clone())
     };
 
     let sessions = SessionStore::new();

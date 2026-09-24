@@ -987,8 +987,30 @@ impl Workspace {
                 rev,
                 ..
             } => self.on_buffer_saved(&buffer_id, path, rev, cx),
+            AdeEvent::BufferLspState { buffer_id, rev, text, diagnostics, status } => {
+                if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
+                    panel.update(cx, |panel, cx| {
+                        panel.set_lsp_state(rev, text, diagnostics, status, window, cx);
+                    });
+                }
+            }
+            AdeEvent::BufferFormatted { buffer_id, rev, text, status } => {
+                if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
+                    panel.update(cx, |panel, cx| {
+                        panel.apply_formatted(rev, text, status, window, cx);
+                    });
+                }
+            }
             AdeEvent::Error { code, message } => {
                 self.pending_fs.clear();
+                if code == "buffer_format_failed"
+                    && let Some((request_id, detail)) = split_request_message(&message)
+                    && let Some(buffer_id) = request_id.strip_prefix("fmt-")
+                        .and_then(|value| value.rsplit_once('-').map(|(id, _)| id))
+                    && let Some(panel) = self.editor_by_buffer(buffer_id, cx)
+                {
+                    panel.update(cx, |panel, cx| panel.set_format_error(detail.to_string(), cx));
+                }
                 if code == "fs_rename_failed" {
                     if let Some((request_id, _)) = split_request_message(&message) {
                         self.pending_renames.remove(request_id);
