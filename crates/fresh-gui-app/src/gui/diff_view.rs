@@ -269,7 +269,7 @@ impl DiffPanel {
                     let edited = this.editor.read(cx).value().to_string();
                     this.rows = split_diff_lines(&this.original_text, &edited);
                     this.right_diff_decorations.set(
-                        right_diff_decorations(&edited, &this.rows, cx),
+                        build_right_diff_decorations(&edited, &this.rows, cx),
                         cx,
                     );
                 }
@@ -406,7 +406,7 @@ impl DiffPanel {
             let text = self.editor.read(cx).value().to_string();
             self.rows = split_diff_lines(&self.original_text, &text);
             self.right_diff_decorations
-                .set(right_diff_decorations(&text, &self.rows, cx), cx);
+                .set(build_right_diff_decorations(&text, &self.rows, cx), cx);
         }
         cx.notify();
     }
@@ -627,7 +627,7 @@ fn row_left_bg(kind: RowKind, cx: &App) -> Option<Hsla> {
     }
 }
 
-fn right_diff_decorations(text: &str, rows: &[SplitRow], cx: &App) -> Vec<TextDecoration> {
+fn build_right_diff_decorations(text: &str, rows: &[SplitRow], cx: &App) -> Vec<TextDecoration> {
     let mut decorations = Vec::new();
     let mut offset = 0usize;
     for row in rows {
