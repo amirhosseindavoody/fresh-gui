@@ -111,6 +111,21 @@ mod tests {
     use super::*;
     use std::fs;
 
+    #[test]
+    fn link_detection_handles_home_windows_and_trailing_punctuation() {
+        let home = "see ~/src/main.rs:12:3 now";
+        let link = detect_link_at(home, home.find("main").unwrap()).unwrap();
+        assert_eq!((link.path.as_str(), link.line, link.column), ("~/src/main.rs", Some(12), Some(3)));
+
+        let windows = r"at C:\work\main.rs:8:2: error";
+        let link = detect_link_at(windows, windows.find("main").unwrap()).unwrap();
+        assert_eq!((link.path.as_str(), link.line, link.column), (r"C:\work\main.rs", Some(8), Some(2)));
+
+        let punctuated = "wrote ./out/log.txt.";
+        let link = detect_link_at(punctuated, punctuated.find("log").unwrap()).unwrap();
+        assert_eq!(link.path, "./out/log.txt");
+    }
+
     #[tokio::test]
     async fn resolves_relative_under_cwd() {
         let tmp = std::env::temp_dir().join(format!("fresh-gui-path-open-{}", std::process::id()));
@@ -150,6 +165,37 @@ mod tests {
             .unwrap();
         assert!(got.path.ends_with("src/lib.rs"));
         assert_eq!(got.line, Some(1));
+        assert_eq!(got.column, Some(1));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn detects_punctuated_path_with_line_suffix_and_prefers_cwd() {
+        let tmp = std::env::temp_dir().join(format!(
+            "fresh-gui-path-link-cwd-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        let cwd = tmp.join("sub");
+        fs::create_dir_all(&cwd).unwrap();
+        let filename = "my-file_2.rs";
+        fs::write(tmp.join(filename), b"root\n").unwrap();
+        fs::write(cwd.join(filename), b"cwd\n").unwrap();
+        let root = FsRoot::new(tmp.clone()).unwrap();
+
+        let line = "error: ./my-file_2.rs:2:1: failed";
+        let column = line.find("my-file").unwrap();
+        let got = resolve_link_open(
+            &root,
+            line,
+            column as u32,
+            Some(cwd.to_str().unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.path, cwd.join(filename));
+        assert_eq!(got.line, Some(2));
         assert_eq!(got.column, Some(1));
 
         let _ = fs::remove_dir_all(&tmp);

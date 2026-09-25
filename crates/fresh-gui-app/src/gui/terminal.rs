@@ -6,6 +6,7 @@
 //! replies a shell waits on (cursor position, device attributes, palette).
 
 use std::cell::{Cell as StdCell, RefCell};
+use std::ops::Range;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -28,6 +29,46 @@ const DEFAULT_BG: [u8; 3] = [0x1e, 0x1e, 0x1e];
 /// OSC 52 copy larger than this is dropped. A remote program must not be
 /// able to push an unbounded blob onto the host clipboard.
 const OSC52_MAX_BYTES: usize = 256 * 1024;
+
+/// Return the character range around a terminal column for a double-click.
+/// Path punctuation stays attached so `src/foo-bar.rs:12` selects as one unit.
+pub fn word_bounds_at_column(line: &str, column: usize) -> Option<(usize, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    let is_word = |ch: char| {
+        ch.is_alphanumeric() || matches!(ch, '_' | '/' | '.' | '-' | '~' | ':' | '\\')
+    };
+    if column >= chars.len() || !is_word(chars[column]) {
+        return None;
+    }
+    let mut start = column;
+    let mut end = column + 1;
+    while start > 0 && is_word(chars[start - 1]) {
+        start -= 1;
+    }
+    while end < chars.len() && is_word(chars[end]) {
+        end += 1;
+    }
+    Some((start, end))
+}
+
+#[cfg(test)]
+mod word_bounds_tests {
+    use super::word_bounds_at_column;
+
+    #[test]
+    fn double_click_keeps_path_punctuation_together() {
+        let line = "open ./src/my-file_2.rs:17 now";
+        let at = line.find("file").unwrap();
+        assert_eq!(word_bounds_at_column(line, at), Some((5, 26)));
+        assert_eq!(&line[5..26], "./src/my-file_2.rs:17");
+    }
+
+    #[test]
+    fn whitespace_and_punctuation_are_not_word_starts() {
+        assert_eq!(word_bounds_at_column("one, two", 3), None);
+        assert_eq!(word_bounds_at_column("one, two", 5), Some((5, 8)));
+    }
+}
 
 struct Shared {
     replies: RefCell<Vec<u8>>,
@@ -110,6 +151,56 @@ pub struct TermScreen {
     term: Term<ReplyProxy>,
     parser: Processor,
     shared: Rc<Shared>,
+    /// alacritty_terminal currently recognizes DECSET 1049 but leaves the
+    /// equivalent 47 and 1047 alternate-buffer modes unknown. Keep a possible
+    /// split escape sequence until the next PTY chunk so those modes can be
+    /// normalized before the terminal parser sees them.
+    alt_mode_carry: Vec<u8>,
+}
+
+/// Normalize DEC alternate-screen modes not recognized by our alacritty
+/// version to its supported 1049 mode. The terminal's `swap_alt` path restores
+/// the primary grid and cursor, which is the behavior applications expect on
+/// exiting any of 47, 1047, or 1049.
+fn normalize_alt_screen_modes(carry: &mut Vec<u8>, bytes: &[u8]) -> Vec<u8> {
+    const ENTER_47: &[u8] = b"\x1b[?47h";
+    const LEAVE_47: &[u8] = b"\x1b[?47l";
+    const ENTER_1047: &[u8] = b"\x1b[?1047h";
+    const LEAVE_1047: &[u8] = b"\x1b[?1047l";
+    const ENTER_1049: &[u8] = b"\x1b[?1049h";
+    const LEAVE_1049: &[u8] = b"\x1b[?1049l";
+    const TARGETS: [(&[u8], &[u8]); 4] = [
+        (ENTER_47, ENTER_1049),
+        (LEAVE_47, LEAVE_1049),
+        (ENTER_1047, ENTER_1049),
+        (LEAVE_1047, LEAVE_1049),
+    ];
+
+    let mut input = std::mem::take(carry);
+    input.extend_from_slice(bytes);
+    let mut output = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if let Some((sequence, replacement)) =
+            TARGETS.iter().find(|(sequence, _)| input[i..].starts_with(sequence))
+        {
+            output.extend_from_slice(replacement);
+            i += sequence.len();
+            continue;
+        }
+
+        let remaining = &input[i..];
+        let partial = TARGETS.iter().any(|(sequence, _)| {
+            remaining.len() < sequence.len() && sequence.starts_with(remaining)
+        });
+        if partial {
+            carry.extend_from_slice(remaining);
+            break;
+        }
+        output.push(input[i]);
+        i += 1;
+    }
+    output
 }
 
 impl Default for TermScreen {
@@ -152,13 +243,15 @@ impl TermScreen {
             term,
             parser: Processor::new(),
             shared,
+            alt_mode_carry: Vec::new(),
         }
     }
 
     /// Ingest PTY bytes. Returns replies the host must write back (device
     /// attributes, cursor position, palette). ConPTY and fish both wait on these.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
-        self.parser.advance(&mut self.term, bytes);
+        let bytes = normalize_alt_screen_modes(&mut self.alt_mode_carry, bytes);
+        self.parser.advance(&mut self.term, &bytes);
         self.shared.replies.borrow_mut().drain(..).collect()
     }
 
@@ -208,6 +301,12 @@ impl TermScreen {
 
     pub fn alt_screen(&self) -> bool {
         self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// DECSET 1007: translate wheel scrolling into arrow keys while the
+    /// alternate screen is active.
+    pub fn alternate_scroll(&self) -> bool {
+        self.term.mode().contains(TermMode::ALTERNATE_SCROLL)
     }
 
     /// DECSET mouse tracking currently enabled by the program in the PTY.
@@ -340,6 +439,41 @@ impl TermScreen {
         Some(text.trim_end().to_string())
     }
 
+    /// Return row text and translate a terminal grid cell to its Unicode
+    /// scalar column. A wide glyph occupies two cells but only one scalar;
+    /// combining marks can add scalars without occupying cells.
+    pub fn line_text_and_char_column(&self, row: usize, column: usize) -> Option<(String, usize)> {
+        let row = self.rows().into_iter().nth(row)?;
+        let char_column = char_column_for_cell(&row.spans, column);
+        let mut text = String::new();
+        for span in row.spans {
+            text.push_str(&span.text);
+        }
+        let text = text.trim_end().to_string();
+        let len = text.chars().count();
+        Some((text, char_column.min(len)))
+    }
+
+    /// Select a scalar range in a visible row, translating text positions to
+    /// the terminal's cell-based selection coordinates.
+    pub fn select_char_range(&mut self, row: usize, range: Range<usize>) -> bool {
+        if range.is_empty() {
+            return false;
+        }
+        let Some(row_data) = self.rows().into_iter().nth(row) else {
+            return false;
+        };
+        let Some(start_cell) = cell_for_char_column(&row_data.spans, range.start) else {
+            return false;
+        };
+        let Some(end_cell) = cell_for_char_column(&row_data.spans, range.end - 1) else {
+            return false;
+        };
+        self.begin_selection(start_cell, row);
+        self.update_selection(end_cell, row);
+        true
+    }
+
     #[cfg(test)]
     pub fn visible_lines(&self) -> Vec<String> {
         (0..self.rows)
@@ -365,6 +499,90 @@ impl TermScreen {
             return None;
         }
         Some((row as usize, col, content.cursor.shape))
+    }
+}
+
+/// Convert a cell column to a scalar offset in the visible row text.
+fn char_column_for_cell(spans: &[TermSpan], column: usize) -> usize {
+    let mut cells: usize = 0;
+    let mut chars = 0;
+    for span in spans {
+        let span_chars = span.text.chars().count();
+        if column < cells.saturating_add(span.cells) {
+            // Blank runs contain one scalar per cell. A visible glyph span
+            // represents one glyph plus optional zero-width scalars, and any
+            // wide-character spacer cells still point at its first scalar.
+            return chars
+                + if span.text.chars().all(|ch| ch == ' ') {
+                    (column - cells).min(span_chars)
+                } else {
+                    0
+                };
+        }
+        cells += span.cells;
+        chars += span_chars;
+    }
+    chars
+}
+
+/// Map one text scalar to the cell that displays it. Zero-width trailing
+/// scalars stay attached to their glyph; blank runs map one cell per scalar.
+fn cell_for_char_column(spans: &[TermSpan], column: usize) -> Option<usize> {
+    let mut cells = 0;
+    let mut chars = 0;
+    for span in spans {
+        let span_chars = span.text.chars().count();
+        if column < chars + span_chars {
+            let local = column - chars;
+            if span.text.chars().all(|ch| ch == ' ') {
+                return Some(cells + local.min(span.cells.saturating_sub(1)));
+            }
+            return Some(cells);
+        }
+        chars += span_chars;
+        cells += span.cells;
+    }
+    None
+}
+
+#[cfg(test)]
+mod cell_column_tests {
+    use super::{TermSpan, cell_for_char_column, char_column_for_cell};
+
+    fn span(text: &str, cells: usize) -> TermSpan {
+        TermSpan {
+            text: text.into(),
+            cells,
+            fg: None,
+            bg: None,
+            bold: false,
+            selected: false,
+        }
+    }
+
+    #[test]
+    fn wide_glyph_spacer_maps_to_glyph_scalar() {
+        let spans = [span("a", 1), span("界", 2), span("b", 1)];
+        assert_eq!(char_column_for_cell(&spans, 0), 0);
+        assert_eq!(char_column_for_cell(&spans, 1), 1);
+        assert_eq!(char_column_for_cell(&spans, 2), 1);
+        assert_eq!(char_column_for_cell(&spans, 3), 2);
+    }
+
+    #[test]
+    fn combining_scalars_do_not_shift_later_cells() {
+        let spans = [span("e\u{301}", 1), span("x", 1)];
+        assert_eq!(char_column_for_cell(&spans, 0), 0);
+        assert_eq!(char_column_for_cell(&spans, 1), 2);
+    }
+
+    #[test]
+    fn scalar_ranges_map_back_to_cells() {
+        let spans = [span("界\u{301}", 2), span("x", 1)];
+        assert_eq!(cell_for_char_column(&spans, 0), Some(0));
+        assert_eq!(cell_for_char_column(&spans, 1), Some(0));
+        assert_eq!(cell_for_char_column(&spans, 2), Some(2));
+        assert_eq!(cell_for_char_column(&spans, 3), None);
     }
 }
 
@@ -969,6 +1187,43 @@ mod tests {
         let primary = s.visible_text();
         assert!(primary.contains("primary"), "{primary}");
         assert!(!primary.contains("altscreen"), "{primary}");
+    }
+
+    #[test]
+    fn alternate_screen_modes_47_and_1047_switch_and_restore() {
+        for mode in [47, 1047] {
+            let mut s = TermScreen::new(20, 6);
+            s.feed(b"primary");
+            s.feed(format!("\x1b[?{mode}h").as_bytes());
+            assert!(s.alt_screen(), "mode {mode} did not enter alternate screen");
+            s.feed(b"\x1b[2J\x1b[Halternate");
+            let alternate = s.visible_text();
+            assert!(alternate.contains("alternate"), "{alternate}");
+            s.feed(format!("\x1b[?{mode}l").as_bytes());
+            assert!(!s.alt_screen(), "mode {mode} did not leave alternate screen");
+            assert!(s.visible_text().contains("primary"));
+        }
+    }
+
+    #[test]
+    fn alternate_screen_mode_can_cross_pty_chunks() {
+        let mut s = TermScreen::new(20, 6);
+        s.feed(b"\x1b[?104");
+        assert!(!s.alt_screen());
+        s.feed(b"7h");
+        assert!(s.alt_screen());
+        s.feed(b"\x1b[?1047l");
+        assert!(!s.alt_screen());
+    }
+
+    #[test]
+    fn alternate_scroll_tracks_dec_mode_1007() {
+        let mut s = TermScreen::new(20, 6);
+        assert!(!s.alternate_scroll());
+        s.feed(b"\x1b[?1007h");
+        assert!(s.alternate_scroll());
+        s.feed(b"\x1b[?1007l");
+        assert!(!s.alternate_scroll());
     }
 
     #[test]

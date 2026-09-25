@@ -5,6 +5,7 @@ use std::io::{self, IsTerminal, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -90,6 +91,88 @@ pub struct RemoteSession {
     pub token: Option<String>,
     pub ws_url: String,
     tunnel: Child,
+}
+
+/// Cloneable control for an SSH remote that stays alive for the GUI lifetime.
+/// Restarting drops the old tunnel before binding its local port again.
+#[derive(Clone)]
+pub struct RemoteControlHandle(Arc<Mutex<RemoteControlState>>);
+
+struct RemoteControlState {
+    target: SshTarget,
+    daemon: DaemonSource,
+    tools: Toolchain,
+    session: Option<RemoteSession>,
+}
+
+impl std::fmt::Debug for RemoteControlHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteControlHandle").finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for RemoteControlHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for RemoteControlHandle {}
+
+impl RemoteControlHandle {
+    pub fn new(
+        target: SshTarget,
+        daemon: DaemonSource,
+        tools: Toolchain,
+        session: RemoteSession,
+    ) -> Self {
+        Self(Arc::new(Mutex::new(RemoteControlState {
+            target,
+            daemon,
+            tools,
+            session: Some(session),
+        })))
+    }
+
+    /// Stop the running remote daemon, then bootstrap it and return the new endpoint.
+    pub fn restart(&self) -> Result<RemoteEndpoint> {
+        let mut state = self.0.lock().map_err(|_| anyhow::anyhow!("remote control lock poisoned"))?;
+        let previous = state.session.take();
+        if let Some(ref session) = previous {
+            state.target.local_port = Some(session.local_port);
+        }
+        // Release the port before bootstrap starts the replacement tunnel.
+        drop(previous);
+
+        let probe = ssh_probe(&state.target, &state.tools)?;
+        if probe.running {
+            let binary = probe.binary.as_deref().context("remote probe has no binary path")?;
+            ssh_simple(
+                &state.target,
+                &state.tools,
+                &format!("{} close", probe::shell_single_quote(binary)),
+            )?;
+            if ssh_probe(&state.target, &state.tools)?.running {
+                bail!("remote fresh-gui session is still running after close");
+            }
+        }
+
+        let session = bootstrap(&state.target, &state.daemon, &state.tools, |_| {})?;
+        let endpoint = RemoteEndpoint {
+            ws_url: session.ws_url.clone(),
+            token: session.token.clone(),
+            local_port: session.local_port,
+        };
+        state.session = Some(session);
+        Ok(endpoint)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteEndpoint {
+    pub ws_url: String,
+    pub token: Option<String>,
+    pub local_port: u16,
 }
 
 impl std::fmt::Debug for RemoteSession {

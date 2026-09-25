@@ -41,7 +41,7 @@ use super::actions::{
     CloseAllTerminals, CloseTab, CloseWorkspace, CopyExplorer, DeleteExplorer, Disconnect, FilterExplorer,
     AskCopilot, FormatDocument, GoToFile, NewFile, NewTerminal, NewWorkspace, NextTab, OpenDefaultSettings, OpenSettings, PasteExplorer,
     PrevTab, QuitClient, Reconnect, RenameWorkspace, ResetContentZoom, ResetUiZoom, SaveBuffer,
-    SplitTerminal, StopServer, TerminalCopyOrInterrupt, TogglePinTab, ToggleCommandPalette, ToggleSidebar, ZoomInContent, ZoomInUi, ZoomOutContent,
+    SplitTerminal, StopServer, RestartServer, ReloadConfig, TerminalCopyOrInterrupt, TogglePinTab, ToggleCommandPalette, ToggleSidebar, ToggleWordWrap, ZoomInContent, ZoomInUi, ZoomOutContent,
     ZoomOutUi,
 };
 use super::ade::AttachedWorkspace;
@@ -95,9 +95,7 @@ fn goto_is_absolute(path: &str) -> bool {
 }
 
 fn goto_separator(root: &str) -> char {
-    if root.starts_with("\\\\")
-        || root.as_bytes().get(1) == Some(&b':')
-    {
+    if root.starts_with("\\\\") || (root.as_bytes().get(1) == Some(&b':') && root.contains('\\')) {
         '\\'
     } else {
         '/'
@@ -110,6 +108,14 @@ fn goto_join(root: &str, path: &str) -> String {
     }
     let separator = goto_separator(root);
     format!("{}{separator}{path}", root.trim_end_matches(['/', '\\']))
+}
+
+fn goto_initial_query(root: &str) -> String {
+    if root.is_empty() || root.ends_with(['/', '\\']) {
+        root.to_string()
+    } else {
+        format!("{}{sep}", root, sep = goto_separator(root))
+    }
 }
 
 /// Split a path using daemon path syntax, without changing its displayed spelling.
@@ -175,7 +181,7 @@ fn goto_ghost_suffix<'a>(query: &str, completion: &'a str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod goto_match_tests {
-    use super::{goto_completion_path, goto_ghost_suffix, goto_list_matches, split_goto_query};
+    use super::{goto_completion_path, goto_ghost_suffix, goto_initial_query, goto_list_matches, split_goto_query};
     use crate::gui::connect::parse_goto_spec;
     use crate::gui::explorer::pick_goto_target;
     use fresh_gui_protocol::{FsEntry, FsKind};
@@ -200,7 +206,7 @@ mod goto_match_tests {
         assert_eq!(windows.parent, r"C:\project\src");
         assert_eq!(windows.display_prefix, "src\\");
         assert_eq!(split_goto_query(r"C:\src\ma", None, None).unwrap().parent, r"C:\src");
-        assert_eq!(split_goto_query("src/ma", Some("C:/project"), None).unwrap().parent, "C:/project\\src");
+        assert_eq!(split_goto_query("src/ma", Some("C:/project"), None).unwrap().parent, "C:/project/src");
         assert_eq!(split_goto_query("/ma", None, None).unwrap().parent, "/");
         assert_eq!(split_goto_query("ma", Some("/"), None).unwrap().parent, "/");
         assert_eq!(goto_completion_path("src/ma "), "src/ma ");
@@ -208,6 +214,17 @@ mod goto_match_tests {
         let (path, line, column) = parse_goto_spec("src/ma:12:3");
         assert_eq!(pick_goto_target(&path, &["src/Main.rs"]), "src/Main.rs");
         assert_eq!((line, column), (Some(12), Some(3)));
+    }
+
+    #[test]
+    fn initial_query_lists_the_full_root_on_either_daemon() {
+        assert_eq!(goto_initial_query("/home/ada/project"), "/home/ada/project/");
+        assert_eq!(goto_initial_query("/"), "/");
+        assert_eq!(goto_initial_query(r"C:\work"), "C:\\work\\");
+        assert_eq!(goto_initial_query("C:/work"), "C:/work/");
+        assert_eq!(goto_initial_query(r"\\server\share"), "\\\\server\\share\\");
+        assert_eq!(split_goto_query("/tmp/other/fi", Some("/home/ada/project"), None).unwrap().parent, "/tmp/other");
+        assert_eq!(split_goto_query(r"D:\other\fi", Some("/home/ada/project"), None).unwrap().parent, r"D:\other");
     }
 
     #[test]
@@ -755,6 +772,7 @@ pub struct Workspace {
     /// Editor opens issued by this view. Unsolicited `editor_opened` does not
     /// add a tab.
     pending_editors: HashMap<String, bool>,
+    pending_diff_editors: HashMap<String, String>,
     restoring: bool,
     /// Workspace whose name is being edited in the rail. Any row, not only the
     /// active one. `None` when the inline field is closed.
@@ -771,6 +789,7 @@ pub struct Workspace {
     /// Rem-based chrome text. Also multiplies panel text.
     ui_zoom: f32,
     editor_font_base: f32,
+    editor_line_wrap: bool,
     terminal_font_base: f32,
     status: SharedString,
     sidebar_collapsed: bool,
@@ -814,9 +833,14 @@ pub struct Workspace {
     commit_input: Entity<InputState>,
     menu_bar: Entity<AppMenuBar>,
     last_cwd: Option<String>,
+    /// Directory of the focused terminal or editor, independent of sidebar pinning.
+    active_directory: String,
+    pin_to_root: bool,
     /// Directory whose repository is shown in the Git panel.
     git_context_dir: String,
     explorer: Entity<TreeState>,
+    /// Stable daemon root for legacy sessions without workspace support.
+    session_root: String,
     explorer_root: String,
     explorer_cache: HashMap<String, Vec<FsEntry>>,
     /// Directories the user has open. A cache hit is not an expand: rebuilding
@@ -1049,6 +1073,7 @@ impl Workspace {
             pending_split: None,
             pending_tab_group: None,
             pending_editors: HashMap::new(),
+            pending_diff_editors: HashMap::new(),
             restoring: false,
             renaming_id: None,
             relocating_id: None,
@@ -1060,6 +1085,7 @@ impl Workspace {
             content_zoom: 1.0,
             ui_zoom: 1.0,
             editor_font_base: 14.0,
+            editor_line_wrap: true,
             terminal_font_base: 14.0,
             status: "Connecting…".into(),
             sidebar_collapsed: false,
@@ -1100,8 +1126,11 @@ impl Workspace {
             commit_input,
             menu_bar,
             last_cwd: None,
+            active_directory: String::new(),
+            pin_to_root: false,
             git_context_dir: String::new(),
             explorer,
+            session_root: String::new(),
             explorer_root: String::new(),
             explorer_cache: HashMap::new(),
             expanded_dirs: HashSet::new(),
@@ -1188,9 +1217,19 @@ impl Workspace {
                     self.refresh_git();
                 }
             }
-            AdeEvent::ConfigUpdated { shortkeys } => {
+            AdeEvent::ConfigUpdated { shortkeys, ui } => {
                 super::actions::apply_shortkeys(cx, &shortkeys);
-                self.status = "Keyboard shortcuts updated".into();
+                if let Some(ui) = ui.as_ref() {
+                    self.apply_ui_config(ui, window, cx);
+                }
+                if !self.explorer_root.is_empty() {
+                    let root = self.explorer_root.clone();
+                    self.relist(&root);
+                    for directory in self.expanded_dirs.clone() {
+                        self.relist(&directory);
+                    }
+                }
+                self.status = "Config reloaded".into();
             }
             AdeEvent::WorkspaceCreated { workspace } => {
                 let id = workspace.id.clone();
@@ -1209,8 +1248,14 @@ impl Workspace {
                 )
                 .into();
                 if active {
-                    self.explorer_root = workspace.root.clone();
-                    self.git_context_dir.clear();
+                    let previous_root = self.workspace_root().unwrap_or_default();
+                    self.session_root = workspace.root.clone();
+                    if self.active_directory.is_empty() || self.active_directory == previous_root {
+                        self.active_directory = workspace.root.clone();
+                    }
+                    let directory = if self.pin_to_root { workspace.root.clone() } else { self.active_directory.clone() };
+                    self.explorer_root = directory.clone();
+                    self.git_context_dir = directory.clone();
                     self.explorer_cache.clear();
                     self.restore_scroll_index = None;
                     self.pending_lists.clear();
@@ -1218,7 +1263,7 @@ impl Workspace {
                     self.selection.clear();
                     self.anchor = None;
                     self.rebuild_tree(cx);
-                    self.list_dir(&workspace.root);
+                    self.list_dir(&directory);
                     self.clear_git_view();
                     self.close_open_diffs(window, cx);
                     self.refresh_git();
@@ -1300,6 +1345,9 @@ impl Workspace {
                 let goto_listing = request_id.starts_with("goto-");
                 let requested = self.pending_lists.remove(&request_id).unwrap_or_default();
                 let (path, entries) = rebase_listing(&requested, &path, entries);
+                if self.session_root.is_empty() && !goto_listing {
+                    self.session_root = path.clone();
+                }
                 if self.explorer_root.is_empty() && !goto_listing {
                     self.explorer_root = path.clone();
                 }
@@ -1359,6 +1407,12 @@ impl Workspace {
                 line,
                 column,
             } => {
+                if let Some(rel) = self.pending_diff_editors.remove(&request_id) {
+                    if let Some(panel) = self.diffs.get(&rel) {
+                        panel.update(cx, |panel, _| panel.set_buffer(buffer_id));
+                    }
+                    return;
+                }
                 if let Some(activate) = self.pending_editors.remove(&request_id) {
                     self.begin_editor_tab(
                         buffer_id, path, language, line, column, activate, window, cx,
@@ -1371,10 +1425,18 @@ impl Workspace {
                 rev,
                 text,
                 path,
-            } => self.apply_snapshot(buffer_id, rev, text, path, window, cx),
+            } => {
+                if let Some(panel) = self.diffs.values().find(|panel| panel.read(cx).buffer_id() == Some(buffer_id.as_str())).cloned() {
+                    panel.update(cx, |panel, cx| panel.apply_snapshot(&buffer_id, rev, &text, window, cx));
+                } else {
+                    self.apply_snapshot(buffer_id, rev, text, path, window, cx)
+                }
+            }
             AdeEvent::BufferChanged { buffer_id, rev, .. } => {
                 if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
                     panel.update(cx, |panel, cx| panel.set_rev(rev, cx));
+                } else if let Some(panel) = self.diffs.values().find(|panel| panel.read(cx).buffer_id() == Some(buffer_id.as_str())).cloned() {
+                    panel.update(cx, |panel, _| panel.set_rev(rev));
                 }
             }
             AdeEvent::BufferSaved {
@@ -1382,7 +1444,13 @@ impl Workspace {
                 path,
                 rev,
                 ..
-            } => self.on_buffer_saved(&buffer_id, path, rev, cx),
+            } => {
+                if let Some(panel) = self.diffs.values().find(|panel| panel.read(cx).buffer_id() == Some(buffer_id.as_str())).cloned() {
+                    panel.update(cx, |panel, cx| panel.mark_saved(rev, cx));
+                    self.status = "Saved".into();
+                    cx.notify();
+                } else { self.on_buffer_saved(&buffer_id, path, rev, cx); }
+            }
             AdeEvent::BufferLspState { buffer_id, rev, text, diagnostics, status } => {
                 if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
                     panel.update(cx, |panel, cx| {
@@ -1485,7 +1553,7 @@ impl Workspace {
                 self.pending_diffs.remove(&request_id);
                 if let Some(panel) = self.diffs.get(&path).cloned() {
                     panel.update(cx, |panel, cx| {
-                        panel.show_sides(old_text, new_text, binary, truncated, cx);
+                        panel.show_sides(old_text, new_text, binary, truncated, window, cx);
                     });
                 }
             }
@@ -1529,10 +1597,23 @@ impl Workspace {
         self.defaults_path = hello.defaults_path.clone();
         self.git_cap = hello.capabilities.iter().any(|cap| cap == CAP_GIT);
         if let Some(ui) = &hello.ui {
-            self.editor_font_base = (ui.editor_font_size as f32).clamp(8.0, 64.0);
-            self.terminal_font_base = (ui.terminal_font_size as f32).clamp(8.0, 64.0);
-            chrome::apply_configured_theme(&ui.theme, Some(window), cx);
+            self.apply_ui_config(ui, window, cx);
+        } else {
+            self.apply_zoom(window, cx);
         }
+    }
+
+    fn apply_ui_config(&mut self, ui: &fresh_gui_protocol::HelloUi, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor_font_base = (ui.editor_font_size as f32).clamp(8.0, 64.0);
+        self.editor_line_wrap = ui.editor_line_wrap;
+        for panel in self.editors.values() {
+            panel.update(cx, |panel, cx| panel.set_word_wrap(ui.editor_line_wrap, window, cx));
+        }
+        for panel in self.diffs.values() {
+            panel.update(cx, |panel, cx| panel.set_word_wrap(ui.editor_line_wrap, window, cx));
+        }
+        self.terminal_font_base = (ui.terminal_font_size as f32).clamp(8.0, 64.0);
+        chrome::apply_configured_theme(&ui.theme, Some(window), cx);
         self.apply_zoom(window, cx);
     }
 
@@ -1652,6 +1733,7 @@ impl Workspace {
                 cx,
             )
         });
+        panel.update(cx, |panel, cx| panel.set_word_wrap(self.editor_line_wrap, window, cx));
         let panel_id = PanelId::from(panel.entity_id());
         self.dock.update(cx, |dock, cx| {
             dock.add_panel_view(
@@ -1708,6 +1790,9 @@ impl Workspace {
             if matches!(&self.active, Some(ActiveSurface::Editor(current)) if current == &previous)
             {
                 self.active = Some(ActiveSurface::Editor(path.clone()));
+                if let Some(directory) = parent_dir(&path) {
+                    self.follow_directory(&directory, cx);
+                }
             }
             if let Some(parent) = parent_dir(&path) {
                 self.relist(&parent);
@@ -1798,7 +1883,7 @@ impl Workspace {
     ) {
         if active {
             self.active = Some(ActiveSurface::Terminal(pty_id.to_string()));
-            if let Some(cwd) = self.terminals.get(pty_id).and_then(|panel| panel.read(cx).cwd()) {
+            if let Some(cwd) = self.terminals.get(pty_id).and_then(|panel| panel.read(cx).cwd()).or_else(|| self.workspace_root()) {
                 self.follow_directory(&cwd, cx);
             }
             if let Some(id) = self.active_panel_id() {
@@ -1824,9 +1909,12 @@ impl Workspace {
     pub(crate) fn note_editor_active(&mut self, path: &str, active: bool, cx: &mut Context<Self>) {
         if active {
             self.active = Some(ActiveSurface::Editor(path.to_string()));
-            if self.defaults_path.as_deref() != Some(path)
-                && let Some(dir) = parent_dir(path)
-            {
+            let directory = if self.defaults_path.as_deref() == Some(path) {
+                self.workspace_root()
+            } else {
+                parent_dir(path).or_else(|| self.workspace_root())
+            };
+            if let Some(dir) = directory {
                 self.follow_directory(&dir, cx);
             }
             if let Some(id) = self.active_panel_id() {
@@ -2006,8 +2094,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         choose_shell_cwd(explicit.as_deref(), self.workspace_root().as_deref())
     }
 
-    /// Focused workspace directory, else the explorer folder, else the root
-    /// this window was opened with (saved remote root or `--root`).
+    /// Saved workspace root, else the root this window was opened with.
     fn workspace_root(&self) -> Option<String> {
         let from_workspace = self.active_workspace_id.as_ref().and_then(|id| {
             self.workspaces
@@ -2015,16 +2102,14 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                 .find(|workspace| &workspace.id == id)
                 .map(|workspace| workspace.root.clone())
         });
-        let explorer = if self.explorer_root.trim().is_empty() {
+        let session = if self.session_root.trim().is_empty() {
             None
         } else {
-            Some(self.explorer_root.clone())
+            Some(self.session_root.clone())
         };
         choose_shell_cwd(
             from_workspace.as_deref(),
-            explorer
-                .as_deref()
-                .or(self.target.preferred_root.as_deref()),
+            self.target.preferred_root.as_deref().or(session.as_deref()),
         )
     }
 
@@ -2311,6 +2396,9 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.selection.clear();
         self.anchor = None;
         self.explorer_root = info.root.clone();
+        self.session_root = info.root.clone();
+        self.active_directory = info.root.clone();
+        self.pin_to_root = false;
         self.git_context_dir.clear();
         let root = info.root.clone();
         self.upsert_workspace(info);
@@ -2785,6 +2873,18 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     }
 
     fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ActiveSurface::Diff(rel)) = &self.active {
+            let Some(panel) = self.diffs.get(rel).cloned() else { return; };
+            let data = panel.read(cx).save_data(cx);
+            if let Some((buffer_id, rev, text)) = data {
+                self.write_buffer(&buffer_id, rev, &text, true, String::new());
+                self.status = "Saving…".into();
+            } else {
+                self.status = "No changes".into();
+            }
+            cx.notify();
+            return;
+        }
         let Some(ActiveSurface::Editor(path)) = &self.active else {
             return;
         };
@@ -3006,6 +3106,9 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.respawn_titles.clear();
         self.restore_focus = None;
         self.explorer_root.clear();
+        self.session_root.clear();
+        self.active_directory.clear();
+        self.pin_to_root = false;
         self.git_context_dir.clear();
         self.selection.clear();
         self.anchor = None;
@@ -3097,8 +3200,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         });
     }
 
-    /// Change explorer and Git context only when the focused directory changes.
-    /// Repeated OSC 7 reports during TUI frames then cost no FS or Git request.
+    /// Track the focused tab's directory even while the side panels are pinned.
     fn follow_directory(&mut self, directory: &str, cx: &mut Context<Self>) {
         let directory = if directory == "/"
             || directory.ends_with(":/")
@@ -3109,9 +3211,22 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             directory.trim_end_matches(['/', '\\'])
         };
         let directory = if directory.is_empty() { "/" } else { directory };
-        if !std::path::Path::new(directory).is_absolute() {
+        // `Path::is_absolute` uses the client's OS. The daemon may use Windows
+        // paths while this process runs on Unix, or vice versa.
+        if !goto_is_absolute(directory) {
             return;
         }
+        self.active_directory = directory.to_string();
+        if self.pin_to_root {
+            cx.notify();
+            return;
+        }
+        self.set_panel_directory(directory, cx);
+    }
+
+    /// Point Explorer and Git at a daemon directory. GitStatus walks upward
+    /// from this directory to find the containing repository on the daemon.
+    fn set_panel_directory(&mut self, directory: &str, cx: &mut Context<Self>) {
         let mut changed = false;
         if self.explorer_root != directory {
             changed = true;
@@ -3134,6 +3249,21 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         if changed {
             cx.notify();
         }
+    }
+
+    fn toggle_root_pin(&mut self, cx: &mut Context<Self>) {
+        self.pin_to_root = !self.pin_to_root;
+        let directory = if self.pin_to_root {
+            self.workspace_root()
+        } else if !self.active_directory.is_empty() {
+            Some(self.active_directory.clone())
+        } else {
+            self.workspace_root()
+        };
+        if let Some(directory) = directory {
+            self.set_panel_directory(&directory, cx);
+        }
+        cx.notify();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3224,7 +3354,8 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         let title = diff_view::join_repo(&root, &rel);
         let workspace = cx.weak_entity();
         let metrics = self.tab_metrics.clone();
-        let panel = cx.new(|cx| DiffPanel::new(rel.clone(), title, pin, workspace, metrics, cx));
+        let panel = cx.new(|cx| DiffPanel::new(rel.clone(), title.clone(), pin, workspace, metrics, window, cx));
+        panel.update(cx, |panel, cx| panel.set_word_wrap(self.editor_line_wrap, window, cx));
         self.dock.update(cx, |dock, cx| {
             dock.add_panel_view(
                 panel_handle(panel.clone()),
@@ -3240,6 +3371,9 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         }
         self.select_entity(&panel, window, cx);
         self.request_git_diff(&rel);
+        let request_id = next_id("diff-edit");
+        self.pending_diff_editors.insert(request_id.clone(), rel.clone());
+        self.ade.send(AdeCmd::OpenEditor { request_id, path: title, preview: false, line: None, column: None });
     }
 
     fn close_open_diffs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3547,7 +3681,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         cx.notify();
     }
 
-    fn copy_path_text(&mut self, paths: &[String], window: &Window, cx: &mut Context<Self>) {
+    fn copy_path_text(&mut self, paths: &[String], window: &mut Window, cx: &mut Context<Self>) {
         if paths.is_empty() {
             self.status = "No selection".into();
             cx.notify();
@@ -3555,14 +3689,20 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         }
         let text = absolute_paths_text(&display_paths(paths));
         self.status = match super::clipboard::write_text(window, cx, &text) {
-            Ok(()) if paths.len() == 1 => "Copied path".into(),
-            Ok(()) => format!("Copied {} paths", paths.len()).into(),
+            Ok(()) if paths.len() == 1 => {
+                super::clipboard::notify_copied(window, cx);
+                "Copied path".into()
+            }
+            Ok(()) => {
+                super::clipboard::notify_copied(window, cx);
+                format!("Copied {} paths", paths.len()).into()
+            }
             Err(error) => error.into(),
         };
         cx.notify();
     }
 
-    fn arm_file_copy(&mut self, paths: Vec<String>, cx: &mut Context<Self>) {
+    fn arm_file_copy(&mut self, paths: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         if paths.is_empty() {
             self.status = "No selection".into();
             cx.notify();
@@ -3576,6 +3716,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                 ClipboardEntry::ExternalPaths(ExternalPaths(path_bufs.into())),
             ],
         });
+        super::clipboard::notify_copied(window, cx);
         let count = paths.len();
         self.file_clipboard = Some(paths);
         self.status = format!("Copied {count} item(s) — paste in the explorer").into();
@@ -3586,8 +3727,8 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.selection.clone()
     }
 
-    fn copy_explorer_selection(&mut self, cx: &mut Context<Self>) {
-        self.arm_file_copy(self.selected_or_primary(), cx);
+    fn copy_explorer_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.arm_file_copy(self.selected_or_primary(), window, cx);
     }
 
     fn delete_explorer_selection(&mut self, cx: &mut Context<Self>) {
@@ -3911,6 +4052,8 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         if self.goto_open {
             self.palette_open = false;
             self.rename_pty = None;
+            let query = self.workspace_root().map(|root| goto_initial_query(&display_path(&root))).unwrap_or_default();
+            self.goto_input.update(cx, |state, cx| state.set_value(query, window, cx));
             self.request_goto_listing(cx);
             self.goto_input.update(cx, |state, cx| {
                 state.focus(window, cx);
@@ -4079,6 +4222,19 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         cx.notify();
     }
 
+    fn on_toggle_word_wrap(&mut self, _: &ToggleWordWrap, window: &mut Window, cx: &mut Context<Self>) {
+        let enabled = match &self.active {
+            Some(ActiveSurface::Editor(path)) => self.editors.get(path).cloned()
+                .map(|panel| panel.update(cx, |panel, cx| panel.toggle_word_wrap(window, cx))),
+            Some(ActiveSurface::Diff(path)) => self.diffs.get(path).cloned()
+                .map(|panel| panel.update(cx, |panel, cx| panel.toggle_word_wrap(window, cx))),
+            _ => None,
+        };
+        let Some(enabled) = enabled else { return; };
+        self.status = if enabled { "Word wrap on" } else { "Word wrap off" }.into();
+        cx.notify();
+    }
+
     fn on_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
         self.open_settings();
         cx.notify();
@@ -4097,6 +4253,94 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     fn on_reconnect(&mut self, _: &Reconnect, window: &mut Window, cx: &mut Context<Self>) {
         self.reconnect(window, cx);
         cx.notify();
+    }
+
+    fn on_reload_config(&mut self, _: &ReloadConfig, _: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.connection, ConnectionState::Online) {
+            self.ade.send(AdeCmd::ReloadConfig);
+            self.status = "Reloading server config…".into();
+        } else {
+            self.status = "Connect to the server to reload config".into();
+        }
+        cx.notify();
+    }
+
+    fn on_restart_server(&mut self, _: &RestartServer, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.target.local_daemon {
+            let Some(remote_control) = self.target.remote_control.clone() else {
+                self.reconnect(window, cx);
+                self.status = "Reconnecting to server; external endpoints cannot be restarted here".into();
+                cx.notify();
+                return;
+            };
+            if matches!(self.connection, ConnectionState::Online) {
+                self.save_before_exit(cx);
+            }
+            self.ade.send(AdeCmd::Disconnect);
+            self.connection = ConnectionState::Offline { reason: "Restarting remote server".into() };
+            self.status = "Restarting remote server…".into();
+            cx.notify();
+            let (tx, rx) = async_channel::bounded(1);
+            std::thread::spawn(move || { let _ = tx.send_blocking(remote_control.restart()); });
+            cx.spawn_in(window, async move |this, cx| {
+                let Ok(result) = rx.recv().await else { return };
+                let _ = cx.update(|window, app| {
+                    let _ = this.update(app, |this, cx| {
+                        match result {
+                            Ok(endpoint) => {
+                                this.target.ws_url = endpoint.ws_url;
+                                this.target.token = endpoint.token;
+                                this.reconnect(window, cx);
+                                this.status = "Remote server restarted; reconnecting…".into();
+                            }
+                            Err(error) => {
+                                this.connection = ConnectionState::Offline { reason: "Remote restart failed".into() };
+                                this.status = format!("Remote server restart failed: {error:#}").into();
+                            }
+                        }
+                        cx.notify();
+                    });
+                });
+            }).detach();
+            return;
+        }
+        if matches!(self.connection, ConnectionState::Online) {
+            self.save_before_exit(cx);
+        }
+        let root = self.workspace_root();
+        self.ade.send(AdeCmd::Disconnect);
+        self.connection = ConnectionState::Offline { reason: "Restarting server".into() };
+        self.status = "Restarting local server…".into();
+        cx.notify();
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let result = crate::launch::close_local_daemon().and_then(|_| {
+                crate::launch::ensure_local_session(root.as_deref().map(std::path::Path::new))
+            });
+            let _ = tx.send_blocking(result);
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(result) = rx.recv().await else { return };
+            let _ = cx.update(|window, app| {
+                let _ = this.update(app, |this, cx| {
+                    match result {
+                        Ok(session) => {
+                            let mut target = super::connect::parse_connect_target(&session.ws_url, session.token);
+                            target.local_daemon = true;
+                            target.preferred_root = session.preferred_root.or_else(|| this.workspace_root());
+                            this.target = target;
+                            this.reconnect(window, cx);
+                            this.status = "Server restarted; reconnecting…".into();
+                        }
+                        Err(error) => {
+                            this.connection = ConnectionState::Offline { reason: "Restart failed".into() };
+                            this.status = format!("Server restart failed: {error:#}").into();
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        }).detach();
     }
 
     fn on_disconnect(&mut self, _: &Disconnect, _: &mut Window, cx: &mut Context<Self>) {
@@ -4120,8 +4364,8 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.cycle_tab(-1, window, cx);
     }
 
-    fn on_copy_explorer(&mut self, _: &CopyExplorer, _: &mut Window, cx: &mut Context<Self>) {
-        self.copy_explorer_selection(cx);
+    fn on_copy_explorer(&mut self, _: &CopyExplorer, window: &mut Window, cx: &mut Context<Self>) {
+        self.copy_explorer_selection(window, cx);
     }
 
     fn on_ask_copilot(&mut self, _: &AskCopilot, window: &mut Window, cx: &mut Context<Self>) {
@@ -5022,7 +5266,8 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
 
     fn render_explorer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
-        let root_label = explorer_header_label(&self.explorer_root);
+        let root_label = format!("{}: {}", if self.pin_to_root { "Root" } else { "Active" }, explorer_header_label(&self.explorer_root));
+        let workspace_root = self.workspace_root().unwrap_or_default();
         let selected: HashSet<String> = self.selection.iter().cloned().collect();
 
         let kinds = self.explorer_kinds.clone();
@@ -5055,10 +5300,18 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                     .px_2()
                     .items_center()
                     .justify_between()
-                    .child(div().text_xs().font_semibold().child(root_label))
+                    .child(div().min_w_0().text_xs().font_semibold().text_ellipsis().child(root_label))
                     .child(
                         h_flex()
                             .gap_1()
+                            .child(
+                                Button::new("explorer-root-pin")
+                                    .ghost()
+                                    .xsmall()
+                                    .label(if self.pin_to_root { "Follow" } else { "Root" })
+                                    .tooltip(if self.pin_to_root { "Follow active tab" } else { "Pin panels to workspace root" })
+                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_root_pin(cx))),
+                            )
                             .child(
                                 Button::new("refresh-explorer")
                                     .ghost()
@@ -5083,6 +5336,10 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                             ),
                     ),
             )
+            .child(div().w_full().px_2().pb_1().text_xs().text_color(cx.theme().muted_foreground).text_ellipsis().child(format!("Root: {}", display_path(&workspace_root))))
+            .when(!self.active_directory.is_empty(), |column| {
+                column.child(div().w_full().px_2().pb_1().text_xs().text_color(cx.theme().muted_foreground).text_ellipsis().child(format!("Active: {}", display_path(&self.active_directory))))
+            })
             .when(self.filter_open, |this| {
                 this.child(
                     h_flex()
@@ -5328,9 +5585,9 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                         .item(PopupMenuItem::new("Copy").on_click({
                             let view = view.clone();
                             let file_paths = file_paths.clone();
-                            move |_, _, cx| {
+                            move |_, window, cx| {
                                 view.update(cx, |this, cx| {
-                                    this.arm_file_copy(file_paths.clone(), cx)
+                                    this.arm_file_copy(file_paths.clone(), window, cx)
                                 });
                             }
                         }))
@@ -5356,6 +5613,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     fn render_git(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         let zoom = self.ui_zoom;
+        let workspace_root = self.workspace_root().unwrap_or_default();
         let branch = if !self.git_repo {
             "Not a Git repository".to_string()
         } else if self.git_branch.is_empty() {
@@ -5399,10 +5657,18 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                     .px_2()
                     .items_center()
                     .justify_between()
-                    .child(div().text_xs().font_semibold().child("Source Control"))
+                    .child(div().min_w_0().text_xs().font_semibold().text_ellipsis().child(format!("Source Control · {}: {}", if self.pin_to_root { "Root" } else { "Active" }, display_path(&self.git_context_dir))))
                     .child(
                         h_flex()
                             .gap_1()
+                            .child(
+                                Button::new("git-root-pin")
+                                    .ghost()
+                                    .xsmall()
+                                    .label(if self.pin_to_root { "Follow" } else { "Root" })
+                                    .tooltip(if self.pin_to_root { "Follow active tab" } else { "Pin panels to workspace root" })
+                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_root_pin(cx))),
+                            )
                             .child(
                                 Button::new("git-refresh")
                                     .ghost()
@@ -5440,6 +5706,10 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                             .text_color(cx.theme().muted_foreground)
                             .child(branch),
                     )
+                    .child(div().w_full().overflow_hidden().whitespace_nowrap().text_ellipsis().text_xs().text_color(cx.theme().muted_foreground).child(format!("Root: {}", display_path(&workspace_root))))
+                    .when(!self.active_directory.is_empty(), |column| {
+                        column.child(div().w_full().overflow_hidden().whitespace_nowrap().text_ellipsis().text_xs().text_color(cx.theme().muted_foreground).child(format!("Active: {}", display_path(&self.active_directory))))
+                    })
                     .when_some(root_label, |column, root| {
                         column.child(
                             div()
@@ -5563,6 +5833,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             ("New File", Box::new(NewFile)),
             ("Split Terminal Vertically", Box::new(SplitTerminal)),
             ("Format Document", Box::new(FormatDocument)),
+            ("Toggle Word Wrap", Box::new(ToggleWordWrap)),
             ("New Workspace", Box::new(NewWorkspace)),
             ("Rename Workspace", Box::new(RenameWorkspace)),
             ("Close Workspace", Box::new(CloseWorkspace)),
@@ -5585,6 +5856,8 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             ("Reset UI Zoom", Box::new(ResetUiZoom)),
             ("Reconnect", Box::new(Reconnect)),
             ("Disconnect", Box::new(Disconnect)),
+            ("Restart Server", Box::new(RestartServer)),
+            ("Reload Config", Box::new(ReloadConfig)),
             ("Stop Server", Box::new(StopServer)),
             ("Quit Client", Box::new(QuitClient)),
         ];
@@ -5763,11 +6036,18 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                                         } else {
                                             label
                                         };
-                                        Button::new(SharedString::from(format!("goto-{path}")))
-                                            .ghost()
+                                        div()
+                                            .id(SharedString::from(format!("goto-{path}")))
+                                            .w_full()
                                             .h(self.ui_px(32.))
                                             .flex_shrink_0()
-                                            .label(label)
+                                            .flex()
+                                            .items_center()
+                                            .justify_start()
+                                            .px_2()
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(cx.theme().accent.opacity(0.15)))
+                                            .child(div().text_sm().text_ellipsis().child(label))
                                             .on_click(move |_, window, cx| {
                                                 let path = path.clone();
                                                 open.update(cx, |this, cx| {
@@ -6054,6 +6334,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_settings))
             .on_action(cx.listener(Self::on_default_settings))
             .on_action(cx.listener(Self::on_reconnect))
+            .on_action(cx.listener(Self::on_restart_server))
+            .on_action(cx.listener(Self::on_reload_config))
             .on_action(cx.listener(Self::on_disconnect))
             .on_action(cx.listener(Self::on_next_tab))
             .on_action(cx.listener(Self::on_prev_tab))
@@ -6067,6 +6349,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_new_file))
             .on_action(cx.listener(Self::on_split_terminal))
             .on_action(cx.listener(Self::on_format_document))
+            .on_action(cx.listener(Self::on_toggle_word_wrap))
             .on_action(cx.listener(Self::on_new_workspace))
             .on_action(cx.listener(Self::on_rename_workspace))
             .on_action(cx.listener(Self::on_close_workspace))

@@ -16,6 +16,7 @@ mod dock_a11y;
 mod explorer;
 mod file_icons;
 mod icon;
+mod log_highlight;
 mod osc7;
 mod pane;
 mod paths;

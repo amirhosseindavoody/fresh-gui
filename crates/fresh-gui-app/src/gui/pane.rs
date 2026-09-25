@@ -6,6 +6,7 @@
 //! that owns the panel.
 
 use std::cell::Cell;
+use std::ops::Range;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -14,7 +15,7 @@ use fresh_gui_protocol::BufferDiagnostic;
 
 use gpui_kit::base::ElementExt as _;
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent, PanelId};
-use gpui_kit::component::input::{Editor, EditorState, InputEvent, Position};
+use gpui_kit::component::input::{Editor, EditorState, InputEvent, Position, TextDecoration, TextDecorationCollection};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
@@ -35,7 +36,7 @@ use super::rail::path_basename;
 use super::tab_chrome::{TabCloseScope, TabStripMetrics};
 use super::terminal::{
     TermMouseButton, TermMouseKind, TermMouseMods, TermScreen, TermSpan, keystroke_to_bytes,
-    paste_payload, readable_light_foreground,
+    paste_payload, readable_light_foreground, word_bounds_at_column,
 };
 
 /// `text_sm` monospace cell, matching [`super::terminal`] pixel reports.
@@ -94,6 +95,9 @@ pub struct TerminalPanel {
     pressed: Option<TermMouseButton>,
     /// Last cell written as a move or drag, so a hover does not repeat.
     last_mouse_cell: Option<(usize, usize)>,
+    /// Row and scalar bounds of a path under a held Ctrl/Cmd pointer.
+    link_hover: Option<(usize, usize, usize)>,
+    last_pointer: Option<Point<Pixels>>,
     /// Monospace cell, scaled with content and UI zoom. 8×18 at 14px.
     cell_w: f32,
     cell_h: f32,
@@ -130,6 +134,8 @@ impl TerminalPanel {
             selecting: false,
             pressed: None,
             last_mouse_cell: None,
+            link_hover: None,
+            last_pointer: None,
             cell_w: TERM_CELL_W,
             cell_h: TERM_CELL_H,
             font_px: 14.0,
@@ -202,6 +208,8 @@ impl TerminalPanel {
         for text in self.screen.take_clipboard_stores() {
             if let Err(error) = clipboard::write_text(window, cx, &text) {
                 tracing::warn!(%error, "terminal clipboard copy failed");
+            } else {
+                clipboard::notify_copied(window, cx);
             }
         }
         self.arm_sync_timeout(cx);
@@ -307,16 +315,16 @@ impl TerminalPanel {
         }
         if down
             && button == TermMouseButton::Left
-            && (modifiers.control || modifiers.platform)
+            && modifiers.secondary()
             && !modifiers.shift
             && let Some((col, row)) = self.cell_at(position)
-            && let Some(line) = self.screen.line_text(row)
+            && let Some((line, char_col)) = self.screen.line_text_and_char_column(row, col)
         {
             let cwd = self.cwd();
             let workspace = self.workspace.clone();
             workspace
                 .update(cx, |workspace, cx| {
-                    workspace.open_path_link(line, col as u32, cwd, cx);
+                    workspace.open_path_link(line, char_col as u32, cwd, cx);
                 })
                 .ok();
             return;
@@ -367,9 +375,18 @@ impl TerminalPanel {
         modifiers: &Modifiers,
         cx: &mut Context<Self>,
     ) {
+        self.last_pointer = Some(position);
         if self.selecting {
+            if self.link_hover.take().is_some() {
+                cx.notify();
+            }
             self.pointer_select(position, false, cx);
             return;
+        }
+        let hovered = self.link_hover_at(position, modifiers);
+        if hovered != self.link_hover {
+            self.link_hover = hovered;
+            cx.notify();
         }
         let tracking = self.screen.mouse_tracking();
         let kind = if let Some(button) = self.pressed {
@@ -383,6 +400,22 @@ impl TerminalPanel {
             return;
         };
         self.send_mouse(position, kind, modifiers, true);
+    }
+
+    fn link_hover_at(
+        &self,
+        position: Point<Pixels>,
+        modifiers: &Modifiers,
+    ) -> Option<(usize, usize, usize)> {
+        let candidate = self.cell_at(position).and_then(|(col, row)| {
+            self.screen
+                .line_text_and_char_column(row, col)
+                .and_then(|(line, char_col)| {
+                    terminal_link_range(&line, char_col)
+                        .map(|(start, end)| (row, start, end))
+                })
+        });
+        terminal_link_hover(candidate, modifiers)
     }
 
     fn send_mouse(
@@ -413,6 +446,12 @@ impl TerminalPanel {
 
     fn scroll_host(&mut self, lines: f32, cx: &mut Context<Self>) {
         if self.screen.alt_screen() {
+            // Alternate-screen applications own their viewport. DEC mode 1007
+            // opts into translating the host wheel to cursor keys; without it
+            // the wheel must not move the host's primary-screen scrollback.
+            if !self.screen.alternate_scroll() {
+                return;
+            }
             let steps = lines.abs().round().clamp(1., 8.) as usize;
             let seq: &[u8] = if lines > 0. { b"\x1b[A" } else { b"\x1b[B" };
             let mut data = Vec::with_capacity(seq.len() * steps);
@@ -442,6 +481,17 @@ impl TerminalPanel {
         cx.notify();
     }
 
+    fn select_word_at(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((col, row)) = self.cell_at(position) else { return };
+        let Some((line, char_col)) = self.screen.line_text_and_char_column(row, col) else { return };
+        let Some((start, end)) = word_bounds_at_column(&line, char_col) else { return };
+        if !self.screen.select_char_range(row, start..end) {
+            return;
+        }
+        self.selecting = true;
+        self.finish_select(window, cx);
+    }
+
     fn finish_select(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.selecting {
             return;
@@ -461,6 +511,8 @@ impl TerminalPanel {
         };
         if let Err(error) = clipboard::write_text(window, cx, &text) {
             tracing::warn!(%error, "terminal copy failed");
+        } else {
+            clipboard::notify_copied(window, cx);
         }
         cx.notify();
     }
@@ -659,6 +711,8 @@ impl Render for TerminalPanel {
             for text in std::mem::take(&mut self.pending_clipboard) {
                 if let Err(error) = clipboard::write_text(window, cx, &text) {
                     tracing::warn!(%error, "terminal clipboard copy failed");
+                } else {
+                    clipboard::notify_copied(window, cx);
                 }
             }
         }
@@ -676,6 +730,7 @@ impl Render for TerminalPanel {
         let track_outside = self.selecting || self.pressed.is_some();
         let select_entity = cx.entity().downgrade();
         let reporting = self.screen.mouse_tracking().active();
+        let link_hover = self.link_hover;
         let pane = div()
             .id(format!("terminal-pane-{}", self.pty_id))
             .key_context("Terminal")
@@ -688,6 +743,62 @@ impl Render for TerminalPanel {
             .font_family(cx.theme().mono_font_family.clone())
             .text_size(px(self.font_px))
             .track_focus(&self.focus)
+            .when(link_hover.is_some(), |pane| pane.cursor_pointer())
+            .on_mouse_exit(cx.listener(|this, _, _, cx| {
+                this.last_pointer = None;
+                if this.link_hover.take().is_some() {
+                    cx.notify();
+                }
+            }))
+            .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {
+                let hovered = this.last_pointer.and_then(|position| {
+                    this.link_hover_at(position, &event.modifiers)
+                });
+                if hovered != this.link_hover {
+                    this.link_hover = hovered;
+                    cx.notify();
+                }
+            }))
+            // Child hitboxes can consume the bubble phase. TUI mouse reports
+            // and modified path clicks must reach the terminal in capture.
+            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                if event.button == MouseButton::Left && event.modifiers.secondary()
+                    && !event.modifiers.shift
+                {
+                    this.host_pointer(
+                        TermMouseButton::Left,
+                        true,
+                        event.position,
+                        &event.modifiers,
+                        window,
+                        cx,
+                    );
+                } else if event.button == MouseButton::Left && event.click_count >= 2 {
+                    // A double-click is a host selection gesture even when a
+                    // TUI enabled mouse reporting. The first ordinary press
+                    // still reaches the PTY; this press is copied locally.
+                    this.select_word_at(event.position, window, cx);
+                    cx.stop_propagation();
+                } else if this.screen.mouse_tracking().active() && !event.modifiers.shift {
+                    let button = match event.button {
+                        MouseButton::Left => TermMouseButton::Left,
+                        MouseButton::Middle => TermMouseButton::Middle,
+                        MouseButton::Right => TermMouseButton::Right,
+                        _ => return,
+                    };
+                    this.host_pointer(button, true, event.position, &event.modifiers, window, cx);
+                }
+            }))
+            .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                if !this.screen.mouse_tracking().active() || this.pressed.is_none() { return; }
+                let button = match event.button {
+                    MouseButton::Left => TermMouseButton::Left,
+                    MouseButton::Middle => TermMouseButton::Middle,
+                    MouseButton::Right => TermMouseButton::Right,
+                    _ => return,
+                };
+                this.host_pointer(button, false, event.position, &event.modifiers, window, cx);
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -922,13 +1033,17 @@ impl Render for TerminalPanel {
                                 .ok();
                         });
                     })
-                    .children(rows.into_iter().map(|row| {
+                    .children(rows.into_iter().enumerate().map(|(row_index, row)| {
+                        let mut char_start = 0;
                         h_flex().h(px(cell_h)).items_center().children(
-                            row.spans
-                                .into_iter()
-                                .map(|span| {
-                                    term_span_el(span, cell_w, fg_default, accent, light_theme)
-                                }),
+                            row.spans.into_iter().map(|span| {
+                                let char_end = char_start + span.text.chars().count();
+                                let underline = link_hover.is_some_and(|(hover_row, start, end)| {
+                                    hover_row == row_index && start < char_end && char_start < end
+                                });
+                                char_start = char_end;
+                                term_span_el(span, cell_w, fg_default, accent, light_theme, underline)
+                            }),
                         )
                     }))
                     .when_some(cursor, |grid, (row, col, shape)| {
@@ -1020,6 +1135,134 @@ fn is_ui_zoom_in_chord(key: &str, key_char: Option<&str>, modifiers: &Modifiers)
         && (key == "=" || key == "+" || key_char == Some("+"))
 }
 
+fn terminal_link_hover(
+    candidate: Option<(usize, usize, usize)>,
+    modifiers: &Modifiers,
+) -> Option<(usize, usize, usize)> {
+    candidate.filter(|_| {
+        !modifiers.shift
+            && !modifiers.alt
+            && modifiers.secondary()
+    })
+}
+
+fn terminal_link_range(line: &str, column: usize) -> Option<(usize, usize)> {
+    let (start, end) = word_bounds_at_column(line, column)?;
+    let token: String = line.chars().skip(start).take(end - start).collect();
+    let last_component = token
+        .rsplit(|ch| ch == '/' || ch == '\\')
+        .next()
+        .unwrap_or(&token);
+    let looks_like_path = token.contains('/')
+        || token.contains('\\')
+        || token.starts_with('~')
+        || (last_component.contains('.') && last_component.chars().any(char::is_alphabetic));
+    looks_like_path.then_some((start, end))
+}
+
+/// Candidate path tokens and their character columns in one editor line.
+/// Ranges are UTF-8 byte offsets, as required by EditorState decorations.
+fn editor_path_tokens(line: &str) -> Vec<(Range<usize>, u32)> {
+    let is_word = |ch: char| ch.is_alphanumeric() || matches!(ch, '_' | '/' | '.' | '-' | '~' | ':' | '\\');
+    let mut result = Vec::new();
+    let mut start = None;
+    let mut char_start = 0;
+    let mut char_col = 0;
+    for (byte, ch) in line.char_indices().chain(std::iter::once((line.len(), ' '))) {
+        if is_word(ch) {
+            if start.is_none() {
+                start = Some(byte);
+                char_start = char_col;
+            }
+        } else if let Some(begin) = start.take() {
+            let token = &line[begin..byte];
+            let leaf = token.rsplit(['/', '\\']).next().unwrap_or(token);
+            if token.contains(['/', '\\']) || token.starts_with('~')
+                || (leaf.contains('.') && leaf.chars().any(char::is_alphabetic))
+            {
+                result.push((begin..byte, char_start));
+            }
+        }
+        char_col += 1;
+    }
+    result
+}
+
+fn editor_path_at_point(editor: &EditorState, text: &str, position: Point<Pixels>) -> Option<(String, u32, Range<usize>)> {
+    let mut line_start = 0;
+    for line_with_newline in text.split_inclusive('\n') {
+        let line = line_with_newline.trim_end_matches(['\r', '\n']);
+        for (range, column) in editor_path_tokens(line) {
+            let absolute = (line_start + range.start)..(line_start + range.end);
+            let hit = text[absolute.clone()].char_indices().any(|(offset, ch)| {
+                let start = absolute.start + offset;
+                editor.range_to_bounds(&(start..start + ch.len_utf8()))
+                    .is_some_and(|bounds| bounds.contains(&position))
+            });
+            if hit {
+                return Some((line.to_string(), column, absolute));
+            }
+        }
+        line_start += line_with_newline.len();
+    }
+    None
+}
+
+#[cfg(test)]
+mod editor_path_tests {
+    use super::editor_path_tokens;
+
+    #[test]
+    fn extracts_remote_and_relative_paths_with_utf8_byte_offsets() {
+        let line = "é src/my-file.rs:12 C:\\work\\other.log:3 plain";
+        let tokens = editor_path_tokens(line);
+        let values: Vec<_> = tokens.iter().map(|(range, _)| &line[range.clone()]).collect();
+        assert_eq!(values, vec!["src/my-file.rs:12", "C:\\work\\other.log:3"]);
+        assert_eq!(tokens[0].1, 2);
+    }
+}
+
+#[cfg(test)]
+mod terminal_link_hover_tests {
+    use super::{terminal_link_hover, terminal_link_range};
+    use gpui_kit::Modifiers;
+
+    #[test]
+    fn path_tokens_get_ctrl_hover_range_but_words_do_not() {
+        let line = "edit src/main.rs and README";
+        let path_col = line.find("main").unwrap();
+        assert_eq!(terminal_link_range(line, path_col), Some((5, 16)));
+        assert_eq!(terminal_link_range(line, line.find("README").unwrap()), None);
+        assert_eq!(
+            terminal_link_hover(Some((0, 5, 16)), &Modifiers::default()),
+            None
+        );
+        #[cfg(not(target_os = "macos"))]
+        let secondary = Modifiers {
+            control: true,
+            ..Modifiers::default()
+        };
+        #[cfg(target_os = "macos")]
+        let secondary = Modifiers {
+            platform: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            terminal_link_hover(Some((0, 5, 16)), &secondary),
+            Some((0, 5, 16))
+        );
+    }
+
+    #[test]
+    fn path_extraction_keeps_line_suffix_and_windows_separators() {
+        let line = r"open C:\work\my-file_2.rs:17:3 now";
+        let col = line.find("my-file").unwrap();
+        let (start, end) = terminal_link_range(line, col).unwrap();
+        assert_eq!(&line[start..end], r"C:\work\my-file_2.rs:17:3");
+        assert_eq!(terminal_link_range("open README now", 6), None);
+    }
+}
+
 #[cfg(test)]
 mod zoom_tests {
     use super::is_ui_zoom_in_chord;
@@ -1062,6 +1305,9 @@ mod language_path_tests {
             ("main.cpp", "cpp"),
             ("header.hpp", "cpp"),
             ("main.go", "go"),
+            ("server.log", "log"),
+            ("server.log.1", "log"),
+            ("daemon.trace", "log"),
         ] {
             assert_eq!(language_from_path(path, None).as_deref(), Some(expected), "{path}");
         }
@@ -1082,6 +1328,7 @@ fn term_span_el(
     fg_default: Hsla,
     accent: Hsla,
     light_theme: bool,
+    link_hover: bool,
 ) -> gpui::Div {
     let text = if span.text.is_empty() {
         " ".to_string()
@@ -1105,6 +1352,7 @@ fn term_span_el(
         // not shift later characters away from the PTY's cursor columns.
         .text_center()
         .whitespace_nowrap()
+        .when(link_hover, |el| el.underline())
         .when(bold, |el| el.font_semibold())
         .when(!span.selected, |el| match fg {
             Some(fg) => el.text_color(term_rgb(fg)),
@@ -1180,6 +1428,10 @@ pub struct EditorPanel {
     plus_shift: Rc<Cell<f32>>,
     font_px: f32,
     closed: bool,
+    word_wrap: bool,
+    hover_link: Option<Range<usize>>,
+    last_editor_pointer: Option<Point<Pixels>>,
+    hover_decoration: TextDecorationCollection,
     markdown_preview: bool,
     markdown_preview_locked: bool,
     inline_markdown_edit: Option<MarkdownInlineEdit>,
@@ -1221,6 +1473,10 @@ impl EditorPanel {
             }
             state
         });
+        if language_from_path(&path, language.as_deref()).as_deref() == Some("log") {
+            editor.update(cx, |state, cx| state.set_highlighter_factory(super::log_highlight::factory(), cx));
+        }
+        let hover_decoration = editor.update(cx, |state, cx| state.create_decorations_collection(Vec::new(), cx));
         let subscription = cx.subscribe(&editor, |this, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Change) {
                 this.dirty = true;
@@ -1245,6 +1501,10 @@ impl EditorPanel {
             plus_shift: Rc::new(Cell::new(0.0)),
             font_px: 14.0,
             closed: false,
+            word_wrap: true,
+            hover_link: None,
+            last_editor_pointer: None,
+            hover_decoration,
             markdown_preview: false,
             markdown_preview_locked: false,
             inline_markdown_edit: None,
@@ -1259,6 +1519,19 @@ impl EditorPanel {
         }
         self.font_px = font_px;
         cx.notify();
+    }
+
+    pub fn set_word_wrap(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.word_wrap == enabled { return; }
+        self.word_wrap = enabled;
+        self.editor.update(cx, |editor, cx| editor.set_soft_wrap(enabled, window, cx));
+        cx.notify();
+    }
+
+    pub fn toggle_word_wrap(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let enabled = !self.word_wrap;
+        self.set_word_wrap(enabled, window, cx);
+        enabled
     }
 
     pub fn buffer_id(&self) -> &str {
@@ -1293,16 +1566,29 @@ impl EditorPanel {
         cx.notify();
     }
 
-    /// Ctrl+click a path in the buffer. The click lands first so the cursor
-    /// is on the path, then Fresh's link detector opens it.
-    fn open_link_at_cursor(&mut self, cx: &mut Context<Self>) {
-        let position = self.editor.read(cx).cursor_position();
-        let text = self.current_text(cx);
-        let Some(line) = text.lines().nth(position.line as usize) else {
-            return;
-        };
-        let line = line.to_string();
-        let column = position.character;
+    fn link_at_pointer(&self, position: Point<Pixels>, cx: &App) -> Option<(String, u32, Range<usize>)> {
+        let text = self.editor.read(cx).value().to_string();
+        editor_path_at_point(self.editor.read(cx), &text, position)
+    }
+
+    fn hover_path(&mut self, position: Option<Point<Pixels>>, modifiers: &Modifiers, cx: &mut Context<Self>) {
+        let next = if modifiers.secondary() && !modifiers.shift && !modifiers.alt {
+            position.and_then(|position| self.link_at_pointer(position, cx)).map(|(_, _, range)| range)
+        } else { None };
+        if next == self.hover_link { return; }
+        self.hover_link = next.clone();
+        let decorations = next.map(|range| TextDecoration::new(range, gpui::HighlightStyle {
+            underline: Some(gpui::UnderlineStyle { thickness: px(1.), ..Default::default() }),
+            ..Default::default()
+        })).into_iter().collect();
+        self.hover_decoration.set(decorations, cx);
+        cx.notify();
+    }
+
+    /// Resolve the pointer against rendered text, independently of caret and
+    /// selection events that may run later in the mouse dispatch.
+    fn open_link_at_pointer(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let Some((line, column, _)) = self.link_at_pointer(position, cx) else { return false; };
         let cwd = if self.unsaved {
             None
         } else {
@@ -1314,6 +1600,7 @@ impl EditorPanel {
                 workspace.open_path_link(line, column, cwd, cx);
             })
             .ok();
+        true
     }
 
     pub fn rev(&self) -> u64 {
@@ -1750,19 +2037,46 @@ impl Render for EditorPanel {
                     .min_h_0()
                     .flex()
                     .flex_col()
-                    .capture_any_mouse_down(move |event: &MouseDownEvent, _, cx| {
-                        if event.button != MouseButton::Left
-                            || event.modifiers.shift
-                            || !(event.modifiers.control || event.modifiers.platform)
-                        {
-                            return;
-                        }
+                    .capture_action::<gpui_kit::component::input::Copy>(
+                        cx.listener(|this, _, window, cx| {
+                            let has_selection =
+                                !this.editor.read(cx).selected_value().is_empty();
+                            if has_selection {
+                                clipboard::notify_copied(window, cx);
+                            }
+                        }),
+                    )
+                    .when(self.hover_link.is_some(), |pane| pane.cursor_pointer())
+                    .on_mouse_move({
                         let panel = panel.clone();
-                        // The editor moves the cursor on this click. Read it
-                        // after that handler returns.
-                        cx.defer(move |cx| {
-                            panel.update(cx, |this, cx| this.open_link_at_cursor(cx));
-                        });
+                        move |event: &MouseMoveEvent, _, cx| {
+                            panel.update(cx, |this, cx| {
+                                this.last_editor_pointer = Some(event.position);
+                                this.hover_path(Some(event.position), &event.modifiers, cx);
+                            });
+                        }
+                    })
+                    .on_mouse_exit({
+                        let panel = panel.clone();
+                        move |_, _, cx| {
+                            panel.update(cx, |this, cx| {
+                                this.last_editor_pointer = None;
+                                this.hover_path(None, &Modifiers::default(), cx);
+                            });
+                        }
+                    })
+                    .on_modifiers_changed({
+                        let panel = panel.clone();
+                        move |event: &ModifiersChangedEvent, _, cx| {
+                            panel.update(cx, |this, cx| this.hover_path(this.last_editor_pointer, &event.modifiers, cx));
+                        }
+                    })
+                    .capture_any_mouse_down(move |event: &MouseDownEvent, _, cx| {
+                        if event.button != MouseButton::Left || event.modifiers.shift || event.modifiers.alt
+                            || !event.modifiers.secondary() { return; }
+                        if panel.update(cx, |this, cx| this.open_link_at_pointer(event.position, cx)) {
+                            cx.stop_propagation();
+                        }
                     })
                     .child(
                         Editor::new(&self.editor)
@@ -2447,11 +2761,18 @@ pub(super) fn with_close_items(
 }
 
 pub(crate) fn language_from_path(path: &str, reported: Option<&str>) -> Option<String> {
+    let filename = path.rsplit(['/', '\\']).next()?.to_ascii_lowercase();
+    let ext = filename.rsplit('.').next()?;
+    if matches!(ext, "log" | "logs" | "trace")
+        || (ext.chars().all(|ch| ch.is_ascii_digit())
+            && filename.rsplit_once('.').is_some_and(|(base, _)| base.ends_with(".log") || base.ends_with(".trace")))
+    {
+        return Some("log".into());
+    }
     if let Some(lang) = reported.filter(|s| !s.is_empty()) {
         return Some(lang.to_string());
     }
-    let ext = path.rsplit('.').next()?.to_ascii_lowercase();
-    let name = match ext.as_str() {
+    let name = match ext {
         "rs" => "rust",
         "ts" => "typescript",
         "tsx" => "tsx",

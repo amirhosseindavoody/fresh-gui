@@ -10,6 +10,7 @@ use gpui_kit::base::ElementExt as _;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelEvent, PanelId};
 use gpui_kit::component::menu::ContextMenuExt as _;
+use gpui_kit::component::input::{Editor, EditorState, InputEvent};
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _, StyledExt as _, button::Button, h_flex, v_flex,
 };
@@ -17,6 +18,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::pane::{new_terminal_button, note_tab_edge, tab_close_button, with_close_items};
+use super::clipboard;
 use super::paths::display_path;
 use super::rail::path_basename;
 use super::tab_chrome::TabStripMetrics;
@@ -223,12 +225,20 @@ pub struct DiffPanel {
     title_path: String,
     pinned: bool,
     rows: Vec<SplitRow>,
+    editor: Entity<EditorState>,
+    buffer_id: Option<String>,
+    rev: u64,
+    dirty: bool,
+    ready: bool,
+    word_wrap: bool,
+    binary: bool,
     note: String,
     focus: FocusHandle,
     workspace: WeakEntity<Workspace>,
     metrics: TabStripMetrics,
     plus_shift: Rc<Cell<f32>>,
     closed: bool,
+    _editor_subscription: Subscription,
 }
 
 impl DiffPanel {
@@ -238,19 +248,35 @@ impl DiffPanel {
         pinned: bool,
         workspace: WeakEntity<Workspace>,
         metrics: TabStripMetrics,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let editor = cx.new(|cx| EditorState::new(window, cx).line_number(true));
+        let editor_subscription = cx.subscribe(&editor, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.dirty = true;
+                cx.notify();
+            }
+        });
         Self {
             rel,
             title_path,
             pinned,
             rows: Vec::new(),
+            editor,
+            buffer_id: None,
+            rev: 0,
+            dirty: false,
+            ready: false,
+            word_wrap: true,
+            binary: false,
             note: "Loading diff…".into(),
             focus: cx.focus_handle(),
             workspace,
             metrics,
             plus_shift: Rc::new(Cell::new(0.0)),
             closed: false,
+            _editor_subscription: editor_subscription,
         }
     }
 
@@ -269,8 +295,10 @@ impl DiffPanel {
         new_text: String,
         binary: bool,
         truncated: bool,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.binary = binary;
         if binary {
             self.rows.clear();
             self.note = "Binary file — diff is not shown.".into();
@@ -286,6 +314,35 @@ impl DiffPanel {
         }
         cx.notify();
     }
+
+    pub fn set_buffer(&mut self, buffer_id: String) { self.buffer_id = Some(buffer_id); }
+    pub fn set_word_wrap(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.word_wrap == enabled { return; }
+        self.word_wrap = enabled;
+        self.editor.update(cx, |state, cx| state.set_soft_wrap(enabled, window, cx));
+        cx.notify();
+    }
+    pub fn toggle_word_wrap(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let enabled = !self.word_wrap;
+        self.set_word_wrap(enabled, window, cx);
+        enabled
+    }
+    pub fn buffer_id(&self) -> Option<&str> { self.buffer_id.as_deref() }
+    pub fn apply_snapshot(&mut self, buffer_id: &str, rev: u64, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.buffer_id.as_deref() != Some(buffer_id) { return; }
+        self.rev = rev;
+        if !self.dirty {
+            self.editor.update(cx, |state, cx| state.set_value(text, window, cx));
+            self.dirty = false;
+        }
+        self.ready = true;
+    }
+    pub fn save_data(&self, cx: &App) -> Option<(String, u64, String)> {
+        if !self.ready || !self.dirty { return None; }
+        Some((self.buffer_id.clone()?, self.rev, self.editor.read(cx).value().to_string()))
+    }
+    pub fn set_rev(&mut self, rev: u64) { self.rev = rev; }
+    pub fn mark_saved(&mut self, rev: u64, cx: &mut Context<Self>) { self.rev = rev; self.dirty = false; cx.notify(); }
 
     fn label(&self) -> String {
         let shown = display_path(&self.title_path);
@@ -421,8 +478,14 @@ impl Render for DiffPanel {
             .id(format!("diff-pane-{}", self.rel))
             .role(Role::Group)
             .aria_label("Git diff")
+            .key_context("Editor")
             .size_full()
             .track_focus(&self.focus)
+            .capture_action::<gpui_kit::component::input::Copy>(cx.listener(|this, _, window, cx| {
+                if !this.editor.read(cx).selected_value().is_empty() {
+                    clipboard::notify_copied(window, cx);
+                }
+            }))
             .bg(cx.theme().background)
             .font_family(cx.theme().mono_font_family.clone())
             .text_xs()
@@ -441,7 +504,15 @@ impl Render for DiffPanel {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .children(rows.into_iter().map(|row| split_row(row, cx)))
+                    .child(h_flex().size_full().items_start()
+                        .child(v_flex().w(relative(0.5)).h_full().min_w_0().children(rows.iter().cloned().map(|row| diff_cell(row.left.unwrap_or_default(), row_left_bg(row.kind, cx), Some(cx.theme().border)))))
+                        .child(if self.binary || !self.ready {
+                            div().w(relative(0.5)).min_w_0()
+                                .when(!self.binary, |panel| panel.p_2().text_color(cx.theme().muted_foreground).child("Loading working tree…"))
+                                .into_any_element()
+                        } else {
+                            Editor::new(&self.editor).bordered(false).p_0().w(relative(0.5)).h_full().min_w_0().text_size(px(12.)).font_family(cx.theme().mono_font_family.clone()).into_any_element()
+                        }))
                     .when(hidden > 0, |this| {
                         this.child(
                             div()
@@ -455,27 +526,17 @@ impl Render for DiffPanel {
     }
 }
 
-fn split_row(row: SplitRow, cx: &App) -> impl IntoElement {
-    let (left_bg, right_bg) = match row.kind {
-        RowKind::Same => (None, None),
-        RowKind::Removed => (Some(cx.theme().danger.opacity(0.28)), None),
-        RowKind::Added => (None, Some(cx.theme().success.opacity(0.28))),
-        RowKind::Changed => (
-            Some(cx.theme().danger.opacity(0.22)),
-            Some(cx.theme().success.opacity(0.22)),
-        ),
-    };
-    let rule = cx.theme().border;
-    h_flex()
-        .w_full()
-        .items_start()
-        .child(diff_cell(row.left.unwrap_or_default(), left_bg, Some(rule)))
-        .child(diff_cell(row.right.unwrap_or_default(), right_bg, None))
+fn row_left_bg(kind: RowKind, cx: &App) -> Option<Hsla> {
+    match kind {
+        RowKind::Removed => Some(cx.theme().danger.opacity(0.28)),
+        RowKind::Changed => Some(cx.theme().danger.opacity(0.22)),
+        _ => None,
+    }
 }
 
 fn diff_cell(text: String, bg: Option<Hsla>, rule: Option<Hsla>) -> impl IntoElement {
     div()
-        .w(relative(0.5))
+        .w_full()
         .min_w_0()
         .px_2()
         .when_some(bg, |cell, color| cell.bg(color))

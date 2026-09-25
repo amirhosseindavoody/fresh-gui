@@ -2509,6 +2509,7 @@ dependencies = [
  "image",
  "jsonc-parser",
  "raw-window-handle",
+ "regex",
  "serde",
  "serde_json",
  "tokio",
