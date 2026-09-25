@@ -103,15 +103,6 @@ pub fn user_home() -> Option<String> {
     None
 }
 
-/// Explorer header: the open folder's name, never the `\\?\` form.
-pub fn explorer_header_label(root: &str) -> String {
-    let shown = display_path(root);
-    if shown.is_empty() {
-        return "Explorer".to_string();
-    }
-    path_basename(&shown).unwrap_or("Explorer").to_string()
-}
-
 fn fold_home(path: &str, home: Option<&str>) -> String {
     let Some(home) = home.map(display_path).filter(|home| !home.is_empty()) else {
         return path.to_string();
@@ -179,8 +170,6 @@ mod tests {
             workspace_root_label(r"\\?\C:\Users\me\proj", Some(r"\\?\C:\Users\me")),
             r"~\proj"
         );
-        assert_eq!(explorer_header_label(r"\\?\C:\Users\jondoe"), "jondoe");
-        assert_eq!(explorer_header_label(""), "Explorer");
         assert_eq!(
             empty_workspace_name_hint(r"\\?\C:\work\demo"),
             "Leave empty to use \"demo\"."

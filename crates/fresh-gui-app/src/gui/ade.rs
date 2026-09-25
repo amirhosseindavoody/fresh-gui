@@ -179,6 +179,8 @@ pub enum AdeCmd {
     },
     /// Acknowledged once every command queued before it has been written.
     Flush(std::sync::mpsc::Sender<()>),
+    /// Acknowledge the worker has stopped consuming commands before window teardown.
+    Shutdown(std::sync::mpsc::Sender<()>),
     Disconnect,
 }
 
@@ -355,6 +357,14 @@ impl AdeHandle {
         }
         ack_rx.recv_timeout(timeout).is_ok()
     }
+
+    pub fn shutdown_blocking(&self, timeout: Duration) -> bool {
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        if self.tx.try_send(AdeCmd::Shutdown(ack_tx)).is_err() {
+            return false;
+        }
+        ack_rx.recv_timeout(timeout).is_ok()
+    }
 }
 
 pub fn spawn(target: ConnectTarget) -> (AdeHandle, async_channel::Receiver<AdeEvent>) {
@@ -448,6 +458,10 @@ async fn ade_loop(
             }
             cmd = cmd_rx.recv() => {
                 match cmd {
+                    Ok(AdeCmd::Shutdown(done)) => {
+                        let _ = done.send(());
+                        break;
+                    }
                     Ok(AdeCmd::Disconnect) | Err(_) => break,
                     Ok(cmd) => {
                         if let AdeCmd::CloseEditor { buffer_id } = &cmd {
@@ -747,7 +761,7 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
         AdeCmd::ReloadConfig => {
             client.send(Message::ConfigReload).await?;
         }
-        AdeCmd::Disconnect => {}
+        AdeCmd::Disconnect | AdeCmd::Shutdown(_) => {}
         AdeCmd::GitStatus {
             request_id,
             workspace_id,

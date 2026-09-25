@@ -10,7 +10,7 @@ use gpui_kit::base::ElementExt as _;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelEvent, PanelId};
 use gpui_kit::component::menu::ContextMenuExt as _;
-use gpui_kit::component::input::{Editor, EditorState, InputEvent};
+use gpui_kit::component::input::{Editor, EditorState, InputEvent, TextDecoration, TextDecorationCollection};
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _, StyledExt as _, button::Button, h_flex, v_flex,
 };
@@ -25,7 +25,6 @@ use super::tab_chrome::TabStripMetrics;
 use super::workspace::Workspace;
 
 const MAX_DIFF_LINES: usize = 2000;
-const MAX_RENDER_ROWS: usize = 800;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowKind {
@@ -225,7 +224,12 @@ pub struct DiffPanel {
     title_path: String,
     pinned: bool,
     rows: Vec<SplitRow>,
+    /// Immutable comparison side used to reclassify the editable side after
+    /// every editor change.
+    original_text: String,
     editor: Entity<EditorState>,
+    right_diff_decorations: TextDecorationCollection,
+    left_scroll: ScrollHandle,
     buffer_id: Option<String>,
     rev: u64,
     dirty: bool,
@@ -239,6 +243,8 @@ pub struct DiffPanel {
     plus_shift: Rc<Cell<f32>>,
     closed: bool,
     _editor_subscription: Subscription,
+    _editor_scroll_subscription: Subscription,
+    last_editor_scroll: Option<(Point<Pixels>, usize)>,
 }
 
 impl DiffPanel {
@@ -252,9 +258,63 @@ impl DiffPanel {
         cx: &mut Context<Self>,
     ) -> Self {
         let editor = cx.new(|cx| EditorState::new(window, cx).line_number(true));
+        let right_diff_decorations = editor.update(cx, |state, cx| {
+            state.create_decorations_collection(Vec::new(), cx)
+        });
+        let initial_editor_scroll = editor.read(cx).scroll_offset();
         let editor_subscription = cx.subscribe(&editor, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.dirty = true;
+                if !this.binary && this.ready {
+                    let edited = this.editor.read(cx).value().to_string();
+                    this.rows = split_diff_lines(&this.original_text, &edited);
+                    this.right_diff_decorations.set(
+                        build_right_diff_decorations(&edited, &this.rows, cx),
+                        cx,
+                    );
+                }
+                cx.notify();
+            }
+        });
+        // EditorState stops wheel propagation when it consumes a scroll, so a
+        // parent wheel listener cannot observe right-side scrolling. Observe
+        // editor notifications instead; scrolling updates its visible range.
+        let editor_scroll_subscription = cx.observe(&editor, |this, editor, cx| {
+            let (visible_line, offset, line_height) = {
+                let editor = editor.read(cx);
+                (
+                    editor.visible_row_range().map(|range| range.start).unwrap_or(0),
+                    editor.scroll_offset(),
+                    editor.line_height(),
+                )
+            };
+            // The laid-out visible range can lag during wheel handling. Without
+            // wrapping, the current offset gives the precise first line.
+            let line = if !this.word_wrap {
+                line_height
+                    .map(|height| ((-offset.y / height).floor().max(0.0)) as usize)
+                    .unwrap_or(visible_line)
+            } else {
+                visible_line
+            };
+            if this.last_editor_scroll == Some((offset, line)) {
+                return;
+            }
+            this.last_editor_scroll = Some((offset, line));
+            let horizontal = offset.x;
+            if let Some(row) = this
+                .rows
+                .iter()
+                .enumerate()
+                .filter_map(|(row, split)| split.right.as_ref().map(|_| row))
+                .nth(line)
+            {
+                this.left_scroll.scroll_to_top_of_item(row);
+                if !this.word_wrap {
+                    let mut offset = this.left_scroll.offset();
+                    offset.x = horizontal;
+                    this.left_scroll.set_offset(offset);
+                }
                 cx.notify();
             }
         });
@@ -263,7 +323,10 @@ impl DiffPanel {
             title_path,
             pinned,
             rows: Vec::new(),
+            original_text: String::new(),
             editor,
+            right_diff_decorations,
+            left_scroll: ScrollHandle::new(),
             buffer_id: None,
             rev: 0,
             dirty: false,
@@ -277,6 +340,8 @@ impl DiffPanel {
             plus_shift: Rc::new(Cell::new(0.0)),
             closed: false,
             _editor_subscription: editor_subscription,
+            _editor_scroll_subscription: editor_scroll_subscription,
+            last_editor_scroll: Some((initial_editor_scroll, 0)),
         }
     }
 
@@ -303,6 +368,7 @@ impl DiffPanel {
             self.rows.clear();
             self.note = "Binary file — diff is not shown.".into();
         } else {
+            self.original_text = old_text.clone();
             self.rows = split_diff_lines(&old_text, &new_text);
             self.note = if truncated {
                 "Diff truncated to the first 256KB of each side.".into()
@@ -336,6 +402,13 @@ impl DiffPanel {
             self.dirty = false;
         }
         self.ready = true;
+        if !self.binary {
+            let text = self.editor.read(cx).value().to_string();
+            self.rows = split_diff_lines(&self.original_text, &text);
+            self.right_diff_decorations
+                .set(build_right_diff_decorations(&text, &self.rows, cx), cx);
+        }
+        cx.notify();
     }
     pub fn save_data(&self, cx: &App) -> Option<(String, u64, String)> {
         if !self.ready || !self.dirty { return None; }
@@ -466,14 +539,23 @@ impl DockPanel for DiffPanel {
 
 impl Render for DiffPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows = self
-            .rows
-            .iter()
-            .take(MAX_RENDER_ROWS)
-            .cloned()
-            .collect::<Vec<_>>();
-        let hidden = self.rows.len().saturating_sub(rows.len());
+        let rows = self.rows.clone();
         let note = self.note.clone();
+        let left_scroll = self.left_scroll.clone();
+        let editor_for_left_scroll = self.editor.clone();
+        let word_wrap = self.word_wrap;
+        // Deletions occupy rows on the left but have no corresponding editor
+        // line. Keep a mapping between the editor's logical rows and the
+        // aligned diff rows instead of copying raw pixel offsets.
+        let mut left_to_right = Vec::with_capacity(rows.len());
+        let mut right_line = 0usize;
+        for row in &rows {
+            if row.right.is_some() {
+                right_line += 1;
+            }
+            left_to_right.push(right_line.saturating_sub(1));
+        }
+        let left_to_right_for_scroll = left_to_right.clone();
         v_flex()
             .id(format!("diff-pane-{}", self.rel))
             .role(Role::Group)
@@ -503,25 +585,36 @@ impl Render for DiffPanel {
                     .id(format!("diff-scroll-{}", self.rel))
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
                     .child(h_flex().size_full().items_start()
-                        .child(v_flex().w(relative(0.5)).h_full().min_w_0().children(rows.iter().cloned().map(|row| diff_cell(row.left.unwrap_or_default(), row_left_bg(row.kind, cx), Some(cx.theme().border)))))
+                        .child(v_flex().id(format!("diff-left-{}", self.rel)).w(relative(0.5)).h_full().min_w_0().overflow_y_scroll().overflow_x_scroll().track_scroll(&left_scroll)
+                            .on_scroll_wheel(move |_, _, cx| {
+                                let left_scroll = left_scroll.clone();
+                                let editor = editor_for_left_scroll.clone();
+                                let line_map = left_to_right_for_scroll.clone();
+                                cx.defer(move |cx| {
+                                    let row = left_scroll.top_item();
+                                    let line = line_map.get(row).copied().unwrap_or(0);
+                                    let x = left_scroll.offset().x;
+                                    editor.update(cx, |state, cx| {
+                                        let mut offset = state.scroll_offset();
+                                        offset.x = x;
+                                        if let Some(line_height) = state.line_height() {
+                                            offset.y = -(line_height * line as f32);
+                                            state.set_scroll_offset(offset, cx);
+                                        }
+                                    });
+                                });
+                            })
+                            .children(rows.iter().cloned().map(|row| diff_cell(row.left.unwrap_or_default(), row_left_bg(row.kind, cx), Some(cx.theme().border), word_wrap))))
                         .child(if self.binary || !self.ready {
                             div().w(relative(0.5)).min_w_0()
                                 .when(!self.binary, |panel| panel.p_2().text_color(cx.theme().muted_foreground).child("Loading working tree…"))
                                 .into_any_element()
                         } else {
-                            Editor::new(&self.editor).bordered(false).p_0().w(relative(0.5)).h_full().min_w_0().text_size(px(12.)).font_family(cx.theme().mono_font_family.clone()).into_any_element()
+                            div().w(relative(0.5)).h_full().min_w_0()
+                                .child(Editor::new(&self.editor).bordered(false).p_0().size_full().text_size(px(12.)).font_family(cx.theme().mono_font_family.clone()))
+                                .into_any_element()
                         }))
-                    .when(hidden > 0, |this| {
-                        this.child(
-                            div()
-                                .px_2()
-                                .py_1()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(format!("{hidden} more lines not shown")),
-                        )
-                    }),
             )
     }
 }
@@ -534,13 +627,63 @@ fn row_left_bg(kind: RowKind, cx: &App) -> Option<Hsla> {
     }
 }
 
-fn diff_cell(text: String, bg: Option<Hsla>, rule: Option<Hsla>) -> impl IntoElement {
+fn build_right_diff_decorations(text: &str, rows: &[SplitRow], cx: &App) -> Vec<TextDecoration> {
+    let mut decorations = Vec::new();
+    let mut offset = 0usize;
+    for row in rows {
+        let Some(line) = row.right.as_deref() else {
+            continue;
+        };
+        if offset > text.len() || !text.is_char_boundary(offset) {
+            break;
+        }
+        let raw_end = text[offset..]
+            .find('\n')
+            .map(|relative_end| offset + relative_end)
+            .unwrap_or(text.len());
+        let raw_line = text[offset..raw_end].strip_suffix('\r').unwrap_or(&text[offset..raw_end]);
+        // The editor is the source of offsets; rows are only used to classify
+        // each corresponding line. Keeping CRLF bytes in the range prevents
+        // later decorations from drifting on Windows files.
+        let end = if raw_line == line {
+            raw_end
+        } else {
+            offset.saturating_add(line.len()).min(text.len())
+        };
+        let end_with_newline = if text.as_bytes().get(raw_end) == Some(&b'\n') {
+            raw_end + 1
+        } else {
+            end
+        };
+        let color = match row.kind {
+            RowKind::Added => Some(cx.theme().success.opacity(0.28)),
+            RowKind::Changed => Some(cx.theme().success.opacity(0.22)),
+            RowKind::Same | RowKind::Removed => None,
+        };
+        if let Some(background_color) = color {
+            if offset < end_with_newline {
+                decorations.push(TextDecoration::new(
+                    offset..end_with_newline,
+                    HighlightStyle {
+                        background_color: Some(background_color),
+                        ..Default::default()
+                    },
+                ));
+            }
+        }
+        offset = end_with_newline;
+    }
+    decorations
+}
+
+fn diff_cell(text: String, bg: Option<Hsla>, rule: Option<Hsla>, word_wrap: bool) -> impl IntoElement {
     div()
         .w_full()
         .min_w_0()
         .px_2()
         .when_some(bg, |cell, color| cell.bg(color))
         .when_some(rule, |cell, color| cell.border_r_1().border_color(color))
+        .when(!word_wrap, |cell| cell.whitespace_nowrap())
         .child(if text.is_empty() {
             " ".to_string()
         } else {
@@ -767,6 +910,16 @@ mod tests {
         let rows = split_diff_lines("a\nb\n", "a\n");
         assert_eq!(rows[1].kind, RowKind::Removed);
         assert_eq!(rows[1].left.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn split_reclassifies_rows_against_original_after_edit() {
+        let rows = split_diff_lines("one\ntwo\n", "one\nthree\nfour\n");
+        assert_eq!(rows[1].kind, RowKind::Changed);
+        assert_eq!(rows[1].left.as_deref(), Some("two"));
+        assert_eq!(rows[1].right.as_deref(), Some("three"));
+        assert_eq!(rows[2].kind, RowKind::Added);
+        assert_eq!(rows[2].right.as_deref(), Some("four"));
     }
 
     #[test]

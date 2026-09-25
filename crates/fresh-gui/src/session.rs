@@ -19,6 +19,14 @@ struct PtySlot {
     cols: u16,
     rows: u16,
     scrollback: VecDeque<u8>,
+    /// DEC private modes currently set by the foreground application. Scrollback
+    /// can be truncated before the mode-setting escape, so keep these across
+    /// client detach/reattach alongside the state at the replay boundary.
+    active_modes: std::collections::BTreeSet<u16>,
+    mode_carry: Vec<u8>,
+    /// Mode state immediately before the oldest retained scrollback byte.
+    scrollback_modes: std::collections::BTreeSet<u16>,
+    scrollback_mode_carry: Vec<u8>,
 }
 
 pub struct Session {
@@ -58,11 +66,21 @@ impl Session {
     }
 
     fn push_scrollback(slot: &mut PtySlot, bytes: &[u8]) {
+        let mut evicted = Vec::new();
         for &b in bytes {
             if slot.scrollback.len() >= SCROLLBACK_MAX {
-                slot.scrollback.pop_front();
+                if let Some(evicted_byte) = slot.scrollback.pop_front() {
+                    evicted.push(evicted_byte);
+                }
             }
             slot.scrollback.push_back(b);
+        }
+        if !evicted.is_empty() {
+            track_dec_modes(
+                &mut slot.scrollback_mode_carry,
+                &mut slot.scrollback_modes,
+                &evicted,
+            );
         }
     }
 
@@ -135,10 +153,20 @@ impl SessionStore {
         let layout = session.layout.clone();
         let mut replay = Vec::new();
         for slot in session.ptys.values() {
-            if slot.scrollback.is_empty() {
+            if slot.scrollback.is_empty() && slot.scrollback_modes.is_empty() {
                 continue;
             }
-            let bytes: Vec<u8> = slot.scrollback.iter().copied().collect();
+            let mut bytes = Vec::new();
+            // Re-establish modes active at the replay boundary before replaying
+            // retained output. This reconstructs the alternate screen without
+            // resetting it after its contents have been replayed.
+            for mode in &slot.scrollback_modes {
+                bytes.extend_from_slice(format!("\x1b[?{mode}h").as_bytes());
+            }
+            // If the eviction boundary split a DECSET/DECRST sequence, put
+            // its evicted prefix back so the retained suffix remains parseable.
+            bytes.extend_from_slice(&slot.scrollback_mode_carry);
+            bytes.extend(slot.scrollback.iter().copied());
             let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
             replay.push(Message::PtyData {
                 id: slot.session.id().to_owned(),
@@ -190,6 +218,10 @@ impl SessionStore {
                     cols,
                     rows,
                     scrollback: VecDeque::new(),
+                    active_modes: Default::default(),
+                    mode_carry: Vec::new(),
+                    scrollback_modes: Default::default(),
+                    scrollback_mode_carry: Vec::new(),
                 },
             );
         }
@@ -216,6 +248,7 @@ impl SessionStore {
             return;
         };
         Session::push_scrollback(slot, bytes);
+        track_dec_modes(&mut slot.mode_carry, &mut slot.active_modes, bytes);
         let data = base64::engine::general_purpose::STANDARD.encode(bytes);
         session.emit(Message::PtyData {
             id: pty_id.to_owned(),
@@ -286,5 +319,80 @@ impl SessionStore {
             reason: Some("client_close".into()),
         });
         Ok(())
+    }
+}
+
+/// Track DEC private modes independently of the client's terminal grid. The
+/// parser is deliberately limited to CSI ?...h/l sequences and retains a short
+/// incomplete suffix so escape sequences split between PTY reads are handled.
+fn track_dec_modes(carry: &mut Vec<u8>, modes: &mut std::collections::BTreeSet<u16>, bytes: &[u8]) {
+    let mut input = std::mem::take(carry);
+    input.extend_from_slice(bytes);
+    let mut i = 0;
+    while i < input.len() {
+        const PREFIX: &[u8] = b"\x1b[?";
+        let remaining = &input[i..];
+        if remaining.len() < PREFIX.len() && PREFIX.starts_with(remaining) {
+            carry.extend_from_slice(remaining);
+            break;
+        }
+        if !remaining.starts_with(PREFIX) {
+            i += 1;
+            continue;
+        }
+        let start = i + 3;
+        let Some(end) = input[start..].iter().position(|byte| (0x40..=0x7e).contains(byte)) else {
+            // A valid CSI is short. Keep only the unfinished suffix.
+            if input.len() - i <= 128 {
+                carry.extend_from_slice(&input[i..]);
+            }
+            break;
+        };
+        let final_index = start + end;
+        let final_byte = input[final_index];
+        if matches!(final_byte, b'h' | b'l')
+            && let Ok(params) = std::str::from_utf8(&input[start..final_index])
+        {
+            for mode in params.split(';').filter_map(|value| value.parse::<u16>().ok()) {
+                if matches!(mode, 1 | 6 | 47 | 1000 | 1002 | 1003 | 1005 | 1006 | 1007 | 1015 | 1047 | 1049 | 2004 | 2026) {
+                    if matches!(mode, 47 | 1047 | 1049) {
+                        // These are aliases for the same alternate screen in
+                        // the client terminal implementation. Keep one bit so
+                        // replay cannot enter the alternate grid multiple times.
+                        modes.remove(&47);
+                        modes.remove(&1047);
+                        modes.remove(&1049);
+                        if final_byte == b'h' {
+                            modes.insert(1049);
+                        }
+                    } else if final_byte == b'h' {
+                        modes.insert(mode);
+                    } else {
+                        modes.remove(&mode);
+                    }
+                }
+            }
+        }
+        i = final_index + 1;
+    }
+}
+
+#[cfg(test)]
+mod terminal_mode_tests {
+    use super::track_dec_modes;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn tracks_modes_across_output_chunks_and_replays_current_state() {
+        let mut carry = Vec::new();
+        let mut modes = BTreeSet::new();
+        track_dec_modes(&mut carry, &mut modes, b"hello\x1b[?100");
+        assert!(modes.is_empty());
+        track_dec_modes(&mut carry, &mut modes, b"6h\x1b[?1049h");
+        assert!(modes.contains(&1006));
+        assert!(modes.contains(&1049));
+        track_dec_modes(&mut carry, &mut modes, b"\x1b[?1006l");
+        assert!(!modes.contains(&1006));
+        assert!(modes.contains(&1049));
     }
 }
