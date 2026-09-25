@@ -450,7 +450,8 @@ impl TermScreen {
             text.push_str(&span.text);
         }
         let text = text.trim_end().to_string();
-        Some((text, char_column.min(text.chars().count())))
+        let len = text.chars().count();
+        Some((text, char_column.min(len)))
     }
 
     /// Select a scalar range in a visible row, translating text positions to
@@ -503,7 +504,7 @@ impl TermScreen {
 
 /// Convert a cell column to a scalar offset in the visible row text.
 fn char_column_for_cell(spans: &[TermSpan], column: usize) -> usize {
-    let mut cells = 0;
+    let mut cells: usize = 0;
     let mut chars = 0;
     for span in spans {
         let span_chars = span.text.chars().count();
