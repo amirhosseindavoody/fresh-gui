@@ -20,7 +20,59 @@ use ssh::{
     DaemonSource, SshTarget, Toolchain, bootstrap, load_remotes, remotes_config_path, save_remotes,
 };
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::info;
+use tracing_subscriber::layer::{Context as LayerContext, Filter};
+use tracing_subscriber::prelude::*;
+
+/// Set before the window is removed, while its native handle is still valid.
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn note_window_shutdown() {
+    SHUTTING_DOWN.store(true, Ordering::Release);
+}
+
+struct ShutdownWindowNoise;
+
+fn known_shutdown_window_error(message: &str) -> bool {
+    matches!(message.trim_matches('"'),
+        "window not found" | "Invalid window handle (0x80040102)"
+            | "Invalid window handle. (0x80070578)")
+}
+
+impl<S: tracing::Subscriber> Filter<S> for ShutdownWindowNoise {
+    fn enabled(&self, _: &tracing::Metadata<'_>, _: &LayerContext<'_, S>) -> bool {
+        true
+    }
+
+    fn event_enabled(&self, event: &tracing::Event<'_>, _: &LayerContext<'_, S>) -> bool {
+        if !cfg!(windows) || !SHUTTING_DOWN.load(Ordering::Acquire)
+            || *event.metadata().level() != tracing::Level::ERROR
+        {
+            return true;
+        }
+        #[derive(Default)]
+        struct MessageVisitor(Option<String>);
+        impl tracing::field::Visit for MessageVisitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = Some(format!("{value:?}"));
+                }
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "message" {
+                    self.0 = Some(value.to_owned());
+                }
+            }
+        }
+        let mut message = MessageVisitor::default();
+        event.record(&mut message);
+        // GPUI's Windows teardown can report these after DestroyWindow has
+        // invalidated the HWND (including its drag-drop target). The host's
+        // layout and ADE writes are flushed before reaching this point.
+        !message.0.as_deref().is_some_and(known_shutdown_window_error)
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -139,11 +191,10 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER)),
-        )
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER)))
+        .with(tracing_subscriber::fmt::layer().with_filter(ShutdownWindowNoise))
         .init();
 
     let args = Args::parse();
@@ -540,6 +591,15 @@ fn cmd_remote_connect(
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn shutdown_filter_matches_only_reported_window_errors() {
+        assert!(known_shutdown_window_error("window not found"));
+        assert!(known_shutdown_window_error("Invalid window handle (0x80040102)"));
+        assert!(known_shutdown_window_error("Invalid window handle. (0x80070578)"));
+        assert!(!known_shutdown_window_error("Invalid window handle (0x80070578)"));
+        assert!(!known_shutdown_window_error("other error"));
+    }
 
     #[test]
     fn default_log_filter_quiets_gpui_but_keeps_ours() {

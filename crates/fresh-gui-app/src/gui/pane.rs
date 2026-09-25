@@ -79,6 +79,7 @@ pub struct TerminalPanel {
     screen: TermScreen,
     sync_deadline: Option<Instant>,
     sync_task: Option<Task<()>>,
+    resize_task: Option<Task<()>>,
     focus: FocusHandle,
     focus_subscription: Option<Subscription>,
     ade: AdeHandle,
@@ -126,6 +127,7 @@ impl TerminalPanel {
             screen: TermScreen::default(),
             sync_deadline: None,
             sync_task: None,
+            resize_task: None,
             focus: cx.focus_handle(),
             focus_subscription: None,
             ade,
@@ -631,6 +633,11 @@ impl DockPanel for TerminalPanel {
             .gap_1()
             .items_center()
             .min_w_0()
+            // The dock paints all tab shells alike. Tint the terminal title
+            // itself so terminal tabs remain distinct in light and dark themes.
+            .rounded(cx.theme().radius)
+            .px_1()
+            .bg(cx.theme().accent.opacity(if cx.theme().is_dark() { 0.42 } else { 0.32 }))
             .on_prepaint(move |bounds, _, _| note_tab_edge(&metrics, bounds))
             .child(Icon::new(IconName::SquareTerminal).small())
             .child(div().text_ellipsis().child(label))
@@ -725,13 +732,28 @@ impl Render for TerminalPanel {
         let pty_id = self.pty_id.clone();
         if let Some((cols, rows)) = self.pending_grid.get()
             && (cols != self.screen.cols || rows != self.screen.rows)
+            && self.resize_task.is_none()
         {
-            self.screen.resize(cols, rows);
-            self.ade.send(AdeCmd::ResizePty {
-                id: self.pty_id.clone(),
-                cols: cols as u16,
-                rows: rows as u16,
-            });
+            // A short settle window coalesces the several intermediate sizes
+            // GPUI reports while a window or split is being dragged.
+            let timer = cx.background_executor().timer(std::time::Duration::from_millis(75));
+            self.resize_task = Some(cx.spawn(async move |this, cx| {
+                timer.await;
+                let _ = this.update(cx, |this, cx| {
+                    this.resize_task = None;
+                    if let Some((cols, rows)) = this.pending_grid.get()
+                        && (cols != this.screen.cols || rows != this.screen.rows)
+                    {
+                        this.screen.resize(cols, rows);
+                        this.ade.send(AdeCmd::ResizePty {
+                            id: this.pty_id.clone(),
+                            cols: cols.clamp(1, u16::MAX as usize) as u16,
+                            rows: rows.clamp(1, u16::MAX as usize) as u16,
+                        });
+                        cx.notify();
+                    }
+                });
+            }));
         }
         let rows = self.screen.rows();
         let paint_rows = rows.clone();
@@ -1021,7 +1043,12 @@ impl Render for TerminalPanel {
                     .overflow_hidden()
                     .on_prepaint(move |bounds, window, app| {
                         grid_origin.set(Some(bounds.origin));
-                        let next = grid_size(bounds.size, cell_w, cell_h);
+                        let Some(next) = grid_size(bounds.size, cell_w, cell_h) else {
+                            // Hidden/collapsed panes can temporarily have no
+                            // usable area. Keep the last PTY size instead of
+                            // issuing a zero or guessed 80x24 resize.
+                            return;
+                        };
                         if pending_grid.get() != Some(next) {
                             pending_grid.set(Some(next));
                             app.notify(entity_id);
@@ -1130,15 +1157,15 @@ impl Render for TerminalPanel {
     }
 }
 
-fn grid_size(size: Size<Pixels>, cell_w: f32, cell_h: f32) -> (usize, usize) {
+fn grid_size(size: Size<Pixels>, cell_w: f32, cell_h: f32) -> Option<(usize, usize)> {
     let width = f32::from(size.width);
     let height = f32::from(size.height);
     if width < cell_w || height < cell_h {
-        return (80, 24);
+        return None;
     }
     let cols = ((width / cell_w).floor() as usize).clamp(2, 500);
     let rows = ((height / cell_h).floor() as usize).clamp(1, 200);
-    (cols, rows)
+    Some((cols, rows))
 }
 
 fn term_mouse_button(button: MouseButton) -> Option<TermMouseButton> {

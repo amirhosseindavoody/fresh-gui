@@ -47,6 +47,7 @@ use super::actions::{
 use super::ade::AttachedWorkspace;
 use super::ade::{AdeCmd, AdeEvent, AdeHandle};
 use super::chrome;
+use super::client_config;
 use super::connect::{ConnectTarget, parse_goto_spec};
 use super::diff_view::{self, BinaryPanel, DiffPanel};
 use super::dock_a11y::install_workspace_dock;
@@ -64,7 +65,7 @@ use super::paths::{
 };
 use super::rail::{
     WORKSPACE_RAIL_W, WORKSPACE_ROW_H, choose_shell_cwd, empty_workspace_name_hint,
-    explorer_header_label, path_basename, show_workspace_rail, user_home, workspace_rail_hint,
+    path_basename, show_workspace_rail, user_home, workspace_rail_hint,
     workspace_root_label,
 };
 use super::restore::{RestoreStep, restore_plan};
@@ -489,6 +490,7 @@ fn git_file_row(
     busy: bool,
     view: Entity<Workspace>,
     zoom: f32,
+    staged_section: bool,
 ) -> impl IntoElement {
     let mut chars = file.xy.chars();
     let index = chars.next().unwrap_or(' ');
@@ -520,13 +522,14 @@ fn git_file_row(
         })
         .child(div().w(px(20. * zoom)).flex_shrink_0().text_xs().child(xy))
         .child(div().flex_1().min_w_0().text_sm().text_ellipsis().child(name))
-        .when(unstaged, |row| {
+        .when(!staged_section && unstaged, |row| {
             let view = view.clone();
             row.child(
                 Button::new(format!("git-stage-{ix}"))
                     .ghost()
                     .xsmall()
-                    .label("Stage")
+                    .icon(IconName::Plus)
+                    .tooltip("Stage file")
                     .disabled(busy)
                     .on_click(move |_, _, cx| {
                         let rel = stage_rel.clone();
@@ -535,13 +538,14 @@ fn git_file_row(
                     }),
             )
         })
-        .when(staged, |row| {
+        .when(staged_section && staged, |row| {
             let view = view.clone();
             row.child(
                 Button::new(format!("git-unstage-{ix}"))
                     .ghost()
                     .xsmall()
-                    .label("Unstage")
+                    .icon(IconName::Minus)
+                    .tooltip("Unstage file")
                     .disabled(busy)
                     .on_click(move |_, _, cx| {
                         let rel = unstage_rel.clone();
@@ -550,18 +554,48 @@ fn git_file_row(
                     }),
             )
         })
-        .child(
+        .when(!staged_section, |row| row.child(
             Button::new(format!("git-revert-{ix}"))
                 .ghost()
                 .xsmall()
-                .label("Revert")
+                .icon(IconName::Undo2)
+                .tooltip("Discard changes")
                 .disabled(busy)
                 .on_click(move |_, _, cx| {
                     let rel = revert_rel.clone();
                     view.update(cx, |this, cx| this.git_restore(vec![rel], cx));
                     cx.stop_propagation();
                 }),
-        )
+        ))
+}
+
+fn git_section_header(
+    name: &'static str,
+    count: usize,
+    open: bool,
+    view: Entity<Workspace>,
+) -> impl IntoElement {
+    let section = name.to_string();
+    h_flex()
+        .id(format!("git-section-{name}"))
+        .w_full()
+        .h(px(TREE_ROW_H))
+        .gap_1()
+        .items_center()
+        .cursor_pointer()
+        .on_click(move |_, _, cx| {
+            view.update(cx, |this, cx| {
+                if open {
+                    this.git_sections_collapsed.insert(section.clone());
+                } else {
+                    this.git_sections_collapsed.remove(&section);
+                }
+                cx.notify();
+            });
+        })
+        .child(Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight }).xsmall())
+        .child(div().text_xs().font_semibold().child(name))
+        .child(div().text_xs().child(format!("{count}")))
 }
 
 #[cfg(test)]
@@ -758,6 +792,8 @@ pub struct Workspace {
     target: ConnectTarget,
     ade: AdeHandle,
     connection: ConnectionState,
+    /// Last daemon UI snapshot, before the optional client-side SSH overlay.
+    server_ui: Option<fresh_gui_protocol::HelloUi>,
     session_id: Option<String>,
     workspace_cap: bool,
     workspaces: Vec<WorkspaceInfo>,
@@ -826,6 +862,7 @@ pub struct Workspace {
     git_files: Vec<GitFile>,
     /// Directory paths (relative, `/`-separated) the user has collapsed.
     git_collapsed: HashSet<String>,
+    git_sections_collapsed: HashSet<String>,
     git_detail: Option<String>,
     git_busy: bool,
     git_status_req: Option<String>,
@@ -1060,8 +1097,9 @@ impl Workspace {
         // This host does not keep a window handle of its own.
         window.on_window_should_close(cx, move |_, cx| {
             if let Some(this) = closing.upgrade() {
-                this.update(cx, |this, cx| this.save_before_exit(cx));
+                this.update(cx, |this, cx| this.shutdown_client(cx));
             }
+            crate::note_window_shutdown();
             true
         });
 
@@ -1069,6 +1107,7 @@ impl Workspace {
             target,
             ade,
             connection: ConnectionState::Connecting,
+            server_ui: None,
             session_id: None,
             workspace_cap: false,
             workspaces: Vec::new(),
@@ -1123,6 +1162,7 @@ impl Workspace {
             git_behind: 0,
             git_files: Vec::new(),
             git_collapsed: HashSet::new(),
+            git_sections_collapsed: HashSet::new(),
             git_detail: None,
             git_busy: false,
             git_status_req: None,
@@ -1226,7 +1266,7 @@ impl Workspace {
             AdeEvent::ConfigUpdated { shortkeys, ui } => {
                 super::actions::apply_shortkeys(cx, &shortkeys);
                 if let Some(ui) = ui.as_ref() {
-                    self.apply_ui_config(ui, window, cx);
+                    self.apply_received_ui_config(ui, window, cx);
                 }
                 if !self.explorer_root.is_empty() {
                     let root = self.explorer_root.clone();
@@ -1605,9 +1645,25 @@ impl Workspace {
         self.defaults_path = hello.defaults_path.clone();
         self.git_cap = hello.capabilities.iter().any(|cap| cap == CAP_GIT);
         if let Some(ui) = &hello.ui {
-            self.apply_ui_config(ui, window, cx);
+            self.apply_received_ui_config(ui, window, cx);
         } else {
             self.apply_zoom(window, cx);
+        }
+    }
+
+    fn apply_received_ui_config(&mut self, ui: &fresh_gui_protocol::HelloUi, window: &mut Window, cx: &mut Context<Self>) {
+        self.server_ui = Some(ui.clone());
+        if self.target.local_daemon {
+            self.apply_ui_config(ui, window, cx);
+            return;
+        }
+        match client_config::load_ui(ui) {
+            Ok(client_ui) => self.apply_ui_config(&client_ui, window, cx),
+            Err(error) => {
+                tracing::warn!(%error, "could not load client UI config");
+                self.apply_ui_config(ui, window, cx);
+                self.status = format!("Client config: {error:#}").into();
+            }
         }
     }
 
@@ -1622,6 +1678,16 @@ impl Workspace {
         }
         self.terminal_font_base = (ui.terminal_font_size as f32).clamp(8.0, 64.0);
         chrome::apply_configured_theme(&ui.theme, Some(window), cx);
+        if !ui.font_family.trim().is_empty() || !ui.mono_font_family.trim().is_empty() {
+            let theme = gpui_kit::component::Theme::global_mut(cx);
+            if !ui.font_family.trim().is_empty() {
+                theme.font_family = ui.font_family.clone().into();
+            }
+            if !ui.mono_font_family.trim().is_empty() {
+                theme.mono_font_family = ui.mono_font_family.clone().into();
+            }
+            gpui_kit::component::Theme::sync_base(cx);
+        }
         self.apply_zoom(window, cx);
     }
 
@@ -2336,6 +2402,13 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.publish_layout(cx);
         self.ade
             .flush_blocking(std::time::Duration::from_millis(500));
+    }
+
+    fn shutdown_client(&mut self, cx: &App) {
+        self.save_before_exit(cx);
+        // Wait briefly for the socket worker to stop while the HWND and view
+        // still exist. The daemon and its PTYs stay alive for later attach.
+        self.ade.shutdown_blocking(std::time::Duration::from_millis(500));
     }
 
     fn finish_restore_if_idle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4305,7 +4378,13 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         cx.notify();
     }
 
-    fn on_reload_config(&mut self, _: &ReloadConfig, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_reload_config(&mut self, _: &ReloadConfig, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.target.local_daemon {
+            if let Some(ui) = self.server_ui.clone() {
+                // The daemon cannot see the client's config file over SSH.
+                self.apply_received_ui_config(&ui, window, cx);
+            }
+        }
         if matches!(self.connection, ConnectionState::Online) {
             self.ade.send(AdeCmd::ReloadConfig);
             self.status = "Reloading server config…".into();
@@ -4565,7 +4644,8 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     }
 
     fn on_quit_client(&mut self, _: &QuitClient, window: &mut Window, cx: &mut Context<Self>) {
-        self.save_before_exit(cx);
+        self.shutdown_client(cx);
+        crate::note_window_shutdown();
         window.remove_window();
     }
 
@@ -5316,8 +5396,6 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
 
     fn render_explorer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
-        let root_label = format!("{}: {}", if self.pin_to_root { "Root" } else { "Active" }, explorer_header_label(&self.explorer_root));
-        let workspace_root = self.workspace_root().unwrap_or_default();
         let selected: HashSet<String> = self.selection.iter().cloned().collect();
 
         let kinds = self.explorer_kinds.clone();
@@ -5349,8 +5427,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                     .h(self.ui_px(SIDEBAR_HEADER_H))
                     .px_2()
                     .items_center()
-                    .justify_between()
-                    .child(div().min_w_0().text_xs().font_semibold().text_ellipsis().child(root_label))
+                    .justify_end()
                     .child(
                         h_flex()
                             .gap_1()
@@ -5386,10 +5463,6 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                             ),
                     ),
             )
-            .child(div().w_full().px_2().pb_1().text_xs().text_color(cx.theme().muted_foreground).text_ellipsis().child(format!("Root: {}", display_path(&workspace_root))))
-            .when(!self.active_directory.is_empty(), |column| {
-                column.child(div().w_full().px_2().pb_1().text_xs().text_color(cx.theme().muted_foreground).text_ellipsis().child(format!("Active: {}", display_path(&self.active_directory))))
-            })
             .when(self.filter_open, |this| {
                 this.child(
                     h_flex()
@@ -5663,7 +5736,6 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     fn render_git(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         let zoom = self.ui_zoom;
-        let workspace_root = self.workspace_root().unwrap_or_default();
         let branch = if !self.git_repo {
             "Not a Git repository".to_string()
         } else if self.git_branch.is_empty() {
@@ -5678,17 +5750,21 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             }
             label
         };
-        let rows = git_change_rows(&self.git_files, &self.git_collapsed);
+        let staged_files: Vec<_> = self.git_files.iter().filter(|file| {
+            file.xy.chars().next().is_some_and(|index| index != ' ' && index != '?')
+        }).cloned().collect();
+        let changed_files: Vec<_> = self.git_files.iter().filter(|file| {
+            let mut status = file.xy.chars();
+            status.next();
+            status.next().is_some_and(|work| work != ' ')
+                || file.xy.starts_with('?')
+        }).cloned().collect();
+        let staged_rows = git_change_rows(&staged_files, &self.git_collapsed);
+        let changed_rows = git_change_rows(&changed_files, &self.git_collapsed);
+        let staged_open = !self.git_sections_collapsed.contains("Staged");
+        let changes_open = !self.git_sections_collapsed.contains("Changes");
         let busy = self.git_busy;
         let repo = self.git_repo;
-        let root_label = if !self.git_root.is_empty() {
-            Some(display_path(&self.git_root))
-        } else if !self.explorer_root.trim().is_empty() {
-            Some(display_path(&self.explorer_root))
-        } else {
-            None
-        };
-
         v_flex()
             .id("git-pane")
             .relative()
@@ -5707,7 +5783,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                     .px_2()
                     .items_center()
                     .justify_between()
-                    .child(div().min_w_0().text_xs().font_semibold().text_ellipsis().child(format!("Source Control · {}: {}", if self.pin_to_root { "Root" } else { "Active" }, display_path(&self.git_context_dir))))
+                    .child(div().min_w_0().text_xs().font_semibold().text_ellipsis().child("Source Control"))
                     .child(
                         h_flex()
                             .gap_1()
@@ -5756,22 +5832,6 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                             .text_color(cx.theme().muted_foreground)
                             .child(branch),
                     )
-                    .child(div().w_full().overflow_hidden().whitespace_nowrap().text_ellipsis().text_xs().text_color(cx.theme().muted_foreground).child(format!("Root: {}", display_path(&workspace_root))))
-                    .when(!self.active_directory.is_empty(), |column| {
-                        column.child(div().w_full().overflow_hidden().whitespace_nowrap().text_ellipsis().text_xs().text_color(cx.theme().muted_foreground).child(format!("Active: {}", display_path(&self.active_directory))))
-                    })
-                    .when_some(root_label, |column, root| {
-                        column.child(
-                            div()
-                                .w_full()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(root),
-                        )
-                    })
                     .when_some(self.git_detail.clone(), |column, detail| {
                         column.child(
                             div()
@@ -5814,7 +5874,9 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .children(rows.into_iter().enumerate().map(|(ix, row)| {
+                    .child(git_section_header("Staged", staged_files.len(), staged_open, view.clone()))
+                    .when(staged_open, |list| list.children(staged_rows.into_iter().enumerate().map(|(ix, row)| {
+                        let ix = ix + 100_000;
                         let view = view.clone();
                         match row {
                             GitTreeRow::Dir { path, depth, name } => {
@@ -5822,10 +5884,23 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                                 git_dir_row(ix, path, name, depth, open, view, zoom).into_any_element()
                             }
                             GitTreeRow::File { file, depth, name } => {
-                                git_file_row(ix, file, name, depth, busy, view, zoom).into_any_element()
+                                git_file_row(ix, file, name, depth, busy, view, zoom, true).into_any_element()
                             }
                         }
-                    })),
+                    })))
+                    .child(git_section_header("Changes", changed_files.len(), changes_open, view.clone()))
+                    .when(changes_open, |list| list.children(changed_rows.into_iter().enumerate().map(|(ix, row)| {
+                        let view = view.clone();
+                        match row {
+                            GitTreeRow::Dir { path, depth, name } => {
+                                let open = !self.git_collapsed.contains(&path);
+                                git_dir_row(ix, path, name, depth, open, view, zoom).into_any_element()
+                            }
+                            GitTreeRow::File { file, depth, name } => {
+                                git_file_row(ix, file, name, depth, busy, view, zoom, false).into_any_element()
+                            }
+                        }
+                    }))),
             )
             .child(self.side_panel_drag_handle("resize-source-control", false, cx))
     }
@@ -6411,7 +6486,8 @@ impl Render for Workspace {
                     // Linux draws its own close button, which removes the
                     // window without the platform should-close hook.
                     .on_close_window(cx.listener(|this, _, window, cx| {
-                        this.save_before_exit(cx);
+                        this.shutdown_client(cx);
+                        crate::note_window_shutdown();
                         window.remove_window();
                     }))
                     .child(
@@ -6425,20 +6501,33 @@ impl Render for Workspace {
                                 div()
                                     .id("app-menu-host")
                                     .h_full()
-                                    .w(self.ui_px(72.))
-                                    .flex_shrink_0()
+                                    // The kit menu already defers and occludes its popup;
+                                    // reserve enough width for both File and Server triggers.
+                                    .w(self.ui_px(132.))
+                                    .flex_none()
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                         cx.stop_propagation();
                                     })
                                     .child(self.menu_bar.clone()),
                             )
-                            .child(div().text_sm().font_semibold().child("fresh-gui"))
                             .child(
-                                div()
-                                    .text_xs()
-                                    .text_ellipsis()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(self.target.chrome_label()),
+                                h_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .gap_2()
+                                    .child(div().flex_none().text_sm().font_semibold().child("fresh-gui"))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_xs()
+                                            .text_ellipsis()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(self.target.chrome_label()),
+                                    ),
                             ),
                     ),
             )
