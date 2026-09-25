@@ -54,6 +54,7 @@
     { "action": "NewTerminal", "shortkey": "ctrl-t", "when": null },
     { "action": "CloseTab", "shortkey": "ctrl-w", "when": null },
     { "action": "SaveBuffer", "shortkey": "ctrl-s", "when": null },
+    { "action": "ToggleWordWrap", "shortkey": "alt-z", "when": "Editor" },
     { "action": "ToggleSidebar", "shortkey": "ctrl-b", "when": null },
     { "action": "ToggleCommandPalette", "shortkey": "ctrl-shift-p", "when": null },
     { "action": "GoToFile", "shortkey": "ctrl-p", "when": null },

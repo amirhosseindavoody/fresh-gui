@@ -151,6 +151,56 @@ pub struct TermScreen {
     term: Term<ReplyProxy>,
     parser: Processor,
     shared: Rc<Shared>,
+    /// alacritty_terminal currently recognizes DECSET 1049 but leaves the
+    /// equivalent 47 and 1047 alternate-buffer modes unknown. Keep a possible
+    /// split escape sequence until the next PTY chunk so those modes can be
+    /// normalized before the terminal parser sees them.
+    alt_mode_carry: Vec<u8>,
+}
+
+/// Normalize DEC alternate-screen modes not recognized by our alacritty
+/// version to its supported 1049 mode. The terminal's `swap_alt` path restores
+/// the primary grid and cursor, which is the behavior applications expect on
+/// exiting any of 47, 1047, or 1049.
+fn normalize_alt_screen_modes(carry: &mut Vec<u8>, bytes: &[u8]) -> Vec<u8> {
+    const ENTER_47: &[u8] = b"\x1b[?47h";
+    const LEAVE_47: &[u8] = b"\x1b[?47l";
+    const ENTER_1047: &[u8] = b"\x1b[?1047h";
+    const LEAVE_1047: &[u8] = b"\x1b[?1047l";
+    const ENTER_1049: &[u8] = b"\x1b[?1049h";
+    const LEAVE_1049: &[u8] = b"\x1b[?1049l";
+    const TARGETS: [(&[u8], &[u8]); 4] = [
+        (ENTER_47, ENTER_1049),
+        (LEAVE_47, LEAVE_1049),
+        (ENTER_1047, ENTER_1049),
+        (LEAVE_1047, LEAVE_1049),
+    ];
+
+    let mut input = std::mem::take(carry);
+    input.extend_from_slice(bytes);
+    let mut output = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if let Some((sequence, replacement)) =
+            TARGETS.iter().find(|(sequence, _)| input[i..].starts_with(sequence))
+        {
+            output.extend_from_slice(replacement);
+            i += sequence.len();
+            continue;
+        }
+
+        let remaining = &input[i..];
+        let partial = TARGETS.iter().any(|(sequence, _)| {
+            remaining.len() < sequence.len() && sequence.starts_with(remaining)
+        });
+        if partial {
+            carry.extend_from_slice(remaining);
+            break;
+        }
+        output.push(input[i]);
+        i += 1;
+    }
+    output
 }
 
 impl Default for TermScreen {
@@ -193,13 +243,15 @@ impl TermScreen {
             term,
             parser: Processor::new(),
             shared,
+            alt_mode_carry: Vec::new(),
         }
     }
 
     /// Ingest PTY bytes. Returns replies the host must write back (device
     /// attributes, cursor position, palette). ConPTY and fish both wait on these.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
-        self.parser.advance(&mut self.term, bytes);
+        let bytes = normalize_alt_screen_modes(&mut self.alt_mode_carry, bytes);
+        self.parser.advance(&mut self.term, &bytes);
         self.shared.replies.borrow_mut().drain(..).collect()
     }
 
@@ -249,6 +301,12 @@ impl TermScreen {
 
     pub fn alt_screen(&self) -> bool {
         self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// DECSET 1007: translate wheel scrolling into arrow keys while the
+    /// alternate screen is active.
+    pub fn alternate_scroll(&self) -> bool {
+        self.term.mode().contains(TermMode::ALTERNATE_SCROLL)
     }
 
     /// DECSET mouse tracking currently enabled by the program in the PTY.
@@ -1128,6 +1186,43 @@ mod tests {
         let primary = s.visible_text();
         assert!(primary.contains("primary"), "{primary}");
         assert!(!primary.contains("altscreen"), "{primary}");
+    }
+
+    #[test]
+    fn alternate_screen_modes_47_and_1047_switch_and_restore() {
+        for mode in [47, 1047] {
+            let mut s = TermScreen::new(20, 6);
+            s.feed(b"primary");
+            s.feed(format!("\x1b[?{mode}h").as_bytes());
+            assert!(s.alt_screen(), "mode {mode} did not enter alternate screen");
+            s.feed(b"\x1b[2J\x1b[Halternate");
+            let alternate = s.visible_text();
+            assert!(alternate.contains("alternate"), "{alternate}");
+            s.feed(format!("\x1b[?{mode}l").as_bytes());
+            assert!(!s.alt_screen(), "mode {mode} did not leave alternate screen");
+            assert!(s.visible_text().contains("primary"));
+        }
+    }
+
+    #[test]
+    fn alternate_screen_mode_can_cross_pty_chunks() {
+        let mut s = TermScreen::new(20, 6);
+        s.feed(b"\x1b[?104");
+        assert!(!s.alt_screen());
+        s.feed(b"7h");
+        assert!(s.alt_screen());
+        s.feed(b"\x1b[?1047l");
+        assert!(!s.alt_screen());
+    }
+
+    #[test]
+    fn alternate_scroll_tracks_dec_mode_1007() {
+        let mut s = TermScreen::new(20, 6);
+        assert!(!s.alternate_scroll());
+        s.feed(b"\x1b[?1007h");
+        assert!(s.alternate_scroll());
+        s.feed(b"\x1b[?1007l");
+        assert!(!s.alternate_scroll());
     }
 
     #[test]

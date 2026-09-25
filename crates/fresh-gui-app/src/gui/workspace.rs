@@ -41,7 +41,7 @@ use super::actions::{
     CloseAllTerminals, CloseTab, CloseWorkspace, CopyExplorer, DeleteExplorer, Disconnect, FilterExplorer,
     AskCopilot, FormatDocument, GoToFile, NewFile, NewTerminal, NewWorkspace, NextTab, OpenDefaultSettings, OpenSettings, PasteExplorer,
     PrevTab, QuitClient, Reconnect, RenameWorkspace, ResetContentZoom, ResetUiZoom, SaveBuffer,
-    SplitTerminal, StopServer, RestartServer, ReloadConfig, TerminalCopyOrInterrupt, TogglePinTab, ToggleCommandPalette, ToggleSidebar, ZoomInContent, ZoomInUi, ZoomOutContent,
+    SplitTerminal, StopServer, RestartServer, ReloadConfig, TerminalCopyOrInterrupt, TogglePinTab, ToggleCommandPalette, ToggleSidebar, ToggleWordWrap, ZoomInContent, ZoomInUi, ZoomOutContent,
     ZoomOutUi,
 };
 use super::ade::AttachedWorkspace;
@@ -772,6 +772,7 @@ pub struct Workspace {
     /// Editor opens issued by this view. Unsolicited `editor_opened` does not
     /// add a tab.
     pending_editors: HashMap<String, bool>,
+    pending_diff_editors: HashMap<String, String>,
     restoring: bool,
     /// Workspace whose name is being edited in the rail. Any row, not only the
     /// active one. `None` when the inline field is closed.
@@ -788,6 +789,7 @@ pub struct Workspace {
     /// Rem-based chrome text. Also multiplies panel text.
     ui_zoom: f32,
     editor_font_base: f32,
+    editor_line_wrap: bool,
     terminal_font_base: f32,
     status: SharedString,
     sidebar_collapsed: bool,
@@ -1071,6 +1073,7 @@ impl Workspace {
             pending_split: None,
             pending_tab_group: None,
             pending_editors: HashMap::new(),
+            pending_diff_editors: HashMap::new(),
             restoring: false,
             renaming_id: None,
             relocating_id: None,
@@ -1082,6 +1085,7 @@ impl Workspace {
             content_zoom: 1.0,
             ui_zoom: 1.0,
             editor_font_base: 14.0,
+            editor_line_wrap: true,
             terminal_font_base: 14.0,
             status: "Connecting…".into(),
             sidebar_collapsed: false,
@@ -1403,6 +1407,12 @@ impl Workspace {
                 line,
                 column,
             } => {
+                if let Some(rel) = self.pending_diff_editors.remove(&request_id) {
+                    if let Some(panel) = self.diffs.get(&rel) {
+                        panel.update(cx, |panel, _| panel.set_buffer(buffer_id));
+                    }
+                    return;
+                }
                 if let Some(activate) = self.pending_editors.remove(&request_id) {
                     self.begin_editor_tab(
                         buffer_id, path, language, line, column, activate, window, cx,
@@ -1415,10 +1425,18 @@ impl Workspace {
                 rev,
                 text,
                 path,
-            } => self.apply_snapshot(buffer_id, rev, text, path, window, cx),
+            } => {
+                if let Some(panel) = self.diffs.values().find(|panel| panel.read(cx).buffer_id() == Some(buffer_id.as_str())).cloned() {
+                    panel.update(cx, |panel, cx| panel.apply_snapshot(&buffer_id, rev, &text, window, cx));
+                } else {
+                    self.apply_snapshot(buffer_id, rev, text, path, window, cx)
+                }
+            }
             AdeEvent::BufferChanged { buffer_id, rev, .. } => {
                 if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
                     panel.update(cx, |panel, cx| panel.set_rev(rev, cx));
+                } else if let Some(panel) = self.diffs.values().find(|panel| panel.read(cx).buffer_id() == Some(buffer_id.as_str())).cloned() {
+                    panel.update(cx, |panel, _| panel.set_rev(rev));
                 }
             }
             AdeEvent::BufferSaved {
@@ -1426,7 +1444,13 @@ impl Workspace {
                 path,
                 rev,
                 ..
-            } => self.on_buffer_saved(&buffer_id, path, rev, cx),
+            } => {
+                if let Some(panel) = self.diffs.values().find(|panel| panel.read(cx).buffer_id() == Some(buffer_id.as_str())).cloned() {
+                    panel.update(cx, |panel, cx| panel.mark_saved(rev, cx));
+                    self.status = "Saved".into();
+                    cx.notify();
+                } else { self.on_buffer_saved(&buffer_id, path, rev, cx); }
+            }
             AdeEvent::BufferLspState { buffer_id, rev, text, diagnostics, status } => {
                 if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
                     panel.update(cx, |panel, cx| {
@@ -1529,7 +1553,7 @@ impl Workspace {
                 self.pending_diffs.remove(&request_id);
                 if let Some(panel) = self.diffs.get(&path).cloned() {
                     panel.update(cx, |panel, cx| {
-                        panel.show_sides(old_text, new_text, binary, truncated, cx);
+                        panel.show_sides(old_text, new_text, binary, truncated, window, cx);
                     });
                 }
             }
@@ -1581,6 +1605,13 @@ impl Workspace {
 
     fn apply_ui_config(&mut self, ui: &fresh_gui_protocol::HelloUi, window: &mut Window, cx: &mut Context<Self>) {
         self.editor_font_base = (ui.editor_font_size as f32).clamp(8.0, 64.0);
+        self.editor_line_wrap = ui.editor_line_wrap;
+        for panel in self.editors.values() {
+            panel.update(cx, |panel, cx| panel.set_word_wrap(ui.editor_line_wrap, window, cx));
+        }
+        for panel in self.diffs.values() {
+            panel.update(cx, |panel, cx| panel.set_word_wrap(ui.editor_line_wrap, window, cx));
+        }
         self.terminal_font_base = (ui.terminal_font_size as f32).clamp(8.0, 64.0);
         chrome::apply_configured_theme(&ui.theme, Some(window), cx);
         self.apply_zoom(window, cx);
@@ -1702,6 +1733,7 @@ impl Workspace {
                 cx,
             )
         });
+        panel.update(cx, |panel, cx| panel.set_word_wrap(self.editor_line_wrap, window, cx));
         let panel_id = PanelId::from(panel.entity_id());
         self.dock.update(cx, |dock, cx| {
             dock.add_panel_view(
@@ -2841,6 +2873,18 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     }
 
     fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ActiveSurface::Diff(rel)) = &self.active {
+            let Some(panel) = self.diffs.get(rel).cloned() else { return; };
+            let data = panel.read(cx).save_data(cx);
+            if let Some((buffer_id, rev, text)) = data {
+                self.write_buffer(&buffer_id, rev, &text, true, String::new());
+                self.status = "Saving…".into();
+            } else {
+                self.status = "No changes".into();
+            }
+            cx.notify();
+            return;
+        }
         let Some(ActiveSurface::Editor(path)) = &self.active else {
             return;
         };
@@ -3310,7 +3354,8 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         let title = diff_view::join_repo(&root, &rel);
         let workspace = cx.weak_entity();
         let metrics = self.tab_metrics.clone();
-        let panel = cx.new(|cx| DiffPanel::new(rel.clone(), title, pin, workspace, metrics, cx));
+        let panel = cx.new(|cx| DiffPanel::new(rel.clone(), title.clone(), pin, workspace, metrics, window, cx));
+        panel.update(cx, |panel, cx| panel.set_word_wrap(self.editor_line_wrap, window, cx));
         self.dock.update(cx, |dock, cx| {
             dock.add_panel_view(
                 panel_handle(panel.clone()),
@@ -3326,6 +3371,9 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         }
         self.select_entity(&panel, window, cx);
         self.request_git_diff(&rel);
+        let request_id = next_id("diff-edit");
+        self.pending_diff_editors.insert(request_id.clone(), rel.clone());
+        self.ade.send(AdeCmd::OpenEditor { request_id, path: title, preview: false, line: None, column: None });
     }
 
     fn close_open_diffs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4171,6 +4219,19 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             return;
         };
         panel.update(cx, |panel, cx| panel.request_format(window, cx));
+        cx.notify();
+    }
+
+    fn on_toggle_word_wrap(&mut self, _: &ToggleWordWrap, window: &mut Window, cx: &mut Context<Self>) {
+        let enabled = match &self.active {
+            Some(ActiveSurface::Editor(path)) => self.editors.get(path).cloned()
+                .map(|panel| panel.update(cx, |panel, cx| panel.toggle_word_wrap(window, cx))),
+            Some(ActiveSurface::Diff(path)) => self.diffs.get(path).cloned()
+                .map(|panel| panel.update(cx, |panel, cx| panel.toggle_word_wrap(window, cx))),
+            _ => None,
+        };
+        let Some(enabled) = enabled else { return; };
+        self.status = if enabled { "Word wrap on" } else { "Word wrap off" }.into();
         cx.notify();
     }
 
@@ -5276,7 +5337,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                     ),
             )
             .child(div().w_full().px_2().pb_1().text_xs().text_color(cx.theme().muted_foreground).text_ellipsis().child(format!("Root: {}", display_path(&workspace_root))))
-            .when(self.pin_to_root && !self.active_directory.is_empty(), |column| {
+            .when(!self.active_directory.is_empty(), |column| {
                 column.child(div().w_full().px_2().pb_1().text_xs().text_color(cx.theme().muted_foreground).text_ellipsis().child(format!("Active: {}", display_path(&self.active_directory))))
             })
             .when(self.filter_open, |this| {
@@ -5646,7 +5707,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                             .child(branch),
                     )
                     .child(div().w_full().overflow_hidden().whitespace_nowrap().text_ellipsis().text_xs().text_color(cx.theme().muted_foreground).child(format!("Root: {}", display_path(&workspace_root))))
-                    .when(self.pin_to_root && !self.active_directory.is_empty(), |column| {
+                    .when(!self.active_directory.is_empty(), |column| {
                         column.child(div().w_full().overflow_hidden().whitespace_nowrap().text_ellipsis().text_xs().text_color(cx.theme().muted_foreground).child(format!("Active: {}", display_path(&self.active_directory))))
                     })
                     .when_some(root_label, |column, root| {
@@ -5772,6 +5833,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             ("New File", Box::new(NewFile)),
             ("Split Terminal Vertically", Box::new(SplitTerminal)),
             ("Format Document", Box::new(FormatDocument)),
+            ("Toggle Word Wrap", Box::new(ToggleWordWrap)),
             ("New Workspace", Box::new(NewWorkspace)),
             ("Rename Workspace", Box::new(RenameWorkspace)),
             ("Close Workspace", Box::new(CloseWorkspace)),
@@ -6287,6 +6349,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_new_file))
             .on_action(cx.listener(Self::on_split_terminal))
             .on_action(cx.listener(Self::on_format_document))
+            .on_action(cx.listener(Self::on_toggle_word_wrap))
             .on_action(cx.listener(Self::on_new_workspace))
             .on_action(cx.listener(Self::on_rename_workspace))
             .on_action(cx.listener(Self::on_close_workspace))
