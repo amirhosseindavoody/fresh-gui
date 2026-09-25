@@ -833,8 +833,12 @@ pub struct Workspace {
     commit_input: Entity<InputState>,
     menu_bar: Entity<AppMenuBar>,
     last_cwd: Option<String>,
-    /// Directory of the focused terminal or editor, independent of sidebar pinning.
+    /// Directory of the last selected terminal, independent of sidebar pinning.
     active_directory: String,
+    /// Terminal focus order is retained separately for each daemon workspace.
+    terminal_mru: HashMap<String, VecDeque<String>>,
+    /// Last OSC 7 directory of each PTY, retained while its workspace is hidden.
+    terminal_cwds: HashMap<String, HashMap<String, String>>,
     pin_to_root: bool,
     /// Directory whose repository is shown in the Git panel.
     git_context_dir: String,
@@ -1127,6 +1131,8 @@ impl Workspace {
             menu_bar,
             last_cwd: None,
             active_directory: String::new(),
+            terminal_mru: HashMap::new(),
+            terminal_cwds: HashMap::new(),
             pin_to_root: false,
             git_context_dir: String::new(),
             explorer,
@@ -1250,7 +1256,7 @@ impl Workspace {
                 if active {
                     let previous_root = self.workspace_root().unwrap_or_default();
                     self.session_root = workspace.root.clone();
-                    if self.active_directory.is_empty() || self.active_directory == previous_root {
+                    if self.last_active_terminal().is_none() || self.active_directory.is_empty() || self.active_directory == previous_root {
                         self.active_directory = workspace.root.clone();
                     }
                     let directory = if self.pin_to_root { workspace.root.clone() } else { self.active_directory.clone() };
@@ -1272,6 +1278,8 @@ impl Workspace {
             }
             AdeEvent::WorkspaceClosed { id, focused_id } => {
                 let was_active = self.active_workspace_id.as_deref() == Some(id.as_str());
+                self.terminal_mru.remove(&id);
+                self.terminal_cwds.remove(&id);
                 self.workspaces.retain(|workspace| workspace.id != id);
                 if was_active {
                     self.release_dock(window, cx);
@@ -1679,8 +1687,11 @@ impl Workspace {
         let cwd = panel.update(cx, |panel, cx| panel.push_bytes(bytes, window, cx));
         if let Some(cwd) = cwd {
             self.last_cwd = Some(cwd.clone());
+            let workspace_id = self.workspace_id_or_empty();
+            self.terminal_cwds.entry(workspace_id)
+                .or_default().insert(pty_id.to_string(), cwd.clone());
             if previous_cwd.as_deref() != Some(cwd.as_str())
-                && matches!(&self.active, Some(ActiveSurface::Terminal(id)) if id == pty_id)
+                && self.last_active_terminal() == Some(pty_id)
             {
                 self.follow_directory(&cwd, cx);
             }
@@ -1790,9 +1801,6 @@ impl Workspace {
             if matches!(&self.active, Some(ActiveSurface::Editor(current)) if current == &previous)
             {
                 self.active = Some(ActiveSurface::Editor(path.clone()));
-                if let Some(directory) = parent_dir(&path) {
-                    self.follow_directory(&directory, cx);
-                }
             }
             if let Some(parent) = parent_dir(&path) {
                 self.relist(&parent);
@@ -1882,7 +1890,14 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if active {
+            if !self.terminals.contains_key(pty_id) {
+                return;
+            }
             self.active = Some(ActiveSurface::Terminal(pty_id.to_string()));
+            let key = self.workspace_id_or_empty();
+            let order = self.terminal_mru.entry(key).or_default();
+            order.retain(|id| id != pty_id);
+            order.push_front(pty_id.to_string());
             if let Some(cwd) = self.terminals.get(pty_id).and_then(|panel| panel.read(cx).cwd()).or_else(|| self.workspace_root()) {
                 self.follow_directory(&cwd, cx);
             }
@@ -1909,14 +1924,6 @@ impl Workspace {
     pub(crate) fn note_editor_active(&mut self, path: &str, active: bool, cx: &mut Context<Self>) {
         if active {
             self.active = Some(ActiveSurface::Editor(path.to_string()));
-            let directory = if self.defaults_path.as_deref() == Some(path) {
-                self.workspace_root()
-            } else {
-                parent_dir(path).or_else(|| self.workspace_root())
-            };
-            if let Some(dir) = directory {
-                self.follow_directory(&dir, cx);
-            }
             if let Some(id) = self.active_panel_id() {
                 self.last_saved_panel = Some(id);
             }
@@ -1930,7 +1937,24 @@ impl Workspace {
     }
 
     pub(crate) fn forget_terminal(&mut self, pty_id: &str, cx: &mut Context<Self>) {
+        let was_last = self.last_active_terminal() == Some(pty_id);
         self.terminals.remove(pty_id);
+        let key = self.workspace_id_or_empty();
+        if let Some(order) = self.terminal_mru.get_mut(&key) {
+            order.retain(|id| id != pty_id);
+        }
+        if let Some(cwds) = self.terminal_cwds.get_mut(&key) {
+            cwds.remove(pty_id);
+        }
+        if was_last {
+            let directory = self.last_active_terminal()
+                .and_then(|id| self.terminals.get(id))
+                .and_then(|panel| panel.read(cx).cwd())
+                .or_else(|| self.workspace_root());
+            if let Some(directory) = directory {
+                self.follow_directory(&directory, cx);
+            }
+        }
         if matches!(&self.active, Some(ActiveSurface::Terminal(id)) if id == pty_id) {
             self.active = None;
         }
@@ -2399,7 +2423,8 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.session_root = info.root.clone();
         self.active_directory = info.root.clone();
         self.pin_to_root = false;
-        self.git_context_dir.clear();
+        self.git_context_dir = info.root.clone();
+        let workspace_id = info.id.clone();
         let root = info.root.clone();
         self.upsert_workspace(info);
         self.rebuild_tree(cx);
@@ -2413,6 +2438,20 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         }
 
         let live: Vec<String> = ptys.into_iter().map(|PtyInfo { id, .. }| id).collect();
+        let live_ids: HashSet<&str> = live.iter().map(String::as_str).collect();
+        if let Some(order) = self.terminal_mru.get_mut(&workspace_id) {
+            order.retain(|id| live_ids.contains(id.as_str()));
+        }
+        if let Some(cwds) = self.terminal_cwds.get_mut(&workspace_id) {
+            cwds.retain(|id, _| live_ids.contains(id.as_str()));
+        }
+        let followed = self.terminal_mru.get(&workspace_id)
+            .and_then(|order| order.front())
+            .and_then(|id| self.terminal_cwds.get(&workspace_id).and_then(|cwds| cwds.get(id)))
+            .cloned();
+        if let Some(directory) = followed {
+            self.follow_directory(&directory, cx);
+        }
         let plan = restore_plan(tabs, active_tab, &live);
         let mut editor_jobs = Vec::new();
         for step in plan.steps {
@@ -2458,11 +2497,15 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     /// have taken the selection) and publish the rebuilt tab list.
     fn finish_restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.restoring = false;
+        for panel in self.terminals.values() {
+            panel.update(cx, |panel, _| panel.set_restoring(false));
+        }
         self.apply_restored_center(window, cx);
         if let Some(pty_id) = self.restore_focus.take()
             && let Some(panel) = self.terminals.get(&pty_id).cloned()
         {
             self.select_entity(&panel, window, cx);
+            self.note_terminal_active(&pty_id, true, cx);
         }
         if !self.panes_empty() {
             self.publish_layout(cx);
@@ -2513,9 +2556,14 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         let panel =
             cx.new(|cx| TerminalPanel::new(pty_id.clone(), number, ade, workspace, metrics, cx));
         let workspace_id = self.active_workspace_id.clone();
+        let tracked_cwd = self.terminal_cwds.get(&self.workspace_id_or_empty())
+            .and_then(|cwds| cwds.get(&pty_id)).cloned();
+        let restoring = self.restoring;
         let custom = parsed.is_none() && !title.is_empty() && title != number.to_string();
         panel.update(cx, |panel, cx| {
             panel.bind_workspace(workspace_id);
+            panel.restore_cwd(tracked_cwd);
+            panel.set_restoring(restoring);
             if custom {
                 panel.set_custom_title(title, cx);
             }
@@ -3108,6 +3156,8 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.explorer_root.clear();
         self.session_root.clear();
         self.active_directory.clear();
+        self.terminal_mru.clear();
+        self.terminal_cwds.clear();
         self.pin_to_root = false;
         self.git_context_dir.clear();
         self.selection.clear();
@@ -3187,6 +3237,12 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.active_workspace_id.clone().unwrap_or_default()
     }
 
+    fn last_active_terminal(&self) -> Option<&str> {
+        self.terminal_mru.get(&self.workspace_id_or_empty())
+            .and_then(|order| order.iter().find(|id| self.terminals.contains_key(*id)))
+            .map(String::as_str)
+    }
+
     fn refresh_git(&mut self) {
         if !self.git_cap || !matches!(self.connection, ConnectionState::Online) {
             return;
@@ -3200,7 +3256,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         });
     }
 
-    /// Track the focused tab's directory even while the side panels are pinned.
+    /// Track the last selected terminal's directory even while panels are pinned.
     fn follow_directory(&mut self, directory: &str, cx: &mut Context<Self>) {
         let directory = if directory == "/"
             || directory.ends_with(":/")
@@ -3310,12 +3366,6 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         );
         self.selection = next;
         self.anchor = anchor;
-        if !is_folder
-            && gesture == super::explorer::SelectGesture::Replace
-            && let Some(dir) = parent_dir(path)
-        {
-            self.follow_directory(&dir, cx);
-        }
         let highlight =
             (gesture == super::explorer::SelectGesture::Range).then(|| path.to_string());
         self.sync_tree_highlight(highlight, cx);
@@ -5309,7 +5359,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                                     .ghost()
                                     .xsmall()
                                     .label(if self.pin_to_root { "Follow" } else { "Root" })
-                                    .tooltip(if self.pin_to_root { "Follow active tab" } else { "Pin panels to workspace root" })
+                                    .tooltip(if self.pin_to_root { "Follow last active terminal" } else { "Pin panels to workspace root" })
                                     .on_click(cx.listener(|this, _, _, cx| this.toggle_root_pin(cx))),
                             )
                             .child(
@@ -5666,7 +5716,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                                     .ghost()
                                     .xsmall()
                                     .label(if self.pin_to_root { "Follow" } else { "Root" })
-                                    .tooltip(if self.pin_to_root { "Follow active tab" } else { "Pin panels to workspace root" })
+                                    .tooltip(if self.pin_to_root { "Follow last active terminal" } else { "Pin panels to workspace root" })
                                     .on_click(cx.listener(|this, _, _, cx| this.toggle_root_pin(cx))),
                             )
                             .child(

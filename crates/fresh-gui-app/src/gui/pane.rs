@@ -35,7 +35,7 @@ use super::paths::display_path;
 use super::rail::path_basename;
 use super::tab_chrome::{TabCloseScope, TabStripMetrics};
 use super::terminal::{
-    TermMouseButton, TermMouseKind, TermMouseMods, TermScreen, TermSpan, keystroke_to_bytes,
+    TermMouseButton, TermMouseKind, TermMouseMods, TermRow, TermScreen, TermSpan, keystroke_to_bytes,
     paste_payload, readable_light_foreground, word_bounds_at_column,
 };
 
@@ -80,6 +80,7 @@ pub struct TerminalPanel {
     sync_deadline: Option<Instant>,
     sync_task: Option<Task<()>>,
     focus: FocusHandle,
+    focus_subscription: Option<Subscription>,
     ade: AdeHandle,
     workspace: WeakEntity<Workspace>,
     metrics: TabStripMetrics,
@@ -102,6 +103,7 @@ pub struct TerminalPanel {
     cell_w: f32,
     cell_h: f32,
     font_px: f32,
+    restoring: bool,
     closed: bool,
     /// OSC 52 text that arrived without a window handle (sync-update flush).
     pending_clipboard: Vec<String>,
@@ -125,6 +127,7 @@ impl TerminalPanel {
             sync_deadline: None,
             sync_task: None,
             focus: cx.focus_handle(),
+            focus_subscription: None,
             ade,
             workspace,
             metrics,
@@ -139,6 +142,7 @@ impl TerminalPanel {
             cell_w: TERM_CELL_W,
             cell_h: TERM_CELL_H,
             font_px: 14.0,
+            restoring: false,
             closed: false,
             pending_clipboard: Vec::new(),
         }
@@ -159,6 +163,14 @@ impl TerminalPanel {
 
     pub fn cwd(&self) -> Option<String> {
         self.cwd.clone()
+    }
+
+    pub fn restore_cwd(&mut self, cwd: Option<String>) {
+        self.cwd = cwd;
+    }
+
+    pub fn set_restoring(&mut self, restoring: bool) {
+        self.restoring = restoring;
     }
 
     pub fn label(&self) -> &str {
@@ -572,13 +584,15 @@ impl BasePanel for TerminalPanel {
         // The dock delivers this from inside the panel update, and Ctrl+W
         // reaches it while `Workspace` is still on the stack. Defer the
         // workspace write until that update returns.
-        cx.defer(move |cx| {
-            workspace
-                .update(cx, |workspace, cx| {
-                    workspace.note_terminal_active(&pty, active, cx);
-                })
-                .ok();
-        });
+        if !self.restoring {
+            cx.defer(move |cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.note_terminal_active(&pty, active, cx);
+                    })
+                    .ok();
+            });
+        }
         if active {
             window.focus(&self.focus, cx);
         }
@@ -695,6 +709,19 @@ impl DockPanel for TerminalPanel {
 
 impl Render for TerminalPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.focus_subscription.is_none() {
+            let handle = self.focus.clone();
+            self.focus_subscription = Some(cx.on_focus(&handle, window, |this, _, cx| {
+                if this.restoring {
+                    return;
+                }
+                let workspace = this.workspace.clone();
+                let pty = this.pty_id.clone();
+                cx.defer(move |cx| {
+                    workspace.update(cx, |workspace, cx| workspace.note_terminal_active(&pty, true, cx)).ok();
+                });
+            }));
+        }
         let pty_id = self.pty_id.clone();
         if let Some((cols, rows)) = self.pending_grid.get()
             && (cols != self.screen.cols || rows != self.screen.rows)
@@ -707,6 +734,7 @@ impl Render for TerminalPanel {
             });
         }
         let rows = self.screen.rows();
+        let paint_rows = rows.clone();
         if !self.pending_clipboard.is_empty() {
             for text in std::mem::take(&mut self.pending_clipboard) {
                 if let Err(error) = clipboard::write_text(window, cx, &text) {
@@ -1033,6 +1061,20 @@ impl Render for TerminalPanel {
                                 .ok();
                         });
                     })
+                    // GPUI text backgrounds use glyph/line bounds, which can leave
+                    // fractional device-pixel gaps between terminal grid rows.
+                    .child(
+                        gpui::canvas(|_, _, _| {}, move |bounds, _, window, _| {
+                            paint_terminal_cells(
+                                bounds, &paint_rows, cell_w, cell_h,
+                                fg_default, accent, light_theme, window,
+                            );
+                        })
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                    )
                     .children(rows.into_iter().enumerate().map(|(row_index, row)| {
                         let mut char_start = 0;
                         h_flex().h(px(cell_h)).items_center().children(
@@ -1047,9 +1089,17 @@ impl Render for TerminalPanel {
                         )
                     }))
                     .when_some(cursor, |grid, (row, col, shape)| {
-                        grid.child(terminal_cursor_el(
-                            row, col, shape, cell_w, cell_h, fg_default,
-                        ))
+                        grid.child(
+                            gpui::canvas(|_, _, _| {}, move |bounds, _, window, _| {
+                                paint_terminal_cursor(
+                                    bounds, row, col, shape, cell_w, cell_h, fg_default, window,
+                                );
+                            })
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full(),
+                        )
                     })
                     .when(focused, |this| this.opacity(1.))
                     .when(!focused, |this| this.opacity(0.85)),
@@ -1109,6 +1159,150 @@ fn scroll_lines(delta: ScrollDelta, cell_h: f32) -> f32 {
 
 fn term_rgb(rgb: [u8; 3]) -> gpui::Rgba {
     gpui::rgb((u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2]))
+}
+
+fn snapped_edge(origin: f32, offset: f32, scale: f32) -> f32 {
+    ((origin + offset) * scale).round() / scale
+}
+
+fn paint_cell_rect(window: &mut Window, x0: f32, y0: f32, x1: f32, y1: f32, color: gpui::Rgba) {
+    if x1 > x0 && y1 > y0 {
+        window.paint_quad(gpui::fill(gpui::Bounds {
+            origin: gpui::point(px(x0), px(y0)),
+            size: gpui::size(px(x1 - x0), px(y1 - y0)),
+        }, color));
+    }
+}
+
+/// Paint grid backgrounds and terminal graphics from shared, device-pixel-snapped
+/// edges. GPUI's text/div background follows line and glyph bounds, and its
+/// independently rounded fractional row rectangles exposed the pane color as
+/// thin seams. Font box glyphs also have ascent/descent padding, so they do not
+/// reach the edges of a terminal cell.
+fn paint_terminal_cells(
+    bounds: Bounds<Pixels>, rows: &[TermRow], cell_w: f32, cell_h: f32,
+    fg_default: Hsla, accent: Hsla, light_theme: bool, window: &mut Window,
+) {
+    let scale = window.scale_factor();
+    let ox = f32::from(bounds.origin.x);
+    let oy = f32::from(bounds.origin.y);
+    for (row, content) in rows.iter().enumerate() {
+        let y0 = snapped_edge(oy, row as f32 * cell_h, scale);
+        let y1 = snapped_edge(oy, (row + 1) as f32 * cell_h, scale);
+        let mut col = 0;
+        for span in &content.spans {
+            let x0 = snapped_edge(ox, col as f32 * cell_w, scale);
+            let x1 = snapped_edge(ox, (col + span.cells) as f32 * cell_w, scale);
+            let bg = if span.selected { Some(accent.opacity(1.).to_rgb()) }
+                else { span.bg.map(term_rgb) };
+            if let Some(bg) = bg {
+                paint_cell_rect(window, x0, y0, x1, y1, bg);
+            }
+            if let Some(ch) = span.text.chars().next().filter(|ch| is_procedural_cell(*ch)) {
+                let fg = if span.selected { terminal_selection_foreground(accent) }
+                    else if let Some(rgb) = span.fg {
+                        term_rgb(if light_theme { readable_light_foreground(rgb, span.bg) } else { rgb })
+                    } else { fg_default.to_rgb() };
+                paint_terminal_graphic(window, ch, x0, y0, x1, y1, fg, scale);
+            }
+            col += span.cells;
+        }
+    }
+}
+
+fn is_procedural_cell(ch: char) -> bool {
+    box_arms(ch).is_some() || ('\u{2580}'..='\u{259f}').contains(&ch)
+}
+
+// N, E, S, W. Mixed-weight box characters use the heavier common stroke.
+fn box_arms(ch: char) -> Option<(u8, u8)> {
+    let arms = match ch {
+        '─' | '━' | '═' => 0b1010,
+        '│' | '┃' | '║' => 0b0101,
+        '┌' | '┍' | '┎' | '┏' | '╔' => 0b0110,
+        '┐' | '┑' | '┒' | '┓' | '╗' => 0b1100,
+        '└' | '┕' | '┖' | '┗' | '╚' => 0b0011,
+        '┘' | '┙' | '┚' | '┛' | '╝' => 0b1001,
+        '├' | '┝' | '┞' | '┟' | '┠' | '┡' | '┢' | '┣' | '╠' => 0b0111,
+        '┤' | '┥' | '┦' | '┧' | '┨' | '┩' | '┪' | '┫' | '╣' => 0b1101,
+        '┬' | '┭' | '┮' | '┯' | '┰' | '┱' | '┲' | '┳' | '╦' => 0b1110,
+        '┴' | '┵' | '┶' | '┷' | '┸' | '┹' | '┺' | '┻' | '╩' => 0b1011,
+        '┼' | '┽' | '┾' | '┿' | '╀' | '╁' | '╂' | '╃' | '╄' | '╅' | '╆' | '╇' | '╈' | '╉' | '╊' | '╋' | '╬' => 0b1111,
+        '╴' | '╸' => 0b1000,
+        '╵' | '╹' => 0b0001,
+        '╶' | '╺' => 0b0010,
+        '╷' | '╻' => 0b0100,
+        '╼' => 0b1010,
+        '╽' => 0b0101,
+        _ => return None,
+    };
+    let weight = if matches!(ch, '═' | '║' | '╔' | '╗' | '╚' | '╝' | '╠' | '╣' | '╦' | '╩' | '╬') { 2 }
+        else if matches!(ch, '━' | '┃' | '┏' | '┓' | '┗' | '┛' | '┣' | '┫' | '┳' | '┻' | '╋') { 1 }
+        else { 0 };
+    Some((arms, weight))
+}
+
+fn paint_terminal_graphic(
+    window: &mut Window, ch: char, x0: f32, y0: f32, x1: f32, y1: f32,
+    color: gpui::Rgba, scale: f32,
+) {
+    let w = x1 - x0;
+    let h = y1 - y0;
+    let edge = |x: f32, base: f32| (x * scale).round() / scale + base;
+    let rect = |window: &mut Window, a: f32, b: f32, c: f32, d: f32| {
+        paint_cell_rect(window, edge(a, x0), edge(b, y0), edge(c, x0), edge(d, y0), color);
+    };
+    if let Some((arms, weight)) = box_arms(ch) {
+        let stroke = (if weight == 1 { 2. } else { 1. } / scale).min(w.min(h));
+        let cx = w / 2.;
+        let cy = h / 2.;
+        let offsets: &[f32] = if weight == 2 { &[-1.5, 1.5] } else { &[0.] };
+        for offset in offsets {
+            let dx = *offset / scale;
+            let dy = *offset / scale;
+            let reach = if weight == 2 { 2. / scale } else { stroke / 2. };
+            if arms & 0b0001 != 0 { rect(window, cx + dx - stroke/2., 0., cx + dx + stroke/2., cy + reach); }
+            if arms & 0b0010 != 0 { rect(window, cx - reach, cy + dy - stroke/2., w, cy + dy + stroke/2.); }
+            if arms & 0b0100 != 0 { rect(window, cx + dx - stroke/2., cy - reach, cx + dx + stroke/2., h); }
+            if arms & 0b1000 != 0 { rect(window, 0., cy + dy - stroke/2., cx + reach, cy + dy + stroke/2.); }
+        }
+        return;
+    }
+    match ch {
+        '▀' => rect(window, 0., 0., w, h/2.),
+        '▄' => rect(window, 0., h/2., w, h),
+        '█' => rect(window, 0., 0., w, h),
+        '▌' => rect(window, 0., 0., w/2., h),
+        '▐' => rect(window, w/2., 0., w, h),
+        '▔' => rect(window, 0., 0., w, h/8.),
+        '▕' => rect(window, w*7./8., 0., w, h),
+        '▁'..='▇' => {
+            let eighths = (ch as u32 - '▁' as u32 + 1) as f32;
+            rect(window, 0., h*(8.-eighths)/8., w, h);
+        }
+        '▉'..='▏' => {
+            let eighths = (8 - (ch as u32 - '▉' as u32)) as f32;
+            rect(window, 0., 0., w*eighths/8., h);
+        }
+        '░' | '▒' | '▓' => {
+            let density = match ch { '░' => 0.25, '▒' => 0.5, _ => 0.75 };
+            paint_cell_rect(window, x0, y0, x1, y1,
+                gpui::Rgba { a: color.a * density, ..color });
+        }
+        '▖'..='▟' => {
+            let mask = match ch {
+                '▖' => 0b0100, '▗' => 0b1000, '▘' => 0b0001,
+                '▙' => 0b1101, '▚' => 0b1001, '▛' => 0b0111,
+                '▜' => 0b1011, '▝' => 0b0010, '▞' => 0b0110,
+                '▟' => 0b1110, _ => 0,
+            };
+            if mask & 1 != 0 { rect(window, 0., 0., w/2., h/2.); }
+            if mask & 2 != 0 { rect(window, w/2., 0., w, h/2.); }
+            if mask & 4 != 0 { rect(window, 0., h/2., w/2., h); }
+            if mask & 8 != 0 { rect(window, w/2., h/2., w, h); }
+        }
+        _ => {}
+    }
 }
 
 fn terminal_selection_foreground(background: Hsla) -> gpui::Rgba {
@@ -1330,7 +1524,9 @@ fn term_span_el(
     light_theme: bool,
     link_hover: bool,
 ) -> gpui::Div {
-    let text = if span.text.is_empty() {
+    let text = if span.text.chars().next().is_some_and(is_procedural_cell) {
+        " ".to_string()
+    } else if span.text.is_empty() {
         " ".to_string()
     } else {
         span.text
@@ -1343,7 +1539,6 @@ fn term_span_el(
             rgb
         }
     });
-    let bg = span.bg;
     div()
         .w(px(span.cells as f32 * cell_w))
         .flex_shrink_0()
@@ -1358,49 +1553,49 @@ fn term_span_el(
             Some(fg) => el.text_color(term_rgb(fg)),
             None => el.text_color(fg_default),
         })
-        .when(!span.selected, |el| match bg {
-            Some(bg) => el.bg(term_rgb(bg)),
-            None => el,
-        })
         .when(span.selected, |el| {
             // Keep the selection background opaque. Semi-transparent accents
             // let terminal cell colors bleed through and made selected text
             // nearly indistinguishable in several themes.
             let selected_fg = terminal_selection_foreground(accent);
-            el.bg(accent.opacity(1.)).text_color(selected_fg)
+            el.text_color(selected_fg)
         })
         .child(text)
 }
 
-fn terminal_cursor_el(
+fn paint_terminal_cursor(
+    bounds: Bounds<Pixels>,
     row: usize,
     col: usize,
     shape: CursorShape,
     cell_w: f32,
     cell_h: f32,
     color: Hsla,
-) -> gpui::Div {
-    let (left, top, width, height) = match shape {
-        CursorShape::Beam => (col as f32 * cell_w, row as f32 * cell_h, 2., cell_h),
-        CursorShape::Underline => (
-            col as f32 * cell_w,
-            (row as f32 + 1.) * cell_h - 2.,
-            cell_w,
-            2.,
-        ),
-        _ => (col as f32 * cell_w, row as f32 * cell_h, cell_w, cell_h),
-    };
-    div()
-        .absolute()
-        .left(px(left))
-        .top(px(top))
-        .w(px(width))
-        .h(px(height))
-        .when(shape == CursorShape::Block, |el| el.bg(color.opacity(0.4)))
-        .when(shape == CursorShape::HollowBlock || shape == CursorShape::Block, |el| {
-            el.border_1().border_color(color)
-        })
-        .when(shape == CursorShape::Beam || shape == CursorShape::Underline, |el| el.bg(color))
+    window: &mut Window,
+) {
+    let scale = window.scale_factor();
+    let ox = f32::from(bounds.origin.x);
+    let oy = f32::from(bounds.origin.y);
+    let x0 = snapped_edge(ox, col as f32 * cell_w, scale);
+    let x1 = snapped_edge(ox, (col + 1) as f32 * cell_w, scale);
+    let y0 = snapped_edge(oy, row as f32 * cell_h, scale);
+    let y1 = snapped_edge(oy, (row + 1) as f32 * cell_h, scale);
+    let stroke = 1. / scale;
+    let fg = color.to_rgb();
+    match shape {
+        CursorShape::Beam => paint_cell_rect(window, x0, y0, x0 + 2. * stroke, y1, fg),
+        CursorShape::Underline => paint_cell_rect(window, x0, y1 - 2. * stroke, x1, y1, fg),
+        CursorShape::Block | CursorShape::HollowBlock => {
+            if shape == CursorShape::Block {
+                paint_cell_rect(window, x0, y0, x1, y1, color.opacity(0.4).to_rgb());
+            }
+            paint_cell_rect(window, x0, y0, x1, y0 + stroke, fg);
+            paint_cell_rect(window, x0, y1 - stroke, x1, y1, fg);
+            paint_cell_rect(window, x0, y0, x0 + stroke, y1, fg);
+            paint_cell_rect(window, x1 - stroke, y0, x1, y1, fg);
+        }
+        _ => {}
+    }
 }
 
 struct EditorPending {
