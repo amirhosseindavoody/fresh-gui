@@ -35,7 +35,7 @@ use super::rail::path_basename;
 use super::tab_chrome::{TabCloseScope, TabStripMetrics};
 use super::terminal::{
     TermMouseButton, TermMouseKind, TermMouseMods, TermScreen, TermSpan, keystroke_to_bytes,
-    paste_payload, readable_light_foreground,
+    paste_payload, readable_light_foreground, word_bounds_at_column,
 };
 
 /// `text_sm` monospace cell, matching [`super::terminal`] pixel reports.
@@ -94,6 +94,9 @@ pub struct TerminalPanel {
     pressed: Option<TermMouseButton>,
     /// Last cell written as a move or drag, so a hover does not repeat.
     last_mouse_cell: Option<(usize, usize)>,
+    /// Row and scalar bounds of a path under a held Ctrl/Cmd pointer.
+    link_hover: Option<(usize, usize, usize)>,
+    last_pointer: Option<Point<Pixels>>,
     /// Monospace cell, scaled with content and UI zoom. 8×18 at 14px.
     cell_w: f32,
     cell_h: f32,
@@ -130,6 +133,8 @@ impl TerminalPanel {
             selecting: false,
             pressed: None,
             last_mouse_cell: None,
+            link_hover: None,
+            last_pointer: None,
             cell_w: TERM_CELL_W,
             cell_h: TERM_CELL_H,
             font_px: 14.0,
@@ -202,6 +207,8 @@ impl TerminalPanel {
         for text in self.screen.take_clipboard_stores() {
             if let Err(error) = clipboard::write_text(window, cx, &text) {
                 tracing::warn!(%error, "terminal clipboard copy failed");
+            } else {
+                clipboard::notify_copied(window, cx);
             }
         }
         self.arm_sync_timeout(cx);
@@ -310,13 +317,13 @@ impl TerminalPanel {
             && (modifiers.control || modifiers.platform)
             && !modifiers.shift
             && let Some((col, row)) = self.cell_at(position)
-            && let Some(line) = self.screen.line_text(row)
+            && let Some((line, char_col)) = self.screen.line_text_and_char_column(row, col)
         {
             let cwd = self.cwd();
             let workspace = self.workspace.clone();
             workspace
                 .update(cx, |workspace, cx| {
-                    workspace.open_path_link(line, col as u32, cwd, cx);
+                    workspace.open_path_link(line, char_col as u32, cwd, cx);
                 })
                 .ok();
             return;
@@ -367,9 +374,18 @@ impl TerminalPanel {
         modifiers: &Modifiers,
         cx: &mut Context<Self>,
     ) {
+        self.last_pointer = Some(position);
         if self.selecting {
+            if self.link_hover.take().is_some() {
+                cx.notify();
+            }
             self.pointer_select(position, false, cx);
             return;
+        }
+        let hovered = self.link_hover_at(position, modifiers);
+        if hovered != self.link_hover {
+            self.link_hover = hovered;
+            cx.notify();
         }
         let tracking = self.screen.mouse_tracking();
         let kind = if let Some(button) = self.pressed {
@@ -383,6 +399,22 @@ impl TerminalPanel {
             return;
         };
         self.send_mouse(position, kind, modifiers, true);
+    }
+
+    fn link_hover_at(
+        &self,
+        position: Point<Pixels>,
+        modifiers: &Modifiers,
+    ) -> Option<(usize, usize, usize)> {
+        let candidate = self.cell_at(position).and_then(|(col, row)| {
+            self.screen
+                .line_text_and_char_column(row, col)
+                .and_then(|(line, char_col)| {
+                    terminal_link_range(&line, char_col)
+                        .map(|(start, end)| (row, start, end))
+                })
+        });
+        terminal_link_hover(candidate, modifiers)
     }
 
     fn send_mouse(
@@ -442,6 +474,17 @@ impl TerminalPanel {
         cx.notify();
     }
 
+    fn select_word_at(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((col, row)) = self.cell_at(position) else { return };
+        let Some((line, char_col)) = self.screen.line_text_and_char_column(row, col) else { return };
+        let Some((start, end)) = word_bounds_at_column(&line, char_col) else { return };
+        if !self.screen.select_char_range(row, start..end) {
+            return;
+        }
+        self.selecting = true;
+        self.finish_select(window, cx);
+    }
+
     fn finish_select(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.selecting {
             return;
@@ -461,6 +504,8 @@ impl TerminalPanel {
         };
         if let Err(error) = clipboard::write_text(window, cx, &text) {
             tracing::warn!(%error, "terminal copy failed");
+        } else {
+            clipboard::notify_copied(window, cx);
         }
         cx.notify();
     }
@@ -659,6 +704,8 @@ impl Render for TerminalPanel {
             for text in std::mem::take(&mut self.pending_clipboard) {
                 if let Err(error) = clipboard::write_text(window, cx, &text) {
                     tracing::warn!(%error, "terminal clipboard copy failed");
+                } else {
+                    clipboard::notify_copied(window, cx);
                 }
             }
         }
@@ -676,6 +723,7 @@ impl Render for TerminalPanel {
         let track_outside = self.selecting || self.pressed.is_some();
         let select_entity = cx.entity().downgrade();
         let reporting = self.screen.mouse_tracking().active();
+        let link_hover = self.link_hover;
         let pane = div()
             .id(format!("terminal-pane-{}", self.pty_id))
             .key_context("Terminal")
@@ -688,6 +736,50 @@ impl Render for TerminalPanel {
             .font_family(cx.theme().mono_font_family.clone())
             .text_size(px(self.font_px))
             .track_focus(&self.focus)
+            .when(link_hover.is_some(), |pane| pane.cursor_pointer())
+            .on_mouse_exit(cx.listener(|this, _, _, cx| {
+                this.last_pointer = None;
+                if this.link_hover.take().is_some() {
+                    cx.notify();
+                }
+            }))
+            .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {
+                let hovered = this.last_pointer.and_then(|position| {
+                    this.link_hover_at(position, &event.modifiers)
+                });
+                if hovered != this.link_hover {
+                    this.link_hover = hovered;
+                    cx.notify();
+                }
+            }))
+            // Resolve modified clicks during capture: bubbling is too late for
+            // a terminal grid nested below the context-menu/hit-test subtree,
+            // where downstream mouse handling can consume the press before
+            // this pane receives it. That was why the old modifier check and
+            // daemon call were present in code but Ctrl/Cmd-click did nothing.
+            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                if event.button != MouseButton::Left {
+                    return;
+                }
+                if (event.modifiers.control || event.modifiers.platform)
+                    && !event.modifiers.shift
+                {
+                    this.host_pointer(
+                        TermMouseButton::Left,
+                        true,
+                        event.position,
+                        &event.modifiers,
+                        window,
+                        cx,
+                    );
+                } else if event.click_count >= 2 {
+                    // A double-click is a host selection gesture even when a
+                    // TUI enabled mouse reporting. The first ordinary press
+                    // still reaches the PTY; this press is copied locally.
+                    this.select_word_at(event.position, window, cx);
+                    cx.stop_propagation();
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -922,13 +1014,17 @@ impl Render for TerminalPanel {
                                 .ok();
                         });
                     })
-                    .children(rows.into_iter().map(|row| {
+                    .children(rows.into_iter().enumerate().map(|(row_index, row)| {
+                        let mut char_start = 0;
                         h_flex().h(px(cell_h)).items_center().children(
-                            row.spans
-                                .into_iter()
-                                .map(|span| {
-                                    term_span_el(span, cell_w, fg_default, accent, light_theme)
-                                }),
+                            row.spans.into_iter().map(|span| {
+                                let char_end = char_start + span.text.chars().count();
+                                let underline = link_hover.is_some_and(|(hover_row, start, end)| {
+                                    hover_row == row_index && start < char_end && char_start < end
+                                });
+                                char_start = char_end;
+                                term_span_el(span, cell_w, fg_default, accent, light_theme, underline)
+                            }),
                         )
                     }))
                     .when_some(cursor, |grid, (row, col, shape)| {
@@ -1020,6 +1116,54 @@ fn is_ui_zoom_in_chord(key: &str, key_char: Option<&str>, modifiers: &Modifiers)
         && (key == "=" || key == "+" || key_char == Some("+"))
 }
 
+fn terminal_link_hover(
+    candidate: Option<(usize, usize, usize)>,
+    modifiers: &Modifiers,
+) -> Option<(usize, usize, usize)> {
+    candidate.filter(|_| {
+        !modifiers.shift
+            && !modifiers.alt
+            && (modifiers.control || modifiers.platform)
+    })
+}
+
+fn terminal_link_range(line: &str, column: usize) -> Option<(usize, usize)> {
+    let (start, end) = word_bounds_at_column(line, column)?;
+    let token: String = line.chars().skip(start).take(end - start).collect();
+    let last_component = token
+        .rsplit(|ch| ch == '/' || ch == '\\')
+        .next()
+        .unwrap_or(&token);
+    let looks_like_path = token.contains('/')
+        || token.contains('\\')
+        || token.starts_with('~')
+        || (last_component.contains('.') && last_component.chars().any(char::is_alphabetic));
+    looks_like_path.then_some((start, end))
+}
+
+#[cfg(test)]
+mod terminal_link_hover_tests {
+    use super::{terminal_link_hover, terminal_link_range};
+    use gpui_kit::Modifiers;
+
+    #[test]
+    fn path_tokens_get_ctrl_hover_range_but_words_do_not() {
+        let line = "edit src/main.rs and README";
+        let path_col = line.find("main").unwrap();
+        assert_eq!(terminal_link_range(line, path_col), Some((5, 16)));
+        assert_eq!(terminal_link_range(line, line.find("README").unwrap()), None);
+        assert_eq!(
+            terminal_link_hover(Some((0, 5, 16)), &Modifiers::default()),
+            None
+        );
+        let ctrl = Modifiers {
+            control: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(terminal_link_hover(Some((0, 5, 16)), &ctrl), Some((0, 5, 16)));
+    }
+}
+
 #[cfg(test)]
 mod zoom_tests {
     use super::is_ui_zoom_in_chord;
@@ -1082,6 +1226,7 @@ fn term_span_el(
     fg_default: Hsla,
     accent: Hsla,
     light_theme: bool,
+    link_hover: bool,
 ) -> gpui::Div {
     let text = if span.text.is_empty() {
         " ".to_string()
@@ -1105,6 +1250,7 @@ fn term_span_el(
         // not shift later characters away from the PTY's cursor columns.
         .text_center()
         .whitespace_nowrap()
+        .when(link_hover, |el| el.underline())
         .when(bold, |el| el.font_semibold())
         .when(!span.selected, |el| match fg {
             Some(fg) => el.text_color(term_rgb(fg)),
@@ -1302,6 +1448,8 @@ impl EditorPanel {
             return;
         };
         let line = line.to_string();
+        // gpui-base's RopeExt::offset_to_position returns a Unicode scalar
+        // column, matching Fresh's detect_link_at (despite using LSP's type).
         let column = position.character;
         let cwd = if self.unsaved {
             None
@@ -1750,19 +1898,30 @@ impl Render for EditorPanel {
                     .min_h_0()
                     .flex()
                     .flex_col()
-                    .capture_any_mouse_down(move |event: &MouseDownEvent, _, cx| {
-                        if event.button != MouseButton::Left
-                            || event.modifiers.shift
+                    .capture_action::<gpui_kit::component::input::Copy>(
+                        cx.listener(|this, _, window, cx| {
+                            let has_selection =
+                                !this.editor.read(cx).selected_value().is_empty();
+                            if has_selection {
+                                clipboard::notify_copied(window, cx);
+                            }
+                        }),
+                    )
+                    // InputBaseState handles the click on its child element and
+                    // moves the caret during bubbling. A capture handler that
+                    // deferred a read still ran before that child handler in
+                    // GPUI's effect cycle, so it opened the path at the *old*
+                    // caret. Handle the same press on the wrapper's bubble
+                    // phase, after InputBaseState::on_mouse_down has resolved
+                    // the clicked position. Input's EditorMode::on_click only
+                    // consumes it for an already-hovered LSP definition.
+                    .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _, cx| {
+                        if event.modifiers.shift
                             || !(event.modifiers.control || event.modifiers.platform)
                         {
                             return;
                         }
-                        let panel = panel.clone();
-                        // The editor moves the cursor on this click. Read it
-                        // after that handler returns.
-                        cx.defer(move |cx| {
-                            panel.update(cx, |this, cx| this.open_link_at_cursor(cx));
-                        });
+                        panel.update(cx, |this, cx| this.open_link_at_cursor(cx));
                     })
                     .child(
                         Editor::new(&self.editor)

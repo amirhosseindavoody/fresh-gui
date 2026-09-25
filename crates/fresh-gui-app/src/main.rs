@@ -259,15 +259,24 @@ fn open_bootstrapped(target: &SshTarget, daemon: &DaemonSource) -> Result<()> {
         "Tunnel ready. Opening fresh-gui at {} ({})",
         session.ws_url, session.destination
     );
+    let ws_url = session.ws_url.clone();
+    let token = session.token.clone();
+    let destination = session.destination.clone();
+    let remote_control = ssh::RemoteControlHandle::new(
+        target.clone(),
+        daemon.clone(),
+        Toolchain::default(),
+        session,
+    );
     let gui_target = gui::ConnectTarget {
-        ws_url: session.ws_url.clone(),
-        token: session.token.clone(),
+        ws_url,
+        token,
         local_daemon: false,
-        label: Some(session.destination.clone()),
+        label: Some(destination),
         preferred_root: target.remote_root.clone(),
+        remote_control: Some(remote_control),
     };
     let result = gui::run_target(gui_target);
-    drop(session);
     eprintln!("Closed SSH tunnel.");
     result
 }

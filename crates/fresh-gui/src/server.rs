@@ -39,6 +39,24 @@ pub struct AppState {
     pub config_path: PathBuf,
 }
 
+fn hello_ui(cfg: &Config) -> HelloUi {
+    HelloUi {
+        theme: cfg.ui.theme.clone(),
+        palette: cfg.ui.palette.clone(),
+        terminal_font_size: cfg.ui.terminal_font_size,
+        editor_font_size: cfg.ui.editor_font_size,
+        font_weight: cfg.ui.font_weight,
+        mono_font_weight: cfg.ui.mono_font_weight,
+        font_family: cfg.ui.font_family.clone(),
+        mono_font_family: cfg.ui.mono_font_family.clone(),
+        webgl: cfg.ui.webgl,
+        show_dotfiles: cfg.ui.show_dotfiles,
+        show_git_dirs: cfg.ui.show_git_dirs,
+        editor_minimap: cfg.ui.editor_minimap,
+        editor_line_wrap: cfg.ui.editor_line_wrap,
+    }
+}
+
 pub async fn serve_listener(
     listener: tokio::net::TcpListener,
     state: Arc<AppState>,
@@ -106,24 +124,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     if state.editor.is_none() {
         caps.retain(|c| c != CAP_EDITOR && c != CAP_LSP && c != CAP_SCENE);
     }
-    let ui = {
-        let cfg = state.config.read().expect("config lock");
-        HelloUi {
-            theme: cfg.ui.theme.clone(),
-            palette: cfg.ui.palette.clone(),
-            terminal_font_size: cfg.ui.terminal_font_size,
-            editor_font_size: cfg.ui.editor_font_size,
-            font_weight: cfg.ui.font_weight,
-            mono_font_weight: cfg.ui.mono_font_weight,
-            font_family: cfg.ui.font_family.clone(),
-            mono_font_family: cfg.ui.mono_font_family.clone(),
-            webgl: cfg.ui.webgl,
-            show_dotfiles: cfg.ui.show_dotfiles,
-            show_git_dirs: cfg.ui.show_git_dirs,
-            editor_minimap: cfg.ui.editor_minimap,
-            editor_line_wrap: cfg.ui.editor_line_wrap,
-        }
-    };
+    let ui = hello_ui(&state.config.read().expect("config lock"));
     let mut hello = Hello::backend(format!("fresh-gui/{}", env!("CARGO_PKG_VERSION")), caps);
     hello.config_path = Some(state.config_path.display().to_string());
     hello.defaults_path = Some(defaults_path.display().to_string());
@@ -252,6 +253,31 @@ async fn handle_client_msg(
                     code: "send_failed".into(),
                     message: "failed to send Pong".into(),
                 })?;
+            Ok(())
+        }
+        Message::ConfigReload => {
+            require_auth(*authed)?;
+            let cfg = Config::load_from_path(&state.config_path).map_err(|err| Message::Error {
+                code: "config_reload_failed".into(),
+                message: format!("{err:#}"),
+            })?;
+            if let Some(editor) = state.editor.as_ref() {
+                editor.reconfigure(cfg.clone()).await.map_err(|err| Message::Error {
+                    code: "config_reload_failed".into(),
+                    message: format!("failed to apply editor config: {err:#}"),
+                })?;
+            }
+            let shortkeys = cfg.shortkeys.iter().map(|key| fresh_gui_protocol::Shortkey {
+                action: key.action.clone(),
+                shortkey: key.shortkey.clone(),
+                when: key.when.clone(),
+            }).collect();
+            let ui = hello_ui(&cfg);
+            *state.config.write().expect("config lock") = cfg;
+            send_msg(sink, &Message::ConfigUpdated { shortkeys, ui: Some(ui) }).await.map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send ConfigUpdated".into(),
+            })?;
             Ok(())
         }
         Message::SessionCreate { layout } => {
@@ -873,12 +899,13 @@ async fn handle_client_msg(
                         let shortkeys = cfg.shortkeys.iter().map(|key| fresh_gui_protocol::Shortkey {
                             action: key.action.clone(), shortkey: key.shortkey.clone(), when: key.when.clone(),
                         }).collect();
+                        let ui = hello_ui(&cfg);
                         if let Some(editor) = state.editor.as_ref()
                             && let Err(err) = editor.reconfigure(cfg.clone()).await {
                                 warn!(%err, "failed to apply language-server config to Fresh editor");
                             }
                         *state.config.write().expect("config lock") = cfg;
-                        send_msg(sink, &Message::ConfigUpdated { shortkeys }).await.map_err(|_| Message::Error {
+                        send_msg(sink, &Message::ConfigUpdated { shortkeys, ui: Some(ui) }).await.map_err(|_| Message::Error {
                             code: "send_failed".into(), message: "failed to send ConfigUpdated".into(),
                         })?;
                     }

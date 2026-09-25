@@ -11,6 +11,8 @@ pub struct ConnectTarget {
     /// Absolute project directory to focus or create after connect.
     /// Set when `fresh-gui /path` attaches to a daemon that is already running.
     pub preferred_root: Option<String>,
+    /// Keeps an SSH tunnel alive and allows the GUI to restart its remote daemon.
+    pub remote_control: Option<crate::ssh::RemoteControlHandle>,
 }
 
 /// Turn a CLI `--backend` plus optional `--token` into a WebSocket URL.
@@ -28,6 +30,7 @@ pub fn parse_connect_target(backend: &str, cli_token: Option<String>) -> Connect
         local_daemon: false,
         label: None,
         preferred_root: None,
+        remote_control: None,
     }
 }
 

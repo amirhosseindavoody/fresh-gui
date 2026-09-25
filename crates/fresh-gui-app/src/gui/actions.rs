@@ -11,11 +11,11 @@ thread_local! {
     static KIT_BINDINGS: RefCell<Vec<KeyBinding>> = const { RefCell::new(Vec::new()) };
 }
 
-/// File menu: stop the local daemon, or leave it running and close the window.
+/// Application menus for file and daemon operations.
 pub fn install_menus(cx: &mut App) {
-    let menus = vec![file_menu().owned()];
+    let menus = vec![file_menu().owned(), server_menu().owned()];
     GlobalState::global_mut(cx).set_app_menus(menus);
-    cx.set_menus(vec![file_menu()]);
+    cx.set_menus(vec![file_menu(), server_menu()]);
 }
 
 fn file_menu() -> Menu {
@@ -25,9 +25,16 @@ fn file_menu() -> Menu {
         MenuItem::separator(),
         MenuItem::action("Save", SaveBuffer),
         MenuItem::separator(),
-        MenuItem::action("Stop Server", StopServer),
-        MenuItem::separator(),
         MenuItem::action("Quit Client", QuitClient),
+    ])
+}
+
+fn server_menu() -> Menu {
+    Menu::new("Server").items([
+        MenuItem::action("Restart Server", RestartServer),
+        MenuItem::action("Reload Config", ReloadConfig),
+        MenuItem::separator(),
+        MenuItem::action("Stop Server", StopServer),
     ])
 }
 
@@ -73,6 +80,8 @@ actions!(
         ZoomOutUi,
         ResetUiZoom,
         StopServer,
+        RestartServer,
+        ReloadConfig,
         QuitClient,
     ]
 );
@@ -145,6 +154,8 @@ pub fn apply_shortkeys(cx: &mut App, shortkeys: &[Shortkey]) {
             "ZoomOutUi" => KeyBinding::new(key, ZoomOutUi, when),
             "ResetUiZoom" => KeyBinding::new(key, ResetUiZoom, when),
             "StopServer" => KeyBinding::new(key, StopServer, when),
+            "RestartServer" => KeyBinding::new(key, RestartServer, when),
+            "ReloadConfig" => KeyBinding::new(key, ReloadConfig, when),
             "QuitClient" => KeyBinding::new(key, QuitClient, when),
             unknown => {
                 tracing::warn!(action = unknown, "unknown shortkey action");

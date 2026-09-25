@@ -6,6 +6,7 @@
 //! replies a shell waits on (cursor position, device attributes, palette).
 
 use std::cell::{Cell as StdCell, RefCell};
+use std::ops::Range;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -28,6 +29,46 @@ const DEFAULT_BG: [u8; 3] = [0x1e, 0x1e, 0x1e];
 /// OSC 52 copy larger than this is dropped. A remote program must not be
 /// able to push an unbounded blob onto the host clipboard.
 const OSC52_MAX_BYTES: usize = 256 * 1024;
+
+/// Return the character range around a terminal column for a double-click.
+/// Path punctuation stays attached so `src/foo-bar.rs:12` selects as one unit.
+pub fn word_bounds_at_column(line: &str, column: usize) -> Option<(usize, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    let is_word = |ch: char| {
+        ch.is_alphanumeric() || matches!(ch, '_' | '/' | '.' | '-' | '~' | ':' | '\\')
+    };
+    if column >= chars.len() || !is_word(chars[column]) {
+        return None;
+    }
+    let mut start = column;
+    let mut end = column + 1;
+    while start > 0 && is_word(chars[start - 1]) {
+        start -= 1;
+    }
+    while end < chars.len() && is_word(chars[end]) {
+        end += 1;
+    }
+    Some((start, end))
+}
+
+#[cfg(test)]
+mod word_bounds_tests {
+    use super::word_bounds_at_column;
+
+    #[test]
+    fn double_click_keeps_path_punctuation_together() {
+        let line = "open ./src/my-file_2.rs:17 now";
+        let at = line.find("file").unwrap();
+        assert_eq!(word_bounds_at_column(line, at), Some((5, 26)));
+        assert_eq!(&line[5..26], "./src/my-file_2.rs:17");
+    }
+
+    #[test]
+    fn whitespace_and_punctuation_are_not_word_starts() {
+        assert_eq!(word_bounds_at_column("one, two", 3), None);
+        assert_eq!(word_bounds_at_column("one, two", 5), Some((5, 8)));
+    }
+}
 
 struct Shared {
     replies: RefCell<Vec<u8>>,
@@ -340,6 +381,40 @@ impl TermScreen {
         Some(text.trim_end().to_string())
     }
 
+    /// Return row text and translate a terminal grid cell to its Unicode
+    /// scalar column. A wide glyph occupies two cells but only one scalar;
+    /// combining marks can add scalars without occupying cells.
+    pub fn line_text_and_char_column(&self, row: usize, column: usize) -> Option<(String, usize)> {
+        let row = self.rows().into_iter().nth(row)?;
+        let char_column = char_column_for_cell(&row.spans, column);
+        let mut text = String::new();
+        for span in row.spans {
+            text.push_str(&span.text);
+        }
+        let text = text.trim_end().to_string();
+        Some((text, char_column.min(text.chars().count())))
+    }
+
+    /// Select a scalar range in a visible row, translating text positions to
+    /// the terminal's cell-based selection coordinates.
+    pub fn select_char_range(&mut self, row: usize, range: Range<usize>) -> bool {
+        if range.is_empty() {
+            return false;
+        }
+        let Some(row_data) = self.rows().into_iter().nth(row) else {
+            return false;
+        };
+        let Some(start_cell) = cell_for_char_column(&row_data.spans, range.start) else {
+            return false;
+        };
+        let Some(end_cell) = cell_for_char_column(&row_data.spans, range.end - 1) else {
+            return false;
+        };
+        self.begin_selection(start_cell, row);
+        self.update_selection(end_cell, row);
+        true
+    }
+
     #[cfg(test)]
     pub fn visible_lines(&self) -> Vec<String> {
         (0..self.rows)
@@ -365,6 +440,90 @@ impl TermScreen {
             return None;
         }
         Some((row as usize, col, content.cursor.shape))
+    }
+}
+
+/// Convert a cell column to a scalar offset in the visible row text.
+fn char_column_for_cell(spans: &[TermSpan], column: usize) -> usize {
+    let mut cells = 0;
+    let mut chars = 0;
+    for span in spans {
+        let span_chars = span.text.chars().count();
+        if column < cells.saturating_add(span.cells) {
+            // Blank runs contain one scalar per cell. A visible glyph span
+            // represents one glyph plus optional zero-width scalars, and any
+            // wide-character spacer cells still point at its first scalar.
+            return chars
+                + if span.text.chars().all(|ch| ch == ' ') {
+                    (column - cells).min(span_chars)
+                } else {
+                    0
+                };
+        }
+        cells += span.cells;
+        chars += span_chars;
+    }
+    chars
+}
+
+/// Map one text scalar to the cell that displays it. Zero-width trailing
+/// scalars stay attached to their glyph; blank runs map one cell per scalar.
+fn cell_for_char_column(spans: &[TermSpan], column: usize) -> Option<usize> {
+    let mut cells = 0;
+    let mut chars = 0;
+    for span in spans {
+        let span_chars = span.text.chars().count();
+        if column < chars + span_chars {
+            let local = column - chars;
+            if span.text.chars().all(|ch| ch == ' ') {
+                return Some(cells + local.min(span.cells.saturating_sub(1)));
+            }
+            return Some(cells);
+        }
+        chars += span_chars;
+        cells += span.cells;
+    }
+    None
+}
+
+#[cfg(test)]
+mod cell_column_tests {
+    use super::{TermSpan, cell_for_char_column, char_column_for_cell};
+
+    fn span(text: &str, cells: usize) -> TermSpan {
+        TermSpan {
+            text: text.into(),
+            cells,
+            fg: None,
+            bg: None,
+            bold: false,
+            selected: false,
+        }
+    }
+
+    #[test]
+    fn wide_glyph_spacer_maps_to_glyph_scalar() {
+        let spans = [span("a", 1), span("界", 2), span("b", 1)];
+        assert_eq!(char_column_for_cell(&spans, 0), 0);
+        assert_eq!(char_column_for_cell(&spans, 1), 1);
+        assert_eq!(char_column_for_cell(&spans, 2), 1);
+        assert_eq!(char_column_for_cell(&spans, 3), 2);
+    }
+
+    #[test]
+    fn combining_scalars_do_not_shift_later_cells() {
+        let spans = [span("e\u{301}", 1), span("x", 1)];
+        assert_eq!(char_column_for_cell(&spans, 0), 0);
+        assert_eq!(char_column_for_cell(&spans, 1), 2);
+    }
+
+    #[test]
+    fn scalar_ranges_map_back_to_cells() {
+        let spans = [span("界\u{301}", 2), span("x", 1)];
+        assert_eq!(cell_for_char_column(&spans, 0), Some(0));
+        assert_eq!(cell_for_char_column(&spans, 1), Some(0));
+        assert_eq!(cell_for_char_column(&spans, 2), Some(2));
+        assert_eq!(cell_for_char_column(&spans, 3), None);
     }
 }
 

@@ -249,8 +249,14 @@ pub struct GitFile {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Message {
     Hello(Hello),
-    /// Backend → client after a successful settings save.
-    ConfigUpdated { shortkeys: Vec<Shortkey> },
+    /// Backend → client after a successful settings save or explicit reload.
+    ConfigUpdated {
+        shortkeys: Vec<Shortkey>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ui: Option<HelloUi>,
+    },
+    /// Client → backend: reload the configured settings file from disk.
+    ConfigReload,
     /// Client → backend. Required before PTY/FS ops when the backend demands a token.
     Auth {
         token: String,
@@ -871,6 +877,13 @@ impl Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_reload_and_legacy_config_updated_roundtrip() {
+        assert_eq!(Message::from_json(&Message::ConfigReload.to_json().unwrap()).unwrap(), Message::ConfigReload);
+        let old = r#"{"type":"config_updated","shortkeys":[]}"#;
+        assert_eq!(Message::from_json(old).unwrap(), Message::ConfigUpdated { shortkeys: Vec::new(), ui: None });
+    }
 
     #[test]
     fn hello_includes_editor_and_scene() {

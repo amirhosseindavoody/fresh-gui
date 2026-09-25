@@ -1,9 +1,18 @@
 //! Text copied from remote paths belongs on the client's system clipboard.
 
 use gpui_kit::{App, Window};
+use gpui_kit::component::WindowExt;
 
 #[cfg(not(windows))]
 use gpui_kit::ClipboardItem;
+
+/// Show the standard short-lived toast after a successful copy operation.
+///
+/// The app root already renders gpui-component's notification layer, so the
+/// normal `WindowExt` notification path is available throughout the workspace.
+pub fn notify_copied(window: &mut Window, cx: &mut App) {
+    window.push_notification("Copied to clipboard", cx);
+}
 
 #[cfg(not(windows))]
 pub fn write_text(_: &Window, cx: &mut App, text: &str) -> Result<(), String> {
