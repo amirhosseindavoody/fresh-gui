@@ -130,6 +130,13 @@ impl SettingsEditor {
         self.selected = None;
         self.load(cx);
     }
+    pub fn deactivate(&mut self, cx: &mut Context<Self>) {
+        self.capture = false;
+        self.pending = None;
+        self.selected = None;
+        cx.notify();
+    }
+
     fn id(&mut self) -> String {
         self.request += 1;
         format!("settings-{}", self.request)
@@ -887,5 +894,13 @@ mod tests {
             assert!(!host.editor.read(cx).capture);
             assert_eq!(host.editor.read(cx).value.read(cx).value(), "ctrl-s");
         });
+        host.update_in(cx, |host, _, cx| {
+            host.editor.update(cx, |editor, cx| {
+                editor.capture = true;
+                editor.deactivate(cx);
+            });
+        });
+        cx.simulate_keystrokes("ctrl-s");
+        host.read_with(cx, |host, _| assert_eq!(host.save_actions, 1));
     }
 }

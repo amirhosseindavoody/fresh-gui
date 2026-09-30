@@ -1256,7 +1256,7 @@ impl Workspace {
                 SettingsEvent::OpenJson(path) => {
                     if !path.is_empty() {
                         this.open_path(path.clone(), false);
-                        this.settings_open = false;
+                        this.close_settings(cx);
                     }
                 }
                 SettingsEvent::LocalApplied => {
@@ -1267,7 +1267,7 @@ impl Workspace {
                     }
                     if this.target.local_daemon { this.ade.send(AdeCmd::ReloadConfig); }
                 }
-                SettingsEvent::Close => this.settings_open = false,
+                SettingsEvent::Close => this.close_settings(cx),
             }
             cx.notify();
         });
@@ -1647,7 +1647,7 @@ impl Workspace {
                 self.restore_workspace(*attached, window, cx);
             }
             AdeEvent::Disconnected { reason } => {
-                self.settings_open = false;
+                self.close_settings(cx);
                 for panel in self.editors.values() {
                     panel.update(cx, |panel, _| panel.detach_transport());
                 }
@@ -2903,7 +2903,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     }
 
     fn switch_to_ready(&mut self, id: String, cx: &mut Context<Self>) {
-        self.settings_open = false;
+        self.close_settings(cx);
         self.pending_save_close = None;
         let from = if self.restoring {
             None
@@ -2943,7 +2943,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.settings_open = false;
+        self.close_settings(cx);
         let AttachedWorkspace {
             info,
             tabs,
@@ -3669,6 +3669,11 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
 
     fn open_path(&mut self, path: String, preview: bool) {
         self.open_editor(path, preview, true);
+    }
+
+    fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        self.settings.update(cx, |settings, cx| settings.deactivate(cx));
     }
 
     fn open_settings(&mut self, cx: &mut Context<Self>) {
