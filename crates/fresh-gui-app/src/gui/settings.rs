@@ -188,6 +188,8 @@ impl SettingsEditor {
             return;
         }
         self.pending = None;
+        self.selected = None;
+        self.capture = false;
         self.path = path;
         self.text = text;
         self.defaults = defaults;
@@ -327,6 +329,7 @@ impl SettingsEditor {
                     match client_config::patch_document(&self.text, &path, value.as_ref()) {
                         Ok(text) => {
                             self.text = text;
+                            self.selected = None;
                             self.status = "Applied live to this client".into();
                             cx.emit(SettingsEvent::LocalApplied);
                         }
@@ -822,6 +825,7 @@ mod tests {
         let (editor, cx) = cx.add_window_view(SettingsEditor::new);
         editor.update_in(cx, |editor, _, cx| {
             editor.pending = Some("settings-2".into());
+            editor.selected = Some(vec!["shortkeys".into(), "0".into(), "shortkey".into()]);
             editor.snapshot(
                 "settings-1",
                 "/old/config.json".into(),
@@ -842,6 +846,10 @@ mod tests {
             );
             assert!(editor.ready);
             assert!(editor.pending.is_none());
+            assert!(
+                editor.selected.is_none(),
+                "A save/removal must not retain an index pointing to the next binding"
+            );
         });
     }
 
