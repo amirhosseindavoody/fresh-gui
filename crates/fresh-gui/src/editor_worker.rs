@@ -1071,9 +1071,21 @@ fn open_buffer(
             .with_context(|| format!("open_file {}", path.display()))?
     };
 
+    let id = buffer_id.0.to_string();
+    let previous = tracked
+        .get(&id)
+        .filter(|entry| {
+            entry.workspace_id == workspace_id && entry.path.as_deref().is_some_and(same_path)
+        })
+        .cloned();
     let language = Some(editor.active_state().language.clone());
     let total_bytes = editor.active_state().buffer.total_bytes();
-    let paged = total_bytes > MAX_SNAPSHOT_BYTES;
+    // Once a buffer enters Fresh's lazy piece-tree mode it stays paged for its
+    // lifetime, even if edits later shrink it below the initial threshold.
+    let paged = total_bytes > MAX_SNAPSHOT_BYTES
+        || previous
+            .as_ref()
+            .is_some_and(|entry| entry.total_bytes.is_some());
     let text = if paged {
         String::new()
     } else {
@@ -1092,13 +1104,6 @@ fn open_buffer(
         );
     }
 
-    let id = buffer_id.0.to_string();
-    let previous = tracked
-        .get(&id)
-        .filter(|entry| {
-            entry.workspace_id == workspace_id && entry.path.as_deref().is_some_and(same_path)
-        })
-        .cloned();
     let rev = previous.as_ref().map(|t| t.rev).unwrap_or(0);
     let base_text = previous
         .as_ref()
@@ -2055,7 +2060,10 @@ fn sync_fresh_text(
         .get(&BufferId(id))
         .context("Fresh buffer unavailable")?;
     let total_bytes = state.buffer.total_bytes();
-    if total_bytes > MAX_SNAPSHOT_BYTES {
+    let was_paged = tracked
+        .get(buffer_id)
+        .is_some_and(|entry| entry.total_bytes.is_some());
+    if total_bytes > MAX_SNAPSHOT_BYTES || was_paged {
         let entry = tracked
             .get_mut(buffer_id)
             .with_context(|| format!("unknown buffer_id {buffer_id}"))?;
@@ -2662,14 +2670,18 @@ fn save_buffer(
         bail!("unsaved buffer needs a path");
     }
     let total_bytes = editor.active_state().buffer.total_bytes();
-    let text = if total_bytes > MAX_SNAPSHOT_BYTES {
+    let was_paged = tracked
+        .get(buffer_id)
+        .is_some_and(|entry| entry.total_bytes.is_some());
+    let paged = total_bytes > MAX_SNAPSHOT_BYTES || was_paged;
+    let text = if paged {
         String::new()
     } else {
         editor.active_state().buffer.to_string().unwrap_or_default()
     };
     let entry = tracked.get_mut(buffer_id).expect("tracked");
     entry.text = text;
-    entry.total_bytes = (total_bytes > MAX_SNAPSHOT_BYTES).then_some(total_bytes);
+    entry.total_bytes = paged.then_some(total_bytes);
     entry.base_text = (entry.total_bytes.is_none()).then(|| entry.text.clone());
     entry.disk = Some(disk_generation(
         entry.path.as_deref().context("saved buffer path")?,
@@ -3000,6 +3012,92 @@ mod paged_file_tests {
                 .await
                 .unwrap();
             assert_eq!(following.text, "x");
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shrinking_a_lazy_buffer_does_not_switch_back_to_snapshot_edits() {
+        let root =
+            std::env::temp_dir().join(format!("fresh-paged-sticky-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("large.txt");
+        let recovery = root.join("recovery");
+        let original_len = MAX_SNAPSHOT_BYTES + 32 * 1024;
+        std::fs::write(&path, vec![b'x'; original_len]).unwrap();
+        let editor = EditorHandle::spawn_with_recovery_dir(
+            root.clone(),
+            crate::config::Config::default(),
+            recovery,
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let opened = editor.open(path.clone(), false).await.unwrap();
+            assert_eq!(opened.total_bytes, Some(original_len));
+            let tail = editor
+                .read_page(opened.buffer_id.clone(), MAX_SNAPSHOT_BYTES, 32 * 1024)
+                .await
+                .unwrap();
+            let deleted = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "sticky-page".into(),
+                    opened.rev,
+                    vec![RangeEdit {
+                        start: MAX_SNAPSHOT_BYTES,
+                        end: original_len,
+                        text: String::new(),
+                    }],
+                    Some(ByteRange {
+                        start: tail.start,
+                        len: tail.text.len(),
+                    }),
+                    ByteSelection {
+                        anchor: MAX_SNAPSHOT_BYTES,
+                        head: MAX_SNAPSHOT_BYTES,
+                    },
+                )
+                .await
+                .unwrap();
+            editor
+                .save(opened.buffer_id.clone(), deleted.rev, None)
+                .await
+                .unwrap();
+            let page = editor
+                .read_page(opened.buffer_id.clone(), 0, 16)
+                .await
+                .unwrap();
+            assert_eq!(page.total_bytes, MAX_SNAPSHOT_BYTES);
+            let edited = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "sticky-page".into(),
+                    page.rev,
+                    vec![RangeEdit {
+                        start: page.start,
+                        end: page.start + 1,
+                        text: "y".into(),
+                    }],
+                    Some(ByteRange {
+                        start: page.start,
+                        len: page.text.len(),
+                    }),
+                    ByteSelection {
+                        anchor: page.start + 1,
+                        head: page.start + 1,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(edited.page.unwrap().text, "yxxxxxxxxxxxxxxx");
+            assert_eq!(
+                editor.read_page(opened.buffer_id, 0, 1).await.unwrap().text,
+                "y"
+            );
         });
         let _ = std::fs::remove_dir_all(root);
     }
