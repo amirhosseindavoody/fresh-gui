@@ -118,7 +118,9 @@ pixi install
 pixi run gui
 ```
 
-`pixi run gui` builds the daemon and opens the native window. See the [daemon README](crates/fresh-gui/README.md) for server flags, [architecture](docs/DESIGN.md) for how the pieces fit, and [security notes](docs/SECURITY.md) for remote access.
+`pixi run gui` builds the daemon and opens the native window. Checks run through the same environment: `pixi run check`, `pixi run test`, and `pixi run clippy`. To compile-check Windows-only code from Linux, install a MinGW C compiler (for example `gcc-mingw-w64-x86-64`) and run `pixi run -e windows-check check-windows`.
+
+See the [daemon README](crates/fresh-gui/README.md) for server flags, [architecture](docs/DESIGN.md) for how the pieces fit, and [security notes](docs/SECURITY.md) for remote access.
 
 ## License
 

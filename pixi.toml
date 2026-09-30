@@ -54,3 +54,23 @@ update-version = "scripts/update-version.sh"
 
 [dependencies]
 rust = ">=1.97.1,<1.98"
+pkg-config = "*"
+libxcb = "*"
+libxkbcommon = "*"
+fontconfig = "*"
+expat = "*"
+freetype = "*"
+wayland = "*"
+
+# Cross-target std for compile-checking `#[cfg(windows)]` code from Linux
+# (`pixi run check-windows`). Build scripts that compile C for the Windows
+# target need a host MinGW compiler (`x86_64-w64-mingw32-gcc`, e.g. Debian/
+# Ubuntu `gcc-mingw-w64-x86-64`), which conda-forge does not ship for linux-64.
+[feature.windows-check.dependencies]
+rust-std-x86_64-pc-windows-gnu = "==1.97.1"
+
+[feature.windows-check.tasks]
+check-windows = "cargo check --locked -p fresh-gui-app -p fresh-gui --target x86_64-pc-windows-gnu"
+
+[environments]
+windows-check = ["windows-check"]
