@@ -3280,6 +3280,13 @@ impl Render for EditorPanel {
                             _ => { this.lsp_status = Some(format!("Enter a byte offset from 0 to {total}")); cx.notify(); }
                         }
                     })))
+                .when(self.sync_paused && !self.conflict, |bar| bar.child(
+                    Button::new("page-retry").ghost().xsmall().label("Retry sync").disabled(busy)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.sync_paused = false;
+                            this.flush_pending(cx);
+                            cx.notify();
+                        }))))
                 .when(busy, |bar| bar.child(div().text_xs().child("Loading…"))));
         }
         if markdown {

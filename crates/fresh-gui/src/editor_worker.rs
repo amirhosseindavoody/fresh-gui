@@ -139,14 +139,10 @@ pub(crate) fn disk_generation(path: &Path) -> Result<DiskGeneration> {
         if bytes.len() > MAX_SNAPSHOT_BYTES {
             bail!("external file exceeds snapshot limit: {}", path.display());
         }
-        Some(
-            String::from_utf8(bytes.clone())
-                .with_context(|| format!("external file is not UTF-8 text: {}", path.display()))?,
-        )
-        .map(|text| {
-            Some(bytes).hash(&mut hasher);
-            text
-        })
+        let text = String::from_utf8(bytes.clone())
+            .with_context(|| format!("external file is not UTF-8 text: {}", path.display()))?;
+        Some(bytes).hash(&mut hasher);
+        Some(text)
     } else {
         None
     };
@@ -770,10 +766,8 @@ fn run_loop(
                         selection,
                     )
                     .and_then(|result| {
-                        if result.accepted {
-                            if result.dirty {
-                                checkpoint(&drafts, &tracked, &buffer_id)?;
-                            }
+                        if result.accepted && result.dirty {
+                            checkpoint(&drafts, &tracked, &buffer_id)?;
                         }
                         Ok(result)
                     });
@@ -1601,6 +1595,7 @@ fn set_selection(editor: &mut Editor, selection: ByteSelection) {
     cursor.anchor = (selection.anchor != selection.head).then_some(selection.anchor);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn range_edit_buffer(
     editor: &mut Editor,
     tracked: &mut HashMap<String, TrackedBuffer>,
@@ -1751,6 +1746,7 @@ fn range_edit_buffer(
     transaction_result(tracked, editor, buffer_id, true)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paged_range_edit(
     editor: &mut Editor,
     tracked: &mut HashMap<String, TrackedBuffer>,

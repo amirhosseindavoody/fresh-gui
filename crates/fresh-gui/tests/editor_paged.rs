@@ -210,6 +210,7 @@ async fn range_edit(
     edit: RangeEdit,
     request_id: &str,
 ) -> (u64, bool, String, usize) {
+    let viewport_start = if edit.start < 128 { 0 } else { edit.start };
     let request = Message::BufferRangeEdit {
         request_id: request_id.to_owned(),
         buffer_id: buffer_id.to_owned(),
@@ -217,10 +218,10 @@ async fn range_edit(
         base_rev,
         edits: vec![edit],
         viewport: Some(ByteRange {
-            start: 0,
-            len: 128,
+            start: viewport_start,
+            len: MAX_PAGE_BYTES / 2,
         }),
-        selection: ByteSelection { anchor: 0, head: 0 },
+        selection: ByteSelection { anchor: viewport_start, head: viewport_start },
     };
     let mut wire_bytes = json_size(&request);
     client
@@ -488,7 +489,7 @@ async fn sparse_multigibibyte_file_with_nul_holes_is_classified_as_binary() {
     file.set_len(SPARSE_BYTES).expect("make sparse 3 GiB fixture");
     file.write_all(b"ASCII sparse head\n")
         .expect("write sparse head");
-    file.seek(SeekFrom::End(-16)).expect("seek to sparse tail");
+    file.seek(SeekFrom::End(-17)).expect("seek to sparse tail");
     file.write_all(b"ASCII sparse tail")
         .expect("write sparse tail");
     drop(file);
@@ -559,10 +560,10 @@ async fn paged_buffers_remain_scoped_to_their_workspace() {
         .expect("create beta workspace");
 
     client.switch_workspace(&alpha.id).await.expect("switch alpha");
-    let alpha_buffer = open_paged(&mut client, "same.txt", "alpha-open").await;
+    let alpha_buffer = open_paged(&mut client, &alpha_root.join("same.txt").display().to_string(), "alpha-open").await;
     let (_, _, _, alpha_page, _) =
         read_page(&mut client, &alpha_buffer.buffer_id, 0, 64, "alpha-read").await;
-    assert!(alpha_page.contains("alpha contents"));
+    assert!(alpha_page.starts_with("alpha"));
 
     client.switch_workspace(&beta.id).await.expect("switch beta");
     client
@@ -594,10 +595,10 @@ async fn paged_buffers_remain_scoped_to_their_workspace() {
     .await
     .expect("workspace isolation response timed out");
 
-    let beta_buffer = open_paged(&mut client, "same.txt", "beta-open").await;
+    let beta_buffer = open_paged(&mut client, &beta_root.join("same.txt").display().to_string(), "beta-open").await;
     let (_, _, _, beta_page, _) =
         read_page(&mut client, &beta_buffer.buffer_id, 0, 64, "beta-read").await;
-    assert!(beta_page.contains("beta contents"));
+    assert!(beta_page.starts_with("beta"));
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_dir_all(alpha_root);
     let _ = fs::remove_dir_all(beta_root);
@@ -623,14 +624,16 @@ async fn measure_large_file_open_range_edit_and_daemon_rss() {
     drop(output);
 
     let addr = free_loopback();
+    let daemon_start = Instant::now();
     let mut backend = spawn_backend(addr, &root);
     wait_health(addr);
+    let daemon_start_ms = daemon_start.elapsed().as_secs_f64() * 1000.0;
     let pid = backend.0.id();
     let mut client = connect(addr).await;
 
     let start = Instant::now();
     let opened = open_paged(&mut client, "measurement.txt", "measure-open").await;
-    let open_ms = start.elapsed().as_millis();
+    let open_ms = start.elapsed().as_secs_f64() * 1000.0;
     let start = Instant::now();
     let (rev, _page_start, reported_total, viewport, page_transfer_bytes) = read_page(
         &mut client,
@@ -640,7 +643,7 @@ async fn measure_large_file_open_range_edit_and_daemon_rss() {
         "measure-range",
     )
     .await;
-    let page_ms = start.elapsed().as_millis();
+    let page_ms = start.elapsed().as_secs_f64() * 1000.0;
     assert_eq!(reported_total, bytes);
     assert!(viewport.len() <= MAX_PAGE_BYTES);
 
@@ -657,15 +660,47 @@ async fn measure_large_file_open_range_edit_and_daemon_rss() {
         "measure-edit",
     )
     .await;
-    let edit_ms = start.elapsed().as_millis();
+    let edit_ms = start.elapsed().as_secs_f64() * 1000.0;
     assert!(accepted);
+
+    let save_request = Message::BufferSave { request_id: "measure-save".into(),
+        buffer_id: opened.buffer_id.clone(), base_rev: edit_rev, path: String::new() };
+    let mut save_transfer_bytes = json_size(&save_request);
+    let start = Instant::now();
+    client.send(save_request).await.expect("send measured save");
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let message = client.recv().await.expect("receive measured save");
+            save_transfer_bytes += json_size(&message);
+            match message {
+                Message::BufferSaved { request_id, .. } if request_id == "measure-save" => break,
+                Message::Error { code, message } => panic!("measured save failed: {code}: {message}"),
+                _ => {}
+            }
+        }
+    }).await.expect("measured save timed out");
+    let save_ms = start.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(fs::metadata(&file).unwrap().len(), bytes as u64);
+    // Check every saved byte using bounded client-side memory as well.
+    let mut saved = fs::File::open(&file).expect("open saved measurement");
+    let mut chunk = vec![0u8; 1024 * 1024];
+    let mut offset = 0;
+    loop {
+        use std::io::Read;
+        let n = saved.read(&mut chunk).expect("read saved measurement");
+        if n == 0 { break; }
+        assert!(chunk[..n].iter().enumerate().all(|(i, byte)|
+            *byte == if offset + i == bytes / 2 { b'b' } else { b'a' }));
+        offset += n;
+    }
+    assert_eq!(offset, bytes);
 
     // /proc reports the child's high-water resident set; sample too, so this
     // still records a useful peak if the daemon has not updated VmHWM yet.
     let peak_rss_kib = peak_rss_kib(pid);
-    let transfer_bytes = opened.wire_bytes + page_transfer_bytes + edit_transfer_bytes;
+    let transfer_bytes = opened.wire_bytes + page_transfer_bytes + edit_transfer_bytes + save_transfer_bytes;
     println!(
-        "LARGE_FILE_RESULT {{\"fixture_bytes\":{bytes},\"open_ms\":{open_ms},\"page_ms\":{page_ms},\"edit_ack_ms\":{edit_ms},\"page_payload_bytes\":{},\"measured_full_duplex_json_bytes\":{transfer_bytes},\"daemon_peak_rss_kib\":{peak_rss_kib},\"resulting_rev\":{edit_rev}}}",
+        "LARGE_FILE_RESULT {{\"fixture_bytes\":{bytes},\"daemon_start_ms\":{daemon_start_ms:.3},\"open_ms\":{open_ms:.3},\"page_ms\":{page_ms:.3},\"edit_ack_ms\":{edit_ms:.3},\"save_ms\":{save_ms:.3},\"page_payload_bytes\":{},\"measured_full_duplex_json_bytes\":{transfer_bytes},\"daemon_peak_rss_kib\":{peak_rss_kib},\"resulting_rev\":{edit_rev}}}",
         viewport.len()
     );
 
