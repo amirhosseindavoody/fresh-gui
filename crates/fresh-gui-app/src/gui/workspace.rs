@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fresh_gui_protocol::{
-    CAP_GIT, CAP_WORKSPACE, CAP_WORKSPACE_SET_ROOT, FsEntry, FsKind, GitFile, Hello, PtyInfo,
+    CAP_GIT, CAP_EDITOR_RANGE_EDITS, CAP_WORKSPACE, CAP_WORKSPACE_SET_ROOT, FsEntry, FsKind, GitFile, Hello, PtyInfo,
     LayoutNode, WorkspaceInfo, WorkspaceLayoutExtra, WorkspaceTab, WorkspaceTabKind,
 };
 use gpui_kit::base::Placement;
@@ -840,6 +840,9 @@ pub struct Workspace {
     tab_metrics: TabStripMetrics,
     terminals: HashMap<String, Entity<TerminalPanel>>,
     editors: HashMap<String, Entity<EditorPanel>>,
+    /// Live views retained only across a transport reconnect, scoped to their
+    /// workspace. This is not persistent draft recovery.
+    reconnect_views: Option<(Option<String>, HashMap<String, Entity<EditorPanel>>)>,
     diffs: HashMap<String, Entity<DiffPanel>>,
     binaries: HashMap<String, Entity<BinaryPanel>>,
     /// Unpinned diff tab. The next preview replaces it.
@@ -1001,9 +1004,15 @@ impl Workspace {
                 this.confirm_file_rename(cx);
             }
         });
-        let save_path_sub = cx.subscribe(&save_path_input, |this, _, ev: &InputEvent, cx| {
+        let save_window = window.window_handle();
+        let save_path_sub = cx.subscribe(&save_path_input, move |this, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::PressEnter { .. }) && this.save_open {
-                this.confirm_save(cx);
+                let workspace = cx.entity();
+                cx.defer(move |cx| {
+                    let _ = save_window.update(cx, |_, window, cx| {
+                        workspace.update(cx, |this, cx| this.confirm_save(window, cx));
+                    });
+                });
             }
         });
         let ws_rename_sub = cx.subscribe(&ws_rename_input, |this, _, ev: &InputEvent, cx| {
@@ -1143,6 +1152,7 @@ impl Workspace {
             tab_metrics: TabStripMetrics::default(),
             terminals: HashMap::new(),
             editors: HashMap::new(),
+            reconnect_views: None,
             diffs: HashMap::new(),
             binaries: HashMap::new(),
             diff_preview: None,
@@ -1339,6 +1349,9 @@ impl Workspace {
                 self.restore_workspace(*attached, window, cx);
             }
             AdeEvent::Disconnected { reason } => {
+                for panel in self.editors.values() {
+                    panel.update(cx, |panel, _| panel.detach_transport());
+                }
                 self.connection = ConnectionState::Offline {
                     reason: reason.clone(),
                 };
@@ -1480,24 +1493,31 @@ impl Workspace {
                     self.apply_snapshot(buffer_id, rev, text, path, window, cx)
                 }
             }
-            AdeEvent::BufferChanged { buffer_id, rev, .. } => {
+            AdeEvent::BufferChanged { request_id, buffer_id, rev } => {
                 if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
-                    panel.update(cx, |panel, cx| panel.set_rev(rev, cx));
+                    panel.update(cx, |panel, cx| panel.acknowledge_legacy(&request_id, rev, cx));
                 } else if let Some(panel) = self.diffs.values().find(|panel| panel.read(cx).buffer_id() == Some(buffer_id.as_str())).cloned() {
                     panel.update(cx, |panel, _| panel.set_rev(rev));
                 }
             }
+            AdeEvent::BufferEditResult { request_id, buffer_id, view_id, rev, text, selection, accepted, dirty } => {
+                if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
+                    panel.update(cx, |panel, cx| {
+                        panel.apply_edit_result(&request_id, &view_id, rev, text, selection, accepted, dirty, window, cx);
+                    });
+                }
+            }
             AdeEvent::BufferSaved {
+                request_id,
                 buffer_id,
                 path,
                 rev,
-                ..
             } => {
                 if let Some(panel) = self.diffs.values().find(|panel| panel.read(cx).buffer_id() == Some(buffer_id.as_str())).cloned() {
                     panel.update(cx, |panel, cx| panel.mark_saved(rev, cx));
                     self.status = "Saved".into();
                     cx.notify();
-                } else { self.on_buffer_saved(&buffer_id, path, rev, cx); }
+                } else { self.on_buffer_saved(&request_id, &buffer_id, path, rev, cx); }
             }
             AdeEvent::BufferLspState { buffer_id, rev, text, diagnostics, status } => {
                 if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
@@ -1506,10 +1526,10 @@ impl Workspace {
                     });
                 }
             }
-            AdeEvent::BufferFormatted { buffer_id, rev, text, status } => {
+            AdeEvent::BufferFormatted { request_id, buffer_id, rev, text, status } => {
                 if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
                     panel.update(cx, |panel, cx| {
-                        panel.apply_formatted(rev, text, status, window, cx);
+                        panel.apply_formatted(&request_id, rev, text, status, window, cx);
                     });
                 }
             }
@@ -1520,13 +1540,14 @@ impl Workspace {
                 {
                     self.pending_lists.remove(request_id);
                 }
-                if code == "buffer_format_failed"
+                if code.starts_with("buffer_")
                     && let Some((request_id, detail)) = split_request_message(&message)
-                    && let Some(buffer_id) = request_id.strip_prefix("fmt-")
-                        .and_then(|value| value.rsplit_once('-').map(|(id, _)| id))
-                    && let Some(panel) = self.editor_by_buffer(buffer_id, cx)
                 {
-                    panel.update(cx, |panel, cx| panel.set_format_error(detail.to_string(), cx));
+                    for panel in self.editors.values() {
+                        panel.update(cx, |panel, cx| {
+                            panel.handle_request_error(request_id, detail, cx);
+                        });
+                    }
                 }
                 if code == "fs_create_failed" {
                     self.pending_creates.clear();
@@ -1641,6 +1662,10 @@ impl Workspace {
             super::actions::apply_shortkeys(cx, &hello.shortkeys);
         }
         self.capabilities = hello.capabilities.clone();
+        let range_edits = self.capabilities.iter().any(|cap| cap == CAP_EDITOR_RANGE_EDITS);
+        for panel in self.editors.values() {
+            panel.update(cx, |panel, cx| panel.configure_range_edits(range_edits, cx));
+        }
         self.config_path = hello.config_path.clone();
         self.defaults_path = hello.defaults_path.clone();
         self.git_cap = hello.capabilities.iter().any(|cap| cap == CAP_GIT);
@@ -1779,6 +1804,7 @@ impl Workspace {
         if let Some(panel) = self.editors.get(&path).cloned() {
             panel.update(cx, |panel, cx| {
                 panel.note_reopen(buffer_id, line, column, cx);
+                panel.reconnect(self.ade.clone(), self.capabilities.iter().any(|cap| cap == CAP_EDITOR_RANGE_EDITS), cx);
             });
             if activate {
                 self.select_entity(&panel, window, cx);
@@ -1810,7 +1836,10 @@ impl Workspace {
                 cx,
             )
         });
-        panel.update(cx, |panel, cx| panel.set_word_wrap(self.editor_line_wrap, window, cx));
+        panel.update(cx, |panel, cx| {
+            panel.configure_range_edits(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_RANGE_EDITS), cx);
+            panel.set_word_wrap(self.editor_line_wrap, window, cx);
+        });
         let panel_id = PanelId::from(panel.entity_id());
         self.dock.update(cx, |dock, cx| {
             dock.add_panel_view(
@@ -1855,11 +1884,11 @@ impl Workspace {
         }
     }
 
-    fn on_buffer_saved(&mut self, buffer_id: &str, path: String, rev: u64, cx: &mut Context<Self>) {
+    fn on_buffer_saved(&mut self, request_id: &str, buffer_id: &str, path: String, rev: u64, cx: &mut Context<Self>) {
         let Some(panel) = self.editor_by_buffer(buffer_id, cx) else {
             return;
         };
-        let previous = panel.update(cx, |panel, cx| panel.mark_saved(path.clone(), rev, cx));
+        let previous = panel.update(cx, |panel, cx| panel.finish_save(request_id, path.clone(), rev, cx));
         if let Some(previous) = previous
             && let Some(entity) = self.editors.remove(&previous)
         {
@@ -2551,6 +2580,24 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             });
         }
 
+        if self.reconnect_views.as_ref().is_some_and(|(id, _)| id.as_deref() == Some(workspace_id.as_str())) {
+            let (_, views) = self.reconnect_views.take().expect("matched reconnect workspace");
+            for (path, panel) in views {
+                let unsaved = panel.read(cx).is_unsaved();
+                // Saved paths reopen below to bind to the current daemon's
+                // buffer identity before resync. Untitled views stay paused.
+                if unsaved {
+                    panel.update(cx, |panel, cx| panel.keep_detached_draft(cx));
+                }
+                if !unsaved && !editor_jobs.iter().any(|(job, _)| job == &path) {
+                    editor_jobs.push((path.clone(), false));
+                }
+                self.dock.update(cx, |dock, cx| {
+                    dock.add_panel_view(panel_handle(panel.clone()), DockPlacement::Center, None, window, cx);
+                });
+                self.editors.insert(path, panel);
+            }
+        }
         let expect_editors = !editor_jobs.is_empty();
         if self.terminals.is_empty() && !expect_editors && self.respawn_titles.is_empty() {
             self.restoring = false;
@@ -3012,27 +3059,16 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         let Some(panel) = self.editors.get(path).cloned() else {
             return;
         };
-        panel.update(cx, |panel, cx| panel.commit_markdown_inline_edit(window, cx));
-        let (buffer_id, rev, text, dirty, unsaved) = {
-            let panel = panel.read(cx);
-            (
-                panel.buffer_id().to_string(),
-                panel.rev(),
-                panel.current_text(cx),
-                panel.is_dirty(),
-                panel.is_unsaved(),
-            )
-        };
-        if unsaved {
+        if panel.read(cx).is_unsaved() {
             self.open_save_dialog(window, cx);
             return;
         }
-        if !dirty {
+        if !panel.read(cx).is_dirty() {
             self.status = "No changes".into();
             cx.notify();
             return;
         }
-        self.write_buffer(&buffer_id, rev, &text, dirty, String::new());
+        panel.update(cx, |panel, cx| panel.request_save(String::new(), window, cx));
         self.status = "Saving…".into();
         cx.notify();
     }
@@ -3062,7 +3098,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         cx.notify();
     }
 
-    fn confirm_save(&mut self, cx: &mut Context<Self>) {
+    fn confirm_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let raw = self.save_path_input.read(cx).value().to_string();
         let raw = raw.trim().to_string();
         if raw.is_empty() {
@@ -3098,17 +3134,8 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             cx.notify();
             return;
         };
-        let (buffer_id, rev, text, dirty) = {
-            let panel = panel.read(cx);
-            (
-                panel.buffer_id().to_string(),
-                panel.rev(),
-                panel.current_text(cx),
-                panel.is_dirty(),
-            )
-        };
         self.save_open = false;
-        self.write_buffer(&buffer_id, rev, &text, dirty, path);
+        panel.update(cx, |panel, cx| panel.request_save(path, window, cx));
         self.status = "Saving…".into();
         cx.notify();
     }
@@ -3197,6 +3224,12 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     fn reconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.connection, ConnectionState::Online) {
             self.publish_layout(cx);
+        }
+        if !self.editors.is_empty() {
+            self.reconnect_views = Some((self.active_workspace_id.clone(), self.editors.clone()));
+        }
+        for panel in self.editors.values() {
+            panel.update(cx, |panel, _| panel.detach_transport());
         }
         self.ade.send(AdeCmd::Disconnect);
         let (ade, evt_rx) = super::ade::spawn(self.target.clone());
@@ -6305,8 +6338,8 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                                     })),
                             )
                             .child(Button::new("save-ok").primary().label("Save").on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.confirm_save(cx);
+                                cx.listener(|this, _, window, cx| {
+                                    this.confirm_save(window, cx);
                                 }),
                             )),
                     ),

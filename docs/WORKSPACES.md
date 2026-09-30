@@ -8,6 +8,8 @@ The daemon saves workspace names, roots, order, focused workspace, tab titles an
 
 On Linux, the file is `workspaces.json` in `$XDG_STATE_HOME/fresh-gui/` (normally `~/.local/state/fresh-gui/`). On Windows it is under `%LOCALAPPDATA%\fresh-gui\`. `FRESH_GUI_WORKSPACES_FILE` overrides the location and enables persistence in foreground mode.
 
+Editor typing reaches daemon-owned Fresh buffers continuously when range edits are negotiated. Transport reconnects retain current live editor views within their workspace and resync saved paths against the daemon; divergent changes keep the local draft for explicit resolution. This does not persist draft text across closing or restarting the client, and untitled views remain paused after reconnect pending recoverable-draft support (#142). External-file reload policy is separate (#143).
+
 Closing the client window disconnects it and leaves the daemon and its workspaces running. `fresh-gui close` stops the daemon. The last workspace cannot be closed.
 
 ## Name and location

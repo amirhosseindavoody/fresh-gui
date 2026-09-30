@@ -6,7 +6,7 @@
 
 - The **client** renders the workspace rail, explorer, Source Control, editor, and terminal tabs. It connects to the daemon using the ADE WebSocket protocol.
 - The **daemon** owns sessions, terminal processes, workspace state, and sandboxed file operations. Linux is the remote SSH target; standalone daemon builds also exist for Windows.
-- The daemon embeds Fresh's editor library for opening, editing, and saving buffers. The client displays those buffers in a native GPUI editor view.
+- The daemon embeds Fresh's editor library for opening, editing, and saving buffers. The client displays those buffers in a native GPUI editor view. Negotiated range edits stream into Fresh transactions; Fresh owns undo/redo and LSP change semantics. The client retains its draft and the authoritative server snapshot when revisions conflict.
 
 A local `fresh-gui` command attaches to or starts the daemon and opens the window. `fresh-gui user@host` uses the system OpenSSH client to install/start a Linux daemon when needed and opens a tunneled connection. Closing the client window disconnects it; `fresh-gui close` stops the local daemon.
 

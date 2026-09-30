@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use fresh_gui_client::{Client, ConnectOptions};
 use fresh_gui_protocol::{
-    CAP_LSP, CAP_WORKSPACE, BufferDiagnostic, FsEntry, GitFile, Hello, Message, PtyInfo, WorkspaceInfo, WorkspaceTab,
+    CAP_LSP, CAP_EDITOR_RANGE_EDITS, CAP_WORKSPACE, ByteSelection, RangeEdit, EditorAction, BufferDiagnostic, FsEntry, GitFile, Hello, Message, PtyInfo, WorkspaceInfo, WorkspaceTab,
 };
 
 use super::connect::ConnectTarget;
@@ -61,6 +61,27 @@ pub enum AdeCmd {
         base_rev: u64,
         text: String,
     },
+    RangeEdit {
+        request_id: String,
+        buffer_id: String,
+        view_id: String,
+        base_rev: u64,
+        edits: Vec<RangeEdit>,
+        selection: ByteSelection,
+    },
+    ActionBuffer {
+        request_id: String,
+        buffer_id: String,
+        view_id: String,
+        base_rev: u64,
+        action: EditorAction,
+        selection: ByteSelection,
+    },
+    SyncBuffer {
+        request_id: String,
+        buffer_id: String,
+        view_id: String,
+    },
     SaveBuffer {
         request_id: String,
         buffer_id: String,
@@ -72,6 +93,11 @@ pub enum AdeCmd {
         request_id: String,
         buffer_id: String,
         base_rev: u64,
+    },
+    /// Client-local acknowledgement of an installed/reconciled poll snapshot.
+    AcknowledgeBufferState {
+        buffer_id: String,
+        rev: u64,
     },
     CloseEditor {
         buffer_id: String,
@@ -269,6 +295,16 @@ pub enum AdeEvent {
         buffer_id: String,
         rev: u64,
     },
+    BufferEditResult {
+        request_id: String,
+        buffer_id: String,
+        view_id: String,
+        rev: u64,
+        text: String,
+        selection: ByteSelection,
+        accepted: bool,
+        dirty: bool,
+    },
     BufferSaved {
         request_id: String,
         buffer_id: String,
@@ -283,6 +319,7 @@ pub enum AdeEvent {
         status: Option<String>,
     },
     BufferFormatted {
+        request_id: String,
         buffer_id: String,
         rev: u64,
         text: Option<String>,
@@ -431,6 +468,7 @@ async fn ade_loop(
     };
 
     let lsp_enabled = hello.capabilities.iter().any(|cap| cap == CAP_LSP);
+    let range_enabled = hello.capabilities.iter().any(|cap| cap == CAP_EDITOR_RANGE_EDITS);
     let _ = evt_tx
         .send(AdeEvent::Connected {
             hello: Box::new(hello),
@@ -445,7 +483,7 @@ async fn ade_loop(
     lsp_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            _ = lsp_tick.tick(), if lsp_enabled => {
+            _ = lsp_tick.tick(), if lsp_enabled || range_enabled => {
                 for (buffer_id, known_rev) in &open_buffers {
                     if let Err(err) = client.send(Message::BufferLspGet {
                         buffer_id: buffer_id.clone(), known_rev: *known_rev,
@@ -464,6 +502,10 @@ async fn ade_loop(
                     }
                     Ok(AdeCmd::Disconnect) | Err(_) => break,
                     Ok(cmd) => {
+                        if let AdeCmd::AcknowledgeBufferState { buffer_id, rev } = &cmd {
+                            if let Some(known) = open_buffers.get_mut(buffer_id) { *known = (*known).max(*rev); }
+                            continue;
+                        }
                         if let AdeCmd::CloseEditor { buffer_id } = &cmd {
                             open_buffers.remove(buffer_id);
                         }
@@ -487,9 +529,10 @@ async fn ade_loop(
                             Message::EditorOpened { buffer_id, .. } => { open_buffers.insert(buffer_id.clone(), 0); }
                             Message::BufferSnapshot { buffer_id, rev, .. }
                             | Message::BufferChanged { buffer_id, rev, .. }
+                            | Message::BufferEditResult { buffer_id, rev, .. }
                             | Message::BufferSaved { buffer_id, rev, .. }
                             | Message::BufferFormatted { buffer_id, rev, .. }
-                            | Message::BufferLspState { buffer_id, rev, .. } => {
+                            => {
                                 if let Some(known) = open_buffers.get_mut(buffer_id) { *known = *rev; }
                             }
                             _ => {}
@@ -590,6 +633,70 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
                 })
                 .await?;
         }
+        AdeCmd::RangeEdit {
+            request_id,
+            buffer_id,
+            view_id,
+            base_rev,
+            edits,
+            selection,
+        } => {
+            anyhow::ensure!(
+                client.supports_capability(CAP_EDITOR_RANGE_EDITS),
+                "daemon does not support range edits"
+            );
+            client
+                .send(Message::BufferRangeEdit {
+                    request_id,
+                    buffer_id,
+                    view_id,
+                    base_rev,
+                    edits,
+                    selection,
+                })
+                .await?;
+        }
+        AdeCmd::ActionBuffer {
+            request_id,
+            buffer_id,
+            view_id,
+            base_rev,
+            action,
+            selection,
+        } => {
+            anyhow::ensure!(
+                client.supports_capability(CAP_EDITOR_RANGE_EDITS),
+                "daemon does not support editor actions"
+            );
+            client
+                .send(Message::BufferAction {
+                    request_id,
+                    buffer_id,
+                    view_id,
+                    base_rev,
+                    action,
+                    selection,
+                })
+                .await?;
+        }
+        AdeCmd::SyncBuffer {
+            request_id,
+            buffer_id,
+            view_id,
+        } => {
+            anyhow::ensure!(
+                client.supports_capability(CAP_EDITOR_RANGE_EDITS),
+                "daemon does not support editor resync"
+            );
+            client
+                .send(Message::BufferSync {
+                    request_id,
+                    buffer_id,
+                    view_id,
+                })
+                .await?;
+        }
+
         AdeCmd::SaveBuffer {
             request_id,
             buffer_id,
@@ -618,6 +725,7 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
                 })
                 .await?;
         }
+        AdeCmd::AcknowledgeBufferState { .. } => {}
         AdeCmd::CloseEditor { buffer_id } => {
             client.send(Message::EditorClose { buffer_id }).await?;
         }
@@ -1060,6 +1168,8 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             buffer_id,
             rev,
         }),
+        Message::BufferEditResult { request_id, buffer_id, view_id, rev, text, selection, accepted, dirty } =>
+            Some(AdeEvent::BufferEditResult { request_id, buffer_id, view_id, rev, text, selection, accepted, dirty }),
         Message::ConfigUpdated { shortkeys, ui } => Some(AdeEvent::ConfigUpdated { shortkeys, ui }),
         Message::BufferSaved {
             request_id,
@@ -1074,8 +1184,8 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
         }),
         Message::BufferLspState { buffer_id, rev, text, diagnostics, status } =>
             Some(AdeEvent::BufferLspState { buffer_id, rev, text, diagnostics, status }),
-        Message::BufferFormatted { buffer_id, rev, text, status, .. } =>
-            Some(AdeEvent::BufferFormatted { buffer_id, rev, text, status }),
+        Message::BufferFormatted { request_id, buffer_id, rev, text, status } =>
+            Some(AdeEvent::BufferFormatted { request_id, buffer_id, rev, text, status }),
         Message::FsCopied {
             request_id,
             entries,

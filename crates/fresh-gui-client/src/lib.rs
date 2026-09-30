@@ -1,5 +1,7 @@
 //! Host-side WebSocket client for the fresh-gui ADE protocol.
 
+pub mod edit_sync;
+
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -803,6 +805,12 @@ impl Client {
     /// so PTY data is never dropped while waiting on FS/editor replies.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
         send_msg(&mut self.sink, &msg).await
+    }
+
+    /// Whether the connected daemon advertised an optional protocol feature.
+    /// Callers can retain legacy message paths when this returns false.
+    pub fn supports_capability(&self, capability: &str) -> bool {
+        self.backend_hello.capabilities.iter().any(|c| c == capability)
     }
 
     pub fn decode_pty_data(data_b64: &str) -> Result<Vec<u8>> {

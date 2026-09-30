@@ -18,6 +18,8 @@ pub const CAP_WORKSPACE: &str = "workspace";
 /// Changing the root of an existing workspace.
 pub const CAP_WORKSPACE_SET_ROOT: &str = "workspace_set_root";
 pub const CAP_EDITOR: &str = "editor";
+/// Revisioned Fresh-backed editor transactions and actions.
+pub const CAP_EDITOR_RANGE_EDITS: &str = "editor.range-edits";
 pub const CAP_LSP: &str = "lsp";
 pub const CAP_SCENE: &str = "scene";
 /// Workspace git status, diff, and stage/commit/pull/push. Absent on older daemons.
@@ -232,6 +234,32 @@ pub struct BufferDiagnostic {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+}
+
+/// Buffer selection positions and range edit offsets are UTF-8 byte offsets
+/// into the buffer text. Offsets must be valid UTF-8 character boundaries.
+/// LSP positions remain zero-based UTF-16 line/column pairs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ByteSelection {
+    pub anchor: usize,
+    pub head: usize,
+}
+
+/// Replace `start..end` with `text` in UTF-8 byte offsets. Edits in one
+/// `BufferRangeEdit` are applied sequentially, so each range addresses the
+/// result of all preceding edits in that message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RangeEdit {
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EditorAction {
+    Undo,
+    Redo,
 }
 
 /// One changed path from `git status --porcelain`.
@@ -600,6 +628,48 @@ pub enum Message {
         base_rev: u64,
         text: String,
     },
+    /// Client → backend: apply ordered UTF-8 range edits as one Fresh
+    /// transaction. Requires `editor.range-edits` capability.
+    BufferRangeEdit {
+        request_id: String,
+        buffer_id: String,
+        view_id: String,
+        base_rev: u64,
+        edits: Vec<RangeEdit>,
+        /// Selection after the edits, in UTF-8 byte offsets.
+        selection: ByteSelection,
+    },
+    /// Client → backend: run a Fresh editor action. The selection is captured
+    /// before the action, in UTF-8 byte offsets.
+    BufferAction {
+        request_id: String,
+        buffer_id: String,
+        view_id: String,
+        base_rev: u64,
+        action: EditorAction,
+        selection: ByteSelection,
+    },
+    /// Client → backend: request the authoritative current buffer state.
+    BufferSync {
+        request_id: String,
+        buffer_id: String,
+        view_id: String,
+    },
+    /// Backend → client: result or conflict snapshot for range edit, action,
+    /// or sync. `accepted=false` means the operation was rejected and `text`
+    /// is the current authoritative buffer text at `rev`.
+    BufferEditResult {
+        request_id: String,
+        buffer_id: String,
+        view_id: String,
+        rev: u64,
+        text: String,
+        selection: ByteSelection,
+        accepted: bool,
+        /// Fresh's modified state; a rejected operation leaves the local draft dirty.
+        #[serde(default)]
+        dirty: bool,
+    },
     /// Backend → client: edit applied (or conflict via `error`).
     BufferChanged {
         request_id: String,
@@ -843,6 +913,7 @@ impl Hello {
             CAP_WORKSPACE.to_owned(),
             CAP_WORKSPACE_SET_ROOT.to_owned(),
             CAP_EDITOR.to_owned(),
+            CAP_EDITOR_RANGE_EDITS.to_owned(),
             CAP_LSP.to_owned(),
             CAP_SCENE.to_owned(),
             CAP_GIT.to_owned(),
@@ -857,6 +928,7 @@ impl Hello {
             CAP_SESSION.to_owned(),
             CAP_WORKSPACE.to_owned(),
             CAP_EDITOR.to_owned(),
+            CAP_EDITOR_RANGE_EDITS.to_owned(),
             CAP_LSP.to_owned(),
             CAP_SCENE.to_owned(),
             CAP_GIT.to_owned(),
@@ -890,9 +962,53 @@ mod tests {
         let hello = Hello::backend("fresh-gui/test", Hello::default_backend_caps());
         let json = Message::Hello(hello).to_json().unwrap();
         assert!(json.contains("\"editor\""));
+        assert!(json.contains("editor.range-edits"));
         assert!(json.contains("\"scene\""));
         assert!(json.contains("\"workspace\""));
         assert!(json.contains("0.4.0"));
+    }
+
+    #[test]
+    fn editor_range_messages_roundtrip() {
+        let selection = ByteSelection { anchor: 5, head: 9 };
+        let messages = [
+            Message::BufferRangeEdit {
+                request_id: "r1".into(),
+                buffer_id: "b1".into(),
+                view_id: "v1".into(),
+                base_rev: 7,
+                edits: vec![RangeEdit { start: 0, end: 4, text: "你好".into() }],
+                selection,
+            },
+            Message::BufferAction {
+                request_id: "r2".into(),
+                buffer_id: "b1".into(),
+                view_id: "v1".into(),
+                base_rev: 8,
+                action: EditorAction::Undo,
+                selection,
+            },
+            Message::BufferSync {
+                request_id: "r3".into(),
+                buffer_id: "b1".into(),
+                view_id: "v1".into(),
+            },
+            Message::BufferEditResult {
+                request_id: "r4".into(),
+                buffer_id: "b1".into(),
+                view_id: "v1".into(),
+                rev: 9,
+                text: "a🦀你好".into(),
+                selection,
+                accepted: false,
+                dirty: true,
+            },
+        ];
+        for message in messages {
+            assert_eq!(Message::from_json(&message.to_json().unwrap()).unwrap(), message);
+        }
+        assert!(Hello::default_backend_caps().iter().any(|c| c == CAP_EDITOR_RANGE_EDITS));
+        assert!(Hello::default_client_caps().iter().any(|c| c == CAP_EDITOR_RANGE_EDITS));
     }
 
     #[test]

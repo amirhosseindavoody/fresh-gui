@@ -6,12 +6,15 @@
 //! that owns the panel.
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use alacritty_terminal::vte::ansi::CursorShape;
-use fresh_gui_protocol::BufferDiagnostic;
+use fresh_gui_client::edit_sync::{EditSync, SnapshotReconciliation, contiguous_diff};
+use fresh_gui_protocol::{BufferDiagnostic, ByteSelection, EditorAction};
 
 use gpui_kit::base::ElementExt as _;
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent, PanelId};
@@ -1630,6 +1633,8 @@ struct EditorPending {
     column: Option<u32>,
 }
 
+static NEXT_EDITOR_VIEW: AtomicU64 = AtomicU64::new(1);
+
 pub struct EditorPanel {
     buffer_id: String,
     path: String,
@@ -1641,7 +1646,30 @@ pub struct EditorPanel {
     diagnostics: Vec<BufferDiagnostic>,
     lsp_status: Option<String>,
     format_pending_text: Option<String>,
+    format_sent_selection: Option<ByteSelection>,
+    format_request_id: Option<String>,
     rev: u64,
+    view_id: String,
+    range_edits: bool,
+    transport_connected: bool,
+    edit_sync: Option<EditSync>,
+    edit_flush_scheduled: bool,
+    edit_request_id: Option<String>,
+    sync_request_id: Option<String>,
+    edit_sent_selection: Option<ByteSelection>,
+    legacy_sent_text: Option<String>,
+    next_request: u64,
+    pending_save: Option<String>,
+    pending_format: bool,
+    format_inflight: bool,
+    pending_actions: VecDeque<EditorAction>,
+    action_inflight: bool,
+    action_sent_text: Option<String>,
+    action_sent_selection: Option<ByteSelection>,
+    conflict: bool,
+    sync_paused: bool,
+    save_request_id: Option<String>,
+    save_sent_text: Option<String>,
     pending: Option<EditorPending>,
     editor: Entity<EditorState>,
     ade: AdeHandle,
@@ -1702,9 +1730,14 @@ impl EditorPanel {
         let subscription = cx.subscribe(&editor, |this, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Change) {
                 this.dirty = true;
+                this.schedule_edit_flush(cx);
                 cx.notify();
             }
         });
+        let view_id = format!("view-{}-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_nanos(),
+            NEXT_EDITOR_VIEW.fetch_add(1, Ordering::Relaxed));
         Self {
             buffer_id,
             path,
@@ -1714,7 +1747,30 @@ impl EditorPanel {
             diagnostics: Vec::new(),
             lsp_status: None,
             format_pending_text: None,
+            format_sent_selection: None,
+            format_request_id: None,
             rev: 0,
+            view_id,
+            range_edits: false,
+            transport_connected: true,
+            edit_sync: unsaved.then(|| EditSync::new(String::new(), 0)),
+            edit_flush_scheduled: false,
+            edit_request_id: None,
+            sync_request_id: None,
+            edit_sent_selection: None,
+            legacy_sent_text: None,
+            next_request: 1,
+            pending_save: None,
+            pending_format: false,
+            format_inflight: false,
+            pending_actions: VecDeque::new(),
+            action_inflight: false,
+            action_sent_text: None,
+            action_sent_selection: None,
+            conflict: false,
+            sync_paused: false,
+            save_request_id: None,
+            save_sent_text: None,
             pending: Some(EditorPending { line, column }),
             editor,
             ade,
@@ -1760,6 +1816,212 @@ impl EditorPanel {
         &self.buffer_id
     }
 
+    pub fn configure_range_edits(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.range_edits = enabled;
+        // EditorOpen/New always supplies the initial BufferSnapshot. Do not
+        // race it with a second snapshot that could undo its reveal position.
+        cx.notify();
+    }
+
+    fn next_edit_request(&mut self, prefix: &str) -> String {
+        let id = format!("{prefix}-{}-{}", self.view_id, self.next_request);
+        self.next_request = self.next_request.wrapping_add(1);
+        id
+    }
+
+    fn byte_selection(&self, cx: &App) -> ByteSelection {
+        let (editor, offset) = if let Some(edit) = &self.inline_markdown_edit {
+            let source = self.editor.read(cx).value();
+            let offset = source
+                .split_inclusive('\n')
+                .take(edit.line_index)
+                .map(str::len)
+                .sum::<usize>()
+                + edit.prefix.len();
+            (edit.editor.read(cx), offset)
+        } else {
+            (self.editor.read(cx), 0)
+        };
+        let cursor = editor.cursor();
+        let range = editor.selected_range();
+        let anchor = if range.is_empty() {
+            cursor
+        } else if cursor == range.start {
+            range.end
+        } else {
+            range.start
+        };
+        ByteSelection {
+            anchor: offset + anchor,
+            head: offset + cursor,
+        }
+    }
+
+    fn schedule_edit_flush(&mut self, cx: &mut Context<Self>) {
+        if self.edit_flush_scheduled || self.conflict {
+            return;
+        }
+        self.edit_flush_scheduled = true;
+        let timer = cx
+            .background_executor()
+            .timer(std::time::Duration::from_millis(75));
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = this.update(cx, |this, cx| {
+                this.edit_flush_scheduled = false;
+                this.flush_pending(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn flush_pending(&mut self, cx: &mut Context<Self>) {
+        if !self.transport_connected
+            || self.closed
+            || self.conflict
+            || self.sync_paused
+            || self.edit_request_id.is_some()
+            || self.action_inflight
+            || self.save_request_id.is_some()
+            || self.sync_request_id.is_some()
+            || self.format_inflight
+        {
+            return;
+        }
+        let draft = self.current_text(cx);
+        let Some(sync) = self.edit_sync.as_mut() else {
+            if !self.range_edits {
+                return;
+            }
+            let request_id = self.next_edit_request("sync");
+            self.sync_request_id = Some(request_id.clone());
+            self.ade.send(AdeCmd::SyncBuffer {
+                request_id,
+                buffer_id: self.buffer_id.clone(),
+                view_id: self.view_id.clone(),
+            });
+            return;
+        };
+        let edit = sync.begin_edit(&draft);
+        if let Some((base_rev, edits)) = edit {
+            let request_id = self.next_edit_request("edit");
+            self.edit_request_id = Some(request_id.clone());
+            self.edit_sent_selection = Some(self.byte_selection(cx));
+            if self.range_edits {
+                self.ade.send(AdeCmd::RangeEdit {
+                    request_id,
+                    buffer_id: self.buffer_id.clone(),
+                    view_id: self.view_id.clone(),
+                    base_rev,
+                    edits,
+                    selection: self.edit_sent_selection.expect("just recorded"),
+                });
+            } else {
+                self.legacy_sent_text = Some(draft.clone());
+                self.ade.send(AdeCmd::EditBuffer {
+                    request_id,
+                    buffer_id: self.buffer_id.clone(),
+                    base_rev,
+                    text: draft,
+                });
+            }
+            return;
+        }
+        self.drain_pending(cx);
+    }
+
+    fn drain_pending(&mut self, cx: &mut Context<Self>) {
+        if !self.transport_connected
+            || self.closed
+            || self.conflict
+            || self.sync_paused
+            || self.edit_request_id.is_some()
+            || self.action_inflight
+            || self.save_request_id.is_some()
+            || self.sync_request_id.is_some()
+            || self.format_inflight
+        {
+            return;
+        }
+        let draft = self.current_text(cx);
+        let dirty_against_server = self
+            .edit_sync
+            .as_ref()
+            .is_some_and(|sync| sync.acknowledged().0 != draft);
+        if dirty_against_server {
+            self.flush_pending(cx);
+            return;
+        }
+        if let Some(action) = self.pending_actions.pop_front() {
+            let base_rev = self
+                .edit_sync
+                .as_ref()
+                .map_or(self.rev, |sync| sync.acknowledged().1);
+            let request_id = self.next_edit_request("action");
+            self.edit_request_id = Some(request_id.clone());
+            self.action_inflight = true;
+            self.action_sent_text = Some(draft);
+            self.action_sent_selection = Some(self.byte_selection(cx));
+            self.ade.send(AdeCmd::ActionBuffer {
+                request_id,
+                buffer_id: self.buffer_id.clone(),
+                view_id: self.view_id.clone(),
+                base_rev,
+                action,
+                selection: self.action_sent_selection.expect("just recorded"),
+            });
+            return;
+        }
+        if let Some(path) = self.pending_save.take() {
+            let base_rev = self
+                .edit_sync
+                .as_ref()
+                .map_or(self.rev, |sync| sync.acknowledged().1);
+            let request_id = self.next_edit_request("save");
+            self.save_request_id = Some(request_id.clone());
+            self.save_sent_text = Some(draft.clone());
+            self.ade.send(AdeCmd::SaveBuffer {
+                request_id,
+                buffer_id: self.buffer_id.clone(),
+                base_rev,
+                path,
+            });
+        } else if self.pending_format {
+            self.pending_format = false;
+            let base_rev = self
+                .edit_sync
+                .as_ref()
+                .map_or(self.rev, |sync| sync.acknowledged().1);
+            self.format_pending_text = Some(draft);
+            self.format_sent_selection = Some(self.byte_selection(cx));
+            let request_id = self.next_edit_request("format");
+            self.format_request_id = Some(request_id.clone());
+            self.ade.send(AdeCmd::FormatBuffer {
+                request_id,
+                buffer_id: self.buffer_id.clone(),
+                base_rev,
+            });
+            self.format_inflight = true;
+            self.lsp_status = Some("Formatting…".into());
+        }
+        cx.notify();
+    }
+
+    fn request_editor_action(&mut self, action: EditorAction, cx: &mut Context<Self>) -> bool {
+        if !self.range_edits {
+            return false;
+        }
+        if self.conflict || !self.transport_connected {
+            return true;
+        }
+        if self.sync_paused {
+            return true;
+        }
+        self.pending_actions.push_back(action);
+        self.flush_pending(cx);
+        true
+    }
+
     /// Compact file-scoped information for the workspace status bar.
     pub fn status_summary(&self) -> String {
         let mut parts = vec![format!("{} problems", self.diagnostics.len())];
@@ -1781,11 +2043,6 @@ impl EditorPanel {
 
     pub fn is_unsaved(&self) -> bool {
         self.unsaved
-    }
-
-    pub fn set_dirty(&mut self, dirty: bool, cx: &mut Context<Self>) {
-        self.dirty = dirty;
-        cx.notify();
     }
 
     fn link_at_pointer(&self, position: Point<Pixels>, cx: &App) -> Option<(String, u32, Range<usize>)> {
@@ -1825,10 +2082,6 @@ impl EditorPanel {
         true
     }
 
-    pub fn rev(&self) -> u64 {
-        self.rev
-    }
-
     /// Full Markdown source, including an active rich-preview block edit.
     pub fn current_text(&self, cx: &App) -> String {
         let source = self.editor.read(cx).value().to_string();
@@ -1858,6 +2111,7 @@ impl EditorPanel {
         let subscription = cx.subscribe(&editor, |this, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Change) {
                 this.dirty = true;
+                this.schedule_edit_flush(cx);
                 cx.notify();
             }
         });
@@ -1903,32 +2157,320 @@ impl EditorPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.rev = rev;
         if !path.is_empty() {
             self.path = path;
         }
-        self.dirty = false;
         self.diagnostics.clear();
-        self.inline_markdown_edit = None;
-        self.inline_markdown_subscription = None;
-        let jump = self.pending.take();
-        self.editor.update(cx, |state, cx| {
-            state.set_value(&text, window, cx);
-            if let Some(jump) = jump
-                && let Some(line) = jump.line
-            {
-                let pos = Position::new(
-                    line.saturating_sub(1),
-                    jump.column.unwrap_or(1).saturating_sub(1),
-                );
-                state.set_cursor_position(pos, window, cx);
+        let draft = self.current_text(cx);
+        if let Some(sync) = self.edit_sync.as_mut() {
+            match sync.reconcile_snapshot(rev, text.clone(), &draft) {
+                SnapshotReconciliation::Adopted => {
+                    self.rev = rev;
+                    if draft != text || self.pending.is_some() {
+                        let selection = map_selection_through_edits(&draft, &text, self.byte_selection(cx));
+                        self.set_editor_text_and_selection(&text, Some(selection), window, cx);
+                        self.dirty = false;
+                    }
+                    self.conflict = false;
+                }
+                SnapshotReconciliation::KeepDraft => {
+                    self.rev = rev;
+                    self.conflict = false;
+                    self.schedule_edit_flush(cx);
+                }
+                SnapshotReconciliation::Conflict => {
+                    self.rev = rev;
+                    self.conflict = true;
+                    self.lsp_status = Some("Server and local edits conflict; local draft kept".into());
+                }
             }
-        });
+        } else {
+            let (sync, outcome) =
+                EditSync::from_initial_snapshot(text.clone(), rev, &draft, self.dirty);
+            self.edit_sync = Some(sync);
+            self.rev = rev;
+            self.conflict = outcome == SnapshotReconciliation::Conflict;
+            if self.conflict {
+                self.lsp_status =
+                    Some("Server text arrived after local editing; local draft kept".into());
+            } else {
+                self.dirty = false;
+                self.set_editor_text_and_selection(&text, None, window, cx);
+            }
+        }
+        // Fetch Fresh's modified state as well as the text supplied by the
+        // legacy snapshot. Keep the opening reveal position when text matches.
+        if self.range_edits && self.sync_request_id.is_none() {
+            let request_id = self.next_edit_request("sync");
+            self.sync_request_id = Some(request_id.clone());
+            self.ade.send(AdeCmd::SyncBuffer {
+                request_id,
+                buffer_id: self.buffer_id.clone(),
+                view_id: self.view_id.clone(),
+            });
+        }
+        self.flush_pending(cx);
         cx.notify();
     }
 
-    pub fn set_rev(&mut self, rev: u64, cx: &mut Context<Self>) {
+    fn set_editor_text_and_selection(
+        &mut self,
+        text: &str,
+        selection: Option<ByteSelection>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.inline_markdown_edit = None;
+        self.inline_markdown_subscription = None;
+        self.editor.update(cx, |state, cx| {
+            state.set_value(text, window, cx);
+            if let Some(selection) = selection {
+                state.set_selected_range(selection.anchor..selection.head, cx);
+            }
+        });
+        if let Some(jump) = self.pending.take()
+            && let Some(line) = jump.line
+        {
+            let pos = Position::new(
+                line.saturating_sub(1),
+                jump.column.unwrap_or(1).saturating_sub(1),
+            );
+            self.editor
+                .update(cx, |state, cx| state.set_cursor_position(pos, window, cx));
+        }
+    }
+
+    pub fn apply_edit_result(
+        &mut self,
+        request_id: &str,
+        view_id: &str,
+        rev: u64,
+        text: String,
+        selection: ByteSelection,
+        accepted: bool,
+        server_dirty: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.view_id != view_id {
+            return;
+        }
+        if self.sync_request_id.as_deref() == Some(request_id) {
+            self.sync_request_id = None;
+            let draft = self.current_text(cx);
+            let outcome = if let Some(sync) = self.edit_sync.as_mut() {
+                sync.reconcile_snapshot(rev, text.clone(), &draft)
+            } else {
+                let (sync, outcome) =
+                    EditSync::from_initial_snapshot(text.clone(), rev, &draft, self.dirty);
+                self.edit_sync = Some(sync);
+                outcome
+            };
+            self.rev = rev;
+            match outcome {
+                SnapshotReconciliation::Adopted => {
+                    if draft != text || self.pending.is_some() {
+                        let local_selection =
+                            map_selection_through_edits(&draft, &text, self.byte_selection(cx));
+                        self.set_editor_text_and_selection(&text, Some(local_selection), window, cx);
+                        self.dirty = server_dirty;
+                    }
+                    self.conflict = false;
+                }
+                SnapshotReconciliation::KeepDraft => {
+                    self.conflict = false;
+                    self.schedule_edit_flush(cx);
+                }
+                SnapshotReconciliation::Conflict => {
+                    self.conflict = true;
+                    self.lsp_status = Some("Server and local edits conflict; local draft kept".into());
+                }
+            }
+            self.dirty = server_dirty || self.current_text(cx) != text || self.conflict;
+            self.flush_pending(cx);
+            cx.notify();
+            return;
+        }
+        if self.edit_request_id.as_deref() != Some(request_id) {
+            return;
+        }
+        self.edit_request_id = None;
         self.rev = rev;
+        if !accepted {
+            if let Some(sync) = self.edit_sync.as_mut() {
+                sync.finish(false, rev, text);
+            }
+            self.conflict = true;
+            self.pending_save = None;
+            self.pending_format = false;
+            self.pending_actions.clear();
+            self.action_inflight = false;
+            self.action_sent_text = None;
+            self.action_sent_selection = None;
+            self.edit_sent_selection = None;
+            self.lsp_status =
+                Some("Server revision changed; local draft kept for conflict resolution".into());
+            cx.notify();
+            return;
+        }
+
+        let action_result = self.action_inflight;
+        self.action_inflight = false;
+        let draft = self.current_text(cx);
+        let action_draft_matches = self.action_sent_text.take().as_deref() == Some(draft.as_str());
+        let action_selection_unchanged = self
+            .action_sent_selection
+            .take()
+            .is_some_and(|sent| self.byte_selection(cx) == sent);
+        let edit_selection_unchanged = self
+            .edit_sent_selection
+            .take()
+            .is_some_and(|sent| self.byte_selection(cx) == sent);
+        self.action_sent_selection = None;
+        if let Some(sync) = self.edit_sync.as_mut() {
+            if action_result {
+                if action_draft_matches {
+                    sync.reconcile_snapshot(rev, text.clone(), &draft);
+                } else {
+                    sync.finish(false, rev, text.clone());
+                }
+            } else {
+                sync.finish(true, rev, text.clone());
+            }
+            self.conflict = sync.conflict().is_some();
+        }
+        self.rev = rev;
+        if action_result && action_draft_matches {
+            if draft != text {
+                self.dirty = true;
+            }
+            let selection = if action_selection_unchanged {
+                selection
+            } else {
+                self.byte_selection(cx)
+            };
+            self.set_editor_text_and_selection(&text, Some(selection), window, cx);
+        } else if !action_result && draft == text && edit_selection_unchanged {
+            self.editor.update(cx, |state, cx| {
+                state.set_selected_range(selection.anchor..selection.head, cx);
+            });
+        }
+        self.dirty = server_dirty || self.current_text(cx) != text || self.conflict;
+        if self.conflict {
+            self.lsp_status = Some("Server and local edits conflict; local draft kept".into());
+            self.pending_save = None;
+            self.pending_format = false;
+        } else {
+            self.flush_pending(cx);
+        }
+        cx.notify();
+    }
+
+    pub fn acknowledge_legacy(&mut self, request_id: &str, rev: u64, cx: &mut Context<Self>) {
+        if self.edit_request_id.as_deref() != Some(request_id) || self.range_edits {
+            return;
+        }
+        self.edit_request_id = None;
+        self.rev = rev;
+        let text = self
+            .legacy_sent_text
+            .take()
+            .unwrap_or_else(|| self.current_text(cx));
+        if let Some(sync) = self.edit_sync.as_mut() {
+            sync.finish(true, rev, text);
+        }
+        self.flush_pending(cx);
+    }
+
+    pub fn detach_transport(&mut self) {
+        self.transport_connected = false;
+        self.edit_request_id = None;
+        self.legacy_sent_text = None;
+        self.sync_request_id = None;
+        self.pending_actions.clear();
+        self.action_inflight = false;
+        self.pending_save = None;
+        self.pending_format = false;
+        self.save_request_id = None;
+        self.save_sent_text = None;
+        self.format_inflight = false;
+    }
+
+    pub fn keep_detached_draft(&mut self, cx: &mut Context<Self>) {
+        self.transport_connected = false;
+        self.sync_paused = true;
+        self.closed = true;
+        self.edit_request_id = None;
+        self.sync_request_id = None;
+        self.pending_actions.clear();
+        self.pending_save = None;
+        self.pending_format = false;
+        self.save_request_id = None;
+        self.save_sent_text = None;
+        self.lsp_status = Some("Untitled draft kept; reconnect recovery is not available yet".into());
+        cx.notify();
+    }
+
+    pub fn reconnect(&mut self, ade: AdeHandle, range_edits: bool, cx: &mut Context<Self>) {
+        self.ade = ade;
+        self.transport_connected = true;
+        self.sync_paused = false;
+        self.closed = false;
+        self.range_edits = range_edits;
+        self.edit_request_id = None;
+        self.sync_request_id = None;
+        self.legacy_sent_text = None;
+        self.save_request_id = None;
+        self.save_sent_text = None;
+        self.format_inflight = false;
+        if range_edits {
+            let request_id = self.next_edit_request("sync");
+            self.sync_request_id = Some(request_id.clone());
+            self.ade.send(AdeCmd::SyncBuffer {
+                request_id,
+                buffer_id: self.buffer_id.clone(),
+                view_id: self.view_id.clone(),
+            });
+        }
+        cx.notify();
+    }
+
+    pub fn request_save(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_markdown_inline_edit(window, cx);
+        if self.conflict {
+            self.lsp_status = Some("Resolve the edit conflict before saving".into());
+            cx.notify();
+            return;
+        }
+        self.pending_save = Some(path);
+        self.flush_pending(cx);
+    }
+
+    pub fn resolve_keep_local(&mut self, cx: &mut Context<Self>) {
+        let Some(conflict) = self.edit_sync.as_mut().and_then(EditSync::resolve_conflict) else {
+            return;
+        };
+        self.rev = conflict.rev;
+        self.conflict = false;
+        self.sync_paused = false;
+        self.lsp_status = Some("Keeping local edits; synchronizing against server version".into());
+        self.flush_pending(cx);
+        cx.notify();
+    }
+
+    pub fn resolve_use_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let selection = self.byte_selection(cx);
+        let Some(conflict) = self.edit_sync.as_mut().and_then(EditSync::resolve_conflict) else {
+            return;
+        };
+        self.rev = conflict.rev;
+        self.conflict = false;
+        self.sync_paused = false;
+        self.dirty = true;
+        self.inline_markdown_edit = None;
+        self.inline_markdown_subscription = None;
+        self.set_editor_text_and_selection(&conflict.text, Some(selection), window, cx);
+        self.lsp_status = Some("Using server version; save to write changes".into());
         cx.notify();
     }
 
@@ -1942,18 +2484,64 @@ impl EditorPanel {
         cx: &mut Context<Self>,
     ) {
         if let Some(text) = text {
-            if !self.dirty && rev > self.rev {
-                self.editor.update(cx, |state, cx| state.set_value(&text, window, cx));
-                self.rev = rev;
-                self.dirty = true;
-            } else if rev > self.rev {
-                self.lsp_status = Some("Formatting changed the server buffer while local edits are open; save to resolve".into());
+            let request_pending = self.edit_request_id.is_some()
+                || self.sync_request_id.is_some()
+                || self.save_request_id.is_some()
+                || self.format_inflight;
+            if !request_pending && (rev > self.rev || self.edit_sync.is_none()) {
+                let draft = self.current_text(cx);
+                if let Some(sync) = self.edit_sync.as_mut() {
+                    match sync.reconcile_snapshot(rev, text.clone(), &draft) {
+                        SnapshotReconciliation::Adopted => {
+                            if draft != text {
+                                let selection = map_selection_through_edits(&draft, &text, self.byte_selection(cx));
+                        self.set_editor_text_and_selection(&text, Some(selection), window, cx);
+                                self.dirty = true;
+                            }
+                            self.rev = rev;
+                            self.conflict = false;
+                        }
+                        SnapshotReconciliation::KeepDraft => {
+                            self.rev = rev;
+                            self.schedule_edit_flush(cx);
+                        }
+                        SnapshotReconciliation::Conflict => {
+                            self.rev = rev;
+                            self.conflict = true;
+                            self.lsp_status =
+                                Some("Server and local edits conflict; local draft kept".into());
+                        }
+                    }
+                } else {
+                    let (sync, outcome) =
+                        EditSync::from_initial_snapshot(text.clone(), rev, &draft, self.dirty);
+                    self.edit_sync = Some(sync);
+                    self.rev = rev;
+                    self.conflict = outcome == SnapshotReconciliation::Conflict;
+                    if self.conflict {
+                        self.lsp_status =
+                            Some("Server text arrived after local editing; local draft kept".into());
+                    } else if draft != text {
+                        self.set_editor_text_and_selection(&text, None, window, cx);
+                        self.dirty = true;
+                    }
+                }
+                self.ade.send(AdeCmd::AcknowledgeBufferState {
+                    buffer_id: self.buffer_id.clone(),
+                    rev,
+                });
             }
         }
         self.diagnostics = diagnostics;
         if status.is_some() {
-            self.lsp_status = status;
-        } else if self.lsp_status.as_deref().is_some_and(|s| s.starts_with("LSP")) {
+            if !self.conflict {
+                self.lsp_status = status;
+            }
+        } else if self
+            .lsp_status
+            .as_deref()
+            .is_some_and(|s| s.starts_with("LSP"))
+        {
             self.lsp_status = None;
         }
         cx.notify();
@@ -1961,56 +2549,134 @@ impl EditorPanel {
 
     pub fn apply_formatted(
         &mut self,
+        request_id: &str,
         rev: u64,
         text: Option<String>,
         status: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let safe = self.format_pending_text.take()
+        if self.format_request_id.as_deref() != Some(request_id) {
+            return;
+        }
+        self.format_request_id = None;
+        self.format_inflight = false;
+        let expected = self.format_pending_text.take();
+        let safe = expected
+            .as_deref()
             .is_some_and(|expected| expected == self.current_text(cx));
-        self.rev = rev;
+        let prior_selection = self.format_sent_selection.take();
         if let Some(text) = text {
             if safe {
-                self.editor.update(cx, |state, cx| state.set_value(&text, window, cx));
+                let selection = expected
+                    .as_deref()
+                    .zip(prior_selection)
+                    .map(|(old, selection)| map_selection_through_edits(old, &text, selection));
+                if let Some(sync) = self.edit_sync.as_mut() {
+                    sync.finish(true, rev, text.clone());
+                } else {
+                    self.edit_sync = Some(EditSync::new(text.clone(), rev));
+                }
+                self.set_editor_text_and_selection(&text, selection, window, cx);
+                self.rev = rev;
                 self.dirty = true;
+                self.conflict = false;
                 self.lsp_status = Some("Formatted; save to write changes".into());
             } else {
-                self.lsp_status = Some("Formatting finished after further local edits; those edits were kept".into());
+                let draft = self.current_text(cx);
+                let result = self
+                    .edit_sync
+                    .as_mut()
+                    .map(|sync| sync.reconcile_snapshot(rev, text.clone(), &draft));
+                self.rev = rev;
+                if result == Some(SnapshotReconciliation::Conflict) {
+                    self.conflict = true;
+                    self.lsp_status =
+                        Some("Formatting conflicted with newer edits; local draft kept".into());
+                } else {
+                    self.conflict = false;
+                    self.lsp_status = Some(
+                        "Formatting finished after further local edits; those edits were kept".into(),
+                    );
+                    self.schedule_edit_flush(cx);
+                }
             }
         } else {
+            if let Some(sync) = self.edit_sync.as_mut() {
+                let (acknowledged, _) = sync.acknowledged();
+                sync.finish(true, rev, acknowledged.to_owned());
+            }
+            self.rev = rev;
             self.lsp_status = status.or_else(|| Some("No formatting changes".into()));
+        }
+        if !self.conflict {
+            self.flush_pending(cx);
         }
         cx.notify();
     }
 
-    pub fn set_format_error(&mut self, message: String, cx: &mut Context<Self>) {
-        self.format_pending_text = None;
-        self.lsp_status = Some(message);
-        cx.notify();
+    pub fn handle_request_error(
+        &mut self,
+        request_id: &str,
+        message: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.edit_request_id.as_deref() == Some(request_id) {
+            self.edit_request_id = None;
+            self.legacy_sent_text = None;
+            self.action_inflight = false;
+            self.action_sent_text = None;
+            self.action_sent_selection = None;
+            self.edit_sent_selection = None;
+            let draft = self.current_text(cx);
+            if let Some(sync) = self.edit_sync.as_mut() {
+                let (base, rev) = sync.acknowledged();
+                let base = base.to_owned();
+                sync.reconcile_snapshot(rev, base, &draft);
+            }
+            self.lsp_status = Some(format!("Edit was not applied: {message}"));
+            self.sync_paused = true;
+            self.pending_save = None;
+            self.pending_format = false;
+            self.pending_actions.clear();
+            cx.notify();
+            return true;
+        }
+        if self.save_request_id.as_deref() == Some(request_id) {
+            self.save_request_id = None;
+            self.save_sent_text = None;
+            self.lsp_status = Some(format!("Save failed: {message}"));
+            self.flush_pending(cx);
+            return true;
+        }
+        if self.format_request_id.as_deref() == Some(request_id) {
+            self.format_request_id = None;
+            self.format_pending_text = None;
+            self.format_sent_selection = None;
+            self.format_inflight = false;
+            self.lsp_status = Some(format!("Format failed: {message}"));
+            self.flush_pending(cx);
+            return true;
+        }
+        if self.sync_request_id.as_deref() == Some(request_id) {
+            self.sync_request_id = None;
+            self.sync_paused = true;
+            self.lsp_status = Some(format!("Editor resync failed: {message}"));
+            cx.notify();
+            return true;
+        }
+        false
     }
 
     pub(crate) fn request_format(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_markdown_inline_edit(window, cx);
-        let text = self.current_text(cx);
-        let base_rev = if self.dirty {
-            self.ade.send(AdeCmd::EditBuffer {
-                request_id: format!("fmt-edit-{}-{}", self.buffer_id, self.rev),
-                buffer_id: self.buffer_id.clone(),
-                base_rev: self.rev,
-                text: text.clone(),
-            });
-            self.rev + 1
-        } else {
-            self.rev
-        };
-        self.format_pending_text = Some(text);
-        self.ade.send(AdeCmd::FormatBuffer {
-            request_id: format!("fmt-{}-{base_rev}", self.buffer_id),
-            buffer_id: self.buffer_id.clone(),
-            base_rev,
-        });
-        self.lsp_status = Some("Formatting…".into());
+        if self.conflict {
+            self.lsp_status = Some("Resolve the edit conflict before formatting".into());
+            cx.notify();
+            return;
+        }
+        self.pending_format = true;
+        self.flush_pending(cx);
         cx.notify();
     }
 
@@ -2022,9 +2688,32 @@ impl EditorPanel {
         self.unsaved = false;
         self.unsaved_title = None;
         self.rev = rev;
-        self.dirty = false;
+        self.save_request_id = None;
+        let saved_text = self.save_sent_text.take();
+        if let (Some(sync), Some(saved)) = (self.edit_sync.as_mut(), saved_text.as_ref()) {
+            sync.finish(true, rev, saved.clone());
+        }
+        self.dirty = saved_text
+            .as_deref()
+            .is_some_and(|saved| saved != self.current_text(cx));
         cx.notify();
+        if self.dirty {
+            self.flush_pending(cx);
+        }
         previous
+    }
+
+    pub fn finish_save(
+        &mut self,
+        request_id: &str,
+        path: String,
+        rev: u64,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        if self.save_request_id.as_deref() != Some(request_id) {
+            return None;
+        }
+        self.mark_saved(path, rev, cx)
     }
 
     fn label(&self) -> String {
@@ -2156,7 +2845,18 @@ impl Render for EditorPanel {
             self.path.rsplit('.').next().map(str::to_ascii_lowercase).as_deref(),
             Some("md" | "markdown")
         );
-        let mut root = div().key_context("Editor").size_full().flex().flex_col();
+        let mut root = div().key_context("Editor").size_full().flex().flex_col()
+                    .capture_action::<gpui_kit::component::input::Undo>(cx.listener(|this, _, _, cx| {
+                        if this.request_editor_action(EditorAction::Undo, cx) {
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .capture_action::<gpui_kit::component::input::Redo>(cx.listener(|this, _, _, cx| {
+                        if this.request_editor_action(EditorAction::Redo, cx) {
+                            cx.stop_propagation();
+                        }
+                    }))
+            ;
         if markdown {
             let panel = cx.entity();
             root = root.child(
@@ -2312,6 +3012,28 @@ impl Render for EditorPanel {
                     ),
             );
         }
+        if self.conflict {
+            let panel = cx.entity();
+            root = root.child(
+                h_flex()
+                    .w_full()
+                    .h_9()
+                    .px_2()
+                    .gap_2()
+                    .items_center()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .child(div().flex_1().text_xs().text_color(cx.theme().danger)
+                        .child("Server and local edits conflict"))
+                    .child(Button::new("conflict-keep-local").ghost().xsmall().label("Keep my edits")
+                        .on_click({
+                            let panel = panel.clone();
+                            move |_, _, cx| panel.update(cx, |this, cx| this.resolve_keep_local(cx))
+                        }))
+        .child(Button::new("conflict-use-server").ghost().xsmall().label("Use server text")
+                        .on_click(move |_, window, cx| { let _ = panel.update(cx, |this, cx| this.resolve_use_server(window, cx)); }))
+            );
+        }
         if !self.diagnostics.is_empty() {
             let mut problems = v_flex().id("editor-problems").w_full().h(px(112.))
                 .overflow_y_scroll().border_t_1().border_color(cx.theme().border);
@@ -2357,14 +3079,47 @@ fn utf16_to_scalar_column(text: &str, line: u32, utf16_col: u32) -> u32 {
     scalars
 }
 
+fn map_selection_through_edits(old: &str, new: &str, selection: ByteSelection) -> ByteSelection {
+    let Some(edit) = contiguous_diff(old, new).into_iter().next() else {
+        return selection;
+    };
+    let map = |offset: usize| {
+        if offset <= edit.start {
+            offset
+        } else if offset >= edit.end {
+            offset - (edit.end - edit.start) + edit.text.len()
+        } else {
+            edit.start + edit.text.len()
+        }
+    };
+    ByteSelection {
+        anchor: map(selection.anchor),
+        head: map(selection.head),
+    }
+}
+
 #[cfg(test)]
 mod lsp_position_tests {
-    use super::utf16_to_scalar_column;
+    use super::{ByteSelection, map_selection_through_edits, utf16_to_scalar_column};
 
     #[test]
     fn diagnostic_columns_after_non_bmp_characters() {
         assert_eq!(utf16_to_scalar_column("first\na😀b\n", 1, 3), 2);
         assert_eq!(utf16_to_scalar_column("first\na😀b\n", 1, 4), 3);
+    }
+
+    #[test]
+    fn formatting_maps_forward_and_reverse_byte_selections_across_emoji() {
+        let old = "a😀bc";
+        let new = "a🙂Xbc";
+        assert_eq!(
+            map_selection_through_edits(old, new, ByteSelection { anchor: 5, head: 6 }),
+            ByteSelection { anchor: 6, head: 7 },
+        );
+        assert_eq!(
+            map_selection_through_edits(old, new, ByteSelection { anchor: 6, head: 1 }),
+            ByteSelection { anchor: 7, head: 1 },
+        );
     }
 }
 
