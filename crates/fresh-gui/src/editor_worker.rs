@@ -1938,6 +1938,47 @@ fn save_buffer(
     ))
 }
 
+#[cfg(test)]
+mod external_generation_tests {
+    use super::*;
+
+    #[test]
+    fn disk_generation_detects_atomic_replace_delete_and_recreate() {
+        let root = std::env::temp_dir().join(format!(
+            "fresh-external-generation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("buffer.txt");
+        let tmp = root.join("buffer.tmp");
+        std::fs::write(&path, "old text").unwrap();
+        let initial = disk_generation(&path);
+        std::fs::write(&tmp, "new text").unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        let replaced = disk_generation(&path);
+        assert_ne!(
+            initial.signature, replaced.signature,
+            "same-size atomic replacement is visible by content hash"
+        );
+        assert_eq!(replaced.text.as_deref(), Some("new text"));
+
+        std::fs::remove_file(&path).unwrap();
+        let missing = disk_generation(&path);
+        assert!(missing.text.is_none());
+        assert_ne!(replaced.signature, missing.signature);
+        std::fs::write(&path, "new text").unwrap();
+        let recreated = disk_generation(&path);
+        assert!(recreated.text.is_some());
+        assert_ne!(missing.signature, recreated.signature);
+        assert_eq!(
+            recreated.signature,
+            disk_generation(&path).signature,
+            "duplicate notifications coalesce to one generation"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
