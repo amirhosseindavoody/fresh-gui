@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -130,7 +131,14 @@ pub(crate) fn disk_generation(path: &Path) -> Result<DiskGeneration> {
     }
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     let text = if metadata.len() as usize <= MAX_SNAPSHOT_BYTES {
-        let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        let mut file = std::fs::File::open(path)
+            .with_context(|| format!("read {}", path.display()))?
+            .take((MAX_SNAPSHOT_BYTES + 1) as u64);
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_SNAPSHOT_BYTES {
+            bail!("external file exceeds snapshot limit: {}", path.display());
+        }
         Some(
             String::from_utf8(bytes.clone())
                 .with_context(|| format!("external file is not UTF-8 text: {}", path.display()))?,
