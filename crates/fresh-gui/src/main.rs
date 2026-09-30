@@ -8,6 +8,7 @@ mod binary;
 mod config;
 mod daemon;
 mod drafts;
+mod editor_fs;
 mod editor_worker;
 mod fs;
 mod fs_watch;

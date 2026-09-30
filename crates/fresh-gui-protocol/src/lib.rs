@@ -20,6 +20,10 @@ pub const CAP_WORKSPACE_SET_ROOT: &str = "workspace_set_root";
 pub const CAP_EDITOR: &str = "editor";
 /// Revisioned Fresh-backed editor transactions and actions.
 pub const CAP_EDITOR_RANGE_EDITS: &str = "editor.range-edits";
+/// Bounded reads and viewport refreshes for large editor buffers.
+pub const CAP_EDITOR_PAGED_READS: &str = "editor.paged-reads";
+/// Maximum requested or returned editor page size.
+pub const MAX_PAGE_BYTES: usize = 64 * 1024;
 /// Durable daemon-owned dirty-buffer recovery.
 pub const CAP_EDITOR_DRAFT_RECOVERY: &str = "editor.draft-recovery";
 /// Revisioned external file change checks and resolution.
@@ -263,6 +267,14 @@ pub struct BufferDiagnostic {
 pub struct ByteSelection {
     pub anchor: usize,
     pub head: usize,
+}
+
+/// A bounded byte range in a UTF-8 buffer. `start` and `len` are UTF-8 byte
+/// offsets; the start and end must fall on character boundaries.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ByteRange {
+    pub start: usize,
+    pub len: usize,
 }
 
 /// Replace `start..end` with `text` in UTF-8 byte offsets. Edits in one
@@ -585,7 +597,7 @@ pub enum Message {
     /// Client → backend: open an empty unsaved buffer (capability `editor`).
     ///
     /// The reply is [`Message::EditorOpened`] plus [`Message::BufferSnapshot`]
-    /// with an empty `path`. The buffer is written only by a later
+    /// (or [`Message::BufferPaged`] when paged-read mode applies) with an empty `path`. The buffer is written only by a later
     /// [`Message::BufferSave`] that includes a destination path.
     EditorNew {
         request_id: String,
@@ -665,6 +677,35 @@ pub enum Message {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         column: Option<u32>,
     },
+    /// Backend → client: large file metadata; content is requested by pages.
+    BufferPaged {
+        buffer_id: String,
+        rev: u64,
+        total_bytes: usize,
+        path: String,
+        dirty: bool,
+    },
+    /// Client → backend: read one bounded byte range of a paged buffer.
+    BufferRead {
+        request_id: String,
+        buffer_id: String,
+        view_id: String,
+        start: usize,
+        len: usize,
+    },
+    /// Backend → client: one bounded page and its authoritative metadata.
+    BufferPage {
+        request_id: String,
+        buffer_id: String,
+        view_id: String,
+        rev: u64,
+        start: usize,
+        total_bytes: usize,
+        text: String,
+        selection: ByteSelection,
+        accepted: bool,
+        dirty: bool,
+    },
     /// Backend → client: full buffer text.
     BufferSnapshot {
         buffer_id: String,
@@ -687,6 +728,9 @@ pub enum Message {
         view_id: String,
         base_rev: u64,
         edits: Vec<RangeEdit>,
+        /// Optional viewport to return after applying the transaction.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        viewport: Option<ByteRange>,
         /// Selection after the edits, in UTF-8 byte offsets.
         selection: ByteSelection,
     },
@@ -1023,6 +1067,7 @@ impl Hello {
             CAP_WORKSPACE_SET_ROOT.to_owned(),
             CAP_EDITOR.to_owned(),
             CAP_EDITOR_RANGE_EDITS.to_owned(),
+            CAP_EDITOR_PAGED_READS.to_owned(),
             CAP_EDITOR_DRAFT_RECOVERY.to_owned(),
             CAP_EDITOR_EXTERNAL_CHANGES.to_owned(),
             CAP_LSP.to_owned(),
@@ -1040,6 +1085,7 @@ impl Hello {
             CAP_WORKSPACE.to_owned(),
             CAP_EDITOR.to_owned(),
             CAP_EDITOR_RANGE_EDITS.to_owned(),
+            CAP_EDITOR_PAGED_READS.to_owned(),
             CAP_EDITOR_DRAFT_RECOVERY.to_owned(),
             CAP_EDITOR_EXTERNAL_CHANGES.to_owned(),
             CAP_LSP.to_owned(),
@@ -1085,6 +1131,7 @@ mod tests {
         let json = Message::Hello(hello).to_json().unwrap();
         assert!(json.contains("\"editor\""));
         assert!(json.contains("editor.range-edits"));
+        assert!(json.contains(CAP_EDITOR_PAGED_READS));
         assert!(json.contains("\"scene\""));
         assert!(json.contains("\"workspace\""));
         assert!(json.contains("0.4.0"));
@@ -1104,6 +1151,7 @@ mod tests {
                     end: 4,
                     text: "你好".into(),
                 }],
+                viewport: Some(ByteRange { start: 10, len: 64 }),
                 selection,
             },
             Message::BufferAction {
@@ -1569,5 +1617,44 @@ mod tests {
             Message::from_json(&formatted.to_json().unwrap()).unwrap(),
             formatted
         );
+    }
+
+    #[test]
+    fn paged_messages_roundtrip_and_legacy_range_edit_defaults_viewport() {
+        let opened = Message::BufferPaged {
+            buffer_id: "b1".into(),
+            rev: 1,
+            total_bytes: 3_000_000,
+            path: "/tmp/large.txt".into(),
+            dirty: false,
+        };
+        assert_eq!(Message::from_json(&opened.to_json().unwrap()).unwrap(), opened);
+        let read = Message::BufferRead {
+            request_id: "read-1".into(),
+            buffer_id: "b1".into(),
+            view_id: "v1".into(),
+            start: 64,
+            len: MAX_PAGE_BYTES,
+        };
+        assert_eq!(Message::from_json(&read.to_json().unwrap()).unwrap(), read);
+        let page = Message::BufferPage {
+            request_id: "read-1".into(),
+            buffer_id: "b1".into(),
+            view_id: "v1".into(),
+            rev: 2,
+            start: 64,
+            total_bytes: 1_000_000,
+            text: "page".into(),
+            selection: ByteSelection { anchor: 0, head: 0 },
+            accepted: true,
+            dirty: false,
+        };
+        assert_eq!(Message::from_json(&page.to_json().unwrap()).unwrap(), page);
+
+        let legacy = r#"{"type":"buffer_range_edit","request_id":"r","buffer_id":"b","view_id":"v","base_rev":1,"edits":[],"selection":{"anchor":0,"head":0}}"#;
+        assert!(matches!(
+            Message::from_json(legacy).unwrap(),
+            Message::BufferRangeEdit { viewport: None, .. }
+        ));
     }
 }

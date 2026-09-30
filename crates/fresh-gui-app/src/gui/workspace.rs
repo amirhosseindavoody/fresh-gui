@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fresh_gui_protocol::{
-    CAP_GIT, CAP_EDITOR_EXTERNAL_CHANGES, CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_DRAFT_RECOVERY, CAP_WORKSPACE, CAP_WORKSPACE_SET_ROOT, FsEntry, FsKind, GitFile, Hello, PtyInfo,
+    CAP_GIT, CAP_EDITOR_PAGED_READS, CAP_EDITOR_EXTERNAL_CHANGES, CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_DRAFT_RECOVERY, CAP_WORKSPACE, CAP_WORKSPACE_SET_ROOT, FsEntry, FsKind, GitFile, Hello, PtyInfo,
     LayoutNode, WorkspaceInfo, WorkspaceLayoutExtra, WorkspaceTab, WorkspaceTabKind,
 };
 use gpui_kit::base::Placement;
@@ -1797,6 +1797,18 @@ impl Workspace {
                     }
                 }
             }
+            AdeEvent::BufferPaged { buffer_id, rev, total_bytes, path, dirty } => {
+                if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
+                    panel.update(cx, |panel, cx| panel.begin_paged(rev, total_bytes, path, dirty, cx));
+                } else {
+                    self.status = "Large files use the paged editor; open this file in an editor tab".into();
+                }
+            }
+            AdeEvent::BufferPage { request_id, buffer_id, view_id, rev, start, total_bytes, text, selection, accepted, dirty } => {
+                if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
+                    panel.update(cx, |panel, cx| panel.apply_page(&request_id, &view_id, rev, start, total_bytes, text, selection, accepted, dirty, window, cx));
+                }
+            }
             AdeEvent::BufferSnapshot {
                 buffer_id,
                 rev,
@@ -2138,7 +2150,7 @@ impl Workspace {
                 panel.configure_draft_recovery(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
                 panel.configure_external_changes(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES));
                 panel.note_reopen(buffer_id, line, column, cx);
-                panel.reconnect(self.ade.clone(), self.capabilities.iter().any(|cap| cap == CAP_EDITOR_RANGE_EDITS), cx);
+                panel.reconnect(self.ade.clone(), self.capabilities.iter().any(|cap| cap == CAP_EDITOR_RANGE_EDITS), self.capabilities.iter().any(|cap| cap == CAP_EDITOR_PAGED_READS), cx);
             });
             if activate {
                 self.select_entity(&panel, window, cx);

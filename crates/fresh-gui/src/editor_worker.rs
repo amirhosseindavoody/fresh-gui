@@ -16,11 +16,15 @@ use fresh::model::event::{BufferId, Event};
 use fresh::model::filesystem::{FileSystem, StdFileSystem};
 use fresh::types::LspFeature;
 use fresh::view::color_support::ColorCapability;
-use fresh_gui_protocol::{BufferDiagnostic, ByteSelection, EditorAction, RangeEdit, SceneBuffer};
+use fresh_gui_protocol::{
+    BufferDiagnostic, ByteRange, ByteSelection, EditorAction, RangeEdit, SceneBuffer,
+};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 const MAX_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PAGE_BYTES: usize = 64 * 1024;
+const MAX_PAGED_RECOVERY_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct OpenedBuffer {
@@ -30,6 +34,18 @@ pub struct OpenedBuffer {
     pub language: Option<String>,
     pub rev: u64,
     pub text: String,
+    /// Total byte length when `text` is omitted for a lazily loaded buffer.
+    pub total_bytes: Option<usize>,
+    pub dirty: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadPage {
+    pub rev: u64,
+    pub start: usize,
+    pub total_bytes: usize,
+    pub text: String,
+    pub dirty: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +53,7 @@ struct TrackedBuffer {
     /// `None` until the buffer is saved to a path.
     path: Option<PathBuf>,
     text: String,
+    total_bytes: Option<usize>,
     rev: u64,
     dirty: bool,
     language: Option<String>,
@@ -47,6 +64,8 @@ struct TrackedBuffer {
     disk: Option<DiskGeneration>,
     external: Option<ExternalChange>,
     overwrite_generation: Option<String>,
+    paged_generation: Option<String>,
+    paged_journal: Vec<crate::drafts::PagedEditTransaction>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,12 +108,12 @@ pub enum ExternalResolution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DiskGeneration {
-    signature: String,
-    text: Option<String>,
+pub(crate) struct DiskGeneration {
+    pub(crate) signature: String,
+    pub(crate) text: Option<String>,
 }
 
-fn disk_generation(path: &Path) -> Result<DiskGeneration> {
+pub(crate) fn disk_generation(path: &Path) -> Result<DiskGeneration> {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -110,22 +129,23 @@ fn disk_generation(path: &Path) -> Result<DiskGeneration> {
     if !metadata.is_file() {
         bail!("external path is not a regular file: {}", path.display());
     }
-    if metadata.len() as usize > MAX_SNAPSHOT_BYTES {
-        bail!("external file exceeds snapshot limit: {}", path.display());
-    }
-    let file = std::fs::File::open(path).with_context(|| format!("read {}", path.display()))?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take((MAX_SNAPSHOT_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_SNAPSHOT_BYTES {
-        bail!("external file exceeds snapshot limit: {}", path.display());
-    }
-    let text = Some(
-        String::from_utf8(bytes.clone())
-            .with_context(|| format!("external file is not UTF-8 text: {}", path.display()))?,
-    );
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    Some(bytes).hash(&mut hasher);
+    let text = if metadata.len() as usize <= MAX_SNAPSHOT_BYTES {
+        let mut file = std::fs::File::open(path)
+            .with_context(|| format!("read {}", path.display()))?
+            .take((MAX_SNAPSHOT_BYTES + 1) as u64);
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_SNAPSHOT_BYTES {
+            bail!("external file exceeds snapshot limit: {}", path.display());
+        }
+        let text = String::from_utf8(bytes.clone())
+            .with_context(|| format!("external file is not UTF-8 text: {}", path.display()))?;
+        Some(bytes).hash(&mut hasher);
+        Some(text)
+    } else {
+        None
+    };
     let len = metadata.len();
     let modified = metadata
         .modified()
@@ -133,8 +153,15 @@ fn disk_generation(path: &Path) -> Result<DiskGeneration> {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        format!("{}:{}", metadata.dev(), metadata.ino())
+    };
+    #[cfg(not(unix))]
+    let identity = String::new();
     Ok(DiskGeneration {
-        signature: format!("{len}:{modified}:{:016x}", hasher.finish()),
+        signature: format!("{len}:{modified}:{identity}:{:016x}", hasher.finish()),
         text,
     })
 }
@@ -161,6 +188,7 @@ enum Cmd {
         view_id: String,
         base_rev: u64,
         edits: Vec<RangeEdit>,
+        viewport: Option<ByteRange>,
         selection: ByteSelection,
         reply: oneshot::Sender<Result<BufferTransactionResult>>,
     },
@@ -175,6 +203,12 @@ enum Cmd {
     Sync {
         buffer_id: String,
         reply: oneshot::Sender<Result<BufferTransactionResult>>,
+    },
+    ReadPage {
+        buffer_id: String,
+        start: usize,
+        len: usize,
+        reply: oneshot::Sender<Result<ReadPage>>,
     },
     Save {
         buffer_id: String,
@@ -243,6 +277,7 @@ pub struct BufferTransactionResult {
     pub selection: ByteSelection,
     pub accepted: bool,
     pub dirty: bool,
+    pub page: Option<ReadPage>,
 }
 
 /// Handle to the editor thread. Cloneable; commands are serialized on the worker.
@@ -384,6 +419,7 @@ impl EditorHandle {
         view_id: String,
         base_rev: u64,
         edits: Vec<RangeEdit>,
+        viewport: Option<ByteRange>,
         selection: ByteSelection,
     ) -> Result<BufferTransactionResult> {
         let (reply, rx) = oneshot::channel();
@@ -393,6 +429,7 @@ impl EditorHandle {
                 view_id,
                 base_rev,
                 edits,
+                viewport,
                 selection,
                 reply,
             })
@@ -428,6 +465,20 @@ impl EditorHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Cmd::Sync { buffer_id, reply })
+            .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+    }
+
+    pub async fn read_page(&self, buffer_id: String, start: usize, len: usize) -> Result<ReadPage> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::ReadPage {
+                buffer_id,
+                start,
+                len,
+                reply,
+            })
             .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
         rx.await
             .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
@@ -594,6 +645,9 @@ fn build_editor(working_dir: &Path, gui_config: &crate::config::Config) -> Resul
     let dir_context = DirectoryContext::for_testing(&state_dir);
     let mut cfg = Config::load_with_layers(&dir_context, working_dir);
     cfg.editor.animations = false;
+    // ADE snapshots stop at 2 MiB; use Fresh's piece-tree lazy mode above the
+    // same boundary so the daemon never builds a full String for those files.
+    cfg.editor.large_file_threshold_bytes = MAX_SNAPSHOT_BYTES as u64 + 1;
     // Fresh owns LSP lifecycle; only the servers explicitly configured for
     // fresh-gui are started on this daemon host.
     cfg.lsp = gui_config.lsp.clone();
@@ -606,7 +660,7 @@ fn build_editor(working_dir: &Path, gui_config: &crate::config::Config) -> Resul
             config.formatter = None;
         }
     }
-    let fs: Arc<dyn FileSystem + Send + Sync> = Arc::new(StdFileSystem);
+    let fs: Arc<dyn FileSystem + Send + Sync> = Arc::new(crate::editor_fs::EditorFileSystem::new());
     Editor::with_working_dir(
         cfg,
         80,
@@ -697,6 +751,7 @@ fn run_loop(
                     view_id,
                     base_rev,
                     edits,
+                    viewport,
                     selection,
                     reply,
                 } => {
@@ -707,13 +762,12 @@ fn run_loop(
                         &view_id,
                         base_rev,
                         edits,
+                        viewport,
                         selection,
                     )
                     .and_then(|result| {
-                        if result.accepted {
-                            if result.dirty {
-                                checkpoint(&drafts, &tracked, &buffer_id)?;
-                            }
+                        if result.accepted && result.dirty {
+                            checkpoint(&drafts, &tracked, &buffer_id)?;
                         }
                         Ok(result)
                     });
@@ -754,6 +808,10 @@ fn run_loop(
                             checkpoint(&drafts, &tracked, &buffer_id)?;
                             Ok(result)
                         });
+                    let _ = reply.send(result);
+                }
+                Cmd::ReadPage { buffer_id, start, len, reply } => {
+                    let result = read_page(&mut editor, &mut tracked, &buffer_id, start, len);
                     let _ = reply.send(result);
                 }
                 Cmd::Save {
@@ -997,14 +1055,6 @@ fn open_buffer(
             path: path.to_path_buf(),
         }));
     }
-    let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    if meta.len() as usize > MAX_SNAPSHOT_BYTES {
-        bail!(
-            "file too large for snapshot ({} bytes; max {MAX_SNAPSHOT_BYTES})",
-            meta.len()
-        );
-    }
-
     let buffer_id = if preview {
         editor
             .open_file_preview(path)
@@ -1015,12 +1065,30 @@ fn open_buffer(
             .with_context(|| format!("open_file {}", path.display()))?
     };
 
+    let id = buffer_id.0.to_string();
+    let previous = tracked
+        .get(&id)
+        .filter(|entry| {
+            entry.workspace_id == workspace_id && entry.path.as_deref().is_some_and(same_path)
+        })
+        .cloned();
     let language = Some(editor.active_state().language.clone());
-    let text = editor
-        .active_state()
-        .buffer
-        .to_string()
-        .context("buffer has unloaded regions (large-file mode); cannot snapshot")?;
+    let total_bytes = editor.active_state().buffer.total_bytes();
+    // Once a buffer enters Fresh's lazy piece-tree mode it stays paged for its
+    // lifetime, even if edits later shrink it below the initial threshold.
+    let paged = total_bytes > MAX_SNAPSHOT_BYTES
+        || previous
+            .as_ref()
+            .is_some_and(|entry| entry.total_bytes.is_some());
+    let text = if paged {
+        String::new()
+    } else {
+        editor
+            .active_state()
+            .buffer
+            .to_string()
+            .context("buffer has unloaded regions")?
+    };
     let dirty = editor.active_state().buffer.is_modified();
 
     if text.len() > MAX_SNAPSHOT_BYTES {
@@ -1030,18 +1098,11 @@ fn open_buffer(
         );
     }
 
-    let id = buffer_id.0.to_string();
-    let previous = tracked
-        .get(&id)
-        .filter(|entry| {
-            entry.workspace_id == workspace_id && entry.path.as_deref().is_some_and(same_path)
-        })
-        .cloned();
     let rev = previous.as_ref().map(|t| t.rev).unwrap_or(0);
     let base_text = previous
         .as_ref()
         .and_then(|entry| entry.base_text.clone())
-        .unwrap_or_else(|| text.clone());
+        .or_else(|| (!paged).then(|| text.clone()));
     let disk = match previous.as_ref().and_then(|entry| entry.disk.clone()) {
         Some(disk) => disk,
         None => disk_generation(path)?,
@@ -1050,6 +1111,10 @@ fn open_buffer(
     let overwrite_generation = previous
         .as_ref()
         .and_then(|entry| entry.overwrite_generation.clone());
+    let paged_generation = previous
+        .as_ref()
+        .and_then(|entry| entry.paged_generation.clone())
+        .or_else(|| paged.then(|| disk.signature.clone()));
     let draft_id = previous
         .as_ref()
         .map(|entry| entry.draft_id.clone())
@@ -1059,16 +1124,21 @@ fn open_buffer(
         TrackedBuffer {
             path: Some(path.to_path_buf()),
             text: text.clone(),
+            total_bytes: paged.then_some(total_bytes),
             rev,
             dirty,
             language: language.clone(),
             workspace_id: workspace_id.to_owned(),
             draft_id,
-            base_text: Some(base_text),
+            base_text,
             recovery_path: Some(path.to_path_buf()),
-            disk: Some(disk),
+            disk: Some(disk.clone()),
             external,
             overwrite_generation,
+            paged_generation,
+            paged_journal: previous
+                .map(|entry| entry.paged_journal)
+                .unwrap_or_default(),
         },
     );
 
@@ -1079,6 +1149,8 @@ fn open_buffer(
         language,
         rev,
         text,
+        total_bytes: paged.then_some(total_bytes),
+        dirty,
     })
 }
 
@@ -1103,6 +1175,14 @@ fn checkpoint(
                 .map(|path| path.display().to_string()),
             text: entry.text.clone(),
             base_text: entry.base_text.clone(),
+            paged: entry
+                .paged_generation
+                .clone()
+                .filter(|_| !entry.paged_journal.is_empty())
+                .map(|generation| crate::drafts::PagedDraft {
+                    generation,
+                    edits: entry.paged_journal.clone(),
+                }),
         },
     )
 }
@@ -1118,6 +1198,36 @@ fn restore_draft(
         .get(workspace_id, draft_id)?
         .context("draft not found")?;
     let source_changed = DraftStore::source_changed(&draft);
+    if let Some(paged) = draft.paged.as_ref() {
+        if source_changed {
+            bail!(
+                "paged draft source changed; recovery copy is preserved and cannot be replayed safely"
+            );
+        }
+        if let Some((buffer_id, entry)) = tracked.iter().find(|(_, entry)| {
+            entry.draft_id == draft.draft_id
+                && entry.total_bytes.is_some()
+                && entry.paged_generation.as_deref() == Some(paged.generation.as_str())
+        }) {
+            let opened = OpenedBuffer {
+                buffer_id: buffer_id.clone(),
+                draft_id: entry.draft_id.clone(),
+                path: entry
+                    .recovery_path
+                    .as_deref()
+                    .or(entry.path.as_deref())
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+                language: entry.language.clone(),
+                rev: entry.rev,
+                text: String::new(),
+                total_bytes: entry.total_bytes,
+                dirty: entry.dirty,
+            };
+            activate_tracked(editor, tracked, buffer_id)?;
+            return Ok((opened, false));
+        }
+    }
     let mut opened =
         if let Some(path) = draft.path.as_ref().filter(|path| Path::new(path).is_file()) {
             match open_buffer(editor, tracked, Path::new(path), false, workspace_id) {
@@ -1127,6 +1237,58 @@ fn restore_draft(
         } else {
             create_untitled(editor, tracked, workspace_id)?
         };
+    if let Some(paged) = draft.paged.as_ref() {
+        let source = draft
+            .path
+            .as_deref()
+            .context("paged draft has no source path")?;
+        let generation = disk_generation(Path::new(source))?;
+        if generation.signature != paged.generation {
+            bail!(
+                "paged draft source changed; recovery copy is preserved and cannot be replayed safely"
+            );
+        }
+        if opened.total_bytes.is_none() {
+            bail!("paged recovery source did not reopen lazily");
+        }
+        let mut rev = opened.rev;
+        for transaction in &paged.edits {
+            let batch = &transaction.edits;
+            let page = read_page(
+                editor,
+                tracked,
+                &opened.buffer_id,
+                transaction.viewport.start,
+                transaction.viewport.len,
+            )?;
+            let result = paged_range_edit(
+                editor,
+                tracked,
+                &opened.buffer_id,
+                "draft-recovery",
+                rev,
+                batch.clone(),
+                Some(transaction.viewport),
+                ByteSelection {
+                    anchor: page.start,
+                    head: page.start,
+                },
+            )?;
+            rev = result.rev;
+        }
+        opened.rev = rev;
+        opened.total_bytes = tracked
+            .get(&opened.buffer_id)
+            .and_then(|entry| entry.total_bytes);
+        opened.dirty = true;
+        if let Some(entry) = tracked.get_mut(&opened.buffer_id) {
+            entry.draft_id = draft.draft_id.clone();
+            entry.workspace_id = workspace_id.to_owned();
+            entry.recovery_path = draft.path.as_deref().map(PathBuf::from);
+            entry.dirty = true;
+        }
+        return Ok((opened, source_changed));
+    }
     let buffer_id = opened.buffer_id.clone();
     let current = editor
         .active_state()
@@ -1215,6 +1377,12 @@ fn edit_buffer(
     base_rev: u64,
     text: &str,
 ) -> Result<u64> {
+    if tracked
+        .get(buffer_id)
+        .is_some_and(|entry| entry.total_bytes.is_some())
+    {
+        bail!("full-text replacement is unavailable for paged buffers; use viewport range edits");
+    }
     if text.len() > MAX_SNAPSHOT_BYTES {
         bail!(
             "edit too large ({} bytes; max {MAX_SNAPSHOT_BYTES})",
@@ -1282,17 +1450,141 @@ fn transaction_result(
         .get(buffer_id)
         .with_context(|| format!("unknown buffer_id {buffer_id}"))?;
     let id: usize = buffer_id.parse().context("invalid buffer_id")?;
-    let text = editor
-        .active_window()
-        .buffers
-        .get(&BufferId(id))
-        .and_then(|state| state.buffer.to_string())
-        .context("Fresh buffer unavailable")?;
+    let text = if entry.total_bytes.is_some() {
+        String::new()
+    } else {
+        editor
+            .active_window()
+            .buffers
+            .get(&BufferId(id))
+            .and_then(|state| state.buffer.to_string())
+            .context("Fresh buffer unavailable")?
+    };
     Ok(BufferTransactionResult {
         rev: entry.rev,
         text,
         selection: current_selection(editor),
         accepted,
+        dirty: entry.dirty,
+        page: None,
+    })
+}
+
+fn read_page(
+    editor: &mut Editor,
+    tracked: &mut HashMap<String, TrackedBuffer>,
+    buffer_id: &str,
+    start: usize,
+    len: usize,
+) -> Result<ReadPage> {
+    let _ = sync_fresh_text(editor, tracked, buffer_id)?;
+    if let Some(entry) = tracked.get(buffer_id) {
+        let path = entry
+            .path
+            .as_deref()
+            .context("paged buffer has no source path")?;
+        if entry.total_bytes.is_some()
+            && entry.paged_generation.as_deref() != Some(disk_generation(path)?.signature.as_str())
+        {
+            bail!(
+                "file changed on disk; paged reads are blocked until external change is resolved"
+            );
+        }
+    }
+    activate_tracked(editor, tracked, buffer_id)?;
+    let total = editor.active_state().buffer.total_bytes();
+    if start > total {
+        bail!("page start exceeds buffer length");
+    }
+    if len == 0 {
+        if start > 0 && start < total {
+            let mut probe_start = start.saturating_sub(4);
+            let probe_end = start.saturating_add(4).min(total);
+            let mut bytes = editor
+                .active_state_mut()
+                .buffer
+                .get_text_range_mut(probe_start, probe_end - probe_start)
+                .context("validate empty page boundary")?;
+            while probe_start > 0 && bytes.first().is_some_and(|byte| byte & 0xc0 == 0x80) {
+                probe_start -= 1;
+                bytes = editor
+                    .active_state_mut()
+                    .buffer
+                    .get_text_range_mut(probe_start, probe_end - probe_start)
+                    .context("align empty page boundary")?;
+            }
+            let valid_len = match std::str::from_utf8(&bytes) {
+                Ok(_) => bytes.len(),
+                Err(error) if error.error_len().is_none() => error.valid_up_to(),
+                Err(_) => bail!("Fresh page contains invalid UTF-8"),
+            };
+            let probe =
+                std::str::from_utf8(&bytes[..valid_len]).context("invalid UTF-8 boundary probe")?;
+            if start < probe_start
+                || start - probe_start > probe.len()
+                || !probe.is_char_boundary(start - probe_start)
+            {
+                bail!("empty viewport start is not a UTF-8 boundary");
+            }
+        }
+        let entry = tracked.get(buffer_id).context("unknown buffer_id")?;
+        return Ok(ReadPage {
+            rev: entry.rev,
+            start,
+            total_bytes: total,
+            text: String::new(),
+            dirty: entry.dirty,
+        });
+    }
+    if len > MAX_PAGE_BYTES {
+        bail!("page length must be 1..={MAX_PAGE_BYTES} bytes");
+    }
+    let requested_end = start.saturating_add(len).min(total);
+    let mut load_start = start.saturating_sub(4);
+    let load_end = requested_end.saturating_add(4).min(total);
+    let mut bytes = editor
+        .active_state_mut()
+        .buffer
+        .get_text_range_mut(load_start, load_end - load_start)
+        .context("load Fresh text page")?;
+    // A byte range can begin within a UTF-8 code point. Back up to its lead
+    // byte; at most three bytes are needed for valid UTF-8.
+    while load_start > 0 && bytes.first().is_some_and(|byte| byte & 0xc0 == 0x80) {
+        load_start -= 1;
+        bytes = editor
+            .active_state_mut()
+            .buffer
+            .get_text_range_mut(load_start, load_end - load_start)
+            .context("align Fresh page start")?;
+    }
+    let valid_len = match std::str::from_utf8(&bytes) {
+        Ok(_) => bytes.len(),
+        Err(error) if error.error_len().is_none() => error.valid_up_to(),
+        Err(_) => bail!("Fresh page contains invalid UTF-8"),
+    };
+    let loaded = std::str::from_utf8(&bytes[..valid_len]).context("Fresh page is not UTF-8")?;
+    let mut local_start = start - load_start;
+    while local_start > 0 && !loaded.is_char_boundary(local_start) {
+        local_start -= 1;
+    }
+    let mut local_end = requested_end - load_start;
+    while local_end < loaded.len() && !loaded.is_char_boundary(local_end) {
+        local_end += 1;
+    }
+    // Keep page transfer bounded even when a multibyte character straddles
+    // the final byte. UTF-8 code points need at most three extra bytes.
+    if local_end - local_start > MAX_PAGE_BYTES {
+        local_end = local_start + MAX_PAGE_BYTES;
+        while !loaded.is_char_boundary(local_end) {
+            local_end -= 1;
+        }
+    }
+    let entry = tracked.get(buffer_id).context("unknown buffer")?;
+    Ok(ReadPage {
+        rev: entry.rev,
+        start: load_start + local_start,
+        total_bytes: total,
+        text: loaded[local_start..local_end].to_owned(),
         dirty: entry.dirty,
     })
 }
@@ -1303,6 +1595,7 @@ fn set_selection(editor: &mut Editor, selection: ByteSelection) {
     cursor.anchor = (selection.anchor != selection.head).then_some(selection.anchor);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn range_edit_buffer(
     editor: &mut Editor,
     tracked: &mut HashMap<String, TrackedBuffer>,
@@ -1310,10 +1603,19 @@ fn range_edit_buffer(
     view_id: &str,
     base_rev: u64,
     edits: Vec<RangeEdit>,
+    viewport: Option<ByteRange>,
     selection: ByteSelection,
 ) -> Result<BufferTransactionResult> {
     if view_id.is_empty() {
         bail!("view_id cannot be empty");
+    }
+    if tracked
+        .get(buffer_id)
+        .is_some_and(|entry| entry.total_bytes.is_some())
+    {
+        return paged_range_edit(
+            editor, tracked, buffer_id, view_id, base_rev, edits, viewport, selection,
+        );
     }
     let _ = sync_fresh_text(editor, tracked, buffer_id)?;
     activate_tracked(editor, tracked, buffer_id)?;
@@ -1444,6 +1746,221 @@ fn range_edit_buffer(
     transaction_result(tracked, editor, buffer_id, true)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn paged_range_edit(
+    editor: &mut Editor,
+    tracked: &mut HashMap<String, TrackedBuffer>,
+    buffer_id: &str,
+    view_id: &str,
+    base_rev: u64,
+    edits: Vec<RangeEdit>,
+    viewport: Option<ByteRange>,
+    selection: ByteSelection,
+) -> Result<BufferTransactionResult> {
+    if view_id.is_empty() {
+        bail!("view_id cannot be empty");
+    }
+    let viewport = viewport.context("paged edits require a viewport")?;
+    let current = tracked.get(buffer_id).context("unknown buffer_id")?;
+    if viewport.start > current.total_bytes.unwrap_or(0) || viewport.len > MAX_PAGE_BYTES {
+        bail!("invalid paged edit viewport length");
+    }
+    if current.rev != base_rev {
+        let mut result = transaction_result(tracked, editor, buffer_id, false)?;
+        result.page = Some(read_page(
+            editor,
+            tracked,
+            buffer_id,
+            viewport.start,
+            viewport.len,
+        )?);
+        return Ok(result);
+    }
+    if edits.is_empty() {
+        let mut result = transaction_result(tracked, editor, buffer_id, true)?;
+        result.page = Some(read_page(
+            editor,
+            tracked,
+            buffer_id,
+            viewport.start,
+            viewport.len,
+        )?);
+        return Ok(result);
+    }
+    let path = current
+        .path
+        .as_deref()
+        .context("paged buffer has no source path")?;
+    let disk = disk_generation(path)?;
+    if current.paged_generation.as_deref() != Some(disk.signature.as_str()) {
+        bail!("file changed on disk; paged edits are blocked until external change is resolved");
+    }
+    if edits.len() > 128 {
+        bail!("too many edits in one transaction");
+    }
+    let inserted: usize = edits.iter().map(|edit| edit.text.len()).sum();
+    let deleted: usize = edits
+        .iter()
+        .map(|edit| edit.end.saturating_sub(edit.start))
+        .sum();
+    if inserted > MAX_PAGE_BYTES || deleted > MAX_PAGE_BYTES {
+        bail!("paged edit payload exceeds 64 KiB");
+    }
+    let prior_recovery_bytes: usize = current
+        .paged_journal
+        .iter()
+        .flat_map(|transaction| transaction.edits.iter())
+        .map(|edit| 32usize.saturating_add(edit.text.len()))
+        .sum();
+    let incoming_recovery_bytes: usize = edits
+        .iter()
+        .map(|edit| 32usize.saturating_add(edit.text.len()))
+        .sum();
+    if prior_recovery_bytes.saturating_add(incoming_recovery_bytes) > MAX_PAGED_RECOVERY_BYTES {
+        bail!(
+            "paged recovery journal reached its 4 MiB limit; save the buffer before editing further"
+        );
+    }
+    activate_tracked(editor, tracked, buffer_id)?;
+    let initial = read_page(editor, tracked, buffer_id, viewport.start, viewport.len)?;
+    if initial.start > viewport.start {
+        bail!("Fresh page starts after requested viewport");
+    }
+    let mut working = initial.text.clone();
+    let mut delta = 0isize;
+    let viewport_end = viewport
+        .start
+        .checked_add(viewport.len)
+        .context("viewport end overflow")?;
+    for edit in &edits {
+        let start = edit.start;
+        let end = edit.end;
+        let adjusted_viewport_end = if delta >= 0 {
+            viewport_end.checked_add(delta as usize)
+        } else {
+            viewport_end.checked_sub(delta.unsigned_abs())
+        }
+        .context("adjusted viewport end overflow")?;
+        if edit.start > edit.end
+            || start < initial.start
+            || end > initial.start + working.len()
+            || start < viewport.start
+            || end > adjusted_viewport_end
+        {
+            bail!("paged edit range must be inside the supplied viewport");
+        }
+        let local_start = start - initial.start;
+        let local_end = end - initial.start;
+        if !working.is_char_boundary(local_start) || !working.is_char_boundary(local_end) {
+            bail!("paged edit range is not on a UTF-8 boundary");
+        }
+        working.replace_range(local_start..local_end, &edit.text);
+        delta += edit.text.len() as isize - (end - start) as isize;
+        if working.len() > MAX_PAGE_BYTES {
+            bail!("edited viewport exceeds 64 KiB");
+        }
+    }
+    let updated_view_end = initial.start + working.len();
+    if selection.anchor < initial.start
+        || selection.head < initial.start
+        || selection.anchor > updated_view_end
+        || selection.head > updated_view_end
+        || !working.is_char_boundary(selection.anchor - initial.start)
+        || !working.is_char_boundary(selection.head - initial.start)
+    {
+        bail!("paged selection must be inside the loaded viewport and on UTF-8 boundaries");
+    }
+
+    let mut prefix = initial
+        .text
+        .bytes()
+        .zip(working.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !initial.text.is_char_boundary(prefix) || !working.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let suffix_max = initial
+        .text
+        .len()
+        .saturating_sub(prefix)
+        .min(working.len().saturating_sub(prefix));
+    let mut suffix = initial.text.as_bytes()[initial.text.len() - suffix_max..]
+        .iter()
+        .rev()
+        .zip(
+            working.as_bytes()[working.len() - suffix_max..]
+                .iter()
+                .rev(),
+        )
+        .take_while(|(a, b)| a == b)
+        .count();
+    while suffix > 0
+        && (!initial.text.is_char_boundary(initial.text.len() - suffix)
+            || !working.is_char_boundary(working.len() - suffix))
+    {
+        suffix -= 1;
+    }
+    let old_end = initial.text.len() - suffix;
+    let new_end = working.len() - suffix;
+    let cursor_id = editor.active_cursors().primary_id();
+    let before = editor.active_cursors().primary();
+    let mut events = Vec::new();
+    if old_end > prefix {
+        events.push(Event::Delete {
+            range: initial.start + prefix..initial.start + old_end,
+            deleted_text: initial.text[prefix..old_end].to_owned(),
+            cursor_id,
+        });
+    }
+    if new_end > prefix {
+        events.push(Event::Insert {
+            position: initial.start + prefix,
+            text: working[prefix..new_end].to_owned(),
+            cursor_id,
+        });
+    }
+    if initial.text != working
+        || before.position != selection.head
+        || before.anchor != (selection.anchor != selection.head).then_some(selection.anchor)
+    {
+        events.push(Event::MoveCursor {
+            cursor_id,
+            old_position: before.position,
+            new_position: selection.head,
+            old_anchor: before.anchor,
+            new_anchor: (selection.anchor != selection.head).then_some(selection.anchor),
+            old_sticky_column: before.sticky_column,
+            new_sticky_column: None,
+        });
+        editor.log_and_apply_event(&Event::Batch {
+            events,
+            description: "ADE paged range edit".into(),
+        });
+    }
+    let changed = initial.text != working;
+    let entry = tracked.get_mut(buffer_id).expect("tracked");
+    if changed {
+        entry.rev += 1;
+        entry.dirty = true;
+        entry
+            .paged_journal
+            .push(crate::drafts::PagedEditTransaction { viewport, edits });
+        entry.text.clear();
+        entry.total_bytes = Some(editor.active_state().buffer.total_bytes());
+    }
+    let mut result = transaction_result(tracked, editor, buffer_id, true)?;
+    let entry = tracked.get(buffer_id).context("unknown buffer_id")?;
+    result.page = Some(ReadPage {
+        rev: entry.rev,
+        start: initial.start,
+        total_bytes: editor.active_state().buffer.total_bytes(),
+        text: working,
+        dirty: entry.dirty,
+    });
+    Ok(result)
+}
+
 fn action_buffer(
     editor: &mut Editor,
     tracked: &mut HashMap<String, TrackedBuffer>,
@@ -1455,6 +1972,12 @@ fn action_buffer(
 ) -> Result<BufferTransactionResult> {
     if view_id.is_empty() {
         bail!("view_id cannot be empty");
+    }
+    if tracked
+        .get(buffer_id)
+        .is_some_and(|entry| entry.total_bytes.is_some())
+    {
+        bail!("undo and redo are unavailable for paged buffers in this version");
     }
     let _ = sync_fresh_text(editor, tracked, buffer_id)?;
     activate_tracked(editor, tracked, buffer_id)?;
@@ -1488,6 +2011,12 @@ fn sync_buffer(
     tracked: &mut HashMap<String, TrackedBuffer>,
     buffer_id: &str,
 ) -> Result<BufferTransactionResult> {
+    if tracked
+        .get(buffer_id)
+        .is_some_and(|entry| entry.total_bytes.is_some())
+    {
+        bail!("paged buffers require a range read; full snapshots are unavailable");
+    }
     activate_tracked(editor, tracked, buffer_id)?;
     let _ = sync_fresh_text(editor, tracked, buffer_id)?;
     transaction_result(tracked, editor, buffer_id, true)
@@ -1526,6 +2055,20 @@ fn sync_fresh_text(
         .buffers
         .get(&BufferId(id))
         .context("Fresh buffer unavailable")?;
+    let total_bytes = state.buffer.total_bytes();
+    let was_paged = tracked
+        .get(buffer_id)
+        .is_some_and(|entry| entry.total_bytes.is_some());
+    if total_bytes > MAX_SNAPSHOT_BYTES || was_paged {
+        let entry = tracked
+            .get_mut(buffer_id)
+            .with_context(|| format!("unknown buffer_id {buffer_id}"))?;
+        entry.total_bytes = Some(total_bytes);
+        entry.dirty = state.buffer.is_modified();
+        // Materializing to_string() here would defeat Fresh's lazy piece tree.
+        // Large-buffer mutations are revisioned through the paged transaction.
+        return Ok(None);
+    }
     let text = state
         .buffer
         .to_string()
@@ -1552,6 +2095,12 @@ fn sync_all_fresh_text(
 ) -> Result<()> {
     let ids: Vec<String> = tracked.keys().cloned().collect();
     for id in ids {
+        if tracked
+            .get(&id)
+            .is_some_and(|entry| entry.total_bytes.is_some())
+        {
+            continue;
+        }
         let _ = sync_fresh_text(editor, tracked, &id)?;
     }
     Ok(())
@@ -1611,12 +2160,19 @@ fn lsp_state(
         .collect();
     let rev = tracked[buffer_id].rev;
     let text = if rev != known_rev {
-        let id: usize = buffer_id.parse().context("invalid buffer_id")?;
-        editor
-            .active_window()
-            .buffers
-            .get(&BufferId(id))
-            .and_then(|state| state.buffer.to_string())
+        if tracked
+            .get(buffer_id)
+            .is_some_and(|entry| entry.total_bytes.is_some())
+        {
+            None
+        } else {
+            let id: usize = buffer_id.parse().context("invalid buffer_id")?;
+            editor
+                .active_window()
+                .buffers
+                .get(&BufferId(id))
+                .and_then(|state| state.buffer.to_string())
+        }
     } else {
         None
     };
@@ -1634,6 +2190,12 @@ async fn format_buffer(
     buffer_id: &str,
     base_rev: u64,
 ) -> Result<FormatState> {
+    if tracked
+        .get(buffer_id)
+        .is_some_and(|entry| entry.total_bytes.is_some())
+    {
+        bail!("formatting is unavailable for paged buffers in this version");
+    }
     let _ = sync_fresh_text(editor, tracked, buffer_id)?;
     let current = tracked
         .get(buffer_id)
@@ -1718,6 +2280,7 @@ fn create_untitled(
         TrackedBuffer {
             path: None,
             text: text.clone(),
+            total_bytes: None,
             rev: 0,
             dirty: false,
             language: language.clone(),
@@ -1728,6 +2291,8 @@ fn create_untitled(
             disk: None,
             external: None,
             overwrite_generation: None,
+            paged_generation: None,
+            paged_journal: Vec::new(),
         },
     );
     Ok(OpenedBuffer {
@@ -1737,6 +2302,8 @@ fn create_untitled(
         language,
         rev: 0,
         text,
+        total_bytes: None,
+        dirty: false,
     })
 }
 
@@ -1805,6 +2372,22 @@ fn poll_external_changes(
             .and_then(|e| e.external.as_ref())
             .is_some_and(|p| p.generation == generation.signature);
         if same_pending {
+            continue;
+        }
+        if tracked
+            .get(&id)
+            .is_some_and(|entry| entry.total_bytes.is_some())
+        {
+            let notice = external_notice(&id, tracked.get(&id).expect("tracked"), &generation);
+            let dirty = notice.dirty;
+            tracked.get_mut(&id).expect("tracked").external = Some(notice.clone());
+            // Fresh's lazy pieces still reference the original path. Once it
+            // changes, neither reloading nor saving can safely reconstruct
+            // the old backing. Preserve the journal and require manual review.
+            if dirty {
+                checkpoint(drafts, tracked, &id)?;
+            }
+            let _ = tx.send(notice);
             continue;
         }
         let _ = sync_fresh_text(editor, tracked, &id);
@@ -1901,6 +2484,14 @@ fn resolve_external(
     if pending.generation != generation {
         bail!("external generation changed; check again before resolving");
     }
+    if tracked
+        .get(buffer_id)
+        .is_some_and(|entry| entry.total_bytes.is_some())
+    {
+        bail!(
+            "Fresh lazy backing changed on disk; automatic reload, keep, and overwrite are unsafe. The paged recovery journal is preserved"
+        );
+    }
     let path = PathBuf::from(&pending.path);
     let now = disk_generation(&path)?;
     if now.signature != generation {
@@ -1971,6 +2562,7 @@ fn resolve_external(
         selection: ByteSelection { anchor: 0, head: 0 },
         accepted: true,
         dirty: entry.dirty,
+        page: None,
     })
 }
 
@@ -1999,7 +2591,29 @@ fn save_buffer(
             .get(buffer_id)
             .and_then(|entry| entry.path.clone().or_else(|| entry.recovery_path.clone()))
     });
+    if let Some(entry) = tracked
+        .get(buffer_id)
+        .filter(|entry| entry.total_bytes.is_some())
+    {
+        let source = entry
+            .path
+            .as_deref()
+            .or(entry.recovery_path.as_deref())
+            .context("paged buffer has no original backing path")?;
+        let generation = disk_generation(source)?;
+        if entry.paged_generation.as_deref() != Some(generation.signature.as_str()) {
+            bail!(
+                "Fresh lazy backing changed on disk; paged save is unsafe and the recovery journal is preserved"
+            );
+        }
+    }
     if let Some(dest) = save_path.as_deref() {
+        if tracked.get(buffer_id).is_some_and(|entry| entry.total_bytes.is_some())
+            && !StdFileSystem.is_owner(dest) {
+            // Fresh's ownership-preserving path bypasses write_patched and
+            // materializes Copy operations. Keep paged saves bounded.
+            bail!("paged saves to files owned by another user are unavailable; Save As to a new file");
+        }
         let current_disk = disk_generation(dest)?;
         let entry = tracked.get(buffer_id).expect("tracked");
         let same_destination = entry.path.as_deref().is_some_and(|source| {
@@ -2017,7 +2631,7 @@ fn save_buffer(
                     external.dirty && external.path == dest.display().to_string()
                 })
         } else {
-            current_disk.text.is_some()
+            !current_disk.signature.starts_with("missing:")
         };
         let explicitly_authorized = entry.overwrite_generation.as_deref()
             == Some(current_disk.signature.as_str())
@@ -2057,13 +2671,27 @@ fn save_buffer(
     } else {
         bail!("unsaved buffer needs a path");
     }
-    let text = editor.active_state().buffer.to_string().unwrap_or_default();
+    let total_bytes = editor.active_state().buffer.total_bytes();
+    let was_paged = tracked
+        .get(buffer_id)
+        .is_some_and(|entry| entry.total_bytes.is_some());
+    let paged = total_bytes > MAX_SNAPSHOT_BYTES || was_paged;
+    let text = if paged {
+        String::new()
+    } else {
+        editor.active_state().buffer.to_string().unwrap_or_default()
+    };
     let entry = tracked.get_mut(buffer_id).expect("tracked");
     entry.text = text;
-    entry.base_text = Some(entry.text.clone());
+    entry.total_bytes = paged.then_some(total_bytes);
+    entry.base_text = (entry.total_bytes.is_none()).then(|| entry.text.clone());
     entry.disk = Some(disk_generation(
         entry.path.as_deref().context("saved buffer path")?,
     )?);
+    entry.paged_generation = entry
+        .total_bytes
+        .map(|_| entry.disk.as_ref().expect("just set").signature.clone());
+    entry.paged_journal.clear();
     entry.external = None;
     entry.overwrite_generation = None;
     entry.dirty = false;
@@ -2132,6 +2760,423 @@ mod external_generation_tests {
             disk_generation(&path).unwrap().signature,
             "duplicate notifications coalesce to one generation"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod paged_file_tests {
+    use super::*;
+
+    #[test]
+    fn opens_reads_edits_and_stream_saves_a_file_over_snapshot_limit() {
+        let root =
+            std::env::temp_dir().join(format!("fresh-paged-worker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("large.txt");
+        let recovery = root.join("recovery");
+        let mut contents = vec![b'a'; 3 * 1024 * 1024];
+        let marker = "🙂".as_bytes();
+        let offset = 2 * 1024 * 1024 + 17;
+        contents[offset..offset + marker.len()].copy_from_slice(marker);
+        std::fs::write(&path, contents).unwrap();
+        let editor = EditorHandle::spawn_with_recovery_dir(
+            root.clone(),
+            crate::config::Config::default(),
+            recovery,
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let opened = editor.open(path.clone(), false).await.unwrap();
+            assert!(opened.text.is_empty());
+            assert_eq!(opened.total_bytes, Some(3 * 1024 * 1024));
+            let page = editor
+                .read_page(opened.buffer_id.clone(), offset - 128, MAX_PAGE_BYTES)
+                .await
+                .unwrap();
+            let marker_in_page = page.text.find("🙂").unwrap();
+            assert!(page.text.is_char_boundary(marker_in_page + "🙂".len()));
+            let result = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "paged-test".into(),
+                    opened.rev,
+                    vec![RangeEdit {
+                        start: page.start + marker_in_page,
+                        end: page.start + marker_in_page + 4,
+                        text: "🧪".into(),
+                    }],
+                    Some(ByteRange {
+                        start: page.start,
+                        len: page.text.len(),
+                    }),
+                    ByteSelection {
+                        anchor: page.start + marker_in_page + 4,
+                        head: page.start + marker_in_page + 4,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(result.accepted);
+            assert_eq!(result.rev, opened.rev + 1);
+            let updated = result.page.unwrap();
+            assert!(updated.text.contains("🧪"));
+            let eof = editor
+                .read_page(opened.buffer_id.clone(), 3 * 1024 * 1024, 0)
+                .await
+                .unwrap();
+            assert!(eof.text.is_empty());
+            let appended = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "paged-test".into(),
+                    result.rev,
+                    vec![RangeEdit {
+                        start: eof.total_bytes,
+                        end: eof.total_bytes,
+                        text: "end".into(),
+                    }],
+                    Some(ByteRange {
+                        start: eof.start,
+                        len: 0,
+                    }),
+                    ByteSelection {
+                        anchor: eof.total_bytes + 3,
+                        head: eof.total_bytes + 3,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(appended.accepted);
+            assert_eq!(appended.page.unwrap().text, "end");
+            editor
+                .save(opened.buffer_id.clone(), appended.rev, None)
+                .await
+                .unwrap();
+            let saved = std::fs::read(&path).unwrap();
+            assert_eq!(&saved[offset..offset + 4], "🧪".as_bytes());
+            assert_eq!(&saved[saved.len() - 3..], b"end");
+            assert_eq!(saved.len(), 3 * 1024 * 1024 + 3);
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn changed_lazy_source_blocks_reads_and_preserves_dirty_recovery_journal() {
+        let root =
+            std::env::temp_dir().join(format!("fresh-paged-external-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("large.txt");
+        let recovery = root.join("recovery");
+        std::fs::write(&path, vec![b'x'; 3 * 1024 * 1024]).unwrap();
+        let editor = EditorHandle::spawn_with_recovery_dir(
+            root.clone(),
+            crate::config::Config::default(),
+            recovery.clone(),
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let opened = editor.open(path.clone(), false).await.unwrap();
+            let page = editor
+                .read_page(opened.buffer_id.clone(), 1024, MAX_PAGE_BYTES)
+                .await
+                .unwrap();
+            let edited = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "paged-test".into(),
+                    opened.rev,
+                    vec![RangeEdit {
+                        start: page.start,
+                        end: page.start + 1,
+                        text: "y".into(),
+                    }],
+                    Some(ByteRange {
+                        start: page.start,
+                        len: page.text.len(),
+                    }),
+                    ByteSelection {
+                        anchor: page.start + 1,
+                        head: page.start + 1,
+                    },
+                )
+                .await
+                .unwrap();
+            std::fs::write(&path, vec![b'z'; 3 * 1024 * 1024]).unwrap();
+            assert!(
+                editor
+                    .read_page(opened.buffer_id.clone(), 0, 4096)
+                    .await
+                    .is_err()
+            );
+            let drafts = DraftStore::new(recovery);
+            let draft = drafts.get("default", &opened.draft_id).unwrap().unwrap();
+            assert!(draft.paged.is_some());
+            assert_eq!(draft.paged.unwrap().edits.len(), 1);
+            assert_eq!(edited.rev, opened.rev + 1);
+            let copied = root.join("copy.txt");
+            assert!(
+                editor
+                    .save(opened.buffer_id.clone(), edited.rev, Some(copied.clone()))
+                    .await
+                    .is_err()
+            );
+            assert!(!copied.exists());
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deleting_a_full_page_returns_empty_without_exposing_following_text() {
+        let root =
+            std::env::temp_dir().join(format!("fresh-paged-empty-page-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("large.txt");
+        let recovery = root.join("recovery");
+        std::fs::write(&path, vec![b'x'; 3 * 1024 * 1024]).unwrap();
+        let editor = EditorHandle::spawn_with_recovery_dir(
+            root.clone(),
+            crate::config::Config::default(),
+            recovery,
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let opened = editor.open(path.clone(), false).await.unwrap();
+            let page = editor
+                .read_page(opened.buffer_id.clone(), 0, MAX_PAGE_BYTES)
+                .await
+                .unwrap();
+            let deleted = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "empty-page".into(),
+                    opened.rev,
+                    vec![RangeEdit {
+                        start: page.start,
+                        end: page.start + page.text.len(),
+                        text: String::new(),
+                    }],
+                    Some(ByteRange {
+                        start: page.start,
+                        len: page.text.len(),
+                    }),
+                    ByteSelection {
+                        anchor: page.start,
+                        head: page.start,
+                    },
+                )
+                .await
+                .unwrap();
+            let empty = deleted.page.unwrap();
+            assert!(empty.text.is_empty());
+            let following = editor
+                .read_page(opened.buffer_id.clone(), page.start, 1)
+                .await
+                .unwrap();
+            assert_eq!(following.text, "x");
+
+            let inserted = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "empty-page".into(),
+                    deleted.rev,
+                    vec![RangeEdit {
+                        start: page.start,
+                        end: page.start,
+                        text: "Q".into(),
+                    }],
+                    Some(ByteRange {
+                        start: page.start,
+                        len: 0,
+                    }),
+                    ByteSelection {
+                        anchor: page.start + 1,
+                        head: page.start + 1,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(inserted.page.unwrap().text, "Q");
+            let following = editor
+                .read_page(opened.buffer_id, page.start + 1, 1)
+                .await
+                .unwrap();
+            assert_eq!(following.text, "x");
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shrinking_a_lazy_buffer_does_not_switch_back_to_snapshot_edits() {
+        let root =
+            std::env::temp_dir().join(format!("fresh-paged-sticky-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("large.txt");
+        let recovery = root.join("recovery");
+        let original_len = MAX_SNAPSHOT_BYTES + 32 * 1024;
+        std::fs::write(&path, vec![b'x'; original_len]).unwrap();
+        let editor = EditorHandle::spawn_with_recovery_dir(
+            root.clone(),
+            crate::config::Config::default(),
+            recovery,
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let opened = editor.open(path.clone(), false).await.unwrap();
+            assert_eq!(opened.total_bytes, Some(original_len));
+            let tail = editor
+                .read_page(opened.buffer_id.clone(), MAX_SNAPSHOT_BYTES, 32 * 1024)
+                .await
+                .unwrap();
+            let deleted = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "sticky-page".into(),
+                    opened.rev,
+                    vec![RangeEdit {
+                        start: MAX_SNAPSHOT_BYTES,
+                        end: original_len,
+                        text: String::new(),
+                    }],
+                    Some(ByteRange {
+                        start: tail.start,
+                        len: tail.text.len(),
+                    }),
+                    ByteSelection {
+                        anchor: MAX_SNAPSHOT_BYTES,
+                        head: MAX_SNAPSHOT_BYTES,
+                    },
+                )
+                .await
+                .unwrap();
+            editor
+                .save(opened.buffer_id.clone(), deleted.rev, None)
+                .await
+                .unwrap();
+            let page = editor
+                .read_page(opened.buffer_id.clone(), 0, 16)
+                .await
+                .unwrap();
+            assert_eq!(page.total_bytes, MAX_SNAPSHOT_BYTES);
+            let edited = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "sticky-page".into(),
+                    page.rev,
+                    vec![RangeEdit {
+                        start: page.start,
+                        end: page.start + 1,
+                        text: "y".into(),
+                    }],
+                    Some(ByteRange {
+                        start: page.start,
+                        len: page.text.len(),
+                    }),
+                    ByteSelection {
+                        anchor: page.start + 1,
+                        head: page.start + 1,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(edited.page.unwrap().text, "yxxxxxxxxxxxxxxx");
+            assert_eq!(
+                editor.read_page(opened.buffer_id, 0, 1).await.unwrap().text,
+                "y"
+            );
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn paged_recovery_replays_incremental_edits_after_reopen() {
+        let root =
+            std::env::temp_dir().join(format!("fresh-paged-recovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("large.txt");
+        let recovery = root.join("recovery");
+        let mut bytes = vec![b'x'; 3 * 1024 * 1024];
+        let at = 1024 * 1024 + 11;
+        bytes[at] = b'a';
+        std::fs::write(&path, bytes).unwrap();
+        let editor = EditorHandle::spawn_with_recovery_dir(
+            root.clone(),
+            crate::config::Config::default(),
+            recovery,
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let opened = editor.open(path.clone(), false).await.unwrap();
+            let page = editor
+                .read_page(opened.buffer_id.clone(), at, MAX_PAGE_BYTES / 2)
+                .await
+                .unwrap();
+            let target = at;
+            let edited = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "paged-recovery".into(),
+                    opened.rev,
+                    vec![RangeEdit {
+                        start: target,
+                        end: target + 1,
+                        text: "🧪".into(),
+                    }],
+                    Some(ByteRange {
+                        start: page.start,
+                        len: page.text.len(),
+                    }),
+                    ByteSelection {
+                        anchor: target + 4,
+                        head: target + 4,
+                    },
+                )
+                .await
+                .unwrap();
+            editor.close(opened.buffer_id.clone()).await.unwrap();
+            let (restored, changed) = editor
+                .draft_restore("default".into(), opened.draft_id)
+                .await
+                .unwrap();
+            assert!(!changed);
+            assert_eq!(restored.rev, edited.rev);
+            let restored_page = editor
+                .read_page(restored.buffer_id.clone(), at, MAX_PAGE_BYTES)
+                .await
+                .unwrap();
+            assert!(restored_page.text.contains("🧪"));
+            assert!(restored.dirty);
+            let (again, _) = editor
+                .draft_restore("default".into(), restored.draft_id.clone())
+                .await
+                .unwrap();
+            assert_eq!(again.rev, restored.rev);
+            let page_again = editor
+                .read_page(again.buffer_id, at, MAX_PAGE_BYTES)
+                .await
+                .unwrap();
+            assert!(page_again.text.contains("🧪"));
+        });
         let _ = std::fs::remove_dir_all(root);
     }
 }
@@ -2378,6 +3423,7 @@ mod external_recovery_tests {
                         path: Some(path.display().to_string()),
                         text: "recovered draft".into(),
                         base_text: Some("original".into()),
+                        paged: None,
                     },
                 )
                 .unwrap();
@@ -2706,6 +3752,7 @@ mod tests {
                     path: Some(missing.display().to_string()),
                     text: "review this".into(),
                     base_text: Some("old source".into()),
+                    paged: None,
                 },
             )
             .unwrap();
@@ -2774,6 +3821,7 @@ mod tests {
                             text: "🧪".into(),
                         },
                     ],
+                    None,
                     ByteSelection { anchor: 1, head: 5 },
                 )
                 .await
@@ -2795,6 +3843,7 @@ mod tests {
                         end: 0,
                         text: "lost".into(),
                     }],
+                    None,
                     initial.selection,
                 )
                 .await
@@ -2813,6 +3862,7 @@ mod tests {
                         end: 9,
                         text: "!".into(),
                     }],
+                    None,
                     ByteSelection {
                         anchor: 10,
                         head: 10,
@@ -2888,6 +3938,7 @@ mod tests {
                             text: String::new(),
                         },
                     ],
+                    None,
                     redo_group.selection,
                 )
                 .await;
@@ -3044,6 +4095,7 @@ while True:
                             text: "新🙂\nnext".into(),
                         },
                     ],
+                    None,
                     ByteSelection { anchor: 1, head: 8 },
                 )
                 .await
@@ -3242,6 +4294,7 @@ while True:
                         end: 0,
                         text: "stale".into(),
                     }],
+                    None,
                     ByteSelection { anchor: 0, head: 0 },
                 )
                 .await

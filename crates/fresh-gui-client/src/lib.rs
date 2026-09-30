@@ -643,6 +643,13 @@ impl Client {
                         return Ok((buffer_id, path, lang, rev, text));
                     }
                 }
+                Message::BufferPaged { buffer_id, .. }
+                    if opened
+                        .as_ref()
+                        .is_some_and(|(opened_id, _, _, _, _)| opened_id == &buffer_id) =>
+                {
+                    bail!("editor open returned paged buffer {buffer_id}; use BufferRead events instead of Client::open_editor full snapshots")
+                }
                 Message::Error { code, message } => {
                     bail!("editor open failed: {code}: {message}")
                 }

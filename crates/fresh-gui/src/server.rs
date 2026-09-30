@@ -13,9 +13,9 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use base64::Engine;
 use fresh_gui_protocol::{
-    CAP_EDITOR, CAP_EDITOR_DRAFT_RECOVERY, CAP_EDITOR_EXTERNAL_CHANGES, CAP_EDITOR_RANGE_EDITS,
-    CAP_LSP, CAP_SCENE, EditorDraftInfo, ExternalResolution, Hello, HelloUi, Message,
-    PROTOCOL_VERSION,
+    CAP_EDITOR, CAP_EDITOR_DRAFT_RECOVERY, CAP_EDITOR_EXTERNAL_CHANGES, CAP_EDITOR_PAGED_READS,
+    CAP_EDITOR_RANGE_EDITS, CAP_LSP, CAP_SCENE, ByteSelection, EditorDraftInfo,
+    ExternalResolution, Hello, HelloUi, Message, MAX_PAGE_BYTES, PROTOCOL_VERSION,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
@@ -28,6 +28,8 @@ use crate::fs_watch::FsWatchStore;
 use crate::memory_monitor::MemoryMonitor;
 use crate::session::SessionStore;
 use crate::workspace::WorkspaceStore;
+
+const MAX_SNAPSHOT_BYTES: u64 = 2 * 1024 * 1024;
 
 pub struct AppState {
     pub token: Option<String>,
@@ -127,6 +129,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         caps.retain(|c| {
             c != CAP_EDITOR
                 && c != CAP_EDITOR_RANGE_EDITS
+                && c != CAP_EDITOR_PAGED_READS
                 && c != CAP_EDITOR_DRAFT_RECOVERY
                 && c != CAP_EDITOR_EXTERNAL_CHANGES
                 && c != CAP_LSP
@@ -157,6 +160,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     let mut authed = !state.require_auth;
     let mut client_range_edits = false;
+    let mut client_paged_reads = false;
     let mut client_draft_recovery = false;
     let mut client_external_changes = false;
     let mut session_id: Option<String> = None;
@@ -222,6 +226,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     &defaults_path,
                     &mut authed,
                     &mut client_range_edits,
+                    &mut client_paged_reads,
                     &mut client_draft_recovery,
                     &mut client_external_changes,
                     &mut session_id,
@@ -249,6 +254,7 @@ async fn handle_client_msg(
     defaults_path: &Path,
     authed: &mut bool,
     client_range_edits: &mut bool,
+    client_paged_reads: &mut bool,
     client_draft_recovery: &mut bool,
     client_external_changes: &mut bool,
     session_id: &mut Option<String>,
@@ -261,6 +267,10 @@ async fn handle_client_msg(
                 .capabilities
                 .iter()
                 .any(|cap| cap == CAP_EDITOR_RANGE_EDITS);
+            *client_paged_reads = client_hello
+                .capabilities
+                .iter()
+                .any(|cap| cap == CAP_EDITOR_PAGED_READS);
             *client_draft_recovery = client_hello
                 .capabilities
                 .iter()
@@ -788,6 +798,9 @@ async fn handle_client_msg(
                         code: "editor_open_failed".into(),
                         message: format!("{request_id}: {err:#}"),
                     })?;
+            if !*client_paged_reads && is_large_file(&resolved.path) {
+                return Err(paged_reads_unavailable(&request_id));
+            }
             let workspace_id = current_workspace_id(state, session_id).await?;
             reply_editor_opened(
                 sink,
@@ -798,6 +811,7 @@ async fn handle_client_msg(
                 resolved.line,
                 resolved.column,
                 workspace_id,
+                *client_paged_reads,
             )
             .await
         }
@@ -826,6 +840,9 @@ async fn handle_client_msg(
                 code: "editor_open_failed".into(),
                 message: format!("{request_id}: {err:#}"),
             })?;
+            if !*client_paged_reads && is_large_file(&resolved.path) {
+                return Err(paged_reads_unavailable(&request_id));
+            }
             // Settings config.json is still openable by explicit path; link
             // opens stay inside the FS sandbox / authorized cwds.
             let workspace_id = current_workspace_id(state, session_id).await?;
@@ -838,6 +855,7 @@ async fn handle_client_msg(
                 resolved.line,
                 resolved.column,
                 workspace_id,
+                *client_paged_reads,
             )
             .await
         }
@@ -864,7 +882,7 @@ async fn handle_client_msg(
                     buffer_id: opened.buffer_id.clone(),
                     draft_id: Some(opened.draft_id.clone()),
                     path: opened.path.clone(),
-                    language: opened.language,
+                    language: opened.language.clone(),
                     line: None,
                     column: None,
                 },
@@ -874,15 +892,7 @@ async fn handle_client_msg(
                 code: "send_failed".into(),
                 message: "failed to send EditorOpened".into(),
             })?;
-            send_msg(
-                sink,
-                &Message::BufferSnapshot {
-                    buffer_id: opened.buffer_id,
-                    rev: opened.rev,
-                    text: opened.text,
-                    path: opened.path,
-                },
-            )
+            send_msg(sink, &opened_content_message(opened))
             .await
             .map_err(|_| Message::Error {
                 code: "send_failed".into(),
@@ -953,6 +963,14 @@ async fn handle_client_msg(
                 });
             };
             let workspace_id = current_workspace_id(state, session_id).await?;
+            if !*client_paged_reads {
+                let drafts = editor.draft_list(workspace_id.clone()).await.map_err(|err| Message::Error {
+                    code: "draft_restore_failed".into(), message: format!("{request_id}: {err:#}"),
+                })?;
+                if drafts.iter().any(|draft| draft.draft_id == draft_id && draft.paged.is_some()) {
+                    return Err(paged_reads_unavailable(&request_id));
+                }
+            }
             let (opened, source_changed) = editor
                 .draft_restore(workspace_id, draft_id)
                 .await
@@ -961,6 +979,9 @@ async fn handle_client_msg(
                     message: format!("{request_id}: {err:#}"),
                 })?;
             let restored_buffer_id = opened.buffer_id.clone();
+            if opened.total_bytes.is_some() && !*client_paged_reads {
+                return Err(paged_reads_unavailable(&request_id));
+            }
             send_editor_opened_snapshot(sink, request_id, opened, None, None).await?;
             if source_changed {
                 send_msg(sink, &Message::EditorDraftWarning { buffer_id: restored_buffer_id, message: "The source file changed or is missing; review this recovered draft before saving.".into() }).await.map_err(|_| Message::Error { code: "send_failed".into(), message: "failed to send EditorDraftWarning".into() })?;
@@ -1068,6 +1089,7 @@ async fn handle_client_msg(
             view_id,
             base_rev,
             edits,
+            viewport,
             selection,
         } => {
             require_auth(*authed)?;
@@ -1078,6 +1100,9 @@ async fn handle_client_msg(
                         "{request_id}: client did not negotiate {CAP_EDITOR_RANGE_EDITS}"
                     ),
                 });
+            }
+            if viewport.is_some() && !*client_paged_reads {
+                return Err(paged_reads_unavailable(&request_id));
             }
             let Some(editor) = state.editor.as_ref() else {
                 return Err(Message::Error {
@@ -1092,6 +1117,7 @@ async fn handle_client_msg(
                     view_id.clone(),
                     base_rev,
                     edits,
+                    viewport,
                     selection,
                 )
                 .await
@@ -1099,9 +1125,21 @@ async fn handle_client_msg(
                     code: "buffer_edit_failed".into(),
                     message: format!("{request_id}: {err:#}"),
                 })?;
-            send_msg(
-                sink,
-                &Message::BufferEditResult {
+            let response = if let Some(page) = result.page {
+                Message::BufferPage {
+                    request_id,
+                    buffer_id,
+                    view_id,
+                    rev: page.rev,
+                    start: page.start,
+                    total_bytes: page.total_bytes,
+                    text: page.text,
+                    selection: result.selection,
+                    accepted: result.accepted,
+                    dirty: page.dirty,
+                }
+            } else {
+                Message::BufferEditResult {
                     request_id,
                     buffer_id,
                     view_id,
@@ -1110,12 +1148,69 @@ async fn handle_client_msg(
                     selection: result.selection,
                     dirty: result.dirty,
                     accepted: result.accepted,
-                },
-            )
+                }
+            };
+            send_msg(sink, &response)
             .await
             .map_err(|_| Message::Error {
                 code: "send_failed".into(),
                 message: "failed to send BufferEditResult".into(),
+            })?;
+            Ok(())
+        }
+        Message::BufferRead {
+            request_id,
+            buffer_id,
+            view_id,
+            start,
+            len,
+        } => {
+            require_auth(*authed)?;
+            if !*client_paged_reads {
+                return Err(paged_reads_unavailable(&request_id));
+            }
+            if len > MAX_PAGE_BYTES {
+                return Err(Message::Error {
+                    code: "invalid_buffer_range".into(),
+                    message: format!("{request_id}: page length {len} exceeds {MAX_PAGE_BYTES}"),
+                });
+            }
+            if start.checked_add(len).is_none() {
+                return Err(Message::Error {
+                    code: "invalid_buffer_range".into(),
+                    message: format!("{request_id}: byte range overflow"),
+                });
+            }
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: format!("{request_id}: editor capability not available"),
+                });
+            };
+            ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
+            let page = editor
+                .read_page(buffer_id.clone(), start, len)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "buffer_read_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
+            send_msg(sink, &Message::BufferPage {
+                request_id,
+                buffer_id,
+                view_id,
+                rev: page.rev,
+                start: page.start,
+                total_bytes: page.total_bytes,
+                text: page.text,
+                selection: ByteSelection { anchor: 0, head: 0 },
+                accepted: true,
+                dirty: page.dirty,
+            })
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send BufferPage".into(),
             })?;
             Ok(())
         }
@@ -2105,6 +2200,7 @@ async fn reply_editor_opened(
     line: Option<u32>,
     column: Option<u32>,
     workspace_id: String,
+    paged_reads: bool,
 ) -> Result<(), Message> {
     if crate::binary::is_binary_file(&path).unwrap_or(false) {
         return Err(Message::Error {
@@ -2112,8 +2208,13 @@ async fn reply_editor_opened(
             message: format!("{request_id}: {}", path.display()),
         });
     }
+    let prior_buffers = if !paged_reads {
+        Some(editor.scene().await.map_err(|err| Message::Error {
+            code: "editor_open_failed".into(), message: format!("{request_id}: {err:#}"),
+        })?.buffers)
+    } else { None };
     let opened = editor
-        .open_in_workspace(path, preview, workspace_id)
+        .open_in_workspace(path, preview, workspace_id.clone())
         .await
         .map_err(|err| {
             let binary = err
@@ -2128,6 +2229,17 @@ async fn reply_editor_opened(
                 message: format!("{request_id}: {err:#}"),
             }
         })?;
+    if opened.total_bytes.is_some() && !paged_reads {
+        // A stat/open race can cross the threshold. Remove only a new clean
+        // open; an existing dirty buffer belongs to other connected views.
+        if !opened.dirty && prior_buffers.as_ref().is_some_and(|buffers|
+            !buffers.iter().any(|buffer| buffer.buffer_id == opened.buffer_id)) {
+            editor.close_in_workspace(opened.buffer_id.clone(), workspace_id).await
+                .map_err(|err| Message::Error { code: "editor_close_failed".into(),
+                    message: format!("{request_id}: {err:#}") })?;
+        }
+        return Err(paged_reads_unavailable(&request_id));
+    }
     send_editor_opened_snapshot(sink, request_id, opened, line, column).await?;
     Ok(())
 }
@@ -2146,7 +2258,7 @@ async fn send_editor_opened_snapshot(
             buffer_id: opened.buffer_id.clone(),
             draft_id: Some(opened.draft_id.clone()),
             path: opened.path.clone(),
-            language: opened.language,
+            language: opened.language.clone(),
             line,
             column,
         },
@@ -2156,21 +2268,45 @@ async fn send_editor_opened_snapshot(
         code: "send_failed".into(),
         message: "failed to send EditorOpened".into(),
     })?;
-    send_msg(
-        sink,
-        &Message::BufferSnapshot {
-            buffer_id: opened.buffer_id,
-            rev: opened.rev,
-            text: opened.text,
-            path: opened.path,
-        },
-    )
+    send_msg(sink, &opened_content_message(opened))
     .await
     .map_err(|_| Message::Error {
         code: "send_failed".into(),
         message: "failed to send BufferSnapshot".into(),
     })?;
     Ok(())
+}
+
+fn opened_content_message(opened: crate::editor_worker::OpenedBuffer) -> Message {
+    if let Some(total_bytes) = opened.total_bytes {
+        Message::BufferPaged {
+            buffer_id: opened.buffer_id,
+            rev: opened.rev,
+            total_bytes,
+            path: opened.path,
+            dirty: opened.dirty,
+        }
+    } else {
+        Message::BufferSnapshot {
+            buffer_id: opened.buffer_id,
+            rev: opened.rev,
+            text: opened.text,
+            path: opened.path,
+        }
+    }
+}
+
+fn is_large_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len() > MAX_SNAPSHOT_BYTES)
+        .unwrap_or(false)
+}
+
+fn paged_reads_unavailable(request_id: &str) -> Message {
+    Message::Error {
+        code: "capability_unavailable".into(),
+        message: format!("{request_id}: client did not negotiate {CAP_EDITOR_PAGED_READS}"),
+    }
 }
 
 async fn current_workspace_id(
