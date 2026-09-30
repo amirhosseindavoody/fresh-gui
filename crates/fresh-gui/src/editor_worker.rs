@@ -1942,6 +1942,7 @@ fn resolve_external(
             });
             editor.active_event_log_mut().mark_saved();
             editor.active_state_mut().buffer.set_modified(false);
+            editor.active_state_mut().buffer.set_file_path(path.clone());
             let entry = tracked.get_mut(buffer_id).unwrap();
             drafts.discard(&entry.workspace_id, &entry.draft_id)?;
             entry.text = target.to_owned();
@@ -2391,6 +2392,36 @@ mod external_recovery_tests {
                 assert_eq!(external.text, "recovered draft");
                 if missing {
                     assert!(external.disk_text.is_none());
+                    std::fs::write(&path, "recreated source").unwrap();
+                    let recreated = editor
+                        .check_external(opened.buffer_id.clone())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(recreated.disk_text.as_deref(), Some("recreated source"));
+                    let reloaded = editor
+                        .resolve_external(
+                            opened.buffer_id.clone(),
+                            external.rev,
+                            recreated.generation,
+                            ExternalResolution::Reload,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(reloaded.text, "recreated source");
+                    let rev = editor
+                        .edit(
+                            opened.buffer_id.clone(),
+                            reloaded.rev,
+                            "after reload".into(),
+                        )
+                        .await
+                        .unwrap();
+                    editor
+                        .save(opened.buffer_id.clone(), rev, None)
+                        .await
+                        .unwrap();
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(), "after reload");
                 } else {
                     assert_eq!(external.disk_text.as_deref(), Some("changed on disk"));
                 }
@@ -2475,7 +2506,10 @@ mod external_recovery_tests {
                 std::fs::read_to_string(&existing_path).unwrap(),
                 "overwrite consciously"
             );
-            editor.close(fresh.buffer_id).await.unwrap();
+            editor
+                .close_in_workspace(fresh.buffer_id, "save-as-test".into())
+                .await
+                .unwrap();
             let _ = saved_rev;
         });
         drop(editor);
