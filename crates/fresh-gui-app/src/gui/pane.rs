@@ -1671,6 +1671,7 @@ pub struct EditorPanel {
     conflict: bool,
     external_changes: bool,
     external: Option<ExternalNotice>,
+    external_generation: Option<String>,
     external_pending: Option<ExternalResolution>,
     external_request: Option<(String, String, String)>,
     external_save_path: Option<String>,
@@ -1696,8 +1697,24 @@ pub struct EditorPanel {
     _subscription: Subscription,
 }
 
+fn reload_response_can_replace(sent_draft: &str, current_draft: &str) -> bool {
+    sent_draft == current_draft
+}
+
+#[cfg(test)]
+mod external_reload_tests {
+    use super::reload_response_can_replace;
+
+    #[test]
+    fn reload_discards_only_the_reviewed_draft() {
+        assert!(reload_response_can_replace("reviewed draft", "reviewed draft"));
+        assert!(!reload_response_can_replace("reviewed draft", "new typing after reload"));
+    }
+}
+
 #[derive(Clone)]
 struct ExternalNotice {
+    path: String,
     generation: String,
     disk_text: Option<String>,
     kept: bool,
@@ -1786,6 +1803,7 @@ impl EditorPanel {
             conflict: false,
             external_changes: false,
             external: None,
+            external_generation: None,
             external_pending: None,
             external_request: None,
             external_save_path: None,
@@ -1862,18 +1880,22 @@ impl EditorPanel {
     }
 
     pub fn apply_external_change(
-        &mut self, rev: u64, generation: String, text: String, disk_text: Option<String>,
+        &mut self, path: String, rev: u64, generation: String, text: String, disk_text: Option<String>,
         server_dirty: bool, window: &mut Window, cx: &mut Context<Self>,
     ) {
+        if self.external.is_none() && self.external_generation.as_deref() == Some(generation.as_str()) {
+            return;
+        }
         let decision = external_reconciliation(self.dirty, self.rev, rev, disk_text.is_some(), server_dirty);
         if decision == ExternalSnapshotReconciliation::Ignore { return; }
         if decision == ExternalSnapshotReconciliation::Reload {
             self.external = None;
+            self.external_generation = Some(generation);
             self.apply_snapshot(rev, text, self.path.clone(), window, cx);
             self.dirty = false;
         } else {
             let kept = self.external.as_ref().is_some_and(|notice| notice.generation == generation && notice.kept);
-            self.external = Some(ExternalNotice { generation, disk_text, kept });
+            self.external = Some(ExternalNotice { path, generation, disk_text, kept });
             // The snapshot is the daemon draft, never disk text. Reconcile only
             // when no edit acknowledgement is outstanding; that reply owns its base.
             if self.edit_request_id.is_none() && self.sync_request_id.is_none() {
@@ -1920,9 +1942,10 @@ impl EditorPanel {
         self.edit_sync = Some(EditSync::new(text.clone(), rev));
         self.conflict = false;
         if resolution == ExternalResolution::Reload {
+            self.external_generation = Some(generation.clone());
             self.external = None;
             self.external_save_path = None;
-            if current == sent_draft {
+            if reload_response_can_replace(&sent_draft, &current) {
                 let selection = map_selection_through_edits(&current, &text, self.byte_selection(cx));
                 self.set_editor_text_and_selection(&text, Some(selection), window, cx);
                 self.dirty = server_dirty;
@@ -1937,12 +1960,26 @@ impl EditorPanel {
             }
             self.dirty = server_dirty || current != text;
             if resolution == ExternalResolution::Overwrite {
+                self.external_generation = Some(generation);
                 self.external = None;
                 self.pending_save = self.external_save_path.take();
             }
         }
         self.flush_pending(cx);
         cx.notify();
+    }
+
+    pub fn external_target_path(&self) -> Option<String> {
+        self.external.as_ref().map(|notice| notice.path.clone())
+    }
+
+    pub fn reattach_reloaded_path(&mut self, path: String, cx: &mut Context<Self>) -> Option<String> {
+        let previous = (self.path != path).then(|| self.path.clone());
+        self.path = path;
+        self.unsaved = false;
+        self.unsaved_title = None;
+        cx.notify();
+        previous
     }
 
     fn compare_external(&self, window: &mut Window, cx: &mut Context<Self>) {

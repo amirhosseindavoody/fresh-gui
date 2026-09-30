@@ -1768,10 +1768,10 @@ impl Workspace {
                     self.finish_restore_if_idle(window, cx);
                 }
             }
-            AdeEvent::ExternalChanged { buffer_id, path: _, rev, generation, text, disk_text, dirty } => {
+            AdeEvent::ExternalChanged { buffer_id, path, rev, generation, text, disk_text, dirty } => {
                 if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
                     panel.update(cx, |panel, cx| {
-                        panel.apply_external_change(rev, generation, text, disk_text, dirty, window, cx);
+                        panel.apply_external_change(path, rev, generation, text, disk_text, dirty, window, cx);
                     });
                 } else if let Some(panel) = self.diffs.values().find(|panel| panel.read(cx).buffer_id() == Some(buffer_id.as_str())).cloned() {
                     panel.update(cx, |panel, cx| panel.apply_snapshot(&buffer_id, rev, &text, window, cx));
@@ -1780,9 +1780,21 @@ impl Workspace {
             }
             AdeEvent::ExternalResolved { request_id, buffer_id, rev, generation, text, accepted, dirty, resolution } => {
                 if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
+                    let target = panel.read(cx).external_target_path();
                     panel.update(cx, |panel, cx| {
                         panel.apply_external_resolution(&request_id, rev, generation, text, accepted, dirty, resolution, window, cx);
                     });
+                    if accepted && resolution == fresh_gui_protocol::ExternalResolution::Reload
+                        && let Some(target) = target {
+                        let previous = panel.update(cx, |panel, cx| panel.reattach_reloaded_path(target.clone(), cx));
+                        if let Some(previous) = previous {
+                            self.editors.remove(&previous);
+                            self.editors.insert(target.clone(), panel.clone());
+                            if matches!(&self.active, Some(ActiveSurface::Editor(current)) if current == &previous) {
+                                self.active = Some(ActiveSurface::Editor(target));
+                            }
+                        }
+                    }
                 }
             }
             AdeEvent::BufferSnapshot {
