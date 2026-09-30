@@ -12,7 +12,7 @@ use axum::extract::{State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use base64::Engine;
-use fresh_gui_protocol::{CAP_EDITOR, CAP_LSP, CAP_SCENE, Hello, HelloUi, Message, PROTOCOL_VERSION};
+use fresh_gui_protocol::{CAP_EDITOR, CAP_EDITOR_RANGE_EDITS, CAP_LSP, CAP_SCENE, Hello, HelloUi, Message, PROTOCOL_VERSION};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -122,7 +122,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     let mut caps = Hello::default_backend_caps();
     if state.editor.is_none() {
-        caps.retain(|c| c != CAP_EDITOR && c != CAP_LSP && c != CAP_SCENE);
+        caps.retain(|c| c != CAP_EDITOR && c != CAP_EDITOR_RANGE_EDITS && c != CAP_LSP && c != CAP_SCENE);
     }
     let ui = hello_ui(&state.config.read().expect("config lock"));
     let mut hello = Hello::backend(format!("fresh-gui/{}", env!("CARGO_PKG_VERSION")), caps);
@@ -138,6 +138,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     }
 
     let mut authed = !state.require_auth;
+    let mut client_range_edits = false;
     let mut session_id: Option<String> = None;
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
 
@@ -179,6 +180,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     &state,
                     &defaults_path,
                     &mut authed,
+                    &mut client_range_edits,
                     &mut session_id,
                     out_tx.clone(),
                     &mut sink,
@@ -203,12 +205,14 @@ async fn handle_client_msg(
     state: &AppState,
     defaults_path: &Path,
     authed: &mut bool,
+    client_range_edits: &mut bool,
     session_id: &mut Option<String>,
     out_tx: mpsc::UnboundedSender<Message>,
     sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
 ) -> Result<(), Message> {
     match msg {
         Message::Hello(client_hello) => {
+            *client_range_edits = client_hello.capabilities.iter().any(|cap| cap == CAP_EDITOR_RANGE_EDITS);
             if client_hello.protocol_version != PROTOCOL_VERSION {
                 return Err(Message::Error {
                     code: "protocol_mismatch".into(),
@@ -857,6 +861,166 @@ async fn handle_client_msg(
             })?;
             Ok(())
         }
+        Message::BufferRangeEdit {
+            request_id,
+            buffer_id,
+            view_id,
+            base_rev,
+            edits,
+            selection,
+        } => {
+            require_auth(*authed)?;
+            if !*client_range_edits {
+                return Err(Message::Error {
+                    code: "capability_unavailable".into(),
+                    message: format!(
+                        "{request_id}: client did not negotiate {CAP_EDITOR_RANGE_EDITS}"
+                    ),
+                });
+            }
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: format!("{request_id}: editor capability not available"),
+                });
+            };
+            let result = editor
+                .range_edit(
+                    buffer_id.clone(),
+                    view_id.clone(),
+                    base_rev,
+                    edits,
+                    selection,
+                )
+                .await
+                .map_err(|err| Message::Error {
+                    code: "buffer_edit_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
+            send_msg(
+                sink,
+                &Message::BufferEditResult {
+                    request_id,
+                    buffer_id,
+                    view_id,
+                    rev: result.rev,
+                    text: result.text,
+                    selection: result.selection,
+                    dirty: result.dirty,
+                    accepted: result.accepted,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send BufferEditResult".into(),
+            })?;
+            Ok(())
+        }
+        Message::BufferAction {
+            request_id,
+            buffer_id,
+            view_id,
+            base_rev,
+            action,
+            selection,
+        } => {
+            require_auth(*authed)?;
+            if !*client_range_edits {
+                return Err(Message::Error {
+                    code: "capability_unavailable".into(),
+                    message: format!(
+                        "{request_id}: client did not negotiate {CAP_EDITOR_RANGE_EDITS}"
+                    ),
+                });
+            }
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: format!("{request_id}: editor capability not available"),
+                });
+            };
+            let result = editor
+                .action(
+                    buffer_id.clone(),
+                    view_id.clone(),
+                    base_rev,
+                    action,
+                    selection,
+                )
+                .await
+                .map_err(|err| Message::Error {
+                    code: "buffer_action_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
+            send_msg(
+                sink,
+                &Message::BufferEditResult {
+                    request_id,
+                    buffer_id,
+                    view_id,
+                    rev: result.rev,
+                    text: result.text,
+                    selection: result.selection,
+                    dirty: result.dirty,
+                    accepted: result.accepted,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send BufferEditResult".into(),
+            })?;
+            Ok(())
+        }
+        Message::BufferSync {
+            request_id,
+            buffer_id,
+            view_id,
+        } => {
+            require_auth(*authed)?;
+            if !*client_range_edits {
+                return Err(Message::Error {
+                    code: "capability_unavailable".into(),
+                    message: format!(
+                        "{request_id}: client did not negotiate {CAP_EDITOR_RANGE_EDITS}"
+                    ),
+                });
+            }
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: format!("{request_id}: editor capability not available"),
+                });
+            };
+            let result = editor
+                .sync(buffer_id.clone())
+                .await
+                .map_err(|err| Message::Error {
+                    code: "buffer_sync_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
+            send_msg(
+                sink,
+                &Message::BufferEditResult {
+                    request_id,
+                    buffer_id,
+                    view_id,
+                    rev: result.rev,
+                    text: result.text,
+                    selection: result.selection,
+                    dirty: result.dirty,
+                    accepted: true,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send BufferEditResult".into(),
+            })?;
+            Ok(())
+        }
+
         Message::BufferSave {
             request_id,
             buffer_id,

@@ -13,7 +13,7 @@ use fresh::model::event::{BufferId, Event};
 use fresh::model::filesystem::{FileSystem, StdFileSystem};
 use fresh::types::LspFeature;
 use fresh::view::color_support::ColorCapability;
-use fresh_gui_protocol::{BufferDiagnostic, SceneBuffer};
+use fresh_gui_protocol::{BufferDiagnostic, ByteSelection, EditorAction, RangeEdit, SceneBuffer};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
@@ -74,6 +74,26 @@ enum Cmd {
         text: String,
         reply: oneshot::Sender<Result<u64>>,
     },
+    RangeEdit {
+        buffer_id: String,
+        view_id: String,
+        base_rev: u64,
+        edits: Vec<RangeEdit>,
+        selection: ByteSelection,
+        reply: oneshot::Sender<Result<BufferTransactionResult>>,
+    },
+    Action {
+        buffer_id: String,
+        view_id: String,
+        base_rev: u64,
+        action: EditorAction,
+        selection: ByteSelection,
+        reply: oneshot::Sender<Result<BufferTransactionResult>>,
+    },
+    Sync {
+        buffer_id: String,
+        reply: oneshot::Sender<Result<BufferTransactionResult>>,
+    },
     Save {
         buffer_id: String,
         base_rev: u64,
@@ -102,6 +122,15 @@ enum Cmd {
         config: crate::config::Config,
         reply: oneshot::Sender<Result<()>>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct BufferTransactionResult {
+    pub rev: u64,
+    pub text: String,
+    pub selection: ByteSelection,
+    pub accepted: bool,
+    pub dirty: bool,
 }
 
 /// Handle to the editor thread. Cloneable; commands are serialized on the worker.
@@ -173,6 +202,27 @@ impl EditorHandle {
         reply_rx
             .await
             .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+    }
+
+    pub async fn range_edit(&self, buffer_id: String, view_id: String, base_rev: u64, edits: Vec<RangeEdit>, selection: ByteSelection) -> Result<BufferTransactionResult> {
+        let (reply, rx) = oneshot::channel();
+        self.tx.send(Cmd::RangeEdit { buffer_id, view_id, base_rev, edits, selection, reply })
+            .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        rx.await.map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+    }
+
+    pub async fn action(&self, buffer_id: String, view_id: String, base_rev: u64, action: EditorAction, selection: ByteSelection) -> Result<BufferTransactionResult> {
+        let (reply, rx) = oneshot::channel();
+        self.tx.send(Cmd::Action { buffer_id, view_id, base_rev, action, selection, reply })
+            .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        rx.await.map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+    }
+
+    pub async fn sync(&self, buffer_id: String) -> Result<BufferTransactionResult> {
+        let (reply, rx) = oneshot::channel();
+        self.tx.send(Cmd::Sync { buffer_id, reply })
+            .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        rx.await.map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
     }
 
     pub async fn new_buffer(&self) -> Result<OpenedBuffer> {
@@ -350,6 +400,18 @@ fn run_loop(mut editor: Editor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                         edit_buffer(&mut editor, &mut tracked, &buffer_id, base_rev, &text);
                     let _ = reply.send(result);
                 }
+                Cmd::RangeEdit { buffer_id, view_id, base_rev, edits, selection, reply } => {
+                    let result = range_edit_buffer(&mut editor, &mut tracked, &buffer_id, &view_id, base_rev, edits, selection);
+                    let _ = reply.send(result);
+                }
+                Cmd::Action { buffer_id, view_id, base_rev, action, selection, reply } => {
+                    let result = action_buffer(&mut editor, &mut tracked, &buffer_id, &view_id, base_rev, action, selection);
+                    let _ = reply.send(result);
+                }
+                Cmd::Sync { buffer_id, reply } => {
+                    let result = sync_buffer(&mut editor, &mut tracked, &buffer_id);
+                    let _ = reply.send(result);
+                }
                 Cmd::Save {
                     buffer_id,
                     base_rev,
@@ -413,6 +475,7 @@ fn run_loop(mut editor: Editor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     let _ = reply.send(Ok(()));
                 }
                 Cmd::Scene { reply } => {
+                    let _ = sync_all_fresh_text(&editor, &mut tracked);
                     let active = editor.active_buffer().0.to_string();
                     let buffers = tracked
                         .iter()
@@ -470,6 +533,7 @@ fn open_buffer(
     path: &Path,
     preview: bool,
 ) -> Result<OpenedBuffer> {
+    sync_all_fresh_text(editor, tracked)?;
     if !path.is_file() {
         bail!("not a file: {}", path.display());
     }
@@ -502,6 +566,7 @@ fn open_buffer(
         .buffer
         .to_string()
         .context("buffer has unloaded regions (large-file mode); cannot snapshot")?;
+    let dirty = editor.active_state().buffer.is_modified();
 
     if text.len() > MAX_SNAPSHOT_BYTES {
         bail!(
@@ -518,7 +583,7 @@ fn open_buffer(
             path: Some(path.to_path_buf()),
             text: text.clone(),
             rev,
-            dirty: false,
+            dirty,
             language: language.clone(),
         },
     );
@@ -579,10 +644,8 @@ fn edit_buffer(
             text.len()
         );
     }
-    let current = tracked
-        .get(buffer_id)
-        .with_context(|| format!("unknown buffer_id {buffer_id}"))?
-        .rev;
+    let _ = sync_fresh_text(editor, tracked, buffer_id)?;
+    let current = tracked.get(buffer_id).with_context(|| format!("unknown buffer_id {buffer_id}"))?.rev;
     if current != base_rev {
         bail!("revision conflict: base_rev={base_rev} current={current}");
     }
@@ -594,26 +657,257 @@ fn edit_buffer(
         .context("buffer has unloaded regions")?;
     if old != text {
         let cursor_id = editor.active_cursors().primary_id();
+        let mut events = Vec::new();
         if !old.is_empty() {
-            editor.log_and_apply_event(&Event::Delete {
+            events.push(Event::Delete {
                 range: 0..old.len(),
-                deleted_text: old,
+                deleted_text: old.clone(),
                 cursor_id,
             });
         }
         if !text.is_empty() {
-            editor.log_and_apply_event(&Event::Insert {
+            events.push(Event::Insert {
                 position: 0,
                 text: text.to_owned(),
                 cursor_id,
             });
         }
+        editor.log_and_apply_event(&Event::Batch { events, description: "ADE full-text edit".into() });
     }
     let entry = tracked.get_mut(buffer_id).expect("tracked");
     entry.text = text.to_owned();
     entry.rev += 1;
     entry.dirty = true;
     Ok(entry.rev)
+}
+
+fn current_selection(editor: &Editor) -> ByteSelection {
+    let cursor = editor.active_cursors().primary();
+    ByteSelection {
+        anchor: cursor.anchor.unwrap_or(cursor.position),
+        head: cursor.position,
+    }
+}
+
+fn transaction_result(
+    tracked: &HashMap<String, TrackedBuffer>,
+    editor: &Editor,
+    buffer_id: &str,
+    accepted: bool,
+) -> Result<BufferTransactionResult> {
+    let entry = tracked
+        .get(buffer_id)
+        .with_context(|| format!("unknown buffer_id {buffer_id}"))?;
+    let id: usize = buffer_id.parse().context("invalid buffer_id")?;
+    let text = editor
+        .active_window()
+        .buffers
+        .get(&BufferId(id))
+        .and_then(|state| state.buffer.to_string())
+        .context("Fresh buffer unavailable")?;
+    Ok(BufferTransactionResult {
+        rev: entry.rev,
+        text,
+        selection: current_selection(editor),
+        accepted,
+        dirty: entry.dirty,
+    })
+}
+
+fn set_selection(editor: &mut Editor, selection: ByteSelection) {
+    let cursor = editor.active_cursors_mut().primary_mut();
+    cursor.position = selection.head;
+    cursor.anchor = (selection.anchor != selection.head).then_some(selection.anchor);
+}
+
+fn range_edit_buffer(
+    editor: &mut Editor,
+    tracked: &mut HashMap<String, TrackedBuffer>,
+    buffer_id: &str,
+    view_id: &str,
+    base_rev: u64,
+    edits: Vec<RangeEdit>,
+    selection: ByteSelection,
+) -> Result<BufferTransactionResult> {
+    if view_id.is_empty() {
+        bail!("view_id cannot be empty");
+    }
+    let _ = sync_fresh_text(editor, tracked, buffer_id)?;
+    activate_tracked(editor, tracked, buffer_id)?;
+    let initial = editor
+        .active_state()
+        .buffer
+        .to_string()
+        .context("buffer has unloaded regions")?;
+    if initial.len() > MAX_SNAPSHOT_BYTES {
+        bail!("buffer exceeds edit limit");
+    }
+    let current_rev = tracked.get(buffer_id).context("unknown buffer")?.rev;
+    if current_rev != base_rev {
+        return transaction_result(tracked, editor, buffer_id, false);
+    }
+
+    // Validate and construct every event before mutating Fresh. Ranges are
+    // sequential: each one indexes the text produced by earlier edits.
+    let mut working = initial.clone();
+    let cursor_id = editor.active_cursors().primary_id();
+    let before_cursor = editor.active_cursors().primary();
+    let (old_position, old_anchor, old_sticky_column) = (
+        before_cursor.position,
+        before_cursor.anchor,
+        before_cursor.sticky_column,
+    );
+    let mut events = Vec::with_capacity(3);
+    for edit in edits {
+        if edit.start > edit.end
+            || edit.end > working.len()
+            || !working.is_char_boundary(edit.start)
+            || !working.is_char_boundary(edit.end)
+        {
+            bail!(
+                "invalid UTF-8 byte range {}..{} for {} byte buffer",
+                edit.start,
+                edit.end,
+                working.len()
+            );
+        }
+        working.replace_range(edit.start..edit.end, &edit.text);
+        if working.len() > MAX_SNAPSHOT_BYTES {
+            bail!("edit too large (max {MAX_SNAPSHOT_BYTES} bytes)");
+        }
+    }
+    if selection.anchor > working.len()
+        || selection.head > working.len()
+        || !working.is_char_boundary(selection.anchor)
+        || !working.is_char_boundary(selection.head)
+    {
+        bail!("selection is outside the edited buffer or not on a UTF-8 boundary");
+    }
+
+    // Collapse the sequential protocol edits into one equivalent replacement.
+    // Fresh computes all Batch LSP ranges against the pre-event buffer, while
+    // LSP applies change arrays sequentially. A single net replacement keeps
+    // both coordinate systems correct for arbitrary client edit sequences.
+    let prefix = initial
+        .bytes()
+        .zip(working.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut prefix = prefix;
+    while !initial.is_char_boundary(prefix) || !working.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let suffix_max = initial
+        .len()
+        .saturating_sub(prefix)
+        .min(working.len().saturating_sub(prefix));
+    let mut suffix = initial.as_bytes()[initial.len() - suffix_max..]
+        .iter()
+        .rev()
+        .zip(
+            working.as_bytes()[working.len() - suffix_max..]
+                .iter()
+                .rev(),
+        )
+        .take_while(|(a, b)| a == b)
+        .count();
+    while suffix > 0
+        && (!initial.is_char_boundary(initial.len() - suffix)
+            || !working.is_char_boundary(working.len() - suffix))
+    {
+        suffix -= 1;
+    }
+    let old_end = initial.len() - suffix;
+    let new_end = working.len() - suffix;
+    if old_end > prefix {
+        events.push(Event::Delete {
+            range: prefix..old_end,
+            deleted_text: initial[prefix..old_end].to_owned(),
+            cursor_id,
+        });
+    }
+    if new_end > prefix {
+        events.push(Event::Insert {
+            position: prefix,
+            text: working[prefix..new_end].to_owned(),
+            cursor_id,
+        });
+    }
+
+    if working != initial
+        || old_position != selection.head
+        || old_anchor != (selection.anchor != selection.head).then_some(selection.anchor)
+    {
+        events.push(Event::MoveCursor {
+            cursor_id,
+            old_position,
+            new_position: selection.head,
+            old_anchor,
+            new_anchor: (selection.anchor != selection.head).then_some(selection.anchor),
+            old_sticky_column,
+            new_sticky_column: None,
+        });
+        editor.log_and_apply_event(&Event::Batch {
+            events,
+            description: "ADE range edit".into(),
+        });
+    }
+    let entry = tracked.get_mut(buffer_id).expect("tracked");
+    if working != initial {
+        entry.rev += 1;
+        entry.dirty = true;
+    }
+    entry.text = working;
+    transaction_result(tracked, editor, buffer_id, true)
+}
+
+fn action_buffer(
+    editor: &mut Editor,
+    tracked: &mut HashMap<String, TrackedBuffer>,
+    buffer_id: &str,
+    view_id: &str,
+    base_rev: u64,
+    action: EditorAction,
+    selection: ByteSelection,
+) -> Result<BufferTransactionResult> {
+    if view_id.is_empty() {
+        bail!("view_id cannot be empty");
+    }
+    let _ = sync_fresh_text(editor, tracked, buffer_id)?;
+    activate_tracked(editor, tracked, buffer_id)?;
+    let current_rev = tracked.get(buffer_id).context("unknown buffer")?.rev;
+    let text = editor
+        .active_state()
+        .buffer
+        .to_string()
+        .context("buffer has unloaded regions")?;
+    if current_rev != base_rev {
+        return transaction_result(tracked, editor, buffer_id, false);
+    }
+    if selection.anchor > text.len()
+        || selection.head > text.len()
+        || !text.is_char_boundary(selection.anchor)
+        || !text.is_char_boundary(selection.head)
+    {
+        bail!("selection is outside the buffer or not on a UTF-8 boundary");
+    }
+    set_selection(editor, selection);
+    match action {
+        EditorAction::Undo => editor.handle_undo(),
+        EditorAction::Redo => editor.handle_redo(),
+    }
+    let _ = sync_fresh_text(editor, tracked, buffer_id)?;
+    transaction_result(tracked, editor, buffer_id, true)
+}
+
+fn sync_buffer(
+    editor: &mut Editor,
+    tracked: &mut HashMap<String, TrackedBuffer>,
+    buffer_id: &str,
+) -> Result<BufferTransactionResult> {
+    activate_tracked(editor, tracked, buffer_id)?;
+    let _ = sync_fresh_text(editor, tracked, buffer_id)?;
+    transaction_result(tracked, editor, buffer_id, true)
 }
 
 fn close_buffer(
@@ -644,24 +938,32 @@ fn sync_fresh_text(
     buffer_id: &str,
 ) -> Result<Option<String>> {
     let id: usize = buffer_id.parse().context("invalid buffer_id")?;
-    let text = editor
+    let state = editor
         .active_window()
         .buffers
         .get(&BufferId(id))
-        .and_then(|state| state.buffer.to_string())
         .context("Fresh buffer unavailable")?;
+    let text = state.buffer.to_string().context("Fresh buffer text unavailable")?;
+    let dirty = state.buffer.is_modified();
     let entry = tracked
         .get_mut(buffer_id)
         .with_context(|| format!("unknown buffer_id {buffer_id}"))?;
     // Fresh may apply asynchronous LSP formatting. Advance the ADE revision
     // when that happens so the host receives an authoritative new snapshot.
-    if entry.text == text {
+    let text_changed = entry.text != text;
+    entry.dirty = dirty;
+    if !text_changed {
         return Ok(None);
     }
     entry.text = text.clone();
     entry.rev += 1;
-    entry.dirty = true;
     Ok(Some(text))
+}
+
+fn sync_all_fresh_text(editor: &Editor, tracked: &mut HashMap<String, TrackedBuffer>) -> Result<()> {
+    let ids: Vec<String> = tracked.keys().cloned().collect();
+    for id in ids { let _ = sync_fresh_text(editor, tracked, &id)?; }
+    Ok(())
 }
 
 fn lsp_state(
@@ -741,6 +1043,7 @@ async fn format_buffer(
     buffer_id: &str,
     base_rev: u64,
 ) -> Result<FormatState> {
+    let _ = sync_fresh_text(editor, tracked, buffer_id)?;
     let current = tracked
         .get(buffer_id)
         .with_context(|| format!("unknown buffer_id {buffer_id}"))?
@@ -848,6 +1151,7 @@ fn save_buffer(
     base_rev: u64,
     dest: Option<&Path>,
 ) -> Result<(String, u64)> {
+    let _ = sync_fresh_text(editor, tracked, buffer_id)?;
     let current = tracked
         .get(buffer_id)
         .with_context(|| format!("unknown buffer_id {buffer_id}"))?
@@ -903,12 +1207,82 @@ fn save_buffer(
 mod tests {
     use super::*;
 
+    #[test]
+    fn range_transactions_validate_byte_offsets_stale_revisions_and_fresh_undo_redo() {
+        let root = std::env::temp_dir().join(format!("fresh-gui-range-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let editor = EditorHandle::spawn(root.clone(), crate::config::Config::default()).expect("Fresh worker starts");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let opened = editor.new_buffer().await.unwrap();
+            // Deliberately leave another buffer active while targeting `opened`.
+            let other = editor.new_buffer().await.unwrap();
+            let initial = editor.range_edit(opened.buffer_id.clone(), "view-a".into(), 0, vec![
+                RangeEdit { start: 0, end: 0, text: "a🙂界z".into() },
+                // The second edit addresses the text after the first edit;
+                // the emoji occupies four UTF-8 bytes.
+                RangeEdit { start: 1, end: 5, text: "🧪".into() },
+            ], ByteSelection { anchor: 1, head: 5 }).await.unwrap();
+            assert!(initial.accepted);
+            assert_eq!(initial.text, "a🧪界z");
+            assert_eq!(initial.rev, 1);
+            assert_eq!(initial.selection, ByteSelection { anchor: 1, head: 5 });
+            assert_eq!(editor.sync(other.buffer_id.clone()).await.unwrap().text, "");
+
+            // A stale transaction returns the current snapshot without changing it.
+            let stale = editor.range_edit(opened.buffer_id.clone(), "view-a".into(), 0, vec![
+                RangeEdit { start: 0, end: 0, text: "lost".into() },
+            ], initial.selection).await.unwrap();
+            assert!(!stale.accepted);
+            assert_eq!(stale.rev, 1);
+            assert_eq!(stale.text, "a🧪界z");
+
+            let appended = editor.range_edit(opened.buffer_id.clone(), "view-a".into(), 1, vec![
+                RangeEdit { start: 9, end: 9, text: "!".into() },
+            ], ByteSelection { anchor: 10, head: 10 }).await.unwrap();
+            assert!(appended.accepted);
+            assert_eq!(appended.text, "a🧪界z!");
+            assert_eq!(appended.rev, 2);
+
+            let undo_append = editor.action(opened.buffer_id.clone(), "view-a".into(), 2, EditorAction::Undo, appended.selection).await.unwrap();
+            assert_eq!(undo_append.text, "a🧪界z");
+            assert_eq!(undo_append.rev, 3);
+            assert_eq!(undo_append.selection, ByteSelection { anchor: 1, head: 5 });
+            let undo_group = editor.action(opened.buffer_id.clone(), "view-a".into(), 3, EditorAction::Undo, undo_append.selection).await.unwrap();
+            assert_eq!(undo_group.text, "");
+            assert_eq!(undo_group.rev, 4);
+            assert_eq!(undo_group.selection, ByteSelection { anchor: 0, head: 0 });
+            let redo_group = editor.action(opened.buffer_id.clone(), "view-a".into(), 4, EditorAction::Redo, undo_group.selection).await.unwrap();
+            assert_eq!(redo_group.text, "a🧪界z");
+            assert_eq!(redo_group.rev, 5);
+            assert_eq!(redo_group.selection, initial.selection);
+
+            // A reconnect can request a fresh authoritative snapshot regardless
+            // of the revision cached by the client.
+            let synced = editor.sync(opened.buffer_id.clone()).await.unwrap();
+            assert_eq!(synced.text, "a🧪界z");
+            assert_eq!(synced.rev, 5);
+
+            let invalid = editor.range_edit(opened.buffer_id.clone(), "view-a".into(), 5, vec![
+                RangeEdit { start: 9, end: 9, text: "partial".into() },
+                // A later invalid operation must reject the whole transaction.
+                RangeEdit { start: 2, end: 3, text: String::new() },
+            ], redo_group.selection).await;
+            assert!(invalid.is_err(), "mid-character byte offsets must be rejected");
+            let after_invalid = editor.sync(opened.buffer_id.clone()).await.unwrap();
+            assert_eq!(after_invalid.text, "a🧪界z");
+            assert_eq!(after_invalid.rev, 5);
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     // A stdio LSP exercised through Fresh and the ADE worker, including
     // two Python servers and a TOML server. No developer-installed binary is needed.
     const FAKE_LSP: &str = r#"#!/usr/bin/env python3
 import json, sys
 source = sys.argv[1]
 log_path = sys.argv[0] + '.' + source + '.log'
+documents = {}
 def send(obj):
     body = json.dumps(obj).encode()
     sys.stdout.buffer.write(b'Content-Length: %d\r\n\r\n' % len(body) + body)
@@ -922,6 +1296,25 @@ def read():
         key, value = line.decode().split(':', 1)
         headers[key.lower()] = value.strip()
     return json.loads(sys.stdin.buffer.read(int(headers['content-length'])))
+def byte_offset(text, position):
+    lines = text.splitlines(keepends=True)
+    line = position['line']
+    character = position['character']
+    prefix = ''.join(lines[:line])
+    content = lines[line] if line < len(lines) else ''
+    byte_count = 0
+    utf16_count = 0
+    for char in content:
+        if utf16_count == character: return len(prefix.encode('utf-8')) + byte_count
+        units = 2 if ord(char) > 0xffff else 1
+        if utf16_count + units > character: raise ValueError('position splits UTF-16 surrogate pair')
+        utf16_count += units
+        byte_count += len(char.encode('utf-8'))
+    if utf16_count != character: raise ValueError('position past line end')
+    return len(prefix.encode('utf-8')) + byte_count
+def record_document(uri):
+    with open(log_path + '.text', 'a') as log:
+        log.write(json.dumps(documents[uri], ensure_ascii=False) + '\n')
 while True:
     msg = read()
     if msg is None: break
@@ -930,9 +1323,23 @@ while True:
         with open(log_path, 'a') as log: log.write(method + '\n')
     if method == 'initialize':
         send({'jsonrpc':'2.0','id':msg['id'],'result':{
-            'capabilities':{'textDocumentSync':1,'documentFormattingProvider':True}}})
+            'capabilities':{'textDocumentSync':2,'documentFormattingProvider':True}}})
     elif method in ('textDocument/didOpen', 'textDocument/didChange'):
         uri = msg['params']['textDocument']['uri']
+        if method == 'textDocument/didOpen':
+            documents[uri] = msg['params']['textDocument']['text']
+        else:
+            with open(log_path + '.changes', 'a') as log:
+                log.write(json.dumps(msg['params']['contentChanges'], ensure_ascii=False) + '\n')
+            for change in msg['params']['contentChanges']:
+                if 'range' not in change:
+                    documents[uri] = change['text']
+                else:
+                    start = byte_offset(documents[uri], change['range']['start'])
+                    end = byte_offset(documents[uri], change['range']['end'])
+                    raw = documents[uri].encode('utf-8')
+                    documents[uri] = (raw[:start] + change['text'].encode('utf-8') + raw[end:]).decode('utf-8')
+        record_document(uri)
         bad = method == 'textDocument/didOpen'
         send({'jsonrpc':'2.0','method':'textDocument/publishDiagnostics','params':{
             'uri':uri,'diagnostics':[{'range':{'start':{'line':0,'character':0},
@@ -947,6 +1354,76 @@ while True:
     elif 'id' in msg:
         send({'jsonrpc':'2.0','id':msg['id'],'result':None})
 "#;
+
+    #[test]
+    fn incremental_lsp_applies_unicode_and_newline_range_batch_undo_redo() {
+        if !fresh::services::lsp::command_exists("python3") { return; }
+        let root = std::env::temp_dir().join(format!("fresh-gui-lsp-range-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let script_path = root.join("fake_lsp.py");
+        std::fs::write(&script_path, FAKE_LSP).unwrap();
+        let log_path = format!("{}.Incremental.log.text", script_path.display());
+        let change_log_path = format!("{}.Incremental.log.changes", script_path.display());
+        let source = root.join("range.py");
+        let original = "a🙂界z\nold\n";
+        std::fs::write(&source, original).unwrap();
+        let cfg = crate::config::Config::parse(&serde_json::json!({
+            "lsp": { "python": { "name":"Incremental", "command":"python3", "args":[script_path.display().to_string(), "Incremental"], "only_features":["diagnostics"] } }
+        }).to_string()).unwrap();
+        let editor = EditorHandle::spawn(root.clone(), cfg).expect("Fresh worker starts");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            async fn wait_documents(path: &str, wanted: usize) -> Vec<String> {
+                for _ in 0..120 {
+                    let contents = std::fs::read_to_string(path).unwrap_or_default();
+                    let documents: Vec<String> = contents.lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
+                    if documents.len() >= wanted { return documents; }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                panic!("LSP did not apply {wanted} document updates; log: {}", std::fs::read_to_string(path).unwrap_or_default());
+            }
+
+            let opened = editor.open(source.clone(), false).await.unwrap();
+            wait_documents(&log_path, 1).await;
+            // Both ranges address sequential text: replace emoji + CJK on the
+            // first line, then replace a line with text containing a newline.
+            let edited = editor.range_edit(opened.buffer_id.clone(), "view-lsp".into(), opened.rev, vec![
+                RangeEdit { start: 1, end: 8, text: "😃中".into() },
+                RangeEdit { start: 10, end: 13, text: "新🙂\nnext".into() },
+            ], ByteSelection { anchor: 1, head: 8 }).await.unwrap();
+            let edited_text = "a😃中z\n新🙂\nnext\n";
+            assert_eq!(edited.text, edited_text);
+            let reopened = editor.open(source, false).await.unwrap();
+            assert_eq!(reopened.buffer_id, opened.buffer_id);
+            assert!(editor.scene().await.unwrap().buffers.iter().find(|buffer| buffer.buffer_id == opened.buffer_id).unwrap().dirty,
+                "reopening a modified Fresh buffer must preserve its dirty state");
+            let docs = wait_documents(&log_path, 2).await;
+            assert_eq!(docs[0], original);
+            assert_eq!(docs[1], edited_text, "LSP applied the range changes using UTF-16 positions");
+
+            let undone = editor.action(opened.buffer_id.clone(), "view-lsp".into(), edited.rev, EditorAction::Undo, edited.selection).await.unwrap();
+            assert_eq!(undone.text, original);
+            assert_eq!(undone.selection, ByteSelection { anchor: 0, head: 0 });
+            assert!(!editor.scene().await.unwrap().buffers.iter().find(|buffer| buffer.buffer_id == opened.buffer_id).unwrap().dirty,
+                "undo to Fresh's save point must clear ADE dirty state");
+            let docs = wait_documents(&log_path, 3).await;
+            assert_eq!(docs[2], original, "Fresh undo range changes reconstruct the document");
+
+            let redone = editor.action(opened.buffer_id.clone(), "view-lsp".into(), undone.rev, EditorAction::Redo, undone.selection).await.unwrap();
+            assert_eq!(redone.text, edited_text);
+            assert_eq!(redone.selection, edited.selection);
+            assert!(editor.scene().await.unwrap().buffers.iter().find(|buffer| buffer.buffer_id == opened.buffer_id).unwrap().dirty);
+            let docs = wait_documents(&log_path, 4).await;
+            assert_eq!(docs[3], edited_text, "Fresh redo range changes reconstruct the document");
+            let change_groups: Vec<Vec<serde_json::Value>> = std::fs::read_to_string(&change_log_path).unwrap().lines()
+                .map(|line| serde_json::from_str(line).unwrap()).collect();
+            assert_eq!(change_groups.len(), 3, "forward edit, undo, and redo each notify once");
+            assert!(change_groups.iter().flatten().all(|change| change.get("range").is_some()), "incremental LSP sync must carry ranges, not whole-document replacements");
+            editor.close(opened.buffer_id).await.unwrap();
+        });
+        drop(editor);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn lsp_diagnostics_format_and_missing_binary() {
@@ -1027,6 +1504,16 @@ while True:
             );
             let formatted = editor.format(opened.buffer_id.clone(), rev).await.unwrap();
             assert_eq!(formatted.text.as_deref(), Some("formatted = true\n"));
+            let stale = editor.range_edit(
+                opened.buffer_id.clone(),
+                "view-format".into(),
+                rev,
+                vec![RangeEdit { start: 0, end: 0, text: "stale".into() }],
+                ByteSelection { anchor: 0, head: 0 },
+            ).await.unwrap();
+            assert!(!stale.accepted, "Fresh/LSP formatting advances the ADE revision");
+            assert_eq!(stale.rev, formatted.rev);
+            assert_eq!(stale.text, "formatted = true\n");
             editor.close(opened.buffer_id).await.unwrap();
 
             for source in ["Ruff", "TY"] {
