@@ -655,6 +655,8 @@ fn build_editor(working_dir: &Path, gui_config: &crate::config::Config) -> Resul
     gui_config.apply_fresh(&mut cfg);
     gui_config.apply_fresh_project(&mut cfg, working_dir)?;
     cfg.editor.animations = false;
+    // Config layers cannot change the negotiated ADE lazy/snapshot boundary.
+    cfg.editor.large_file_threshold_bytes = MAX_SNAPSHOT_BYTES as u64 + 1;
     cfg.lsp = gui_config.lsp.clone();
     cfg.lsp_enabled = !cfg.lsp.is_empty();
     for language in cfg.lsp.keys() {
@@ -3571,6 +3573,19 @@ mod external_recovery_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_layers_preserve_ade_lazy_file_boundary() {
+        let root = std::env::temp_dir().join(format!("fresh-gui-config-boundary-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".fresh")).unwrap();
+        std::fs::write(root.join(".fresh/config.json"), r#"{"editor":{"large_file_threshold_bytes":99999999}}"#).unwrap();
+        let config = crate::config::Config::parse(r#"{"editor":{"large_file_threshold_bytes":999999999,"tab_size":9}}"#).unwrap();
+        let editor = super::build_editor(&root, &config).unwrap();
+        assert_eq!(editor.config().editor.large_file_threshold_bytes, super::MAX_SNAPSHOT_BYTES as u64 + 1);
+        assert_eq!(editor.config().editor.tab_size, 9);
+        drop(editor);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn dirty_untitled_draft_survives_worker_restart_and_failed_save() {
