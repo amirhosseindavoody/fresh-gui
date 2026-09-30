@@ -13,8 +13,9 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use base64::Engine;
 use fresh_gui_protocol::{
-    CAP_EDITOR, CAP_EDITOR_DRAFT_RECOVERY, CAP_EDITOR_RANGE_EDITS, CAP_LSP, CAP_SCENE,
-    EditorDraftInfo, Hello, HelloUi, Message, PROTOCOL_VERSION,
+    CAP_EDITOR, CAP_EDITOR_DRAFT_RECOVERY, CAP_EDITOR_EXTERNAL_CHANGES, CAP_EDITOR_RANGE_EDITS,
+    CAP_LSP, CAP_SCENE, EditorDraftInfo, ExternalResolution, Hello, HelloUi, Message,
+    PROTOCOL_VERSION,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
@@ -127,6 +128,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             c != CAP_EDITOR
                 && c != CAP_EDITOR_RANGE_EDITS
                 && c != CAP_EDITOR_DRAFT_RECOVERY
+                && c != CAP_EDITOR_EXTERNAL_CHANGES
                 && c != CAP_LSP
                 && c != CAP_SCENE
         });
@@ -156,11 +158,33 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut authed = !state.require_auth;
     let mut client_range_edits = false;
     let mut client_draft_recovery = false;
+    let mut client_external_changes = false;
     let mut session_id: Option<String> = None;
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
+    let mut external_rx = state.editor.as_ref().map(EditorHandle::subscribe_external);
 
     loop {
         tokio::select! {
+            external = async {
+                match external_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if client_external_changes => {
+                match external {
+                    Ok(change) => {
+                        let owned_here = if let Some(editor) = state.editor.as_ref() {
+                            ensure_editor_workspace(editor, &state, &session_id, &change.buffer_id, "external change").await.is_ok()
+                        } else { false };
+                        if owned_here {
+                            let msg = external_changed_message(change);
+                            if send_msg(&mut sink, &msg).await.is_err() { break; }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => external_rx = None,
+                }
+            }
             maybe_out = out_rx.recv() => {
                 match maybe_out {
                     Some(msg) => {
@@ -199,6 +223,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     &mut authed,
                     &mut client_range_edits,
                     &mut client_draft_recovery,
+                    &mut client_external_changes,
                     &mut session_id,
                     out_tx.clone(),
                     &mut sink,
@@ -225,6 +250,7 @@ async fn handle_client_msg(
     authed: &mut bool,
     client_range_edits: &mut bool,
     client_draft_recovery: &mut bool,
+    client_external_changes: &mut bool,
     session_id: &mut Option<String>,
     out_tx: mpsc::UnboundedSender<Message>,
     sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
@@ -239,6 +265,10 @@ async fn handle_client_msg(
                 .capabilities
                 .iter()
                 .any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY);
+            *client_external_changes = client_hello
+                .capabilities
+                .iter()
+                .any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES);
             if client_hello.protocol_version != PROTOCOL_VERSION {
                 return Err(Message::Error {
                     code: "protocol_mismatch".into(),
@@ -1195,6 +1225,104 @@ async fn handle_client_msg(
             Ok(())
         }
 
+        Message::BufferExternalCheck {
+            request_id,
+            buffer_id,
+        } => {
+            require_auth(*authed)?;
+            require_external_changes(*client_external_changes, &request_id)?;
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: "editor capability not available".into(),
+                });
+            };
+            ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
+            let change = editor
+                .check_external(buffer_id.clone())
+                .await
+                .map_err(|err| Message::Error {
+                    code: "buffer_external_check_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
+            let response = match change {
+                Some(change) => external_checked_message(request_id, change),
+                None => Message::BufferExternalChecked {
+                    request_id,
+                    buffer_id,
+                    found: false,
+                    path: String::new(),
+                    rev: 0,
+                    generation: String::new(),
+                    text: String::new(),
+                    disk_text: None,
+                    dirty: false,
+                },
+            };
+            send_msg(sink, &response)
+                .await
+                .map_err(|_| Message::Error {
+                    code: "send_failed".into(),
+                    message: "failed to send external check result".into(),
+                })?;
+            Ok(())
+        }
+        Message::BufferExternalResolve {
+            request_id,
+            buffer_id,
+            base_rev,
+            generation,
+            resolution,
+        } => {
+            require_auth(*authed)?;
+            require_external_changes(*client_external_changes, &request_id)?;
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: "editor capability not available".into(),
+                });
+            };
+            ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
+            let response_resolution = resolution;
+            let worker_resolution = match resolution {
+                ExternalResolution::Reload => crate::editor_worker::ExternalResolution::Reload,
+                ExternalResolution::Keep => crate::editor_worker::ExternalResolution::Keep,
+                ExternalResolution::Overwrite => {
+                    crate::editor_worker::ExternalResolution::Overwrite
+                }
+            };
+            let result = editor
+                .resolve_external(
+                    buffer_id.clone(),
+                    base_rev,
+                    generation.clone(),
+                    worker_resolution,
+                )
+                .await
+                .map_err(|err| Message::Error {
+                    code: "buffer_external_resolve_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
+            let response = Message::BufferExternalResolved {
+                request_id,
+                buffer_id,
+                rev: result.rev,
+                generation,
+                text: result.text,
+                selection: result.selection,
+                accepted: result.accepted,
+                dirty: result.dirty,
+                resolution: response_resolution,
+            };
+            send_msg(sink, &response)
+                .await
+                .map_err(|_| Message::Error {
+                    code: "send_failed".into(),
+                    message: "failed to send external resolution result".into(),
+                })?;
+            Ok(())
+        }
+
         Message::BufferSave {
             request_id,
             buffer_id,
@@ -1220,13 +1348,28 @@ async fn handle_client_msg(
                         }
                     })?)
                 };
-            let (path, rev) = editor
-                .save(buffer_id.clone(), base_rev, dest)
-                .await
-                .map_err(|err| Message::Error {
-                    code: "buffer_save_failed".into(),
-                    message: format!("{request_id}: {err:#}"),
-                })?;
+            let (path, rev) = match editor.save(buffer_id.clone(), base_rev, dest).await {
+                Ok(saved) => saved,
+                Err(err) => {
+                    // A disk-generation conflict is returned as a save error to
+                    // preserve existing request semantics. Send the structured
+                    // external state first so capable clients can offer a choice.
+                    if *client_external_changes
+                        && let Ok(Some(change)) = editor.check_external(buffer_id.clone()).await
+                    {
+                        send_msg(sink, &external_changed_message(change))
+                            .await
+                            .map_err(|_| Message::Error {
+                                code: "send_failed".into(),
+                                message: "failed to send save conflict state".into(),
+                            })?;
+                    }
+                    return Err(Message::Error {
+                        code: "buffer_save_failed".into(),
+                        message: format!("{request_id}: {err:#}"),
+                    });
+                }
+            };
             if Config::path_matches(&state.config_path, &path) {
                 match Config::load_from_path(&state.config_path) {
                     Ok(cfg) => {
@@ -1873,6 +2016,19 @@ mod workspace_root_tests {
     }
 }
 
+#[cfg(test)]
+mod external_change_capability_tests {
+    use super::require_external_changes;
+    use fresh_gui_protocol::Message;
+
+    #[test]
+    fn external_change_requests_require_negotiated_capability() {
+        let error = require_external_changes(false, "check-1").unwrap_err();
+        assert!(matches!(error, Message::Error { code, .. } if code == "capability_unavailable"));
+        assert!(require_external_changes(true, "check-2").is_ok());
+    }
+}
+
 async fn mirror_workspace_layout(state: &AppState, update: Option<(String, String)>) {
     let Some((session_id, layout)) = update else {
         return;
@@ -2046,6 +2202,48 @@ async fn ensure_editor_workspace(
             code: "editor_workspace_mismatch".into(),
             message: format!("{request_id}: {err:#}"),
         })
+}
+
+fn external_changed_message(change: crate::editor_worker::ExternalChange) -> Message {
+    Message::BufferExternalChanged {
+        buffer_id: change.buffer_id,
+        path: change.path,
+        rev: change.rev,
+        generation: change.generation,
+        text: change.text,
+        disk_text: change.disk_text,
+        dirty: change.dirty,
+    }
+}
+
+fn external_checked_message(
+    request_id: String,
+    change: crate::editor_worker::ExternalChange,
+) -> Message {
+    Message::BufferExternalChecked {
+        request_id,
+        buffer_id: change.buffer_id,
+        found: true,
+        path: change.path,
+        rev: change.rev,
+        generation: change.generation,
+        text: change.text,
+        disk_text: change.disk_text,
+        dirty: change.dirty,
+    }
+}
+
+fn require_external_changes(enabled: bool, request_id: &str) -> Result<(), Message> {
+    if enabled {
+        Ok(())
+    } else {
+        Err(Message::Error {
+            code: "capability_unavailable".into(),
+            message: format!(
+                "{request_id}: client did not negotiate {CAP_EDITOR_EXTERNAL_CHANGES}"
+            ),
+        })
+    }
 }
 
 async fn workspace_dir(state: &AppState, workspace_id: &str) -> Result<PathBuf, Message> {
