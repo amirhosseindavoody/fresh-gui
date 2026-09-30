@@ -1219,7 +1219,8 @@ mod tests {
     #[test]
     fn alternate_scroll_tracks_dec_mode_1007() {
         let mut s = TermScreen::new(20, 6);
-        assert!(!s.alternate_scroll());
+        // Alacritty 0.25 enables alternate scroll by default.
+        assert!(s.alternate_scroll());
         s.feed(b"\x1b[?1007h");
         assert!(s.alternate_scroll());
         s.feed(b"\x1b[?1007l");
