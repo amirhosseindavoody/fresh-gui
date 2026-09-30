@@ -219,6 +219,7 @@ async fn range_bridge_revisions_undo_resync_and_legacy_fallback() {
                     text: "?".into(),
                 },
             ],
+            viewport: None,
             selection: ByteSelection {
                 anchor: 12,
                 head: 12,
@@ -249,6 +250,7 @@ async fn range_bridge_revisions_undo_resync_and_legacy_fallback() {
                 end: 12,
                 text: "!".into(),
             }],
+            viewport: None,
             selection: ByteSelection {
                 anchor: 13,
                 head: 13,
@@ -281,6 +283,7 @@ async fn range_bridge_revisions_undo_resync_and_legacy_fallback() {
                     text: "x".into(),
                 },
             ],
+            viewport: None,
             selection: ByteSelection { anchor: 1, head: 1 },
         })
         .await
@@ -320,6 +323,7 @@ async fn range_bridge_revisions_undo_resync_and_legacy_fallback() {
                 end: 1,
                 text: "x".into(),
             }],
+            viewport: None,
             selection: ByteSelection { anchor: 1, head: 1 },
         })
         .await
@@ -481,6 +485,7 @@ async fn range_bridge_revisions_undo_resync_and_legacy_fallback() {
                 end: 13,
                 text: "~".into(),
             }],
+            viewport: None,
             selection: ByteSelection {
                 anchor: 14,
                 head: 14,
@@ -524,6 +529,7 @@ async fn range_bridge_revisions_undo_resync_and_legacy_fallback() {
                 end: 1,
                 text: "z".into(),
             }],
+            viewport: None,
             selection: ByteSelection { anchor: 1, head: 1 },
         })
         .await
