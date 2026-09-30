@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fresh_gui_protocol::{
-    CAP_GIT, CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_DRAFT_RECOVERY, CAP_WORKSPACE, CAP_WORKSPACE_SET_ROOT, FsEntry, FsKind, GitFile, Hello, PtyInfo,
+    CAP_GIT, CAP_EDITOR_EXTERNAL_CHANGES, CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_DRAFT_RECOVERY, CAP_WORKSPACE, CAP_WORKSPACE_SET_ROOT, FsEntry, FsKind, GitFile, Hello, PtyInfo,
     LayoutNode, WorkspaceInfo, WorkspaceLayoutExtra, WorkspaceTab, WorkspaceTabKind,
 };
 use gpui_kit::base::Placement;
@@ -1768,6 +1768,23 @@ impl Workspace {
                     self.finish_restore_if_idle(window, cx);
                 }
             }
+            AdeEvent::ExternalChanged { buffer_id, path: _, rev, generation, text, disk_text, dirty } => {
+                if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
+                    panel.update(cx, |panel, cx| {
+                        panel.apply_external_change(rev, generation, text, disk_text, dirty, window, cx);
+                    });
+                } else if let Some(panel) = self.diffs.values().find(|panel| panel.read(cx).buffer_id() == Some(buffer_id.as_str())).cloned() {
+                    panel.update(cx, |panel, cx| panel.apply_snapshot(&buffer_id, rev, &text, window, cx));
+                    self.status = "File changed on disk; reopen in an editor to reconcile a dirty diff".into();
+                }
+            }
+            AdeEvent::ExternalResolved { request_id, buffer_id, rev, generation, text, accepted, dirty, resolution } => {
+                if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
+                    panel.update(cx, |panel, cx| {
+                        panel.apply_external_resolution(&request_id, rev, generation, text, accepted, dirty, resolution, window, cx);
+                    });
+                }
+            }
             AdeEvent::BufferSnapshot {
                 buffer_id,
                 rev,
@@ -1964,6 +1981,7 @@ impl Workspace {
             panel.update(cx, |panel, cx| {
                 panel.configure_range_edits(range_edits, cx);
                 panel.configure_draft_recovery(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
+                panel.configure_external_changes(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES));
             });
         }
         self.config_path = hello.config_path.clone();
@@ -2106,6 +2124,7 @@ impl Workspace {
         if let Some(panel) = self.editors.get(&lookup_key).cloned() {
             panel.update(cx, |panel, cx| {
                 panel.configure_draft_recovery(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
+                panel.configure_external_changes(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES));
                 panel.note_reopen(buffer_id, line, column, cx);
                 panel.reconnect(self.ade.clone(), self.capabilities.iter().any(|cap| cap == CAP_EDITOR_RANGE_EDITS), cx);
             });
@@ -2142,6 +2161,7 @@ impl Workspace {
         panel.update(cx, |panel, cx| {
             panel.configure_range_edits(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_RANGE_EDITS), cx);
             panel.configure_draft_recovery(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
+                panel.configure_external_changes(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES));
             panel.set_word_wrap(self.editor_line_wrap, window, cx);
         });
         let panel_id = PanelId::from(panel.entity_id());
@@ -2182,6 +2202,7 @@ impl Workspace {
                 panel.note_reopen(buffer_id, None, None, cx);
             }
             panel.apply_snapshot(rev, text, path, window, cx);
+            panel.check_external();
         });
         if !self.restoring {
             self.select_entity(&panel, window, cx);
@@ -3923,6 +3944,25 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         } else if gesture == super::explorer::SelectGesture::Replace {
             self.open_path(path.to_string(), true);
         }
+    }
+
+    pub fn compare_external(
+        &mut self, path: String, disk: String, draft: String, deleted: bool,
+        window: &mut Window, cx: &mut Context<Self>,
+    ) {
+        let key = format!("external-compare:{path}");
+        let panel = if let Some(panel) = self.diffs.get(&key).cloned() { panel } else {
+            let workspace = cx.weak_entity();
+            let metrics = self.tab_metrics.clone();
+            let panel = cx.new(|cx| DiffPanel::new(key.clone(), path, true, workspace, metrics, window, cx));
+            self.dock.update(cx, |dock, cx| {
+                dock.add_panel_view(panel_handle(panel.clone()), DockPlacement::Center, None, window, cx);
+            });
+            self.diffs.insert(key, panel.clone());
+            panel
+        };
+        panel.update(cx, |panel, cx| panel.show_external_comparison(disk, draft, deleted, window, cx));
+        self.select_entity(&panel, window, cx);
     }
 
     fn open_diff(&mut self, rel: String, pin: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -5905,21 +5945,19 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         for dir in expanded {
             self.relist(&dir);
         }
-        // Reload open editors that map to real paths.
         for (path, panel) in self.editors.clone() {
-            if path.is_empty() || is_untitled_editor_key(&path) {
-                continue;
+            if path.is_empty() || is_untitled_editor_key(&path) { continue; }
+            if self.capabilities.iter().any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES) {
+                panel.read(cx).check_external();
+            } else if !panel.read(cx).is_dirty() {
+                // Old daemons cannot inspect disk generations. Never reopen a
+                // dirty view; protected snapshot reconciliation covers late typing.
+                let request_id = next_id("reload");
+                self.pending_editors.insert(request_id.clone(), false);
+                self.ade.send(AdeCmd::OpenEditor {
+                    request_id, path, preview: false, line: None, column: None,
+                });
             }
-            let request_id = next_id("reload");
-            self.pending_editors.insert(request_id.clone(), false);
-            self.ade.send(AdeCmd::OpenEditor {
-                request_id,
-                path: path.clone(),
-                preview: false,
-                line: None,
-                column: None,
-            });
-            let _ = panel;
         }
         self.status = "Explorer refreshed".into();
         cx.notify();
