@@ -478,6 +478,63 @@ async fn older_client_without_paged_capability_gets_explicit_rejection() {
 }
 
 #[tokio::test]
+async fn sparse_multigibibyte_file_with_nul_holes_is_classified_as_binary() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    const SPARSE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+    let root = temp_root("sparse-binary");
+    let file_path = root.join("sparse.txt");
+    let mut file = fs::File::create(&file_path).expect("create sparse fixture");
+    file.set_len(SPARSE_BYTES).expect("make sparse 3 GiB fixture");
+    file.write_all(b"ASCII sparse head\n")
+        .expect("write sparse head");
+    file.seek(SeekFrom::End(-16)).expect("seek to sparse tail");
+    file.write_all(b"ASCII sparse tail")
+        .expect("write sparse tail");
+    drop(file);
+
+    let addr = free_loopback();
+    let _backend = spawn_backend(addr, &root);
+    wait_health(addr);
+    let mut client = connect(addr).await;
+    client
+        .send(Message::EditorOpen {
+            request_id: "sparse-open".into(),
+            path: "sparse.txt".into(),
+            preview: false,
+            cwd: None,
+            line: None,
+            column: None,
+        })
+        .await
+        .expect("send sparse open");
+
+    let started = Instant::now();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match client.recv().await.expect("receive sparse-file response") {
+                Message::Error { code, message } if message.starts_with("sparse-open") => {
+                    assert_eq!(code, "binary_file");
+                    assert!(message.contains("sparse.txt"));
+                    break;
+                }
+                Message::PtyData { .. }
+                | Message::PtyClosed { .. }
+                | Message::Pong { .. }
+                | Message::Ping { .. }
+                | Message::FsChanged { .. } => {}
+                other => panic!("unexpected sparse-file response: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("sparse-file classification timed out");
+    assert!(started.elapsed() < Duration::from_secs(15));
+    assert_eq!(fs::metadata(file_path).expect("sparse metadata").len(), SPARSE_BYTES);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn paged_buffers_remain_scoped_to_their_workspace() {
     let root = temp_root("workspace-daemon-root");
     let alpha_root = temp_root("workspace-alpha");
