@@ -16,22 +16,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fresh_gui_protocol::{
-    CAP_GIT, CAP_EDITOR_RANGE_EDITS, CAP_WORKSPACE, CAP_WORKSPACE_SET_ROOT, FsEntry, FsKind, GitFile, Hello, PtyInfo,
+    CAP_GIT, CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_DRAFT_RECOVERY, CAP_WORKSPACE, CAP_WORKSPACE_SET_ROOT, FsEntry, FsKind, GitFile, Hello, PtyInfo,
     LayoutNode, WorkspaceInfo, WorkspaceLayoutExtra, WorkspaceTab, WorkspaceTabKind,
 };
 use gpui_kit::base::Placement;
-use gpui_kit::component::dock::{BasePanelView, DockArea, DockEvent, DockLayout, DockPlacement, InsertTarget, PaneNode, PaneRef, PanelId, panel_handle};
+use gpui_kit::component::dock::{BasePanelView, ClosePanel as DockClosePanel, DockArea, DockEvent, DockLayout, DockPlacement, InsertTarget, PaneNode, PaneRef, PanelId, panel_handle};
 use gpui_kit::component::menu::{AppMenuBar, ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{
     ActiveTheme, Disableable as _, Icon, IconName, Root, Selectable, Sizable, StyledExt, TitleBar,
     button::{Button, ButtonVariants as _},
     command::{Command, CommandGroup, CommandItem, CommandState},
+    dialog::DialogFooter,
     h_flex,
     input::{Input, InputEvent, InputState},
     list::ListItem,
     status_bar::StatusBar,
     tree::{TreeEvent, TreeState, tree},
     v_flex,
+    WindowExt,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -75,6 +77,29 @@ use super::tab_chrome::{TabCloseScope, TabStripMetrics, panels_for_close_scope};
 const PTY_BATCH_BYTES: usize = 128 * 1024;
 const PTY_BATCH_EVENTS: usize = 32;
 const GOTO_MAX_VISIBLE: usize = 10;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirtyCloseChoice {
+    Save,
+    Discard,
+    Cancel,
+}
+
+fn close_can_commit(choice: DirtyCloseChoice, save_completed: bool) -> bool {
+    match choice {
+        DirtyCloseChoice::Save => save_completed,
+        DirtyCloseChoice::Discard => true,
+        DirtyCloseChoice::Cancel => false,
+    }
+}
+
+fn bulk_close_can_commit(choices: &[DirtyCloseChoice], save_completed: bool) -> bool {
+    choices.iter().all(|choice| close_can_commit(*choice, save_completed))
+}
+
+fn close_requires_prompt(dirty: bool, recovery_guaranteed: bool) -> bool {
+    dirty && !recovery_guaranteed
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct GotoParts {
@@ -760,6 +785,14 @@ struct PendingFs {
     destination: String,
 }
 
+struct PendingSaveClose {
+    ids: Vec<PanelId>,
+    required_clean: Vec<PanelId>,
+    waiting_for_diff_saves: HashSet<PanelId>,
+    workspace_id: Option<String>,
+    closes_window: bool,
+}
+
 #[derive(Clone)]
 struct ExplorerDrag {
     paths: Vec<String>,
@@ -810,6 +843,8 @@ pub struct Workspace {
     pending_editors: HashMap<String, bool>,
     pending_diff_editors: HashMap<String, String>,
     restoring: bool,
+    pending_switch_target: Option<String>,
+    switch_wait_running: bool,
     /// Workspace whose name is being edited in the rail. Any row, not only the
     /// active one. `None` when the inline field is closed.
     renaming_id: Option<String>,
@@ -840,8 +875,8 @@ pub struct Workspace {
     tab_metrics: TabStripMetrics,
     terminals: HashMap<String, Entity<TerminalPanel>>,
     editors: HashMap<String, Entity<EditorPanel>>,
-    /// Live views retained only across a transport reconnect, scoped to their
-    /// workspace. This is not persistent draft recovery.
+    /// Live views retain unacknowledged edits across transport reconnects,
+    /// scoped to their workspace. Durable drafts remain daemon-owned.
     reconnect_views: Option<(Option<String>, HashMap<String, Entity<EditorPanel>>)>,
     diffs: HashMap<String, Entity<DiffPanel>>,
     binaries: HashMap<String, Entity<BinaryPanel>>,
@@ -917,6 +952,8 @@ pub struct Workspace {
     /// In-app file clipboard for explorer paste (`fs_copy`). Absolute paths.
     file_clipboard: Option<Vec<String>>,
     pending_fs: HashMap<String, PendingFs>,
+    pending_save_close: Option<PendingSaveClose>,
+    diff_save_snapshots: HashMap<String, (PanelId, String, String)>,
     command_state: Entity<CommandState>,
     copilot_input: Entity<InputState>,
     copilot_open: bool,
@@ -936,6 +973,232 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    fn request_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let ids = self.editors.values().map(|panel| PanelId::from(panel.entity_id()))
+            .chain(self.diffs.values().map(|panel| PanelId::from(panel.entity_id())))
+            .collect::<Vec<_>>();
+        let mut prompt_needed = false;
+        for panel in self.editors.values() {
+            let unretained = panel.update(cx, |panel, cx| {
+                if !close_requires_prompt(panel.is_dirty(), panel.recovery_guaranteed(cx)) { return false; }
+                panel.flush_for_recovery(cx);
+                close_requires_prompt(panel.is_dirty(), panel.recovery_guaranteed(cx))
+            });
+            prompt_needed |= unretained;
+        }
+        prompt_needed |= self.diffs.values().any(|panel| panel.read(cx).is_dirty());
+        if !prompt_needed {
+            self.shutdown_client(cx);
+            crate::note_window_shutdown();
+            return true;
+        }
+        let dirty_ids = self.editors.values().filter(|panel| panel.read(cx).is_dirty())
+            .map(|panel| PanelId::from(panel.entity_id()))
+            .chain(self.diffs.values().filter(|panel| panel.read(cx).is_dirty()).map(|panel| PanelId::from(panel.entity_id())))
+            .collect::<Vec<_>>();
+        let dirty_count = dirty_ids.len();
+        self.show_close_prompt(ids, dirty_ids, dirty_count, true, window, cx);
+        false
+    }
+
+    fn show_close_prompt(
+        &mut self,
+        ids: Vec<PanelId>,
+        dirty_ids: Vec<PanelId>,
+        dirty_count: usize,
+        closes_window: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let count = dirty_count;
+        let description = format!("{} unsaved buffer{} will be closed.", count, if count == 1 { "" } else { "s" });
+        let workspace = cx.entity().downgrade();
+        let active_workspace_id = self.active_workspace_id.clone();
+        let save_workspace = workspace.clone();
+        let discard_workspace = workspace.clone();
+        let save_ids = ids.clone();
+        let save_dirty_ids = dirty_ids.clone();
+        let discard_ids = ids;
+        let discard_dirty_ids = dirty_ids;
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let description = description.clone();
+            let save_workspace = save_workspace.clone();
+            let discard_workspace = discard_workspace.clone();
+            let save_ids = save_ids.clone();
+            let save_dirty_ids = save_dirty_ids.clone();
+            let discard_ids = discard_ids.clone();
+            let discard_dirty_ids = discard_dirty_ids.clone();
+            let save_workspace_id = active_workspace_id.clone();
+            let discard_workspace_id = active_workspace_id.clone();
+            alert
+                .title("Unsaved changes")
+                .description(description)
+                .footer(
+                    DialogFooter::new()
+                        .child(Button::new("draft-close-cancel").label("Cancel").on_click(|_, window, cx| {
+                            if !close_can_commit(DirtyCloseChoice::Cancel, false) {
+                                window.close_dialog(cx);
+                            }
+                        }))
+                        .child(Button::new("draft-close-save").label("Save").on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            save_workspace.update(cx, |this, cx| {
+                                this.resolve_close_choice(&save_ids, &save_dirty_ids, &save_workspace_id, closes_window, DirtyCloseChoice::Save, window, cx);
+                            }).ok();
+                        }))
+                        .child(Button::new("draft-close-discard").label("Discard").on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            discard_workspace.update(cx, |this, cx| {
+                                this.resolve_close_choice(&discard_ids, &discard_dirty_ids, &discard_workspace_id, closes_window, DirtyCloseChoice::Discard, window, cx);
+                            }).ok();
+                        })),
+                )
+        });
+    }
+
+    fn resolve_close_choice(
+        &mut self,
+        ids: &[PanelId],
+        dirty_ids: &[PanelId],
+        workspace_id: &Option<String>,
+        closes_window: bool,
+        choice: DirtyCloseChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if &self.active_workspace_id != workspace_id { return; }
+        match choice {
+            DirtyCloseChoice::Save => {
+                self.save_before_close(ids, dirty_ids, closes_window, window, cx);
+            }
+            DirtyCloseChoice::Discard if bulk_close_can_commit(&[choice], false) => {
+                self.discard_and_close(ids, dirty_ids, closes_window, window, cx);
+            }
+            DirtyCloseChoice::Cancel | DirtyCloseChoice::Discard => {}
+        }
+    }
+
+    /// Save is a safe decision for a bulk close only when every selected
+    /// buffer has completed its save. Untitled buffers use sequential Save As
+    /// prompts while every selected panel remains open.
+    fn save_before_close(
+        &mut self,
+        ids: &[PanelId],
+        required_clean: &[PanelId],
+        closes_window: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_save_close = Some(PendingSaveClose {
+            ids: ids.to_vec(),
+            required_clean: required_clean.to_vec(),
+            waiting_for_diff_saves: HashSet::new(),
+            workspace_id: self.active_workspace_id.clone(),
+            closes_window,
+        });
+        let selected = self.editors.iter()
+            .filter(|(_, panel)| required_clean.contains(&PanelId::from(panel.entity_id())))
+            .map(|(key, panel)| (key.clone(), panel.clone(), panel.read(cx).is_unsaved(), panel.read(cx).is_dirty()))
+            .collect::<Vec<_>>();
+        let unsaved_key = selected.iter().find(|(_, _, unsaved, dirty)| *unsaved && *dirty).map(|(key, _, _, _)| key.clone());
+        for (_, panel, _, dirty) in selected {
+            if dirty && !panel.read(cx).is_unsaved() {
+                panel.update(cx, |panel, cx| panel.request_save(String::new(), window, cx));
+            }
+        }
+        let diff_saves = self.diffs.values()
+            .filter(|panel| required_clean.contains(&PanelId::from(panel.entity_id())))
+            .filter_map(|panel| panel.read(cx).save_data(cx).map(|data| (PanelId::from(panel.entity_id()), data)))
+            .collect::<Vec<_>>();
+        if let Some(pending) = self.pending_save_close.as_mut() {
+            pending.waiting_for_diff_saves.extend(diff_saves.iter().map(|(id, _)| *id));
+        }
+        for (panel_id, (buffer_id, rev, text)) in diff_saves {
+            self.write_buffer(panel_id, &buffer_id, rev, &text, true, String::new());
+        }
+        if let Some(key) = unsaved_key {
+            self.active = Some(ActiveSurface::Editor(key));
+            self.open_save_dialog(window, cx);
+            self.status = "Choose a path to save the untitled buffer".into();
+            cx.notify();
+            return;
+        }
+        self.status = "Saving buffers…".into();
+        self.resume_pending_save_close(window, cx);
+        cx.notify();
+    }
+
+    fn resume_pending_save_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_save_close.as_ref() else { return; };
+        if pending.workspace_id != self.active_workspace_id {
+            self.pending_save_close = None;
+            return;
+        }
+        let ids = pending.ids.clone();
+        let required_clean = pending.required_clean.clone();
+        let closes_window = pending.closes_window;
+        let selected = self.editors.iter()
+            .filter(|(_, panel)| required_clean.contains(&PanelId::from(panel.entity_id())))
+            .map(|(key, panel)| (key.clone(), panel.clone()))
+            .collect::<Vec<_>>();
+        let editor_saves_complete = selected.iter().all(|(_, panel)| {
+            let panel = panel.read(cx);
+            !panel.is_dirty() && !panel.is_unsaved() && !panel.save_in_progress()
+        });
+        let diff_saves_complete = self.diffs.values()
+            .filter(|panel| required_clean.contains(&PanelId::from(panel.entity_id())))
+            .all(|panel| !panel.read(cx).is_dirty());
+        let waiting_for_diff_saves = pending.waiting_for_diff_saves.len();
+        if editor_saves_complete && diff_saves_complete && waiting_for_diff_saves == 0 {
+            self.pending_save_close = None;
+            if closes_window {
+                self.shutdown_client(cx);
+                crate::note_window_shutdown();
+                window.remove_window();
+            } else {
+                self.remove_dock_ids(&ids, window, cx);
+            }
+            return;
+        }
+        if let Some((key, _)) = selected.iter().find(|(_, panel)| {
+            let panel = panel.read(cx);
+            panel.is_unsaved() && panel.is_dirty() && !panel.save_in_progress()
+        }) {
+            if self.save_open { return; }
+            self.active = Some(ActiveSurface::Editor(key.clone()));
+            self.open_save_dialog(window, cx);
+            return;
+        }
+        if selected.iter().any(|(_, panel)| panel.read(cx).save_in_progress()) || waiting_for_diff_saves > 0 {
+            return;
+        }
+        self.pending_save_close = None;
+        self.status = "A buffer changed or could not be saved; nothing was closed".into();
+        cx.notify();
+    }
+
+    fn discard_and_close(
+        &mut self,
+        ids: &[PanelId],
+        dirty_ids: &[PanelId],
+        closes_window: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for panel in self.editors.values()
+            .filter(|panel| dirty_ids.contains(&PanelId::from(panel.entity_id())))
+        {
+            panel.update(cx, |panel, cx| panel.discard_recovery(cx));
+        }
+        if closes_window {
+            self.shutdown_client(cx);
+            crate::note_window_shutdown();
+            window.remove_window();
+        } else {
+            self.remove_dock_ids(ids, window, cx);
+        }
+    }
+
     pub fn new(target: ConnectTarget, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (ade, evt_rx) = super::ade::spawn(target.clone());
         let (dock, _) = install_workspace_dock(window, cx);
@@ -1104,9 +1367,9 @@ impl Workspace {
         // `window not found` and the invalid-handle errors that follow are
         // GPUI calling ShowWindow / DestroyWindow after that HWND is gone.
         // This host does not keep a window handle of its own.
-        window.on_window_should_close(cx, move |_, cx| {
+        window.on_window_should_close(cx, move |window, cx| {
             if let Some(this) = closing.upgrade() {
-                this.update(cx, |this, cx| this.shutdown_client(cx));
+                return this.update(cx, |this, cx| this.request_window_close(window, cx));
             }
             crate::note_window_shutdown();
             true
@@ -1127,6 +1390,8 @@ impl Workspace {
             pending_editors: HashMap::new(),
             pending_diff_editors: HashMap::new(),
             restoring: false,
+            pending_switch_target: None,
+            switch_wait_running: false,
             renaming_id: None,
             relocating_id: None,
             rail_hover: None,
@@ -1207,6 +1472,8 @@ impl Workspace {
             anchor: None,
             file_clipboard: None,
             pending_fs: HashMap::new(),
+            pending_save_close: None,
+            diff_save_snapshots: HashMap::new(),
             command_state,
             copilot_input,
             copilot_open: false,
@@ -1460,9 +1727,29 @@ impl Workspace {
             } => {
                 self.finish_fs(&request_id, entries, false, cx);
             }
+            AdeEvent::Drafts { request_id, drafts } => {
+                if request_id != format!("drafts-{}", self.workspace_id_or_empty()) {
+                    return;
+                }
+                for draft in drafts {
+                    // Recovery is authoritative even when a named tab was
+                    // already opened from layout metadata. Rebind retained
+                    // views and let EditSync reconcile any newer local text.
+                    let request_id = format!("restore-draft-{}", draft.draft_id);
+                    self.pending_editors.insert(request_id.clone(), false);
+                    self.ade.send(AdeCmd::RestoreDraft { request_id, draft_id: draft.draft_id });
+                }
+            }
+            AdeEvent::DraftWarning { buffer_id, message } => {
+                if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
+                    panel.update(cx, |panel, cx| panel.note_recovery_warning(message.clone(), cx));
+                }
+                self.status = message.into();
+            }
             AdeEvent::EditorOpened {
                 request_id,
                 buffer_id,
+                draft_id,
                 path,
                 language,
                 line,
@@ -1476,7 +1763,7 @@ impl Workspace {
                 }
                 if let Some(activate) = self.pending_editors.remove(&request_id) {
                     self.begin_editor_tab(
-                        buffer_id, path, language, line, column, activate, window, cx,
+                        buffer_id, draft_id, path, language, line, column, activate, window, cx,
                     );
                     self.finish_restore_if_idle(window, cx);
                 }
@@ -1514,10 +1801,18 @@ impl Workspace {
                 rev,
             } => {
                 if let Some(panel) = self.diffs.values().find(|panel| panel.read(cx).buffer_id() == Some(buffer_id.as_str())).cloned() {
-                    panel.update(cx, |panel, cx| panel.mark_saved(rev, cx));
+                    let panel_id = PanelId::from(panel.entity_id());
+                    let saved_text = if self.diff_save_snapshots.get(&buffer_id).is_some_and(|(_, _, sent_id)| sent_id == &request_id) {
+                        self.diff_save_snapshots.remove(&buffer_id).map(|(_, text, _)| text)
+                    } else { None };
+                    panel.update(cx, |panel, cx| panel.mark_saved(rev, saved_text.as_deref(), cx));
+                    if let Some(pending) = self.pending_save_close.as_mut() {
+                        pending.waiting_for_diff_saves.remove(&panel_id);
+                    }
                     self.status = "Saved".into();
+                    self.resume_pending_save_close(window, cx);
                     cx.notify();
-                } else { self.on_buffer_saved(&request_id, &buffer_id, path, rev, cx); }
+                } else { self.on_buffer_saved(&request_id, &buffer_id, path, rev, window, cx); }
             }
             AdeEvent::BufferLspState { buffer_id, rev, text, diagnostics, status } => {
                 if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
@@ -1540,9 +1835,11 @@ impl Workspace {
                 {
                     self.pending_lists.remove(request_id);
                 }
-                if code.starts_with("buffer_")
+                if (code.starts_with("buffer_") || code == "editor_workspace_mismatch")
                     && let Some((request_id, detail)) = split_request_message(&message)
                 {
+                    self.pending_save_close = None;
+                    self.diff_save_snapshots.clear();
                     for panel in self.editors.values() {
                         panel.update(cx, |panel, cx| {
                             panel.handle_request_error(request_id, detail, cx);
@@ -1664,7 +1961,10 @@ impl Workspace {
         self.capabilities = hello.capabilities.clone();
         let range_edits = self.capabilities.iter().any(|cap| cap == CAP_EDITOR_RANGE_EDITS);
         for panel in self.editors.values() {
-            panel.update(cx, |panel, cx| panel.configure_range_edits(range_edits, cx));
+            panel.update(cx, |panel, cx| {
+                panel.configure_range_edits(range_edits, cx);
+                panel.configure_draft_recovery(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
+            });
         }
         self.config_path = hello.config_path.clone();
         self.defaults_path = hello.defaults_path.clone();
@@ -1793,6 +2093,7 @@ impl Workspace {
     fn begin_editor_tab(
         &mut self,
         buffer_id: String,
+        draft_id: Option<String>,
         path: String,
         language: Option<String>,
         line: Option<u32>,
@@ -1801,8 +2102,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(panel) = self.editors.get(&path).cloned() {
+        let lookup_key = if path.is_empty() { untitled_editor_key(draft_id.as_deref().unwrap_or(&buffer_id)) } else { path.clone() };
+        if let Some(panel) = self.editors.get(&lookup_key).cloned() {
             panel.update(cx, |panel, cx| {
+                panel.configure_draft_recovery(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
                 panel.note_reopen(buffer_id, line, column, cx);
                 panel.reconnect(self.ade.clone(), self.capabilities.iter().any(|cap| cap == CAP_EDITOR_RANGE_EDITS), cx);
             });
@@ -1813,7 +2116,7 @@ impl Workspace {
         }
         let unsaved = path.is_empty();
         let path = if unsaved {
-            untitled_editor_key(&buffer_id)
+            untitled_editor_key(draft_id.as_deref().unwrap_or(&buffer_id))
         } else {
             path
         };
@@ -1838,6 +2141,7 @@ impl Workspace {
         });
         panel.update(cx, |panel, cx| {
             panel.configure_range_edits(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_RANGE_EDITS), cx);
+            panel.configure_draft_recovery(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
             panel.set_word_wrap(self.editor_line_wrap, window, cx);
         });
         let panel_id = PanelId::from(panel.entity_id());
@@ -1884,7 +2188,7 @@ impl Workspace {
         }
     }
 
-    fn on_buffer_saved(&mut self, request_id: &str, buffer_id: &str, path: String, rev: u64, cx: &mut Context<Self>) {
+    fn on_buffer_saved(&mut self, request_id: &str, buffer_id: &str, path: String, rev: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(panel) = self.editor_by_buffer(buffer_id, cx) else {
             return;
         };
@@ -1904,6 +2208,7 @@ impl Workspace {
             }
         }
         self.status = "Saved".into();
+        self.resume_pending_save_close(window, cx);
     }
 
     fn untitled_title(&self, cx: &App) -> String {
@@ -2453,6 +2758,75 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         if self.active_workspace_id.as_deref() == Some(id.as_str()) {
             return;
         }
+        self.checkpoint_editors(cx);
+        if !self.editors_recovery_ready(cx) {
+            if self.has_dirty_diff(cx) {
+                self.status = "Save or discard dirty Git diff buffers before switching workspaces".into();
+                cx.notify();
+                return;
+            }
+            if !self.draft_recovery_enabled() {
+                self.status = "This daemon cannot retain drafts. Save or close dirty tabs with Save/Discard before switching workspaces".into();
+                cx.notify();
+                return;
+            }
+            self.pending_switch_target = Some(id);
+            self.status = "Saving editor drafts before switching workspace…".into();
+            cx.notify();
+            if !self.switch_wait_running {
+                self.switch_wait_running = true;
+                cx.spawn(async move |workspace, cx| {
+                    for _ in 0..50 {
+                        cx.background_executor().timer(Duration::from_millis(100)).await;
+                        let done = workspace.update(cx, |this, cx| {
+                            if !matches!(this.connection, ConnectionState::Online) {
+                                this.pending_switch_target = None;
+                                this.switch_wait_running = false;
+                                return true;
+                            }
+                            this.checkpoint_editors(cx);
+                            if this.editors_recovery_ready(cx) {
+                                this.switch_wait_running = false;
+                                if let Some(target) = this.pending_switch_target.take() {
+                                    this.switch_to_ready(target, cx);
+                                }
+                                true
+                            } else {
+                                this.pending_switch_target.is_none()
+                            }
+                        }).unwrap_or(true);
+                        if done { return; }
+                    }
+                    let _ = workspace.update(cx, |this, cx| {
+                        this.pending_switch_target = None;
+                        this.switch_wait_running = false;
+                        this.status = "Draft checkpoint timed out; save dirty buffers or close them with Save/Discard before switching".into();
+                        cx.notify();
+                    });
+                }).detach();
+            }
+            return;
+        }
+        self.switch_to_ready(id, cx);
+    }
+
+    fn editors_recovery_ready(&self, cx: &App) -> bool {
+        self.editors.values().all(|panel| {
+            let panel = panel.read(cx);
+            !panel.is_dirty() || panel.recovery_guaranteed(cx)
+        }) && self.diffs.values().all(|panel| !panel.read(cx).is_dirty())
+    }
+
+    fn has_dirty_diff(&self, cx: &App) -> bool {
+        self.diffs.values().any(|panel| panel.read(cx).is_dirty())
+    }
+
+    fn draft_recovery_enabled(&self) -> bool {
+        self.capabilities.iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY)
+    }
+
+    fn switch_to_ready(&mut self, id: String, cx: &mut Context<Self>) {
+        self.pending_save_close = None;
         let from = if self.restoring {
             None
         } else {
@@ -2585,7 +2959,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             for (path, panel) in views {
                 let unsaved = panel.read(cx).is_unsaved();
                 // Saved paths reopen below to bind to the current daemon's
-                // buffer identity before resync. Untitled views stay paused.
+                // buffer identity before resync. Draft listing safely rebinds untitled views.
                 if unsaved {
                     panel.update(cx, |panel, cx| panel.keep_detached_draft(cx));
                 }
@@ -2606,6 +2980,9 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.restore_focus = plan.focus_pty;
         for (path, activate) in editor_jobs {
             self.open_editor(path, false, activate);
+        }
+        if self.capabilities.iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY) {
+            self.ade.send(AdeCmd::ListDrafts { request_id: format!("drafts-{}", workspace_id) });
         }
         if !expect_editors {
             self.finish_restore(window, cx);
@@ -2880,9 +3257,19 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.ade.send(AdeCmd::SetWorkspaceRoot { id, root });
     }
 
-    fn close_workspace(&mut self, id: String) {
+    fn close_workspace(&mut self, id: String, cx: &mut Context<Self>) {
         if !self.workspace_cap {
             return;
+        }
+        if self.active_workspace_id.as_deref() == Some(id.as_str()) {
+            self.checkpoint_editors(cx);
+            if self.editors.values().any(|panel| panel.read(cx).is_dirty())
+                || self.diffs.values().any(|panel| panel.read(cx).is_dirty())
+            {
+                self.status = "Save or discard dirty editor and diff buffers before closing this workspace".into();
+                cx.notify();
+                return;
+            }
         }
         if self.workspaces.len() <= 1 {
             self.status = "Cannot close the last workspace".into();
@@ -2910,6 +3297,15 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.panel_key(id).map(|key| self.pinned_tabs.contains(&key))
     }
 
+    pub(crate) fn tab_has_dirty_draft(&self, id: PanelId, cx: &App) -> bool {
+        self.editors.values().any(|panel| PanelId::from(panel.entity_id()) == id && panel.read(cx).is_dirty())
+            || self.diffs.values().any(|panel| PanelId::from(panel.entity_id()) == id && panel.read(cx).is_dirty())
+    }
+
+    pub(crate) fn discard_panel_id(&mut self, id: PanelId, window: &mut Window, cx: &mut Context<Self>) {
+        self.discard_and_close(&[id], &[id], false, window, cx);
+    }
+
     pub(crate) fn toggle_pin(&mut self, id: PanelId, cx: &mut Context<Self>) {
         let Some(key) = self.panel_key(id) else { return; };
         if !self.pinned_tabs.remove(&key) { self.pinned_tabs.insert(key); }
@@ -2931,6 +3327,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.guard_close_ids(&[id], window, cx) { return; }
         self.remove_dock_ids(&[id], window, cx);
     }
 
@@ -2943,6 +3340,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     ) {
         let order = self.panel_order(cx);
         let ids = panels_for_close_scope(&order, &id, scope);
+        if !self.guard_close_ids(&ids, window, cx) { return; }
         self.remove_dock_ids(&ids, window, cx);
     }
 
@@ -2951,6 +3349,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             .chain(self.diffs.values().map(|panel| PanelId::from(panel.entity_id())))
             .chain(self.binaries.values().map(|panel| PanelId::from(panel.entity_id())))
             .collect();
+        if !self.guard_close_ids(&ids, window, cx) { return; }
         self.remove_dock_ids(&ids, window, cx);
     }
 
@@ -2967,7 +3366,33 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
 
     pub(crate) fn close_all_other_tabs(&mut self, keep: Option<PanelId>, window: &mut Window, cx: &mut Context<Self>) {
         let ids: Vec<_> = self.panel_order(cx).into_iter().filter(|id| Some(*id) != keep).collect();
+        if !self.guard_close_ids(&ids, window, cx) { return; }
         self.remove_dock_ids(&ids, window, cx);
+    }
+
+    fn guard_close_ids(&mut self, ids: &[PanelId], window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let mut prompt_needed = false;
+        for panel in self.editors.values().filter(|panel| ids.contains(&PanelId::from(panel.entity_id()))) {
+            let unretained = panel.update(cx, |panel, cx| {
+                if !close_requires_prompt(panel.is_dirty(), panel.recovery_guaranteed(cx)) { return false; }
+                panel.flush_for_recovery(cx);
+                close_requires_prompt(panel.is_dirty(), panel.recovery_guaranteed(cx))
+            });
+            prompt_needed |= unretained;
+        }
+        prompt_needed |= self.diffs.values().any(|panel|
+            ids.contains(&PanelId::from(panel.entity_id())) && panel.read(cx).is_dirty());
+        if !prompt_needed { return true; }
+        let dirty_ids = self.editors.values()
+            .filter(|panel| ids.contains(&PanelId::from(panel.entity_id())) && panel.read(cx).is_dirty())
+            .map(|panel| PanelId::from(panel.entity_id()))
+            .chain(self.diffs.values()
+                .filter(|panel| ids.contains(&PanelId::from(panel.entity_id())) && panel.read(cx).is_dirty())
+                .map(|panel| PanelId::from(panel.entity_id())))
+            .collect::<Vec<_>>();
+        let has_dirty = dirty_ids.len();
+        self.show_close_prompt(ids.to_vec(), dirty_ids, has_dirty, false, window, cx);
+        false
     }
 
     fn remove_dock_ids(&mut self, ids: &[PanelId], window: &mut Window, cx: &mut Context<Self>) {
@@ -3045,7 +3470,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             let Some(panel) = self.diffs.get(rel).cloned() else { return; };
             let data = panel.read(cx).save_data(cx);
             if let Some((buffer_id, rev, text)) = data {
-                self.write_buffer(&buffer_id, rev, &text, true, String::new());
+                self.write_buffer(PanelId::from(panel.entity_id()), &buffer_id, rev, &text, true, String::new());
                 self.status = "Saving…".into();
             } else {
                 self.status = "No changes".into();
@@ -3140,7 +3565,10 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         cx.notify();
     }
 
-    fn write_buffer(&mut self, buffer_id: &str, rev: u64, text: &str, dirty: bool, path: String) {
+    fn write_buffer(&mut self, panel_id: PanelId, buffer_id: &str, rev: u64, text: &str, dirty: bool, path: String) {
+        if self.diff_save_snapshots.contains_key(buffer_id) { return; }
+        let save_request_id = next_id("sv");
+        self.diff_save_snapshots.insert(buffer_id.to_string(), (panel_id, text.to_string(), save_request_id.clone()));
         let base_rev = if dirty {
             self.ade.send(AdeCmd::EditBuffer {
                 request_id: next_id("ed"),
@@ -3153,7 +3581,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             rev
         };
         self.ade.send(AdeCmd::SaveBuffer {
-            request_id: next_id("sv"),
+            request_id: save_request_id,
             buffer_id: buffer_id.to_string(),
             base_rev,
             path,
@@ -3225,6 +3653,19 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         if matches!(self.connection, ConnectionState::Online) {
             self.publish_layout(cx);
         }
+        self.checkpoint_editors(cx);
+        if matches!(self.connection, ConnectionState::Online) && !self.editors_recovery_ready(cx) {
+            self.status = if self.has_dirty_diff(cx) {
+                "Save or discard dirty Git diff buffers before reconnecting".into()
+            } else if self.draft_recovery_enabled() {
+                "Drafts are still syncing; reconnect again after the checkpoint finishes".into()
+            } else {
+                "This daemon cannot retain drafts. Save or close dirty tabs with Save/Discard before reconnecting".into()
+            };
+            cx.notify();
+            return;
+        }
+        self.pending_save_close = None;
         if !self.editors.is_empty() {
             self.reconnect_views = Some((self.active_workspace_id.clone(), self.editors.clone()));
         }
@@ -3533,6 +3974,8 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     }
 
     fn close_open_diffs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids = self.diffs.values().map(|panel| PanelId::from(panel.entity_id())).collect::<Vec<_>>();
+        if !self.guard_close_ids(&ids, window, cx) { return; }
         self.pending_diffs.clear();
         let rels: Vec<String> = self.diffs.keys().cloned().collect();
         for rel in rels {
@@ -3544,6 +3987,14 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         let Some(panel) = self.diffs.get(rel).cloned() else {
             return;
         };
+        if panel.read(cx).is_dirty() {
+            panel.update(cx, |panel, cx| panel.pin(cx));
+            if self.diff_preview.as_deref() == Some(rel) {
+                self.diff_preview = None;
+            }
+            self.status = "Kept the dirty diff open".into();
+            return;
+        }
         panel.update(cx, |panel, _| panel.release());
         self.diffs.remove(rel);
         if self.diff_preview.as_deref() == Some(rel) {
@@ -4428,6 +4879,19 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     }
 
     fn on_restart_server(&mut self, _: &RestartServer, window: &mut Window, cx: &mut Context<Self>) {
+        self.checkpoint_editors(cx);
+        if matches!(self.connection, ConnectionState::Online) && !self.editors_recovery_ready(cx) {
+            self.status = if self.has_dirty_diff(cx) {
+                "Save or discard dirty Git diff buffers before restarting".into()
+            } else if self.draft_recovery_enabled() {
+                "Drafts are still syncing; restart again after the checkpoint finishes".into()
+            } else {
+                "This daemon cannot retain drafts. Save or close dirty tabs with Save/Discard before restarting".into()
+            };
+            cx.notify();
+            return;
+        }
+        self.pending_save_close = None;
         if !self.target.local_daemon {
             let Some(remote_control) = self.target.remote_control.clone() else {
                 self.reconnect(window, cx);
@@ -4436,6 +4900,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                 return;
             };
             if matches!(self.connection, ConnectionState::Online) {
+                self.checkpoint_editors(cx);
                 self.save_before_exit(cx);
             }
             self.ade.send(AdeCmd::Disconnect);
@@ -4467,6 +4932,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             return;
         }
         if matches!(self.connection, ConnectionState::Online) {
+            self.checkpoint_editors(cx);
             self.save_before_exit(cx);
         }
         let root = self.workspace_root();
@@ -4507,6 +4973,19 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
 
     fn on_disconnect(&mut self, _: &Disconnect, _: &mut Window, cx: &mut Context<Self>) {
         // Queued ahead of Disconnect, so the ADE worker sends it first.
+        self.checkpoint_editors(cx);
+        if matches!(self.connection, ConnectionState::Online) && !self.editors_recovery_ready(cx) {
+            self.status = if self.has_dirty_diff(cx) {
+                "Save or discard dirty Git diff buffers before disconnecting".into()
+            } else if self.draft_recovery_enabled() {
+                "Drafts are still syncing; disconnect again after the checkpoint finishes".into()
+            } else {
+                "This daemon cannot retain drafts. Save or close dirty tabs with Save/Discard before disconnecting".into()
+            };
+            cx.notify();
+            return;
+        }
+        self.pending_save_close = None;
         if matches!(self.connection, ConnectionState::Online) {
             self.publish_layout(cx);
         }
@@ -4516,6 +4995,12 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         };
         self.status = "Disconnected".into();
         cx.notify();
+    }
+
+    fn checkpoint_editors(&mut self, cx: &mut Context<Self>) {
+        for panel in self.editors.values() {
+            panel.update(cx, |panel, cx| panel.flush_for_recovery(cx));
+        }
     }
 
     fn on_next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -4630,6 +5115,19 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     }
 
     fn on_stop_server(&mut self, _: &StopServer, window: &mut Window, cx: &mut Context<Self>) {
+        self.checkpoint_editors(cx);
+        if matches!(self.connection, ConnectionState::Online) && !self.editors_recovery_ready(cx) {
+            self.status = if self.has_dirty_diff(cx) {
+                "Save or discard dirty Git diff buffers before stopping the server".into()
+            } else if self.draft_recovery_enabled() {
+                "Drafts are still syncing; stop the server again after the checkpoint finishes".into()
+            } else {
+                "This daemon cannot retain drafts. Save or close dirty tabs with Save/Discard before stopping the server".into()
+            };
+            cx.notify();
+            return;
+        }
+        self.pending_save_close = None;
         if matches!(self.connection, ConnectionState::Online) {
             self.save_before_exit(cx);
         }
@@ -4684,7 +5182,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
 
     fn on_close_workspace(&mut self, _: &CloseWorkspace, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(id) = self.active_workspace_id.clone() {
-            self.close_workspace(id);
+            self.close_workspace(id, cx);
         } else {
             self.status = "No workspace to close".into();
         }
@@ -5006,7 +5504,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                         .disabled(!can_close)
                         .on_click(move |_, _, cx| {
                             close_view.update(cx, |this, cx| {
-                                this.close_workspace(close_id.clone());
+                                this.close_workspace(close_id.clone(), cx);
                                 cx.notify();
                             });
                         }),
@@ -5078,7 +5576,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                         .icon(IconName::Close)
                         .tooltip("Close workspace")
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.close_workspace(close_id.clone());
+                            this.close_workspace(close_id.clone(), cx);
                             cx.notify();
                         })),
                 )
@@ -6309,6 +6807,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     this.save_open = false;
+                    this.pending_save_close = None;
                     cx.notify();
                 }),
             )
@@ -6334,6 +6833,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                                     .label("Cancel")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.save_open = false;
+                                        this.pending_save_close = None;
                                         cx.notify();
                                     })),
                             )
@@ -6453,6 +6953,10 @@ impl Render for Workspace {
 
         div()
             .id("workspace")
+            .capture_action::<DockClosePanel>(cx.listener(|this, _, window, cx| {
+                this.close_active_tab(window, cx);
+                cx.stop_propagation();
+            }))
             .on_mouse_move(cx.listener(Self::on_side_panel_drag_move))
             .on_mouse_up(
                 MouseButton::Left,
@@ -6519,9 +7023,9 @@ impl Render for Workspace {
                     // Linux draws its own close button, which removes the
                     // window without the platform should-close hook.
                     .on_close_window(cx.listener(|this, _, window, cx| {
-                        this.shutdown_client(cx);
-                        crate::note_window_shutdown();
-                        window.remove_window();
+                        if this.request_window_close(window, cx) {
+                            window.remove_window();
+                        }
                     }))
                     .child(
                         h_flex()
@@ -6640,5 +7144,32 @@ impl Render for Workspace {
             .when(self.save_open, |this| this.child(self.render_save(cx)))
             .children(dialog_layer)
             .children(notification_layer)
+    }
+}
+
+#[cfg(test)]
+mod close_prompt_tests {
+    use super::{DirtyCloseChoice, bulk_close_can_commit, close_can_commit, close_requires_prompt};
+
+    #[test]
+    fn close_prompt_requires_a_completed_save_or_explicit_discard() {
+        assert!(close_can_commit(DirtyCloseChoice::Save, true));
+        assert!(!close_can_commit(DirtyCloseChoice::Save, false));
+        assert!(close_can_commit(DirtyCloseChoice::Discard, false));
+        assert!(!close_can_commit(DirtyCloseChoice::Cancel, true));
+    }
+
+    #[test]
+    fn cancel_aborts_the_entire_bulk_close() {
+        let decisions = [DirtyCloseChoice::Discard, DirtyCloseChoice::Cancel];
+        assert!(!bulk_close_can_commit(&decisions, false));
+        assert!(bulk_close_can_commit(&[DirtyCloseChoice::Discard, DirtyCloseChoice::Discard], false));
+    }
+
+    #[test]
+    fn only_unretained_dirty_buffers_need_the_prompt() {
+        assert!(!close_requires_prompt(false, false));
+        assert!(close_requires_prompt(true, false));
+        assert!(!close_requires_prompt(true, true));
     }
 }

@@ -22,6 +22,10 @@ Language servers use the same daemon-side Fresh `LspManager` and its local Autho
 
 The daemon can run without the editor using `--no-editor`; terminal and filesystem features remain available. See [Architecture](./DESIGN.md) for process boundaries and [WORKSPACES.md](./WORKSPACES.md) for workspace behavior.
 
+## Draft recovery
+
+Fresh's pinned recovery service provides periodic hot-exit saves, chunked recovery records, crash detection, and atomic recovery-record replacement. ADE uses the daemon-owned workspace draft store for GUI recovery because recovery must checkpoint every accepted edit, preserve stable GUI untitled identities, expose explicit list/restore/discard operations, and retain complete draft text when the original file is missing or changed. Those protocol semantics do not match Fresh's normal startup crash prompt or its file-chunk reconstruction path. The store writes through a temporary file and rename; it never writes draft text to the working file. Fresh still owns buffer editing and normal saves. Fresh's normal local saves use atomic writes except when ownership requires an in-place write; remote saves use Fresh's remote filesystem path.
+
 ## Edit transactions and actions
 
 The bridge uses the pinned Fresh revision `14f7d28b7ab1` without changing it. `Editor::log_and_apply_event` applies an `Event::Batch` containing `Delete`, `Insert`, and `MoveCursor`; Fresh owns the event log, inverse events, atomic undo groups, buffer side effects, and LSP notifications. `Editor::handle_undo` and `handle_redo` execute actions on the explicitly selected buffer. The bridge does not maintain another undo stack.

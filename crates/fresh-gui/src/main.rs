@@ -7,6 +7,7 @@
 mod binary;
 mod config;
 mod daemon;
+mod drafts;
 mod editor_worker;
 mod fs;
 mod fs_watch;
@@ -291,7 +292,14 @@ async fn run_server_foreground(args: ServeArgs, write_session_meta: bool) -> Res
         info!("Fresh editor disabled (--no-editor)");
         None
     } else {
-        EditorHandle::spawn(fs_root.root_path().to_path_buf(), config.read().expect("config lock").clone())
+        let recovery_dir = workspaces_state_path(paths.as_ref())
+            .map(|path| path.with_extension("drafts"))
+            .unwrap_or_else(|| crate::drafts::temporary_root(fs_root.root_path()));
+        EditorHandle::spawn_with_recovery_dir(
+            fs_root.root_path().to_path_buf(),
+            config.read().expect("config lock").clone(),
+            recovery_dir,
+        )
     };
 
     let sessions = SessionStore::new();

@@ -414,8 +414,13 @@ impl DiffPanel {
         if !self.ready || !self.dirty { return None; }
         Some((self.buffer_id.clone()?, self.rev, self.editor.read(cx).value().to_string()))
     }
+    pub fn is_dirty(&self) -> bool { self.dirty }
     pub fn set_rev(&mut self, rev: u64) { self.rev = rev; }
-    pub fn mark_saved(&mut self, rev: u64, cx: &mut Context<Self>) { self.rev = rev; self.dirty = false; cx.notify(); }
+    pub fn mark_saved(&mut self, rev: u64, saved_text: Option<&str>, cx: &mut Context<Self>) {
+        self.rev = rev;
+        self.dirty = saved_text.map_or(self.dirty, |saved| self.editor.read(cx).value().to_string() != saved);
+        cx.notify();
+    }
 
     fn label(&self) -> String {
         let shown = display_path(&self.title_path);
@@ -437,6 +442,10 @@ impl Focusable for DiffPanel {
 }
 
 impl BasePanel for DiffPanel {
+    fn closable(&self, _: &App) -> bool {
+        !self.dirty
+    }
+
     fn panel_name(&self) -> &'static str {
         "Diff"
     }

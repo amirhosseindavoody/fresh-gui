@@ -620,6 +620,7 @@ impl Client {
                     language,
                     line,
                     column,
+                    ..
                 } if rid == request_id => {
                     opened = Some((buffer_id, path, language, line, column));
                 }
@@ -810,7 +811,10 @@ impl Client {
     /// Whether the connected daemon advertised an optional protocol feature.
     /// Callers can retain legacy message paths when this returns false.
     pub fn supports_capability(&self, capability: &str) -> bool {
-        self.backend_hello.capabilities.iter().any(|c| c == capability)
+        self.backend_hello
+            .capabilities
+            .iter()
+            .any(|c| c == capability)
     }
 
     pub fn decode_pty_data(data_b64: &str) -> Result<Vec<u8>> {

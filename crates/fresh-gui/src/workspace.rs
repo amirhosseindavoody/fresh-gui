@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use fresh_gui_protocol::{WorkspaceInfo, WorkspaceTab, WorkspaceTabKind, WorkspaceLayoutExtra};
+use fresh_gui_protocol::{WorkspaceInfo, WorkspaceLayoutExtra, WorkspaceTab, WorkspaceTabKind};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
@@ -381,6 +381,13 @@ impl WorkspaceStore {
         guard.by_id.get(&id).map(|rec| rec.root.clone())
     }
 
+    /// Persistent workspace ID that owns a session.
+    pub async fn id_for_session(&self, session_id: &str) -> Option<String> {
+        let guard = self.inner.lock().await;
+        let id = guard.by_session.get(session_id)?;
+        guard.by_id.get(id).map(|record| record.id.clone())
+    }
+
     pub async fn focus(&self, id: &str) -> Result<FocusedWorkspace> {
         let mut guard = self.inner.lock().await;
         if !guard.by_id.contains_key(id) {
@@ -717,7 +724,13 @@ mod tests {
             .await
             .unwrap();
         store
-            .set_layout(&beta.id, vec![editor("/work/beta/b.rs")], 0, Vec::new(), WorkspaceLayoutExtra::default())
+            .set_layout(
+                &beta.id,
+                vec![editor("/work/beta/b.rs")],
+                0,
+                Vec::new(),
+                WorkspaceLayoutExtra::default(),
+            )
             .await
             .unwrap();
 
@@ -788,13 +801,26 @@ mod tests {
             .create(&sessions, Some("project".into()), "/old".into())
             .await;
         store
-            .set_layout(&created.id, vec![], 0, vec!["/old/src".into()], WorkspaceLayoutExtra::default())
+            .set_layout(
+                &created.id,
+                vec![],
+                0,
+                vec!["/old/src".into()],
+                WorkspaceLayoutExtra::default(),
+            )
             .await
             .unwrap();
         let changed = store.set_root(&created.id, "/new".into()).await.unwrap();
         assert_eq!(changed.root, "/new");
         assert_eq!(changed.name, "project");
-        assert!(store.focus(&created.id).await.unwrap().explorer_expanded.is_empty());
+        assert!(
+            store
+                .focus(&created.id)
+                .await
+                .unwrap()
+                .explorer_expanded
+                .is_empty()
+        );
         store.save_now().await.unwrap();
         let restored = WorkspaceStore::persistent(path.clone());
         restored.load(&SessionStore::new()).await;
@@ -820,7 +846,16 @@ mod tests {
             pinned: vec!["file:/work/beta/lib.rs".into()],
             center: Some(fresh_gui_protocol::LayoutNode::Split {
                 axis: "horizontal".into(),
-                children: vec![fresh_gui_protocol::LayoutNode::Tabs { tabs: vec![0], active: 0 }, fresh_gui_protocol::LayoutNode::Tabs { tabs: vec![1], active: 0 }],
+                children: vec![
+                    fresh_gui_protocol::LayoutNode::Tabs {
+                        tabs: vec![0],
+                        active: 0,
+                    },
+                    fresh_gui_protocol::LayoutNode::Tabs {
+                        tabs: vec![1],
+                        active: 0,
+                    },
+                ],
                 sizes: vec![Some(320.0), None],
             }),
         };
