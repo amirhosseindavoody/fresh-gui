@@ -1,6 +1,7 @@
 //! In-process Fresh `Editor` on a dedicated `!Send` thread.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -42,6 +43,9 @@ struct TrackedBuffer {
     draft_id: String,
     base_text: Option<String>,
     recovery_path: Option<PathBuf>,
+    disk: Option<DiskGeneration>,
+    external: Option<ExternalChange>,
+    overwrite_generation: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +67,50 @@ pub struct FormatState {
     pub rev: u64,
     pub text: Option<String>,
     pub status: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalChange {
+    pub buffer_id: String,
+    pub path: String,
+    pub rev: u64,
+    pub generation: String,
+    pub text: String,
+    pub disk_text: Option<String>,
+    pub dirty: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalResolution {
+    Reload,
+    Keep,
+    Overwrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiskGeneration {
+    signature: String,
+    text: Option<String>,
+}
+
+fn disk_generation(path: &Path) -> DiskGeneration {
+    let bytes = std::fs::read(path).ok();
+    let text = bytes
+        .as_ref()
+        .and_then(|b| String::from_utf8(b.clone()).ok());
+    let metadata = std::fs::metadata(path).ok();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let len = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+    let modified = metadata
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    DiskGeneration {
+        signature: format!("{len}:{modified}:{:016x}", hasher.finish()),
+        text,
+    }
 }
 
 enum Cmd {
@@ -149,6 +197,17 @@ enum Cmd {
         workspace_id: String,
         reply: oneshot::Sender<Result<()>>,
     },
+    CheckExternal {
+        buffer_id: String,
+        reply: oneshot::Sender<Result<Option<ExternalChange>>>,
+    },
+    ResolveExternal {
+        buffer_id: String,
+        base_rev: u64,
+        generation: String,
+        resolution: ExternalResolution,
+        reply: oneshot::Sender<Result<BufferTransactionResult>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -164,9 +223,44 @@ pub struct BufferTransactionResult {
 #[derive(Clone)]
 pub struct EditorHandle {
     tx: mpsc::UnboundedSender<Cmd>,
+    external_tx: tokio::sync::broadcast::Sender<ExternalChange>,
 }
 
 impl EditorHandle {
+    pub fn subscribe_external(&self) -> tokio::sync::broadcast::Receiver<ExternalChange> {
+        self.external_tx.subscribe()
+    }
+
+    pub async fn check_external(&self, buffer_id: String) -> Result<Option<ExternalChange>> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::CheckExternal { buffer_id, reply })
+            .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+    }
+
+    pub async fn resolve_external(
+        &self,
+        buffer_id: String,
+        base_rev: u64,
+        generation: String,
+        resolution: ExternalResolution,
+    ) -> Result<BufferTransactionResult> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::ResolveExternal {
+                buffer_id,
+                base_rev,
+                generation,
+                resolution,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+    }
+
     /// Spawn the Fresh editor on a dedicated OS thread. Returns `None` if init fails.
     #[cfg(test)]
     pub fn spawn(working_dir: PathBuf, gui_config: crate::config::Config) -> Option<Self> {
@@ -184,6 +278,8 @@ impl EditorHandle {
     ) -> Option<Self> {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
         let (tx, rx) = mpsc::unbounded_channel::<Cmd>();
+        let (external_tx, _) = tokio::sync::broadcast::channel(128);
+        let worker_external = external_tx.clone();
         let dir_for_log = working_dir.clone();
 
         thread::Builder::new()
@@ -191,7 +287,7 @@ impl EditorHandle {
             .spawn(move || match build_editor(&working_dir, &gui_config) {
                 Ok(editor) => {
                     let _ = ready_tx.send(Ok(()));
-                    run_loop(editor, rx, DraftStore::new(recovery_dir));
+                    run_loop(editor, rx, DraftStore::new(recovery_dir), worker_external);
                 }
                 Err(err) => {
                     let _ = ready_tx.send(Err(err));
@@ -202,7 +298,7 @@ impl EditorHandle {
         match ready_rx.recv() {
             Ok(Ok(())) => {
                 info!(dir = %dir_for_log.display(), "Fresh editor worker ready");
-                Some(Self { tx })
+                Some(Self { tx, external_tx })
             }
             Ok(Err(err)) => {
                 warn!(error = %err, "Fresh editor worker failed to start");
@@ -498,7 +594,12 @@ fn build_editor(working_dir: &Path, gui_config: &crate::config::Config) -> Resul
     .context("Editor::with_working_dir")
 }
 
-fn run_loop(mut editor: Editor, mut rx: mpsc::UnboundedReceiver<Cmd>, drafts: DraftStore) {
+fn run_loop(
+    mut editor: Editor,
+    mut rx: mpsc::UnboundedReceiver<Cmd>,
+    drafts: DraftStore,
+    external_tx: tokio::sync::broadcast::Sender<ExternalChange>,
+) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -517,6 +618,7 @@ fn run_loop(mut editor: Editor, mut rx: mpsc::UnboundedReceiver<Cmd>, drafts: Dr
     // Tokio runtime is still in an async teardown path.
     rt.block_on(async {
         let mut ticks = tokio::time::interval(std::time::Duration::from_millis(50));
+        let mut external_ticks = tokio::time::interval(std::time::Duration::from_millis(350));
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let cmd = tokio::select! {
@@ -524,6 +626,10 @@ fn run_loop(mut editor: Editor, mut rx: mpsc::UnboundedReceiver<Cmd>, drafts: Dr
                     if let Err(err) = fresh::app::editor_tick(&mut editor, || Ok(())) {
                         warn!(%err, "Fresh editor tick failed");
                     }
+                    continue;
+                }
+                _ = external_ticks.tick() => {
+                    if let Err(err) = poll_external_changes(&mut editor, &mut tracked, &external_tx) { warn!(%err, "external file reconciliation failed"); }
                     continue;
                 }
                 cmd = rx.recv() => match cmd { Some(cmd) => cmd, None => break },
@@ -761,6 +867,11 @@ fn run_loop(mut editor: Editor, mut rx: mpsc::UnboundedReceiver<Cmd>, drafts: Dr
                             });
                     let _ = reply.send(result);
                 }
+                Cmd::CheckExternal { buffer_id, reply } => { let _ = reply.send(Ok(tracked.get(&buffer_id).and_then(|e| e.external.clone()))); }
+                Cmd::ResolveExternal { buffer_id, base_rev, generation, resolution, reply } => {
+                    let result = resolve_external(&mut editor, &mut tracked, &buffer_id, base_rev, &generation, resolution);
+                    let _ = reply.send(result);
+                }
                 Cmd::Scene { reply } => {
                     let _ = sync_all_fresh_text(&editor, &mut tracked);
                     let active = editor.active_buffer().0.to_string();
@@ -895,6 +1006,9 @@ fn open_buffer(
             draft_id: crate::drafts::named_draft_id(workspace_id, path),
             base_text: Some(base_text),
             recovery_path: Some(path.to_path_buf()),
+            disk: Some(disk_generation(path)),
+            external: None,
+            overwrite_generation: None,
         },
     );
 
@@ -1249,7 +1363,7 @@ fn range_edit_buffer(
     if working != initial {
         entry.rev += 1;
         entry.dirty = true;
-        }
+    }
     entry.text = working;
     transaction_result(tracked, editor, buffer_id, true)
 }
@@ -1535,6 +1649,9 @@ fn create_untitled(
             draft_id: format!("untitled:{}", uuid::Uuid::new_v4()),
             base_text: None,
             recovery_path: None,
+            disk: None,
+            external: None,
+            overwrite_generation: None,
         },
     );
     Ok(OpenedBuffer {
@@ -1544,6 +1661,192 @@ fn create_untitled(
         language,
         rev: 0,
         text,
+    })
+}
+
+fn external_notice(
+    buffer_id: &str,
+    entry: &TrackedBuffer,
+    generation: &DiskGeneration,
+) -> ExternalChange {
+    ExternalChange {
+        buffer_id: buffer_id.to_owned(),
+        path: entry
+            .path
+            .as_deref()
+            .unwrap_or(Path::new(""))
+            .display()
+            .to_string(),
+        rev: entry.rev,
+        generation: generation.signature.clone(),
+        text: entry.text.clone(),
+        disk_text: generation.text.clone(),
+        dirty: entry.dirty,
+    }
+}
+
+fn poll_external_changes(
+    editor: &mut Editor,
+    tracked: &mut HashMap<String, TrackedBuffer>,
+    tx: &tokio::sync::broadcast::Sender<ExternalChange>,
+) -> Result<()> {
+    let ids: Vec<String> = tracked
+        .iter()
+        .filter_map(|(id, e)| e.path.as_ref().map(|_| id.clone()))
+        .collect();
+    for id in ids {
+        let Some(path) = tracked.get(&id).and_then(|e| e.path.clone()) else {
+            continue;
+        };
+        let generation = disk_generation(&path);
+        let changed = tracked
+            .get(&id)
+            .and_then(|e| e.disk.as_ref())
+            .is_some_and(|old| old.signature != generation.signature);
+        if !changed {
+            continue;
+        }
+        let same_pending = tracked
+            .get(&id)
+            .and_then(|e| e.external.as_ref())
+            .is_some_and(|p| p.generation == generation.signature);
+        if same_pending {
+            continue;
+        }
+        let _ = sync_fresh_text(editor, tracked, &id);
+        let dirty = tracked.get(&id).is_some_and(|e| e.dirty);
+        if dirty || generation.text.is_none() {
+            let notice = external_notice(&id, tracked.get(&id).expect("tracked"), &generation);
+            tracked.get_mut(&id).expect("tracked").external = Some(notice.clone());
+            let _ = tx.send(notice);
+            continue;
+        }
+        let path_s = path.display().to_string();
+        editor.handle_file_changed(&path_s);
+        activate_tracked(editor, tracked, &id)?;
+        let mut current = editor.active_state().buffer.to_string().unwrap_or_default();
+        if Some(current.as_str()) != generation.text.as_deref() {
+            // Fresh's watcher uses mtime ordering. For same-timestamp/content-hash
+            // changes use the same event log path while keeping the buffer clean.
+            let target = generation.text.as_deref().unwrap_or_default();
+            let cursor_id = editor.active_cursors().primary_id();
+            let mut events = Vec::new();
+            if !current.is_empty() {
+                events.push(Event::Delete {
+                    range: 0..current.len(),
+                    deleted_text: current.clone(),
+                    cursor_id,
+                });
+            }
+            if !target.is_empty() {
+                events.push(Event::Insert {
+                    position: 0,
+                    text: target.to_owned(),
+                    cursor_id,
+                });
+            }
+            editor.log_and_apply_event(&Event::Batch {
+                events,
+                description: "External file reload".into(),
+            });
+            editor.active_event_log_mut().mark_saved();
+            current = target.to_owned();
+        }
+        let entry = tracked.get_mut(&id).expect("tracked");
+        entry.text = current;
+        entry.rev += 1;
+        entry.dirty = false;
+        entry.base_text = Some(entry.text.clone());
+        entry.disk = Some(generation.clone());
+        entry.external = None;
+        entry.overwrite_generation = None;
+        let _ = tx.send(external_notice(&id, entry, &generation));
+    }
+    Ok(())
+}
+
+fn resolve_external(
+    editor: &mut Editor,
+    tracked: &mut HashMap<String, TrackedBuffer>,
+    buffer_id: &str,
+    base_rev: u64,
+    generation: &str,
+    resolution: ExternalResolution,
+) -> Result<BufferTransactionResult> {
+    let _ = sync_fresh_text(editor, tracked, buffer_id)?;
+    let current = tracked.get(buffer_id).context("unknown buffer")?;
+    if current.rev != base_rev {
+        bail!(
+            "revision conflict: base_rev={base_rev} current={}",
+            current.rev
+        );
+    }
+    let pending = current
+        .external
+        .clone()
+        .context("no unresolved external change")?;
+    if pending.generation != generation {
+        bail!("external generation changed; check again before resolving");
+    }
+    let path = PathBuf::from(&pending.path);
+    let now = disk_generation(&path);
+    if now.signature != generation {
+        bail!("file changed again; check the latest external generation");
+    }
+    match resolution {
+        ExternalResolution::Keep => {
+            tracked.get_mut(buffer_id).unwrap().overwrite_generation = None;
+        }
+        ExternalResolution::Overwrite => {
+            tracked.get_mut(buffer_id).unwrap().overwrite_generation = Some(generation.to_owned());
+        }
+        ExternalResolution::Reload => {
+            let target = pending
+                .disk_text
+                .as_deref()
+                .context("file was deleted; cannot reload")?;
+            activate_tracked(editor, tracked, buffer_id)?;
+            let old = editor.active_state().buffer.to_string().unwrap_or_default();
+            let cursor_id = editor.active_cursors().primary_id();
+            let mut events = Vec::new();
+            if !old.is_empty() {
+                events.push(Event::Delete {
+                    range: 0..old.len(),
+                    deleted_text: old.clone(),
+                    cursor_id,
+                });
+            }
+            if !target.is_empty() {
+                events.push(Event::Insert {
+                    position: 0,
+                    text: target.to_owned(),
+                    cursor_id,
+                });
+            }
+            editor.log_and_apply_event(&Event::Batch {
+                events,
+                description: "Reload external file".into(),
+            });
+            editor.active_event_log_mut().mark_saved();
+            let entry = tracked.get_mut(buffer_id).unwrap();
+            entry.text = target.to_owned();
+            entry.rev += 1;
+            entry.dirty = false;
+            entry.base_text = Some(target.to_owned());
+            entry.path = Some(path.clone());
+            entry.recovery_path = Some(path.clone());
+            entry.disk = Some(now.clone());
+            entry.external = None;
+            entry.overwrite_generation = None;
+        }
+    }
+    let entry = tracked.get(buffer_id).unwrap();
+    Ok(BufferTransactionResult {
+        rev: entry.rev,
+        text: entry.text.clone(),
+        selection: ByteSelection { anchor: 0, head: 0 },
+        accepted: true,
+        dirty: entry.dirty,
     })
 }
 
@@ -1573,6 +1876,28 @@ fn save_buffer(
             .and_then(|entry| entry.path.clone().or_else(|| entry.recovery_path.clone()))
     });
     if let Some(dest) = save_path.as_deref() {
+        let current_disk = disk_generation(dest);
+        let entry = tracked.get(buffer_id).expect("tracked");
+        let conflicts = entry
+            .disk
+            .as_ref()
+            .map(|known| known.signature != current_disk.signature)
+            .unwrap_or_else(|| entry.path.as_deref() != Some(dest) && current_disk.text.is_some());
+        if conflicts
+            && entry.overwrite_generation.as_deref() != Some(current_disk.signature.as_str())
+        {
+            let change = ExternalChange {
+                buffer_id: buffer_id.to_owned(),
+                path: dest.display().to_string(),
+                rev: entry.rev,
+                generation: current_disk.signature.clone(),
+                text: entry.text.clone(),
+                disk_text: current_disk.text.clone(),
+                dirty: entry.dirty,
+            };
+            tracked.get_mut(buffer_id).expect("tracked").external = Some(change);
+            bail!("file changed on disk; resolve the external change before saving");
+        }
         if explicit_destination || !had_fresh_path {
             editor
                 .active_state_mut()
@@ -1596,6 +1921,9 @@ fn save_buffer(
     let entry = tracked.get_mut(buffer_id).expect("tracked");
     entry.text = text;
     entry.base_text = Some(entry.text.clone());
+    entry.disk = Some(disk_generation(dest));
+    entry.external = None;
+    entry.overwrite_generation = None;
     entry.dirty = false;
     // Bump rev so peers know disk matches this generation.
     entry.rev += 1;
