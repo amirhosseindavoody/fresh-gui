@@ -14,11 +14,11 @@ use std::time::Instant;
 
 use alacritty_terminal::vte::ansi::CursorShape;
 use fresh_gui_client::edit_sync::{EditSync, SnapshotReconciliation, contiguous_diff, external_reconciliation, ExternalSnapshotReconciliation};
-use fresh_gui_protocol::{BufferDiagnostic, ByteSelection, EditorAction, ExternalResolution};
+use fresh_gui_protocol::{BufferDiagnostic, ByteRange, ByteSelection, EditorAction, ExternalResolution, MAX_PAGE_BYTES};
 
 use gpui_kit::base::ElementExt as _;
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent, PanelId};
-use gpui_kit::component::input::{Editor, EditorState, InputEvent, Position, TextDecoration, TextDecorationCollection};
+use gpui_kit::component::input::{Editor, EditorState, Input, InputState, InputEvent, Position, TextDecoration, TextDecorationCollection};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
@@ -27,7 +27,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use gpui_kit::base::Selectable as _;
+use gpui_kit::base::{Selectable as _, Disableable as _};
 
 use super::actions::{TerminalInputBacktab, TerminalInputTab, ZoomInUi};
 use super::ade::{AdeCmd, AdeHandle};
@@ -1628,6 +1628,13 @@ fn paint_terminal_cursor(
     }
 }
 
+const PAGE_VIEW_BYTES: usize = MAX_PAGE_BYTES / 2;
+
+struct PageView {
+    start: usize,
+    total_bytes: usize,
+}
+
 struct EditorPending {
     line: Option<u32>,
     column: Option<u32>,
@@ -1652,6 +1659,10 @@ pub struct EditorPanel {
     rev: u64,
     view_id: String,
     range_edits: bool,
+    page: Option<PageView>,
+    page_request: Option<String>,
+    pending_page: Option<usize>,
+    byte_offset_input: Entity<InputState>,
     draft_recovery: bool,
     transport_connected: bool,
     edit_sync: Option<EditSync>,
@@ -1757,6 +1768,7 @@ impl EditorPanel {
         if language_from_path(&path, language.as_deref()).as_deref() == Some("log") {
             editor.update(cx, |state, cx| state.set_highlighter_factory(super::log_highlight::factory(), cx));
         }
+        let byte_offset_input = cx.new(|cx| InputState::new(window, cx).placeholder("Byte offset"));
         let hover_decoration = editor.update(cx, |state, cx| state.create_decorations_collection(Vec::new(), cx));
         let subscription = cx.subscribe(&editor, |this, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Change) {
@@ -1784,6 +1796,10 @@ impl EditorPanel {
             rev: 0,
             view_id,
             range_edits: false,
+            page: None,
+            page_request: None,
+            pending_page: None,
+            byte_offset_input,
             draft_recovery: false,
             transport_connected: true,
             edit_sync: unsaved.then(|| EditSync::new(String::new(), 0)),
@@ -1855,6 +1871,81 @@ impl EditorPanel {
         &self.buffer_id
     }
 
+    pub fn begin_paged(&mut self, rev: u64, total_bytes: usize, path: String, dirty: bool, cx: &mut Context<Self>) {
+        self.path = path;
+        self.rev = rev;
+        self.dirty |= dirty;
+        self.pending = None; // Global line numbers are unknown until Fresh scans the file.
+        if let Some(page) = self.page.as_mut() {
+            page.total_bytes = total_bytes;
+            if self.page_request.is_none() && self.sync_request_id.is_none() {
+                self.request_page_sync(cx);
+            }
+        } else {
+            self.page = Some(PageView { start: 0, total_bytes });
+            self.edit_sync = None;
+            self.request_page_now(0, cx);
+        }
+        cx.notify();
+    }
+
+    fn request_page_sync(&mut self, _cx: &mut Context<Self>) {
+        let Some(page) = self.page.as_ref() else { return; };
+        let start = page.start;
+        let len = self.edit_sync.as_ref().map_or(PAGE_VIEW_BYTES, |sync| sync.acknowledged().0.len().max(1));
+        let request_id = self.next_edit_request("page-sync");
+        self.sync_request_id = Some(request_id.clone());
+        self.ade.send(AdeCmd::ReadBuffer { request_id, buffer_id: self.buffer_id.clone(), view_id: self.view_id.clone(), start, len });
+    }
+
+    fn request_page_now(&mut self, start: usize, cx: &mut Context<Self>) {
+        let request_id = self.next_edit_request("page");
+        self.page_request = Some(request_id.clone());
+        self.ade.send(AdeCmd::ReadBuffer { request_id, buffer_id: self.buffer_id.clone(), view_id: self.view_id.clone(), start, len: PAGE_VIEW_BYTES });
+        cx.notify();
+    }
+
+    fn navigate_page(&mut self, start: usize, cx: &mut Context<Self>) {
+        if self.page_request.is_some() || self.conflict || !self.transport_connected || self.sync_paused { return; }
+        self.pending_page = Some(start);
+        self.flush_pending(cx); // Preserve edits before replacing the visible window.
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_page(&mut self, request_id: &str, view_id: &str, rev: u64, start: usize,
+        total_bytes: usize, text: String, selection: ByteSelection, accepted: bool, dirty: bool,
+        window: &mut Window, cx: &mut Context<Self>) {
+        if view_id != self.view_id { return; }
+        if self.page_request.as_deref() == Some(request_id) {
+            self.page_request = None;
+            self.page = Some(PageView { start, total_bytes });
+            self.rev = rev;
+            let draft = self.current_text(cx);
+            let had_local_changes = self.edit_sync.as_ref().map_or(!draft.is_empty(), |sync| sync.acknowledged().0 != draft);
+            let (sync, outcome) = EditSync::from_initial_snapshot(text.clone(), rev, &draft, had_local_changes);
+            self.edit_sync = Some(sync);
+            self.conflict = outcome == SnapshotReconciliation::Conflict;
+            self.pending = None;
+            if !self.conflict {
+                self.set_editor_text_and_selection(&text, Some(ByteSelection { anchor: 0, head: 0 }), window, cx);
+            }
+            self.editor.update(cx, |state, cx| state.set_scroll_offset(point(px(0.), px(0.)), cx));
+            self.dirty = dirty || self.conflict;
+            self.lsp_status = Some("Paged file · line numbers and Find refer to this page".into());
+            self.flush_pending(cx);
+            cx.notify();
+        } else if self.edit_request_id.as_deref() == Some(request_id) || self.sync_request_id.as_deref() == Some(request_id) {
+            // A reply for another window must never rebase this page's draft.
+            if self.page.as_ref().is_none_or(|page| page.start != start) {
+                self.handle_request_error(request_id, "The server page moved; local edits retained", cx);
+                return;
+            }
+            if let Some(page) = self.page.as_mut() { page.total_bytes = total_bytes; }
+            let selection = ByteSelection { anchor: selection.anchor.saturating_sub(start).min(text.len()), head: selection.head.saturating_sub(start).min(text.len()) };
+            self.apply_edit_result(request_id, view_id, rev, text, selection, accepted, dirty, window, cx);
+        }
+    }
+
     pub fn configure_range_edits(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.range_edits = enabled;
         // EditorOpen/New always supplies the initial BufferSnapshot. Do not
@@ -1871,7 +1962,7 @@ impl EditorPanel {
     }
 
     pub fn check_external(&self) {
-        if self.external_changes && !self.unsaved {
+        if self.external_changes && !self.unsaved && self.page.is_none() {
             self.ade.send(AdeCmd::CheckExternal {
                 request_id: format!("external-{}", self.view_id),
                 buffer_id: self.buffer_id.clone(),
@@ -2081,6 +2172,7 @@ impl EditorPanel {
     fn flush_pending(&mut self, cx: &mut Context<Self>) {
         if !self.transport_connected
             || self.closed
+            || self.page_request.is_some()
             || self.external_request.is_some()
             || self.conflict
             || self.sync_paused
@@ -2107,7 +2199,11 @@ impl EditorPanel {
             return;
         };
         let edit = sync.begin_edit(&draft);
-        if let Some((base_rev, edits)) = edit {
+        if let Some((base_rev, mut edits)) = edit {
+            let viewport = self.page.as_ref().map(|page| ByteRange { start: page.start, len: self.edit_sync.as_ref().map_or(0, |sync| sync.acknowledged().0.len()) });
+            if let Some(page) = self.page.as_ref() {
+                for edit in &mut edits { edit.start += page.start; edit.end += page.start; }
+            }
             let request_id = self.next_edit_request("edit");
             self.edit_request_id = Some(request_id.clone());
             self.edit_sent_selection = Some(self.byte_selection(cx));
@@ -2118,7 +2214,12 @@ impl EditorPanel {
                     view_id: self.view_id.clone(),
                     base_rev,
                     edits,
-                    selection: self.edit_sent_selection.expect("just recorded"),
+                    viewport,
+                    selection: {
+                        let local = self.edit_sent_selection.expect("just recorded");
+                        let start = self.page.as_ref().map_or(0, |page| page.start);
+                        ByteSelection { anchor: local.anchor + start, head: local.head + start }
+                    },
                 });
             } else {
                 self.legacy_sent_text = Some(draft.clone());
@@ -2137,6 +2238,7 @@ impl EditorPanel {
     fn drain_pending(&mut self, cx: &mut Context<Self>) {
         if !self.transport_connected
             || self.closed
+            || self.page_request.is_some()
             || self.external_request.is_some()
             || self.conflict
             || self.sync_paused
@@ -2155,6 +2257,11 @@ impl EditorPanel {
             .is_some_and(|sync| sync.acknowledged().0 != draft);
         if dirty_against_server {
             self.flush_pending(cx);
+            return;
+        }
+        if self.pending_save.is_none() && self.pending_actions.is_empty() && !self.pending_format
+            && let Some(start) = self.pending_page.take() {
+            self.request_page_now(start, cx);
             return;
         }
         if let Some(resolution) = self.external_pending.take() {
@@ -2229,6 +2336,11 @@ impl EditorPanel {
     }
 
     fn request_editor_action(&mut self, action: EditorAction, cx: &mut Context<Self>) -> bool {
+        if self.page.is_some() {
+            self.lsp_status = Some("Undo/redo across pages is not available; edit this page or restore your draft".into());
+            cx.notify();
+            return true;
+        }
         if !self.range_edits {
             return false;
         }
@@ -2646,7 +2758,7 @@ impl EditorPanel {
         cx.notify();
     }
 
-    pub fn reconnect(&mut self, ade: AdeHandle, range_edits: bool, cx: &mut Context<Self>) {
+    pub fn reconnect(&mut self, ade: AdeHandle, range_edits: bool, paged_reads: bool, cx: &mut Context<Self>) {
         self.external_request = None;
         self.external_pending = None;
         self.external_save_path = None;
@@ -2661,7 +2773,16 @@ impl EditorPanel {
         self.save_request_id = None;
         self.save_sent_text = None;
         self.format_inflight = false;
-        if range_edits {
+        self.page_request = None;
+        self.pending_page = None;
+        if self.page.is_some() {
+            if paged_reads {
+                self.request_page_sync(cx);
+            } else {
+                self.sync_paused = true;
+                self.lsp_status = Some("This daemon does not support paged reads; local page draft retained".into());
+            }
+        } else if range_edits {
             let request_id = self.next_edit_request("sync");
             self.sync_request_id = Some(request_id.clone());
             self.ade.send(AdeCmd::SyncBuffer {
@@ -2865,6 +2986,12 @@ impl EditorPanel {
         message: &str,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.page_request.as_deref() == Some(request_id) {
+            self.page_request = None;
+            self.lsp_status = Some(format!("Page read failed: {message}"));
+            cx.notify();
+            return true;
+        }
         if self.external_request.as_ref().is_some_and(|(id, _, _)| id == request_id) {
             self.external_request = None;
             self.external_save_path = None;
@@ -2921,6 +3048,11 @@ impl EditorPanel {
     }
 
     pub(crate) fn request_format(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page.is_some() {
+            self.lsp_status = Some("Formatting is not available for paged files".into());
+            cx.notify();
+            return;
+        }
         self.commit_markdown_inline_edit(window, cx);
         if self.conflict {
             self.lsp_status = Some("Resolve the edit conflict before formatting".into());
@@ -3102,7 +3234,7 @@ impl DockPanel for EditorPanel {
 
 impl Render for EditorPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let markdown = matches!(
+        let markdown = self.page.is_none() && matches!(
             self.path.rsplit('.').next().map(str::to_ascii_lowercase).as_deref(),
             Some("md" | "markdown")
         );
@@ -3118,6 +3250,29 @@ impl Render for EditorPanel {
                         }
                     }))
             ;
+        if let Some(page) = &self.page {
+            let start = page.start;
+            let end = start + self.editor.read(cx).value().len();
+            let total = page.total_bytes;
+            let busy = self.page_request.is_some() || self.sync_request_id.is_some() || !self.transport_connected;
+            let previous = start.saturating_sub(PAGE_VIEW_BYTES);
+            root = root.child(h_flex().w_full().min_h_9().px_2().gap_2().items_center()
+                .border_b_1().border_color(cx.theme().border)
+                .child(Button::new("page-previous").ghost().xsmall().label("Previous page").disabled(busy || start == 0)
+                    .on_click(cx.listener(move |this, _, _, cx| this.navigate_page(previous, cx))))
+                .child(Button::new("page-next").ghost().xsmall().label("Next page").disabled(busy || end >= total)
+                    .on_click(cx.listener(move |this, _, _, cx| this.navigate_page(end, cx))))
+                .child(div().text_xs().child(format!("Bytes {start}–{end} of {total}")))
+                .child(div().w(px(120.)).child(Input::new(&self.byte_offset_input).small()))
+                .child(Button::new("page-go").ghost().xsmall().label("Go to byte").disabled(busy)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        match this.byte_offset_input.read(cx).value().parse::<usize>() {
+                            Ok(offset) if offset <= total => this.navigate_page(offset, cx),
+                            _ => { this.lsp_status = Some(format!("Enter a byte offset from 0 to {total}")); cx.notify(); }
+                        }
+                    })))
+                .when(busy, |bar| bar.child(div().text_xs().child("Loading…"))));
+        }
         if markdown {
             let panel = cx.entity();
             root = root.child(
@@ -3263,6 +3418,7 @@ impl Render for EditorPanel {
                     })
                     .child(
                         Editor::new(&self.editor)
+                            .disabled(self.page_request.is_some() || (self.page.is_some() && self.sync_request_id.is_some()))
                             .bordered(false)
                             .p_0()
                             .flex_1()

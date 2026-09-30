@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use fresh_gui_client::{Client, ConnectOptions};
 use fresh_gui_protocol::{
-    BufferDiagnostic, ByteSelection, CAP_EDITOR_EXTERNAL_CHANGES, CAP_EDITOR_RANGE_EDITS, CAP_LSP,
+    BufferDiagnostic, ByteRange, ByteSelection, CAP_EDITOR_PAGED_READS, CAP_EDITOR_EXTERNAL_CHANGES, CAP_EDITOR_RANGE_EDITS, CAP_LSP,
     CAP_WORKSPACE, EditorAction, EditorDraftInfo, ExternalResolution, FsEntry, GitFile, Hello,
     Message, PtyInfo, RangeEdit, WorkspaceInfo, WorkspaceTab,
 };
@@ -74,12 +74,14 @@ pub enum AdeCmd {
         base_rev: u64,
         text: String,
     },
+    ReadBuffer { request_id: String, buffer_id: String, view_id: String, start: usize, len: usize },
     RangeEdit {
         request_id: String,
         buffer_id: String,
         view_id: String,
         base_rev: u64,
         edits: Vec<RangeEdit>,
+        viewport: Option<ByteRange>,
         selection: ByteSelection,
     },
     ActionBuffer {
@@ -317,6 +319,9 @@ pub enum AdeEvent {
         line: Option<u32>,
         column: Option<u32>,
     },
+    BufferPaged { buffer_id: String, rev: u64, total_bytes: usize, path: String, dirty: bool },
+    BufferPage { request_id: String, buffer_id: String, view_id: String, rev: u64, start: usize,
+        total_bytes: usize, text: String, selection: ByteSelection, accepted: bool, dirty: bool },
     BufferSnapshot {
         buffer_id: String,
         rev: u64,
@@ -585,6 +590,8 @@ async fn ade_loop(
                             Message::BufferSnapshot { buffer_id, rev, .. }
                             | Message::BufferChanged { buffer_id, rev, .. }
                             | Message::BufferEditResult { buffer_id, rev, .. }
+                            | Message::BufferPage { buffer_id, rev, .. }
+                            | Message::BufferPaged { buffer_id, rev, .. }
                             | Message::BufferSaved { buffer_id, rev, .. }
                             | Message::BufferFormatted { buffer_id, rev, .. }
                             => {
@@ -715,18 +722,24 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
                 })
                 .await?;
         }
+        AdeCmd::ReadBuffer { request_id, buffer_id, view_id, start, len } => {
+            anyhow::ensure!(client.supports_capability(CAP_EDITOR_PAGED_READS), "daemon does not support paged reads");
+            client.send(Message::BufferRead { request_id, buffer_id, view_id, start, len }).await?;
+        }
         AdeCmd::RangeEdit {
             request_id,
             buffer_id,
             view_id,
             base_rev,
             edits,
+            viewport,
             selection,
         } => {
             anyhow::ensure!(
                 client.supports_capability(CAP_EDITOR_RANGE_EDITS),
                 "daemon does not support range edits"
             );
+            anyhow::ensure!(viewport.is_none() || client.supports_capability(CAP_EDITOR_PAGED_READS), "daemon does not support paged edits");
             client
                 .send(Message::BufferRangeEdit {
                     request_id,
@@ -734,6 +747,7 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
                     view_id,
                     base_rev,
                     edits,
+                    viewport,
                     selection,
                 })
                 .await?;
@@ -1322,6 +1336,10 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             dirty,
             resolution,
         }),
+        Message::BufferPaged { buffer_id, rev, total_bytes, path, dirty } =>
+            Some(AdeEvent::BufferPaged { buffer_id, rev, total_bytes, path, dirty }),
+        Message::BufferPage { request_id, buffer_id, view_id, rev, start, total_bytes, text, selection, accepted, dirty } =>
+            Some(AdeEvent::BufferPage { request_id, buffer_id, view_id, rev, start, total_bytes, text, selection, accepted, dirty }),
         Message::BufferSnapshot {
             buffer_id,
             rev,
