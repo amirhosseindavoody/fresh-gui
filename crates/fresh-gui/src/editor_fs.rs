@@ -85,10 +85,14 @@ impl FileSystem for EditorFileSystem {
             } else {
                 None
             };
-            let mut output = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp_path)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut output = options.open(&temp_path)?;
             let mut chunk = [0u8; 64 * 1024];
             for op in ops {
                 match op {
@@ -113,10 +117,9 @@ impl FileSystem for EditorFileSystem {
                     WriteOp::Insert { data } => output.write_all(data)?,
                 }
             }
-            if let Some(metadata) = original_metadata.as_ref() {
-                if let Some(permissions) = metadata.permissions.as_ref() {
-                    self.inner.set_permissions(&temp_path, permissions)?;
-                }
+            if let Some(metadata) = original_metadata.as_ref()
+                && let Some(permissions) = metadata.permissions.as_ref() {
+                self.inner.set_permissions(&temp_path, permissions)?;
             }
             output.sync_all()?;
             drop(output);

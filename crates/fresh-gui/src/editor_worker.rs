@@ -660,7 +660,7 @@ fn build_editor(working_dir: &Path, gui_config: &crate::config::Config) -> Resul
             config.formatter = None;
         }
     }
-    let fs: Arc<dyn FileSystem + Send + Sync> = Arc::new(StdFileSystem);
+    let fs: Arc<dyn FileSystem + Send + Sync> = Arc::new(crate::editor_fs::EditorFileSystem::new());
     Editor::with_working_dir(
         cfg,
         80,
@@ -2608,6 +2608,12 @@ fn save_buffer(
         }
     }
     if let Some(dest) = save_path.as_deref() {
+        if tracked.get(buffer_id).is_some_and(|entry| entry.total_bytes.is_some())
+            && !StdFileSystem.is_owner(dest) {
+            // Fresh's ownership-preserving path bypasses write_patched and
+            // materializes Copy operations. Keep paged saves bounded.
+            bail!("paged saves to files owned by another user are unavailable; Save As to a new file");
+        }
         let current_disk = disk_generation(dest)?;
         let entry = tracked.get(buffer_id).expect("tracked");
         let same_destination = entry.path.as_deref().is_some_and(|source| {

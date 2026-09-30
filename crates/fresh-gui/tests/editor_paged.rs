@@ -630,10 +630,12 @@ async fn measure_large_file_open_range_edit_and_daemon_rss() {
     let daemon_start_ms = daemon_start.elapsed().as_secs_f64() * 1000.0;
     let pid = backend.0.id();
     let mut client = connect(addr).await;
+    let baseline_rss_kib = peak_rss_kib(pid);
 
     let start = Instant::now();
     let opened = open_paged(&mut client, "measurement.txt", "measure-open").await;
     let open_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let open_rss_kib = peak_rss_kib(pid);
     let start = Instant::now();
     let (rev, _page_start, reported_total, viewport, page_transfer_bytes) = read_page(
         &mut client,
@@ -644,6 +646,7 @@ async fn measure_large_file_open_range_edit_and_daemon_rss() {
     )
     .await;
     let page_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let page_rss_kib = peak_rss_kib(pid);
     assert_eq!(reported_total, bytes);
     assert!(viewport.len() <= MAX_PAGE_BYTES);
 
@@ -661,6 +664,7 @@ async fn measure_large_file_open_range_edit_and_daemon_rss() {
     )
     .await;
     let edit_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let edit_rss_kib = peak_rss_kib(pid);
     assert!(accepted);
 
     let save_request = Message::BufferSave { request_id: "measure-save".into(),
@@ -700,7 +704,7 @@ async fn measure_large_file_open_range_edit_and_daemon_rss() {
     let peak_rss_kib = peak_rss_kib(pid);
     let transfer_bytes = opened.wire_bytes + page_transfer_bytes + edit_transfer_bytes + save_transfer_bytes;
     println!(
-        "LARGE_FILE_RESULT {{\"fixture_bytes\":{bytes},\"daemon_start_ms\":{daemon_start_ms:.3},\"open_ms\":{open_ms:.3},\"page_ms\":{page_ms:.3},\"edit_ack_ms\":{edit_ms:.3},\"save_ms\":{save_ms:.3},\"page_payload_bytes\":{},\"measured_full_duplex_json_bytes\":{transfer_bytes},\"daemon_peak_rss_kib\":{peak_rss_kib},\"resulting_rev\":{edit_rev}}}",
+        "LARGE_FILE_RESULT {{\"fixture_bytes\":{bytes},\"daemon_start_ms\":{daemon_start_ms:.3},\"open_ms\":{open_ms:.3},\"page_ms\":{page_ms:.3},\"edit_ack_ms\":{edit_ms:.3},\"save_ms\":{save_ms:.3},\"page_payload_bytes\":{},\"measured_full_duplex_json_bytes\":{transfer_bytes},\"baseline_rss_kib\":{baseline_rss_kib},\"open_rss_kib\":{open_rss_kib},\"page_rss_kib\":{page_rss_kib},\"edit_rss_kib\":{edit_rss_kib},\"daemon_peak_rss_kib\":{peak_rss_kib},\"resulting_rev\":{edit_rev}}}",
         viewport.len()
     );
 

@@ -963,6 +963,14 @@ async fn handle_client_msg(
                 });
             };
             let workspace_id = current_workspace_id(state, session_id).await?;
+            if !*client_paged_reads {
+                let drafts = editor.draft_list(workspace_id.clone()).await.map_err(|err| Message::Error {
+                    code: "draft_restore_failed".into(), message: format!("{request_id}: {err:#}"),
+                })?;
+                if drafts.iter().any(|draft| draft.draft_id == draft_id && draft.paged.is_some()) {
+                    return Err(paged_reads_unavailable(&request_id));
+                }
+            }
             let (opened, source_changed) = editor
                 .draft_restore(workspace_id, draft_id)
                 .await
@@ -2200,8 +2208,13 @@ async fn reply_editor_opened(
             message: format!("{request_id}: {}", path.display()),
         });
     }
+    let prior_buffers = if !paged_reads {
+        Some(editor.scene().await.map_err(|err| Message::Error {
+            code: "editor_open_failed".into(), message: format!("{request_id}: {err:#}"),
+        })?.buffers)
+    } else { None };
     let opened = editor
-        .open_in_workspace(path, preview, workspace_id)
+        .open_in_workspace(path, preview, workspace_id.clone())
         .await
         .map_err(|err| {
             let binary = err
@@ -2217,6 +2230,14 @@ async fn reply_editor_opened(
             }
         })?;
     if opened.total_bytes.is_some() && !paged_reads {
+        // A stat/open race can cross the threshold. Remove only a new clean
+        // open; an existing dirty buffer belongs to other connected views.
+        if !opened.dirty && prior_buffers.as_ref().is_some_and(|buffers|
+            !buffers.iter().any(|buffer| buffer.buffer_id == opened.buffer_id)) {
+            editor.close_in_workspace(opened.buffer_id.clone(), workspace_id).await
+                .map_err(|err| Message::Error { code: "editor_close_failed".into(),
+                    message: format!("{request_id}: {err:#}") })?;
+        }
         return Err(paged_reads_unavailable(&request_id));
     }
     send_editor_opened_snapshot(sink, request_id, opened, line, column).await?;
