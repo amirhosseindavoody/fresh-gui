@@ -12,7 +12,10 @@ use axum::extract::{State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use base64::Engine;
-use fresh_gui_protocol::{CAP_EDITOR, CAP_EDITOR_RANGE_EDITS, CAP_LSP, CAP_SCENE, Hello, HelloUi, Message, PROTOCOL_VERSION};
+use fresh_gui_protocol::{
+    CAP_EDITOR, CAP_EDITOR_DRAFT_RECOVERY, CAP_EDITOR_RANGE_EDITS, CAP_LSP, CAP_SCENE,
+    EditorDraftInfo, Hello, HelloUi, Message, PROTOCOL_VERSION,
+};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -115,23 +118,36 @@ async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) ->
 
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (mut sink, mut stream) = socket.split();
-    let defaults_path = std::env::temp_dir().join(format!(
-        "fresh-gui-defaults-{}.jsonc",
-        uuid::Uuid::new_v4()
-    ));
+    let defaults_path =
+        std::env::temp_dir().join(format!("fresh-gui-defaults-{}.jsonc", uuid::Uuid::new_v4()));
 
     let mut caps = Hello::default_backend_caps();
     if state.editor.is_none() {
-        caps.retain(|c| c != CAP_EDITOR && c != CAP_EDITOR_RANGE_EDITS && c != CAP_LSP && c != CAP_SCENE);
+        caps.retain(|c| {
+            c != CAP_EDITOR
+                && c != CAP_EDITOR_RANGE_EDITS
+                && c != CAP_EDITOR_DRAFT_RECOVERY
+                && c != CAP_LSP
+                && c != CAP_SCENE
+        });
     }
     let ui = hello_ui(&state.config.read().expect("config lock"));
     let mut hello = Hello::backend(format!("fresh-gui/{}", env!("CARGO_PKG_VERSION")), caps);
     hello.config_path = Some(state.config_path.display().to_string());
     hello.defaults_path = Some(defaults_path.display().to_string());
     hello.ui = Some(ui);
-    hello.shortkeys = state.config.read().expect("config lock").shortkeys.iter().map(|key| fresh_gui_protocol::Shortkey {
-        action: key.action.clone(), shortkey: key.shortkey.clone(), when: key.when.clone(),
-    }).collect();
+    hello.shortkeys = state
+        .config
+        .read()
+        .expect("config lock")
+        .shortkeys
+        .iter()
+        .map(|key| fresh_gui_protocol::Shortkey {
+            action: key.action.clone(),
+            shortkey: key.shortkey.clone(),
+            when: key.when.clone(),
+        })
+        .collect();
     let hello = Message::Hello(hello);
     if send_msg(&mut sink, &hello).await.is_err() {
         return;
@@ -139,6 +155,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     let mut authed = !state.require_auth;
     let mut client_range_edits = false;
+    let mut client_draft_recovery = false;
     let mut session_id: Option<String> = None;
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
 
@@ -181,6 +198,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     &defaults_path,
                     &mut authed,
                     &mut client_range_edits,
+                    &mut client_draft_recovery,
                     &mut session_id,
                     out_tx.clone(),
                     &mut sink,
@@ -206,13 +224,21 @@ async fn handle_client_msg(
     defaults_path: &Path,
     authed: &mut bool,
     client_range_edits: &mut bool,
+    client_draft_recovery: &mut bool,
     session_id: &mut Option<String>,
     out_tx: mpsc::UnboundedSender<Message>,
     sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
 ) -> Result<(), Message> {
     match msg {
         Message::Hello(client_hello) => {
-            *client_range_edits = client_hello.capabilities.iter().any(|cap| cap == CAP_EDITOR_RANGE_EDITS);
+            *client_range_edits = client_hello
+                .capabilities
+                .iter()
+                .any(|cap| cap == CAP_EDITOR_RANGE_EDITS);
+            *client_draft_recovery = client_hello
+                .capabilities
+                .iter()
+                .any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY);
             if client_hello.protocol_version != PROTOCOL_VERSION {
                 return Err(Message::Error {
                     code: "protocol_mismatch".into(),
@@ -266,19 +292,34 @@ async fn handle_client_msg(
                 message: format!("{err:#}"),
             })?;
             if let Some(editor) = state.editor.as_ref() {
-                editor.reconfigure(cfg.clone()).await.map_err(|err| Message::Error {
-                    code: "config_reload_failed".into(),
-                    message: format!("failed to apply editor config: {err:#}"),
-                })?;
+                editor
+                    .reconfigure(cfg.clone())
+                    .await
+                    .map_err(|err| Message::Error {
+                        code: "config_reload_failed".into(),
+                        message: format!("failed to apply editor config: {err:#}"),
+                    })?;
             }
-            let shortkeys = cfg.shortkeys.iter().map(|key| fresh_gui_protocol::Shortkey {
-                action: key.action.clone(),
-                shortkey: key.shortkey.clone(),
-                when: key.when.clone(),
-            }).collect();
+            let shortkeys = cfg
+                .shortkeys
+                .iter()
+                .map(|key| fresh_gui_protocol::Shortkey {
+                    action: key.action.clone(),
+                    shortkey: key.shortkey.clone(),
+                    when: key.when.clone(),
+                })
+                .collect();
             let ui = hello_ui(&cfg);
             *state.config.write().expect("config lock") = cfg;
-            send_msg(sink, &Message::ConfigUpdated { shortkeys, ui: Some(ui) }).await.map_err(|_| Message::Error {
+            send_msg(
+                sink,
+                &Message::ConfigUpdated {
+                    shortkeys,
+                    ui: Some(ui),
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
                 code: "send_failed".into(),
                 message: "failed to send ConfigUpdated".into(),
             })?;
@@ -493,8 +534,7 @@ async fn handle_client_msg(
                         let config = state.config.read().expect("config lock");
                         (config.ui.show_dotfiles, config.ui.show_git_dirs)
                     };
-                    let entries =
-                        crate::fs::visible_entries(entries, show_dotfiles, show_git_dirs);
+                    let entries = crate::fs::visible_entries(entries, show_dotfiles, show_git_dirs);
                     send_msg(
                         sink,
                         &Message::FsListed {
@@ -665,10 +705,12 @@ async fn handle_client_msg(
                 match std::fs::remove_file(defaults_path) {
                     Ok(()) => {}
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => return Err(Message::Error {
-                        code: "fs_delete_failed".into(),
-                        message: format!("{request_id}: {err}"),
-                    }),
+                    Err(err) => {
+                        return Err(Message::Error {
+                            code: "fs_delete_failed".into(),
+                            message: format!("{request_id}: {err}"),
+                        });
+                    }
                 }
                 send_msg(sink, &Message::FsDeleted { request_id, paths })
                     .await
@@ -716,6 +758,7 @@ async fn handle_client_msg(
                         code: "editor_open_failed".into(),
                         message: format!("{request_id}: {err:#}"),
                     })?;
+            let workspace_id = current_workspace_id(state, session_id).await?;
             reply_editor_opened(
                 sink,
                 editor,
@@ -724,6 +767,7 @@ async fn handle_client_msg(
                 preview,
                 resolved.line,
                 resolved.column,
+                workspace_id,
             )
             .await
         }
@@ -754,6 +798,7 @@ async fn handle_client_msg(
             })?;
             // Settings config.json is still openable by explicit path; link
             // opens stay inside the FS sandbox / authorized cwds.
+            let workspace_id = current_workspace_id(state, session_id).await?;
             reply_editor_opened(
                 sink,
                 editor,
@@ -762,6 +807,7 @@ async fn handle_client_msg(
                 preview,
                 resolved.line,
                 resolved.column,
+                workspace_id,
             )
             .await
         }
@@ -773,15 +819,20 @@ async fn handle_client_msg(
                     message: format!("{request_id}: editor capability not available"),
                 });
             };
-            let opened = editor.new_buffer().await.map_err(|err| Message::Error {
-                code: "editor_new_failed".into(),
-                message: format!("{request_id}: {err:#}"),
-            })?;
+            let workspace_id = current_workspace_id(state, session_id).await?;
+            let opened = editor
+                .new_buffer_in_workspace(workspace_id)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "editor_new_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
             send_msg(
                 sink,
                 &Message::EditorOpened {
                     request_id,
                     buffer_id: opened.buffer_id.clone(),
+                    draft_id: Some(opened.draft_id.clone()),
                     path: opened.path.clone(),
                     language: opened.language,
                     line: None,
@@ -809,6 +860,124 @@ async fn handle_client_msg(
             })?;
             Ok(())
         }
+        Message::EditorDraftList { request_id } => {
+            require_auth(*authed)?;
+            if !*client_draft_recovery {
+                return Err(Message::Error {
+                    code: "capability_unavailable".into(),
+                    message: format!(
+                        "{request_id}: client did not negotiate {CAP_EDITOR_DRAFT_RECOVERY}"
+                    ),
+                });
+            }
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: format!("{request_id}: editor capability not available"),
+                });
+            };
+            let workspace_id = current_workspace_id(state, session_id).await?;
+            let drafts = editor
+                .draft_list(workspace_id)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "draft_list_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
+            let drafts = drafts
+                .into_iter()
+                .map(|draft| {
+                    let source_changed = crate::drafts::DraftStore::source_changed(&draft);
+                    EditorDraftInfo {
+                        draft_id: draft.draft_id,
+                        path: draft.path,
+                        source_changed,
+                    }
+                })
+                .collect();
+            send_msg(sink, &Message::EditorDrafts { request_id, drafts })
+                .await
+                .map_err(|_| Message::Error {
+                    code: "send_failed".into(),
+                    message: "failed to send EditorDrafts".into(),
+                })?;
+            Ok(())
+        }
+        Message::EditorDraftRestore {
+            request_id,
+            draft_id,
+        } => {
+            require_auth(*authed)?;
+            if !*client_draft_recovery {
+                return Err(Message::Error {
+                    code: "capability_unavailable".into(),
+                    message: format!(
+                        "{request_id}: client did not negotiate {CAP_EDITOR_DRAFT_RECOVERY}"
+                    ),
+                });
+            }
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: format!("{request_id}: editor capability not available"),
+                });
+            };
+            let workspace_id = current_workspace_id(state, session_id).await?;
+            let (opened, source_changed) = editor
+                .draft_restore(workspace_id, draft_id)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "draft_restore_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
+            let restored_buffer_id = opened.buffer_id.clone();
+            send_editor_opened_snapshot(sink, request_id, opened, None, None).await?;
+            if source_changed {
+                send_msg(sink, &Message::EditorDraftWarning { buffer_id: restored_buffer_id, message: "The source file changed or is missing; review this recovered draft before saving.".into() }).await.map_err(|_| Message::Error { code: "send_failed".into(), message: "failed to send EditorDraftWarning".into() })?;
+            }
+            Ok(())
+        }
+        Message::EditorDraftDiscard {
+            request_id,
+            buffer_id,
+        } => {
+            require_auth(*authed)?;
+            if !*client_draft_recovery {
+                return Err(Message::Error {
+                    code: "capability_unavailable".into(),
+                    message: format!(
+                        "{request_id}: client did not negotiate {CAP_EDITOR_DRAFT_RECOVERY}"
+                    ),
+                });
+            }
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: format!("{request_id}: editor capability not available"),
+                });
+            };
+            ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
+            editor
+                .draft_discard(buffer_id.clone())
+                .await
+                .map_err(|err| Message::Error {
+                    code: "draft_discard_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
+            send_msg(
+                sink,
+                &Message::EditorDraftDiscarded {
+                    request_id,
+                    buffer_id,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send EditorDraftDiscarded".into(),
+            })?;
+            Ok(())
+        }
         Message::EditorClose { buffer_id } => {
             require_auth(*authed)?;
             let Some(editor) = state.editor.as_ref() else {
@@ -817,8 +986,9 @@ async fn handle_client_msg(
                     message: "editor capability not available".into(),
                 });
             };
+            let workspace_id = current_workspace_id(state, session_id).await?;
             editor
-                .close(buffer_id)
+                .close_in_workspace(buffer_id, workspace_id)
                 .await
                 .map_err(|err| Message::Error {
                     code: "editor_close_failed".into(),
@@ -839,6 +1009,7 @@ async fn handle_client_msg(
                     message: format!("{request_id}: editor capability not available"),
                 });
             };
+            ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
             let rev = editor
                 .edit(buffer_id.clone(), base_rev, text)
                 .await
@@ -884,6 +1055,7 @@ async fn handle_client_msg(
                     message: format!("{request_id}: editor capability not available"),
                 });
             };
+            ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
             let result = editor
                 .range_edit(
                     buffer_id.clone(),
@@ -940,6 +1112,7 @@ async fn handle_client_msg(
                     message: format!("{request_id}: editor capability not available"),
                 });
             };
+            ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
             let result = editor
                 .action(
                     buffer_id.clone(),
@@ -993,6 +1166,7 @@ async fn handle_client_msg(
                     message: format!("{request_id}: editor capability not available"),
                 });
             };
+            ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
             let result = editor
                 .sync(buffer_id.clone())
                 .await
@@ -1034,16 +1208,18 @@ async fn handle_client_msg(
                     message: format!("{request_id}: editor capability not available"),
                 });
             };
-            let dest = if path.is_empty() {
-                None
-            } else {
-                Some(state.fs_root.resolve_new_file(&path).await.map_err(|err| {
-                    Message::Error {
-                        code: "buffer_save_failed".into(),
-                        message: format!("{request_id}: {err:#}"),
-                    }
-                })?)
-            };
+            ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
+            let dest =
+                if path.is_empty() {
+                    None
+                } else {
+                    Some(state.fs_root.resolve_new_file(&path).await.map_err(|err| {
+                        Message::Error {
+                            code: "buffer_save_failed".into(),
+                            message: format!("{request_id}: {err:#}"),
+                        }
+                    })?)
+                };
             let (path, rev) = editor
                 .save(buffer_id.clone(), base_rev, dest)
                 .await
@@ -1060,17 +1236,33 @@ async fn handle_client_msg(
                             theme = %cfg.ui.theme,
                             "reloaded config after save"
                         );
-                        let shortkeys = cfg.shortkeys.iter().map(|key| fresh_gui_protocol::Shortkey {
-                            action: key.action.clone(), shortkey: key.shortkey.clone(), when: key.when.clone(),
-                        }).collect();
+                        let shortkeys = cfg
+                            .shortkeys
+                            .iter()
+                            .map(|key| fresh_gui_protocol::Shortkey {
+                                action: key.action.clone(),
+                                shortkey: key.shortkey.clone(),
+                                when: key.when.clone(),
+                            })
+                            .collect();
                         let ui = hello_ui(&cfg);
                         if let Some(editor) = state.editor.as_ref()
-                            && let Err(err) = editor.reconfigure(cfg.clone()).await {
-                                warn!(%err, "failed to apply language-server config to Fresh editor");
-                            }
+                            && let Err(err) = editor.reconfigure(cfg.clone()).await
+                        {
+                            warn!(%err, "failed to apply language-server config to Fresh editor");
+                        }
                         *state.config.write().expect("config lock") = cfg;
-                        send_msg(sink, &Message::ConfigUpdated { shortkeys, ui: Some(ui) }).await.map_err(|_| Message::Error {
-                            code: "send_failed".into(), message: "failed to send ConfigUpdated".into(),
+                        send_msg(
+                            sink,
+                            &Message::ConfigUpdated {
+                                shortkeys,
+                                ui: Some(ui),
+                            },
+                        )
+                        .await
+                        .map_err(|_| Message::Error {
+                            code: "send_failed".into(),
+                            message: "failed to send ConfigUpdated".into(),
                         })?;
                     }
                     Err(err) => {
@@ -1098,35 +1290,75 @@ async fn handle_client_msg(
             })?;
             Ok(())
         }
-        Message::BufferLspGet { buffer_id, known_rev } => {
+        Message::BufferLspGet {
+            buffer_id,
+            known_rev,
+        } => {
             require_auth(*authed)?;
             let Some(editor) = state.editor.as_ref() else {
-                return Err(Message::Error { code: "editor_unavailable".into(), message: "editor capability not available".into() });
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: "editor capability not available".into(),
+                });
             };
-            let lsp = editor.lsp_get(buffer_id.clone(), known_rev).await.map_err(|err| Message::Error {
-                code: "lsp_failed".into(), message: format!("{buffer_id}: {err:#}"),
-            })?;
-            send_msg(sink, &Message::BufferLspState {
-                buffer_id, rev: lsp.rev, text: lsp.text,
-                diagnostics: lsp.diagnostics, status: lsp.status,
-            }).await.map_err(|_| Message::Error {
-                code: "send_failed".into(), message: "failed to send BufferLspState".into(),
+            let lsp = editor
+                .lsp_get(buffer_id.clone(), known_rev)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "lsp_failed".into(),
+                    message: format!("{buffer_id}: {err:#}"),
+                })?;
+            send_msg(
+                sink,
+                &Message::BufferLspState {
+                    buffer_id,
+                    rev: lsp.rev,
+                    text: lsp.text,
+                    diagnostics: lsp.diagnostics,
+                    status: lsp.status,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send BufferLspState".into(),
             })?;
             Ok(())
         }
-        Message::BufferFormat { request_id, buffer_id, base_rev } => {
+        Message::BufferFormat {
+            request_id,
+            buffer_id,
+            base_rev,
+        } => {
             require_auth(*authed)?;
             let Some(editor) = state.editor.as_ref() else {
-                return Err(Message::Error { code: "editor_unavailable".into(), message: format!("{request_id}: editor capability not available") });
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: format!("{request_id}: editor capability not available"),
+                });
             };
-            let formatted = editor.format(buffer_id.clone(), base_rev).await.map_err(|err| Message::Error {
-                code: "buffer_format_failed".into(), message: format!("{request_id}: {err:#}"),
-            })?;
-            send_msg(sink, &Message::BufferFormatted {
-                request_id, buffer_id, rev: formatted.rev,
-                text: formatted.text, status: formatted.status,
-            }).await.map_err(|_| Message::Error {
-                code: "send_failed".into(), message: "failed to send BufferFormatted".into(),
+            ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
+            let formatted = editor
+                .format(buffer_id.clone(), base_rev)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "buffer_format_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
+            send_msg(
+                sink,
+                &Message::BufferFormatted {
+                    request_id,
+                    buffer_id,
+                    rev: formatted.rev,
+                    text: formatted.text,
+                    status: formatted.status,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send BufferFormatted".into(),
             })?;
             Ok(())
         }
@@ -1203,9 +1435,14 @@ async fn handle_client_msg(
             paths,
         } => {
             require_auth(*authed)?;
-            git_op(state, sink, request_id, workspace_id, directory, move |dir| {
-                crate::git::restore(&dir, &paths)
-            })
+            git_op(
+                state,
+                sink,
+                request_id,
+                workspace_id,
+                directory,
+                move |dir| crate::git::restore(&dir, &paths),
+            )
             .await
         }
         Message::GitStage {
@@ -1216,9 +1453,14 @@ async fn handle_client_msg(
             stage,
         } => {
             require_auth(*authed)?;
-            git_op(state, sink, request_id, workspace_id, directory, move |dir| {
-                crate::git::stage(&dir, &paths, stage)
-            })
+            git_op(
+                state,
+                sink,
+                request_id,
+                workspace_id,
+                directory,
+                move |dir| crate::git::stage(&dir, &paths, stage),
+            )
             .await
         }
         Message::GitCommit {
@@ -1228,9 +1470,14 @@ async fn handle_client_msg(
             message,
         } => {
             require_auth(*authed)?;
-            git_op(state, sink, request_id, workspace_id, directory, move |dir| {
-                crate::git::commit(&dir, &message)
-            })
+            git_op(
+                state,
+                sink,
+                request_id,
+                workspace_id,
+                directory,
+                move |dir| crate::git::commit(&dir, &message),
+            )
             .await
         }
         Message::GitPull {
@@ -1398,6 +1645,21 @@ async fn handle_client_msg(
         }
         Message::WorkspaceClose { workspace_id } => {
             require_auth(*authed)?;
+            if let Some(editor) = state.editor.as_ref()
+                && !editor
+                    .draft_list(workspace_id.clone())
+                    .await
+                    .map_err(|err| Message::Error {
+                        code: "workspace_close_failed".into(),
+                        message: format!("cannot verify draft recovery: {err:#}"),
+                    })?
+                    .is_empty()
+            {
+                return Err(Message::Error {
+                    code: "workspace_close_failed".into(),
+                    message: "workspace has recoverable editor drafts; save or discard them before closing the workspace".into(),
+                });
+            }
             let closed =
                 state
                     .workspaces
@@ -1566,7 +1828,9 @@ fn validate_workspace_root(raw: &str) -> Result<(), String> {
         );
     }
     if !std::path::Path::new(raw).is_absolute() {
-        return Err(format!("workspace root must be an absolute path, got {raw}"));
+        return Err(format!(
+            "workspace root must be an absolute path, got {raw}"
+        ));
     }
     Ok(())
 }
@@ -1580,18 +1844,26 @@ mod workspace_root_tests {
         #[cfg(unix)]
         {
             assert!(validate_workspace_root("/home/me/project").is_ok());
-            assert!(validate_workspace_root("home/me/project")
-                .unwrap_err()
-                .contains("absolute"));
-            assert!(validate_workspace_root(r"C:\work\project")
-                .unwrap_err()
-                .contains("Windows path"));
-            assert!(validate_workspace_root("C:/work/project")
-                .unwrap_err()
-                .contains("Windows path"));
-            assert!(validate_workspace_root(r"\\server\share")
-                .unwrap_err()
-                .contains("Windows path"));
+            assert!(
+                validate_workspace_root("home/me/project")
+                    .unwrap_err()
+                    .contains("absolute")
+            );
+            assert!(
+                validate_workspace_root(r"C:\work\project")
+                    .unwrap_err()
+                    .contains("Windows path")
+            );
+            assert!(
+                validate_workspace_root("C:/work/project")
+                    .unwrap_err()
+                    .contains("Windows path")
+            );
+            assert!(
+                validate_workspace_root(r"\\server\share")
+                    .unwrap_err()
+                    .contains("Windows path")
+            );
         }
         #[cfg(windows)]
         {
@@ -1676,6 +1948,7 @@ async fn reply_editor_opened(
     preview: bool,
     line: Option<u32>,
     column: Option<u32>,
+    workspace_id: String,
 ) -> Result<(), Message> {
     if crate::binary::is_binary_file(&path).unwrap_or(false) {
         return Err(Message::Error {
@@ -1683,24 +1956,39 @@ async fn reply_editor_opened(
             message: format!("{request_id}: {}", path.display()),
         });
     }
-    let opened = editor.open(path, preview).await.map_err(|err| {
-        let binary = err
-            .chain()
-            .any(|cause| cause.is::<crate::binary::BinaryFile>());
-        Message::Error {
-            code: if binary {
-                "binary_file".into()
-            } else {
-                "editor_open_failed".into()
-            },
-            message: format!("{request_id}: {err:#}"),
-        }
-    })?;
+    let opened = editor
+        .open_in_workspace(path, preview, workspace_id)
+        .await
+        .map_err(|err| {
+            let binary = err
+                .chain()
+                .any(|cause| cause.is::<crate::binary::BinaryFile>());
+            Message::Error {
+                code: if binary {
+                    "binary_file".into()
+                } else {
+                    "editor_open_failed".into()
+                },
+                message: format!("{request_id}: {err:#}"),
+            }
+        })?;
+    send_editor_opened_snapshot(sink, request_id, opened, line, column).await?;
+    Ok(())
+}
+
+async fn send_editor_opened_snapshot(
+    sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
+    request_id: String,
+    opened: crate::editor_worker::OpenedBuffer,
+    line: Option<u32>,
+    column: Option<u32>,
+) -> Result<(), Message> {
     send_msg(
         sink,
         &Message::EditorOpened {
             request_id,
             buffer_id: opened.buffer_id.clone(),
+            draft_id: Some(opened.draft_id.clone()),
             path: opened.path.clone(),
             language: opened.language,
             line,
@@ -1729,6 +2017,37 @@ async fn reply_editor_opened(
     Ok(())
 }
 
+async fn current_workspace_id(
+    state: &AppState,
+    session_id: &Option<String>,
+) -> Result<String, Message> {
+    let Some(session_id) = session_id else {
+        return Ok("default".into());
+    };
+    Ok(state
+        .workspaces
+        .id_for_session(session_id)
+        .await
+        .unwrap_or_else(|| "default".into()))
+}
+
+async fn ensure_editor_workspace(
+    editor: &EditorHandle,
+    state: &AppState,
+    session_id: &Option<String>,
+    buffer_id: &str,
+    request_id: &str,
+) -> Result<(), Message> {
+    let workspace_id = current_workspace_id(state, session_id).await?;
+    editor
+        .check_workspace(buffer_id.to_owned(), workspace_id)
+        .await
+        .map_err(|err| Message::Error {
+            code: "editor_workspace_mismatch".into(),
+            message: format!("{request_id}: {err:#}"),
+        })
+}
+
 async fn workspace_dir(state: &AppState, workspace_id: &str) -> Result<PathBuf, Message> {
     let stored = if workspace_id.is_empty() {
         String::new()
@@ -1755,7 +2074,11 @@ async fn workspace_dir(state: &AppState, workspace_id: &str) -> Result<PathBuf, 
     Ok(path)
 }
 
-async fn git_dir(state: &AppState, workspace_id: &str, directory: &str) -> Result<PathBuf, Message> {
+async fn git_dir(
+    state: &AppState,
+    workspace_id: &str,
+    directory: &str,
+) -> Result<PathBuf, Message> {
     if directory.is_empty() {
         return workspace_dir(state, workspace_id).await;
     }

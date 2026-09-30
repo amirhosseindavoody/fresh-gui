@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 
+use crate::drafts::{Draft, DraftStore};
 use anyhow::{Context, Result, bail};
 use fresh::app::Editor;
 use fresh::config::Config;
@@ -22,6 +23,7 @@ const MAX_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 #[derive(Debug, Clone)]
 pub struct OpenedBuffer {
     pub buffer_id: String,
+    pub draft_id: String,
     pub path: String,
     pub language: Option<String>,
     pub rev: u64,
@@ -36,6 +38,10 @@ struct TrackedBuffer {
     rev: u64,
     dirty: bool,
     language: Option<String>,
+    workspace_id: String,
+    draft_id: String,
+    base_text: Option<String>,
+    recovery_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,9 +69,11 @@ enum Cmd {
     Open {
         path: PathBuf,
         preview: bool,
+        workspace_id: String,
         reply: oneshot::Sender<Result<OpenedBuffer>>,
     },
     New {
+        workspace_id: String,
         reply: oneshot::Sender<Result<OpenedBuffer>>,
     },
     Edit {
@@ -103,6 +111,7 @@ enum Cmd {
     },
     Close {
         buffer_id: String,
+        workspace_id: String,
         reply: oneshot::Sender<Result<()>>,
     },
     Scene {
@@ -120,6 +129,24 @@ enum Cmd {
     },
     Reconfigure {
         config: crate::config::Config,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    DraftList {
+        workspace_id: String,
+        reply: oneshot::Sender<Result<Vec<Draft>>>,
+    },
+    DraftRestore {
+        workspace_id: String,
+        draft_id: String,
+        reply: oneshot::Sender<Result<(OpenedBuffer, bool)>>,
+    },
+    DraftDiscard {
+        buffer_id: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    CheckWorkspace {
+        buffer_id: String,
+        workspace_id: String,
         reply: oneshot::Sender<Result<()>>,
     },
 }
@@ -141,7 +168,20 @@ pub struct EditorHandle {
 
 impl EditorHandle {
     /// Spawn the Fresh editor on a dedicated OS thread. Returns `None` if init fails.
+    #[cfg(test)]
     pub fn spawn(working_dir: PathBuf, gui_config: crate::config::Config) -> Option<Self> {
+        Self::spawn_with_recovery_dir(
+            working_dir,
+            gui_config,
+            std::env::temp_dir().join("fresh-gui-worker-test-drafts"),
+        )
+    }
+
+    pub fn spawn_with_recovery_dir(
+        working_dir: PathBuf,
+        gui_config: crate::config::Config,
+        recovery_dir: PathBuf,
+    ) -> Option<Self> {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
         let (tx, rx) = mpsc::unbounded_channel::<Cmd>();
         let dir_for_log = working_dir.clone();
@@ -151,7 +191,7 @@ impl EditorHandle {
             .spawn(move || match build_editor(&working_dir, &gui_config) {
                 Ok(editor) => {
                     let _ = ready_tx.send(Ok(()));
-                    run_loop(editor, rx);
+                    run_loop(editor, rx, DraftStore::new(recovery_dir));
                 }
                 Err(err) => {
                     let _ = ready_tx.send(Err(err));
@@ -175,12 +215,24 @@ impl EditorHandle {
         }
     }
 
+    #[cfg(test)]
     pub async fn open(&self, path: PathBuf, preview: bool) -> Result<OpenedBuffer> {
+        self.open_in_workspace(path, preview, "default".into())
+            .await
+    }
+
+    pub async fn open_in_workspace(
+        &self,
+        path: PathBuf,
+        preview: bool,
+        workspace_id: String,
+    ) -> Result<OpenedBuffer> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(Cmd::Open {
                 path,
                 preview,
+                workspace_id,
                 reply: reply_tx,
             })
             .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
@@ -204,34 +256,127 @@ impl EditorHandle {
             .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
     }
 
-    pub async fn range_edit(&self, buffer_id: String, view_id: String, base_rev: u64, edits: Vec<RangeEdit>, selection: ByteSelection) -> Result<BufferTransactionResult> {
+    pub async fn range_edit(
+        &self,
+        buffer_id: String,
+        view_id: String,
+        base_rev: u64,
+        edits: Vec<RangeEdit>,
+        selection: ByteSelection,
+    ) -> Result<BufferTransactionResult> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(Cmd::RangeEdit { buffer_id, view_id, base_rev, edits, selection, reply })
+        self.tx
+            .send(Cmd::RangeEdit {
+                buffer_id,
+                view_id,
+                base_rev,
+                edits,
+                selection,
+                reply,
+            })
             .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
-        rx.await.map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
     }
 
-    pub async fn action(&self, buffer_id: String, view_id: String, base_rev: u64, action: EditorAction, selection: ByteSelection) -> Result<BufferTransactionResult> {
+    pub async fn action(
+        &self,
+        buffer_id: String,
+        view_id: String,
+        base_rev: u64,
+        action: EditorAction,
+        selection: ByteSelection,
+    ) -> Result<BufferTransactionResult> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(Cmd::Action { buffer_id, view_id, base_rev, action, selection, reply })
+        self.tx
+            .send(Cmd::Action {
+                buffer_id,
+                view_id,
+                base_rev,
+                action,
+                selection,
+                reply,
+            })
             .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
-        rx.await.map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
     }
 
     pub async fn sync(&self, buffer_id: String) -> Result<BufferTransactionResult> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(Cmd::Sync { buffer_id, reply })
+        self.tx
+            .send(Cmd::Sync { buffer_id, reply })
             .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
-        rx.await.map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
     }
 
+    #[cfg(test)]
     pub async fn new_buffer(&self) -> Result<OpenedBuffer> {
+        self.new_buffer_in_workspace("default".into()).await
+    }
+
+    pub async fn new_buffer_in_workspace(&self, workspace_id: String) -> Result<OpenedBuffer> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(Cmd::New { reply: reply_tx })
+            .send(Cmd::New {
+                workspace_id,
+                reply: reply_tx,
+            })
             .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
         reply_rx
             .await
+            .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+    }
+
+    pub async fn draft_list(&self, workspace_id: String) -> Result<Vec<Draft>> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::DraftList {
+                workspace_id,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+    }
+
+    pub async fn draft_restore(
+        &self,
+        workspace_id: String,
+        draft_id: String,
+    ) -> Result<(OpenedBuffer, bool)> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::DraftRestore {
+                workspace_id,
+                draft_id,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+    }
+
+    pub async fn draft_discard(&self, buffer_id: String) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::DraftDiscard { buffer_id, reply })
+            .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+    }
+
+    pub async fn check_workspace(&self, buffer_id: String, workspace_id: String) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::CheckWorkspace {
+                buffer_id,
+                workspace_id,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        rx.await
             .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
     }
 
@@ -255,11 +400,17 @@ impl EditorHandle {
             .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
     }
 
+    #[cfg(test)]
     pub async fn close(&self, buffer_id: String) -> Result<()> {
+        self.close_in_workspace(buffer_id, "default".into()).await
+    }
+
+    pub async fn close_in_workspace(&self, buffer_id: String, workspace_id: String) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(Cmd::Close {
                 buffer_id,
+                workspace_id,
                 reply: reply_tx,
             })
             .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
@@ -347,7 +498,7 @@ fn build_editor(working_dir: &Path, gui_config: &crate::config::Config) -> Resul
     .context("Editor::with_working_dir")
 }
 
-fn run_loop(mut editor: Editor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
+fn run_loop(mut editor: Editor, mut rx: mpsc::UnboundedReceiver<Cmd>, drafts: DraftStore) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -381,13 +532,18 @@ fn run_loop(mut editor: Editor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 Cmd::Open {
                     path,
                     preview,
+                    workspace_id,
                     reply,
                 } => {
-                    let result = open_buffer(&mut editor, &mut tracked, &path, preview);
+                    let result =
+                        open_buffer(&mut editor, &mut tracked, &path, preview, &workspace_id);
                     let _ = reply.send(result);
                 }
-                Cmd::New { reply } => {
-                    let result = create_untitled(&mut editor, &mut tracked);
+                Cmd::New {
+                    workspace_id,
+                    reply,
+                } => {
+                    let result = create_untitled(&mut editor, &mut tracked, &workspace_id);
                     let _ = reply.send(result);
                 }
                 Cmd::Edit {
@@ -397,19 +553,75 @@ fn run_loop(mut editor: Editor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     reply,
                 } => {
                     let result =
-                        edit_buffer(&mut editor, &mut tracked, &buffer_id, base_rev, &text);
+                        edit_buffer(&mut editor, &mut tracked, &buffer_id, base_rev, &text)
+                            .and_then(|rev| {
+                                checkpoint(&drafts, &tracked, &buffer_id)?;
+                                Ok(rev)
+                            });
                     let _ = reply.send(result);
                 }
-                Cmd::RangeEdit { buffer_id, view_id, base_rev, edits, selection, reply } => {
-                    let result = range_edit_buffer(&mut editor, &mut tracked, &buffer_id, &view_id, base_rev, edits, selection);
+                Cmd::RangeEdit {
+                    buffer_id,
+                    view_id,
+                    base_rev,
+                    edits,
+                    selection,
+                    reply,
+                } => {
+                    let result = range_edit_buffer(
+                        &mut editor,
+                        &mut tracked,
+                        &buffer_id,
+                        &view_id,
+                        base_rev,
+                        edits,
+                        selection,
+                    )
+                    .and_then(|result| {
+                        if result.accepted {
+                            if result.dirty {
+                                checkpoint(&drafts, &tracked, &buffer_id)?;
+                            }
+                        }
+                        Ok(result)
+                    });
                     let _ = reply.send(result);
                 }
-                Cmd::Action { buffer_id, view_id, base_rev, action, selection, reply } => {
-                    let result = action_buffer(&mut editor, &mut tracked, &buffer_id, &view_id, base_rev, action, selection);
+                Cmd::Action {
+                    buffer_id,
+                    view_id,
+                    base_rev,
+                    action,
+                    selection,
+                    reply,
+                } => {
+                    let result = action_buffer(
+                        &mut editor,
+                        &mut tracked,
+                        &buffer_id,
+                        &view_id,
+                        base_rev,
+                        action,
+                        selection,
+                    )
+                    .and_then(|result| {
+                        if result.accepted {
+                            if result.dirty {
+                                checkpoint(&drafts, &tracked, &buffer_id)?;
+                            } else if let Some(entry) = tracked.get(&buffer_id) {
+                                drafts.discard(&entry.workspace_id, &entry.draft_id)?;
+                            }
+                        }
+                        Ok(result)
+                    });
                     let _ = reply.send(result);
                 }
                 Cmd::Sync { buffer_id, reply } => {
-                    let result = sync_buffer(&mut editor, &mut tracked, &buffer_id);
+                    let result =
+                        sync_buffer(&mut editor, &mut tracked, &buffer_id).and_then(|result| {
+                            checkpoint(&drafts, &tracked, &buffer_id)?;
+                            Ok(result)
+                        });
                     let _ = reply.send(result);
                 }
                 Cmd::Save {
@@ -418,12 +630,32 @@ fn run_loop(mut editor: Editor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     path,
                     reply,
                 } => {
-                    let result =
-                        save_buffer(&mut editor, &mut tracked, &buffer_id, base_rev, path.as_deref());
+                    let result = save_buffer(
+                        &mut editor,
+                        &mut tracked,
+                        &buffer_id,
+                        base_rev,
+                        path.as_deref(),
+                    )
+                    .and_then(|saved| {
+                        let entry = tracked.get(&buffer_id).expect("saved buffer");
+                        drafts.discard(&entry.workspace_id, &entry.draft_id)?;
+                        Ok(saved)
+                    });
                     let _ = reply.send(result);
                 }
-                Cmd::Close { buffer_id, reply } => {
-                    let result = close_buffer(&mut editor, &mut tracked, &buffer_id);
+                Cmd::Close {
+                    buffer_id,
+                    workspace_id,
+                    reply,
+                } => {
+                    let result = match tracked.get(&buffer_id) {
+                        Some(entry) if entry.workspace_id != workspace_id => {
+                            Err(anyhow::anyhow!("buffer belongs to another workspace"))
+                        }
+                        Some(_) => close_buffer(&mut editor, &mut tracked, &buffer_id),
+                        None => Ok(()),
+                    };
                     let _ = reply.send(result);
                 }
                 Cmd::LspGet {
@@ -431,15 +663,26 @@ fn run_loop(mut editor: Editor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     known_rev,
                     reply,
                 } => {
-                    let _ = reply.send(lsp_state(&mut editor, &mut tracked, &buffer_id, known_rev));
+                    let result = lsp_state(&mut editor, &mut tracked, &buffer_id, known_rev)
+                        .and_then(|result| {
+                            if result.text.is_some() { checkpoint(&drafts, &tracked, &buffer_id)?; }
+                            Ok(result)
+                        });
+                    let _ = reply.send(result);
                 }
                 Cmd::Format {
                     buffer_id,
                     base_rev,
                     reply,
                 } => {
-                    let result =
-                        format_buffer(&mut editor, &mut tracked, &buffer_id, base_rev).await;
+                    let result = format_buffer(&mut editor, &mut tracked, &buffer_id, base_rev)
+                        .await
+                        .and_then(|result| {
+                            if result.text.is_some() {
+                                checkpoint(&drafts, &tracked, &buffer_id)?;
+                            }
+                            Ok(result)
+                        });
                     let _ = reply.send(result);
                 }
                 Cmd::Reconfigure { config, reply } => {
@@ -473,6 +716,50 @@ fn run_loop(mut editor: Editor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                         editor.set_lsp_config(language, servers);
                     }
                     let _ = reply.send(Ok(()));
+                }
+                Cmd::DraftList {
+                    workspace_id,
+                    reply,
+                } => {
+                    let _ = reply.send(drafts.list(&workspace_id));
+                }
+                Cmd::DraftRestore {
+                    workspace_id,
+                    draft_id,
+                    reply,
+                } => {
+                    let result =
+                        restore_draft(&mut editor, &mut tracked, &drafts, &workspace_id, &draft_id);
+                    let _ = reply.send(result);
+                }
+                Cmd::DraftDiscard { buffer_id, reply } => {
+                    let result = tracked
+                        .get_mut(&buffer_id)
+                        .context("unknown buffer")
+                        .and_then(|entry| {
+                            drafts.discard(&entry.workspace_id, &entry.draft_id)?;
+                            Ok(())
+                        })
+                        .and_then(|()| close_buffer(&mut editor, &mut tracked, &buffer_id));
+                    let _ = reply.send(result);
+                }
+                Cmd::CheckWorkspace {
+                    buffer_id,
+                    workspace_id,
+                    reply,
+                } => {
+                    let result =
+                        tracked
+                            .get(&buffer_id)
+                            .context("unknown buffer")
+                            .and_then(|entry| {
+                                if entry.workspace_id == workspace_id {
+                                    Ok(())
+                                } else {
+                                    bail!("buffer belongs to another workspace")
+                                }
+                            });
+                    let _ = reply.send(result);
                 }
                 Cmd::Scene { reply } => {
                     let _ = sync_all_fresh_text(&editor, &mut tracked);
@@ -532,8 +819,22 @@ fn open_buffer(
     tracked: &mut HashMap<String, TrackedBuffer>,
     path: &Path,
     preview: bool,
+    workspace_id: &str,
 ) -> Result<OpenedBuffer> {
     sync_all_fresh_text(editor, tracked)?;
+    let same_path = |candidate: &Path| {
+        candidate
+            .canonicalize()
+            .unwrap_or_else(|_| candidate.to_path_buf())
+            == path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    };
+    if tracked.values().any(|entry| {
+        entry.workspace_id != workspace_id && entry.path.as_deref().is_some_and(same_path)
+    }) {
+        bail!(
+            "this file is already open in another workspace; close it there before opening it here"
+        );
+    }
     if !path.is_file() {
         bail!("not a file: {}", path.display());
     }
@@ -577,6 +878,11 @@ fn open_buffer(
 
     let id = buffer_id.0.to_string();
     let rev = tracked.get(&id).map(|t| t.rev).unwrap_or(0);
+    let base_text = tracked
+        .get(&id)
+        .filter(|entry| entry.workspace_id == workspace_id && entry.path.as_deref() == Some(path))
+        .and_then(|entry| entry.base_text.clone())
+        .unwrap_or_else(|| text.clone());
     tracked.insert(
         id.clone(),
         TrackedBuffer {
@@ -585,16 +891,97 @@ fn open_buffer(
             rev,
             dirty,
             language: language.clone(),
+            workspace_id: workspace_id.to_owned(),
+            draft_id: crate::drafts::named_draft_id(workspace_id, path),
+            base_text: Some(base_text),
+            recovery_path: Some(path.to_path_buf()),
         },
     );
 
     Ok(OpenedBuffer {
+        draft_id: tracked[&id].draft_id.clone(),
         buffer_id: id,
         path: path.display().to_string(),
         language,
         rev,
         text,
     })
+}
+
+fn checkpoint(
+    store: &DraftStore,
+    tracked: &HashMap<String, TrackedBuffer>,
+    buffer_id: &str,
+) -> Result<()> {
+    let entry = tracked.get(buffer_id).context("unknown buffer")?;
+    if !entry.dirty {
+        // A clean named open may be happening immediately before a recovery
+        // restore. Explicit Save, Discard, or undo-to-savepoint removes copies.
+        return Ok(());
+    }
+    store.checkpoint(
+        &entry.workspace_id,
+        Draft {
+            draft_id: entry.draft_id.clone(),
+            path: entry
+                .recovery_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            text: entry.text.clone(),
+            base_text: entry.base_text.clone(),
+        },
+    )
+}
+
+fn restore_draft(
+    editor: &mut Editor,
+    tracked: &mut HashMap<String, TrackedBuffer>,
+    store: &DraftStore,
+    workspace_id: &str,
+    draft_id: &str,
+) -> Result<(OpenedBuffer, bool)> {
+    let draft = store
+        .get(workspace_id, draft_id)?
+        .context("draft not found")?;
+    let source_changed = DraftStore::source_changed(&draft);
+    let mut opened =
+        if let Some(path) = draft.path.as_ref().filter(|path| Path::new(path).is_file()) {
+            match open_buffer(editor, tracked, Path::new(path), false, workspace_id) {
+                Ok(opened) => opened,
+                Err(_) => create_untitled(editor, tracked, workspace_id)?,
+            }
+        } else {
+            create_untitled(editor, tracked, workspace_id)?
+        };
+    let buffer_id = opened.buffer_id.clone();
+    let current = editor
+        .active_state()
+        .buffer
+        .to_string()
+        .context("buffer unavailable")?;
+    if current != draft.text {
+        let rev = edit_buffer(editor, tracked, &buffer_id, opened.rev, &draft.text)?;
+        opened.rev = rev;
+    }
+    // Restore the dirty state even when an external writer happens to have
+    // installed text identical to the draft since its original checkpoint.
+    editor.active_state_mut().buffer.set_modified(true);
+    let entry = tracked.get_mut(&buffer_id).expect("restored buffer");
+    entry.draft_id = draft.draft_id;
+    entry.workspace_id = workspace_id.to_owned();
+    entry.base_text = draft.base_text;
+    entry.recovery_path = draft.path.as_ref().map(PathBuf::from);
+    entry.dirty = true;
+    entry.text = draft.text.clone();
+    // Fresh may hold a missing source as an unnamed buffer; recovery_path
+    // preserves its intended save target independently of Fresh's file path.
+    opened.path = draft.path.unwrap_or_default();
+    let restored_draft_id = entry.draft_id.clone();
+    opened.draft_id = restored_draft_id;
+    opened.text = draft.text;
+    opened.language = entry.language.clone();
+    checkpoint(store, tracked, &buffer_id)?;
+    Ok((opened, source_changed))
 }
 
 fn activate_tracked(
@@ -645,7 +1032,10 @@ fn edit_buffer(
         );
     }
     let _ = sync_fresh_text(editor, tracked, buffer_id)?;
-    let current = tracked.get(buffer_id).with_context(|| format!("unknown buffer_id {buffer_id}"))?.rev;
+    let current = tracked
+        .get(buffer_id)
+        .with_context(|| format!("unknown buffer_id {buffer_id}"))?
+        .rev;
     if current != base_rev {
         bail!("revision conflict: base_rev={base_rev} current={current}");
     }
@@ -672,7 +1062,10 @@ fn edit_buffer(
                 cursor_id,
             });
         }
-        editor.log_and_apply_event(&Event::Batch { events, description: "ADE full-text edit".into() });
+        editor.log_and_apply_event(&Event::Batch {
+            events,
+            description: "ADE full-text edit".into(),
+        });
     }
     let entry = tracked.get_mut(buffer_id).expect("tracked");
     entry.text = text.to_owned();
@@ -856,7 +1249,7 @@ fn range_edit_buffer(
     if working != initial {
         entry.rev += 1;
         entry.dirty = true;
-    }
+        }
     entry.text = working;
     transaction_result(tracked, editor, buffer_id, true)
 }
@@ -943,7 +1336,10 @@ fn sync_fresh_text(
         .buffers
         .get(&BufferId(id))
         .context("Fresh buffer unavailable")?;
-    let text = state.buffer.to_string().context("Fresh buffer text unavailable")?;
+    let text = state
+        .buffer
+        .to_string()
+        .context("Fresh buffer text unavailable")?;
     let dirty = state.buffer.is_modified();
     let entry = tracked
         .get_mut(buffer_id)
@@ -960,9 +1356,14 @@ fn sync_fresh_text(
     Ok(Some(text))
 }
 
-fn sync_all_fresh_text(editor: &Editor, tracked: &mut HashMap<String, TrackedBuffer>) -> Result<()> {
+fn sync_all_fresh_text(
+    editor: &Editor,
+    tracked: &mut HashMap<String, TrackedBuffer>,
+) -> Result<()> {
     let ids: Vec<String> = tracked.keys().cloned().collect();
-    for id in ids { let _ = sync_fresh_text(editor, tracked, &id)?; }
+    for id in ids {
+        let _ = sync_fresh_text(editor, tracked, &id)?;
+    }
     Ok(())
 }
 
@@ -1116,15 +1517,12 @@ async fn format_buffer(
 fn create_untitled(
     editor: &mut Editor,
     tracked: &mut HashMap<String, TrackedBuffer>,
+    workspace_id: &str,
 ) -> Result<OpenedBuffer> {
     let buffer_id = editor.new_buffer();
     let id = buffer_id.0.to_string();
     let language = editor.active_buffer_mode().map(|mode| mode.to_owned());
-    let text = editor
-        .active_state()
-        .buffer
-        .to_string()
-        .unwrap_or_default();
+    let text = editor.active_state().buffer.to_string().unwrap_or_default();
     tracked.insert(
         id.clone(),
         TrackedBuffer {
@@ -1133,9 +1531,14 @@ fn create_untitled(
             rev: 0,
             dirty: false,
             language: language.clone(),
+            workspace_id: workspace_id.to_owned(),
+            draft_id: format!("untitled:{}", uuid::Uuid::new_v4()),
+            base_text: None,
+            recovery_path: None,
         },
     );
     Ok(OpenedBuffer {
+        draft_id: tracked[&id].draft_id.clone(),
         buffer_id: id,
         path: String::new(),
         language,
@@ -1160,35 +1563,39 @@ fn save_buffer(
         bail!("revision conflict: base_rev={base_rev} current={current}");
     }
     activate_tracked(editor, tracked, buffer_id)?;
-    if let Some(dest) = dest {
-        editor
-            .active_state_mut()
-            .buffer
-            .save_to_file(dest)
-            .with_context(|| format!("save to {}", dest.display()))?;
+    let explicit_destination = dest.is_some();
+    let had_fresh_path = tracked
+        .get(buffer_id)
+        .is_some_and(|entry| entry.path.is_some());
+    let save_path = dest.map(Path::to_path_buf).or_else(|| {
+        tracked
+            .get(buffer_id)
+            .and_then(|entry| entry.path.clone().or_else(|| entry.recovery_path.clone()))
+    });
+    if let Some(dest) = save_path.as_deref() {
+        if explicit_destination || !had_fresh_path {
+            editor
+                .active_state_mut()
+                .buffer
+                .save_to_file(dest)
+                .with_context(|| format!("save to {}", dest.display()))?;
+        } else {
+            editor.save().context("Editor::save")?;
+        }
         let language = editor.active_buffer_mode().map(|mode| mode.to_owned());
         let entry = tracked.get_mut(buffer_id).expect("tracked");
         entry.path = Some(dest.to_path_buf());
+        entry.recovery_path = Some(dest.to_path_buf());
         if language.is_some() {
             entry.language = language;
         }
     } else {
-        if tracked
-            .get(buffer_id)
-            .and_then(|entry| entry.path.as_ref())
-            .is_none()
-        {
-            bail!("unsaved buffer needs a path");
-        }
-        editor.save().context("Editor::save")?;
+        bail!("unsaved buffer needs a path");
     }
-    let text = editor
-        .active_state()
-        .buffer
-        .to_string()
-        .unwrap_or_default();
+    let text = editor.active_state().buffer.to_string().unwrap_or_default();
     let entry = tracked.get_mut(buffer_id).expect("tracked");
     entry.text = text;
+    entry.base_text = Some(entry.text.clone());
     entry.dirty = false;
     // Bump rev so peers know disk matches this generation.
     entry.rev += 1;
@@ -1208,21 +1615,243 @@ mod tests {
     use super::*;
 
     #[test]
-    fn range_transactions_validate_byte_offsets_stale_revisions_and_fresh_undo_redo() {
-        let root = std::env::temp_dir().join(format!("fresh-gui-range-test-{}", uuid::Uuid::new_v4()));
+    fn dirty_untitled_draft_survives_worker_restart_and_failed_save() {
+        let root =
+            std::env::temp_dir().join(format!("fresh-gui-draft-test-{}", uuid::Uuid::new_v4()));
+        let recovery = root.join("recovery");
         std::fs::create_dir_all(&root).unwrap();
-        let editor = EditorHandle::spawn(root.clone(), crate::config::Config::default()).expect("Fresh worker starts");
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let editor = EditorHandle::spawn_with_recovery_dir(
+            root.clone(),
+            crate::config::Config::default(),
+            recovery.clone(),
+        )
+        .expect("Fresh worker starts");
+        let draft_id = rt.block_on(async {
+            let opened = editor
+                .new_buffer_in_workspace("workspace-one".into())
+                .await
+                .unwrap();
+            let draft_id = opened.draft_id.clone();
+            editor
+                .edit(
+                    opened.buffer_id.clone(),
+                    opened.rev,
+                    "unsaved scratch".into(),
+                )
+                .await
+                .unwrap();
+            let drafts = editor.draft_list("workspace-one".into()).await.unwrap();
+            assert_eq!(drafts.len(), 1);
+            assert_eq!(drafts[0].text, "unsaved scratch");
+            assert!(
+                editor
+                    .draft_list("workspace-two".into())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let missing = root.join("missing").join("file.txt");
+            assert!(
+                editor
+                    .save(opened.buffer_id.clone(), 1, Some(missing))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                editor
+                    .draft_list("workspace-one".into())
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            draft_id
+        });
+        drop(editor);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let restarted = EditorHandle::spawn_with_recovery_dir(
+            root.clone(),
+            crate::config::Config::default(),
+            recovery,
+        )
+        .expect("restarted Fresh worker");
+        rt.block_on(async {
+            let (restored, changed) = restarted
+                .draft_restore("workspace-one".into(), draft_id.clone())
+                .await
+                .unwrap();
+            assert!(!changed);
+            assert_eq!(restored.text, "unsaved scratch");
+            assert!(
+                restarted.draft_list("workspace-one".into()).await.unwrap()[0].draft_id == draft_id
+            );
+            restarted.draft_discard(restored.buffer_id).await.unwrap();
+            assert!(
+                restarted
+                    .draft_list("workspace-one".into())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+        drop(restarted);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn named_draft_restarts_without_touching_source_until_save() {
+        let root =
+            std::env::temp_dir().join(format!("fresh-gui-named-draft-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("note.txt");
+        std::fs::write(&source, "original").unwrap();
+        let recovery = root.join("recovery");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let editor = EditorHandle::spawn_with_recovery_dir(
+            root.clone(),
+            crate::config::Config::default(),
+            recovery.clone(),
+        )
+        .unwrap();
+        let draft_id = rt.block_on(async {
+            let opened = editor
+                .open_in_workspace(source.clone(), false, "workspace-named".into())
+                .await
+                .unwrap();
+            editor
+                .edit(opened.buffer_id, opened.rev, "unsaved change".into())
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read_to_string(&source).unwrap(), "original");
+            opened.draft_id
+        });
+        drop(editor);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let restarted = EditorHandle::spawn_with_recovery_dir(
+            root.clone(),
+            crate::config::Config::default(),
+            recovery,
+        )
+        .unwrap();
+        rt.block_on(async {
+            let (opened, changed) = restarted
+                .draft_restore("workspace-named".into(), draft_id)
+                .await
+                .unwrap();
+            assert!(!changed);
+            assert_eq!(opened.text, "unsaved change");
+            restarted
+                .save(opened.buffer_id, opened.rev, None)
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read_to_string(&source).unwrap(), "unsaved change");
+            assert!(
+                restarted
+                    .draft_list("workspace-named".into())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+        drop(restarted);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_named_source_restores_as_dirty_reviewable_buffer() {
+        let root =
+            std::env::temp_dir().join(format!("fresh-gui-missing-draft-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let recovery = root.join("recovery");
+        let missing = root.join("deleted.txt");
+        let store = DraftStore::new(recovery.clone());
+        store
+            .checkpoint(
+                "workspace",
+                Draft {
+                    draft_id: "named-missing".into(),
+                    path: Some(missing.display().to_string()),
+                    text: "review this".into(),
+                    base_text: Some("old source".into()),
+                },
+            )
+            .unwrap();
+        let editor = EditorHandle::spawn_with_recovery_dir(
+            root.clone(),
+            crate::config::Config::default(),
+            recovery,
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (opened, changed) = editor
+                .draft_restore("workspace".into(), "named-missing".into())
+                .await
+                .unwrap();
+            assert!(changed);
+            assert_eq!(opened.path, missing.display().to_string());
+            assert_eq!(opened.text, "review this");
+            let scene = editor.scene().await.unwrap();
+            assert!(
+                scene
+                    .buffers
+                    .iter()
+                    .any(|buffer| buffer.buffer_id == opened.buffer_id && buffer.dirty)
+            );
+            editor.draft_discard(opened.buffer_id).await.unwrap();
+        });
+        drop(editor);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn range_transactions_validate_byte_offsets_stale_revisions_and_fresh_undo_redo() {
+        let root =
+            std::env::temp_dir().join(format!("fresh-gui-range-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let editor = EditorHandle::spawn(root.clone(), crate::config::Config::default())
+            .expect("Fresh worker starts");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let opened = editor.new_buffer().await.unwrap();
             // Deliberately leave another buffer active while targeting `opened`.
             let other = editor.new_buffer().await.unwrap();
-            let initial = editor.range_edit(opened.buffer_id.clone(), "view-a".into(), 0, vec![
-                RangeEdit { start: 0, end: 0, text: "a🙂界z".into() },
-                // The second edit addresses the text after the first edit;
-                // the emoji occupies four UTF-8 bytes.
-                RangeEdit { start: 1, end: 5, text: "🧪".into() },
-            ], ByteSelection { anchor: 1, head: 5 }).await.unwrap();
+            let initial = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "view-a".into(),
+                    0,
+                    vec![
+                        RangeEdit {
+                            start: 0,
+                            end: 0,
+                            text: "a🙂界z".into(),
+                        },
+                        // The second edit addresses the text after the first edit;
+                        // the emoji occupies four UTF-8 bytes.
+                        RangeEdit {
+                            start: 1,
+                            end: 5,
+                            text: "🧪".into(),
+                        },
+                    ],
+                    ByteSelection { anchor: 1, head: 5 },
+                )
+                .await
+                .unwrap();
             assert!(initial.accepted);
             assert_eq!(initial.text, "a🧪界z");
             assert_eq!(initial.rev, 1);
@@ -1230,29 +1859,81 @@ mod tests {
             assert_eq!(editor.sync(other.buffer_id.clone()).await.unwrap().text, "");
 
             // A stale transaction returns the current snapshot without changing it.
-            let stale = editor.range_edit(opened.buffer_id.clone(), "view-a".into(), 0, vec![
-                RangeEdit { start: 0, end: 0, text: "lost".into() },
-            ], initial.selection).await.unwrap();
+            let stale = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "view-a".into(),
+                    0,
+                    vec![RangeEdit {
+                        start: 0,
+                        end: 0,
+                        text: "lost".into(),
+                    }],
+                    initial.selection,
+                )
+                .await
+                .unwrap();
             assert!(!stale.accepted);
             assert_eq!(stale.rev, 1);
             assert_eq!(stale.text, "a🧪界z");
 
-            let appended = editor.range_edit(opened.buffer_id.clone(), "view-a".into(), 1, vec![
-                RangeEdit { start: 9, end: 9, text: "!".into() },
-            ], ByteSelection { anchor: 10, head: 10 }).await.unwrap();
+            let appended = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "view-a".into(),
+                    1,
+                    vec![RangeEdit {
+                        start: 9,
+                        end: 9,
+                        text: "!".into(),
+                    }],
+                    ByteSelection {
+                        anchor: 10,
+                        head: 10,
+                    },
+                )
+                .await
+                .unwrap();
             assert!(appended.accepted);
             assert_eq!(appended.text, "a🧪界z!");
             assert_eq!(appended.rev, 2);
 
-            let undo_append = editor.action(opened.buffer_id.clone(), "view-a".into(), 2, EditorAction::Undo, appended.selection).await.unwrap();
+            let undo_append = editor
+                .action(
+                    opened.buffer_id.clone(),
+                    "view-a".into(),
+                    2,
+                    EditorAction::Undo,
+                    appended.selection,
+                )
+                .await
+                .unwrap();
             assert_eq!(undo_append.text, "a🧪界z");
             assert_eq!(undo_append.rev, 3);
             assert_eq!(undo_append.selection, ByteSelection { anchor: 1, head: 5 });
-            let undo_group = editor.action(opened.buffer_id.clone(), "view-a".into(), 3, EditorAction::Undo, undo_append.selection).await.unwrap();
+            let undo_group = editor
+                .action(
+                    opened.buffer_id.clone(),
+                    "view-a".into(),
+                    3,
+                    EditorAction::Undo,
+                    undo_append.selection,
+                )
+                .await
+                .unwrap();
             assert_eq!(undo_group.text, "");
             assert_eq!(undo_group.rev, 4);
             assert_eq!(undo_group.selection, ByteSelection { anchor: 0, head: 0 });
-            let redo_group = editor.action(opened.buffer_id.clone(), "view-a".into(), 4, EditorAction::Redo, undo_group.selection).await.unwrap();
+            let redo_group = editor
+                .action(
+                    opened.buffer_id.clone(),
+                    "view-a".into(),
+                    4,
+                    EditorAction::Redo,
+                    undo_group.selection,
+                )
+                .await
+                .unwrap();
             assert_eq!(redo_group.text, "a🧪界z");
             assert_eq!(redo_group.rev, 5);
             assert_eq!(redo_group.selection, initial.selection);
@@ -1263,12 +1944,31 @@ mod tests {
             assert_eq!(synced.text, "a🧪界z");
             assert_eq!(synced.rev, 5);
 
-            let invalid = editor.range_edit(opened.buffer_id.clone(), "view-a".into(), 5, vec![
-                RangeEdit { start: 9, end: 9, text: "partial".into() },
-                // A later invalid operation must reject the whole transaction.
-                RangeEdit { start: 2, end: 3, text: String::new() },
-            ], redo_group.selection).await;
-            assert!(invalid.is_err(), "mid-character byte offsets must be rejected");
+            let invalid = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "view-a".into(),
+                    5,
+                    vec![
+                        RangeEdit {
+                            start: 9,
+                            end: 9,
+                            text: "partial".into(),
+                        },
+                        // A later invalid operation must reject the whole transaction.
+                        RangeEdit {
+                            start: 2,
+                            end: 3,
+                            text: String::new(),
+                        },
+                    ],
+                    redo_group.selection,
+                )
+                .await;
+            assert!(
+                invalid.is_err(),
+                "mid-character byte offsets must be rejected"
+            );
             let after_invalid = editor.sync(opened.buffer_id.clone()).await.unwrap();
             assert_eq!(after_invalid.text, "a🧪界z");
             assert_eq!(after_invalid.rev, 5);
@@ -1357,8 +2057,11 @@ while True:
 
     #[test]
     fn incremental_lsp_applies_unicode_and_newline_range_batch_undo_redo() {
-        if !fresh::services::lsp::command_exists("python3") { return; }
-        let root = std::env::temp_dir().join(format!("fresh-gui-lsp-range-test-{}", uuid::Uuid::new_v4()));
+        if !fresh::services::lsp::command_exists("python3") {
+            return;
+        }
+        let root =
+            std::env::temp_dir().join(format!("fresh-gui-lsp-range-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let script_path = root.join("fake_lsp.py");
         std::fs::write(&script_path, FAKE_LSP).unwrap();
@@ -1371,54 +2074,153 @@ while True:
             "lsp": { "python": { "name":"Incremental", "command":"python3", "args":[script_path.display().to_string(), "Incremental"], "only_features":["diagnostics"] } }
         }).to_string()).unwrap();
         let editor = EditorHandle::spawn(root.clone(), cfg).expect("Fresh worker starts");
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             async fn wait_documents(path: &str, wanted: usize) -> Vec<String> {
                 for _ in 0..120 {
                     let contents = std::fs::read_to_string(path).unwrap_or_default();
-                    let documents: Vec<String> = contents.lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
-                    if documents.len() >= wanted { return documents; }
+                    let documents: Vec<String> = contents
+                        .lines()
+                        .filter_map(|line| serde_json::from_str(line).ok())
+                        .collect();
+                    if documents.len() >= wanted {
+                        return documents;
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                 }
-                panic!("LSP did not apply {wanted} document updates; log: {}", std::fs::read_to_string(path).unwrap_or_default());
+                panic!(
+                    "LSP did not apply {wanted} document updates; log: {}",
+                    std::fs::read_to_string(path).unwrap_or_default()
+                );
             }
 
             let opened = editor.open(source.clone(), false).await.unwrap();
             wait_documents(&log_path, 1).await;
             // Both ranges address sequential text: replace emoji + CJK on the
             // first line, then replace a line with text containing a newline.
-            let edited = editor.range_edit(opened.buffer_id.clone(), "view-lsp".into(), opened.rev, vec![
-                RangeEdit { start: 1, end: 8, text: "😃中".into() },
-                RangeEdit { start: 10, end: 13, text: "新🙂\nnext".into() },
-            ], ByteSelection { anchor: 1, head: 8 }).await.unwrap();
+            let edited = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "view-lsp".into(),
+                    opened.rev,
+                    vec![
+                        RangeEdit {
+                            start: 1,
+                            end: 8,
+                            text: "😃中".into(),
+                        },
+                        RangeEdit {
+                            start: 10,
+                            end: 13,
+                            text: "新🙂\nnext".into(),
+                        },
+                    ],
+                    ByteSelection { anchor: 1, head: 8 },
+                )
+                .await
+                .unwrap();
             let edited_text = "a😃中z\n新🙂\nnext\n";
             assert_eq!(edited.text, edited_text);
             let reopened = editor.open(source, false).await.unwrap();
             assert_eq!(reopened.buffer_id, opened.buffer_id);
-            assert!(editor.scene().await.unwrap().buffers.iter().find(|buffer| buffer.buffer_id == opened.buffer_id).unwrap().dirty,
-                "reopening a modified Fresh buffer must preserve its dirty state");
+            assert!(
+                editor
+                    .scene()
+                    .await
+                    .unwrap()
+                    .buffers
+                    .iter()
+                    .find(|buffer| buffer.buffer_id == opened.buffer_id)
+                    .unwrap()
+                    .dirty,
+                "reopening a modified Fresh buffer must preserve its dirty state"
+            );
             let docs = wait_documents(&log_path, 2).await;
             assert_eq!(docs[0], original);
-            assert_eq!(docs[1], edited_text, "LSP applied the range changes using UTF-16 positions");
+            assert_eq!(
+                docs[1], edited_text,
+                "LSP applied the range changes using UTF-16 positions"
+            );
 
-            let undone = editor.action(opened.buffer_id.clone(), "view-lsp".into(), edited.rev, EditorAction::Undo, edited.selection).await.unwrap();
+            let undone = editor
+                .action(
+                    opened.buffer_id.clone(),
+                    "view-lsp".into(),
+                    edited.rev,
+                    EditorAction::Undo,
+                    edited.selection,
+                )
+                .await
+                .unwrap();
             assert_eq!(undone.text, original);
             assert_eq!(undone.selection, ByteSelection { anchor: 0, head: 0 });
-            assert!(!editor.scene().await.unwrap().buffers.iter().find(|buffer| buffer.buffer_id == opened.buffer_id).unwrap().dirty,
-                "undo to Fresh's save point must clear ADE dirty state");
+            assert!(
+                !editor
+                    .scene()
+                    .await
+                    .unwrap()
+                    .buffers
+                    .iter()
+                    .find(|buffer| buffer.buffer_id == opened.buffer_id)
+                    .unwrap()
+                    .dirty,
+                "undo to Fresh's save point must clear ADE dirty state"
+            );
             let docs = wait_documents(&log_path, 3).await;
-            assert_eq!(docs[2], original, "Fresh undo range changes reconstruct the document");
+            assert_eq!(
+                docs[2], original,
+                "Fresh undo range changes reconstruct the document"
+            );
 
-            let redone = editor.action(opened.buffer_id.clone(), "view-lsp".into(), undone.rev, EditorAction::Redo, undone.selection).await.unwrap();
+            let redone = editor
+                .action(
+                    opened.buffer_id.clone(),
+                    "view-lsp".into(),
+                    undone.rev,
+                    EditorAction::Redo,
+                    undone.selection,
+                )
+                .await
+                .unwrap();
             assert_eq!(redone.text, edited_text);
             assert_eq!(redone.selection, edited.selection);
-            assert!(editor.scene().await.unwrap().buffers.iter().find(|buffer| buffer.buffer_id == opened.buffer_id).unwrap().dirty);
+            assert!(
+                editor
+                    .scene()
+                    .await
+                    .unwrap()
+                    .buffers
+                    .iter()
+                    .find(|buffer| buffer.buffer_id == opened.buffer_id)
+                    .unwrap()
+                    .dirty
+            );
             let docs = wait_documents(&log_path, 4).await;
-            assert_eq!(docs[3], edited_text, "Fresh redo range changes reconstruct the document");
-            let change_groups: Vec<Vec<serde_json::Value>> = std::fs::read_to_string(&change_log_path).unwrap().lines()
-                .map(|line| serde_json::from_str(line).unwrap()).collect();
-            assert_eq!(change_groups.len(), 3, "forward edit, undo, and redo each notify once");
-            assert!(change_groups.iter().flatten().all(|change| change.get("range").is_some()), "incremental LSP sync must carry ranges, not whole-document replacements");
+            assert_eq!(
+                docs[3], edited_text,
+                "Fresh redo range changes reconstruct the document"
+            );
+            let change_groups: Vec<Vec<serde_json::Value>> =
+                std::fs::read_to_string(&change_log_path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+            assert_eq!(
+                change_groups.len(),
+                3,
+                "forward edit, undo, and redo each notify once"
+            );
+            assert!(
+                change_groups
+                    .iter()
+                    .flatten()
+                    .all(|change| change.get("range").is_some()),
+                "incremental LSP sync must carry ranges, not whole-document replacements"
+            );
             editor.close(opened.buffer_id).await.unwrap();
         });
         drop(editor);
@@ -1504,14 +2306,24 @@ while True:
             );
             let formatted = editor.format(opened.buffer_id.clone(), rev).await.unwrap();
             assert_eq!(formatted.text.as_deref(), Some("formatted = true\n"));
-            let stale = editor.range_edit(
-                opened.buffer_id.clone(),
-                "view-format".into(),
-                rev,
-                vec![RangeEdit { start: 0, end: 0, text: "stale".into() }],
-                ByteSelection { anchor: 0, head: 0 },
-            ).await.unwrap();
-            assert!(!stale.accepted, "Fresh/LSP formatting advances the ADE revision");
+            let stale = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "view-format".into(),
+                    rev,
+                    vec![RangeEdit {
+                        start: 0,
+                        end: 0,
+                        text: "stale".into(),
+                    }],
+                    ByteSelection { anchor: 0, head: 0 },
+                )
+                .await
+                .unwrap();
+            assert!(
+                !stale.accepted,
+                "Fresh/LSP formatting advances the ADE revision"
+            );
             assert_eq!(stale.rev, formatted.rev);
             assert_eq!(stale.text, "formatted = true\n");
             editor.close(opened.buffer_id).await.unwrap();

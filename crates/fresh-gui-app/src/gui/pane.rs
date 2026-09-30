@@ -1645,12 +1645,14 @@ pub struct EditorPanel {
     dirty: bool,
     diagnostics: Vec<BufferDiagnostic>,
     lsp_status: Option<String>,
+    recovery_warning: Option<String>,
     format_pending_text: Option<String>,
     format_sent_selection: Option<ByteSelection>,
     format_request_id: Option<String>,
     rev: u64,
     view_id: String,
     range_edits: bool,
+    draft_recovery: bool,
     transport_connected: bool,
     edit_sync: Option<EditSync>,
     edit_flush_scheduled: bool,
@@ -1746,12 +1748,14 @@ impl EditorPanel {
             dirty: false,
             diagnostics: Vec::new(),
             lsp_status: None,
+            recovery_warning: None,
             format_pending_text: None,
             format_sent_selection: None,
             format_request_id: None,
             rev: 0,
             view_id,
             range_edits: false,
+            draft_recovery: false,
             transport_connected: true,
             edit_sync: unsaved.then(|| EditSync::new(String::new(), 0)),
             edit_flush_scheduled: false,
@@ -1820,6 +1824,41 @@ impl EditorPanel {
         self.range_edits = enabled;
         // EditorOpen/New always supplies the initial BufferSnapshot. Do not
         // race it with a second snapshot that could undo its reveal position.
+        cx.notify();
+    }
+
+    pub fn configure_draft_recovery(&mut self, enabled: bool) {
+        self.draft_recovery = enabled;
+    }
+
+    /// Retention is established by a durable daemon acknowledgement for exactly
+    /// the visible text. Capability negotiation alone never authorizes closing.
+    pub fn recovery_guaranteed(&self, cx: &App) -> bool {
+        self.draft_recovery && self.transport_connected && !self.conflict
+            && !self.sync_paused && self.edit_request_id.is_none()
+            && self.sync_request_id.is_none() && !self.action_inflight
+            && self.save_request_id.is_none() && !self.format_inflight
+            && self.edit_sync.as_ref().is_some_and(|sync| sync.acknowledged().0 == self.current_text(cx))
+    }
+
+    pub fn flush_for_recovery(&mut self, cx: &mut Context<Self>) {
+        self.flush_pending(cx);
+    }
+
+    pub fn save_in_progress(&self) -> bool {
+        self.pending_save.is_some() || self.save_request_id.is_some() || self.edit_request_id.is_some()
+    }
+
+    pub fn discard_recovery(&mut self, _cx: &mut Context<Self>) {
+        if self.draft_recovery && self.transport_connected {
+            let request_id = self.next_edit_request("discard");
+            self.ade.send(AdeCmd::DiscardDraft { request_id, buffer_id: self.buffer_id.clone() });
+        }
+    }
+
+    pub fn note_recovery_warning(&mut self, message: String, cx: &mut Context<Self>) {
+        self.recovery_warning = Some(message);
+        self.dirty = true;
         cx.notify();
     }
 
@@ -2025,6 +2064,9 @@ impl EditorPanel {
     /// Compact file-scoped information for the workspace status bar.
     pub fn status_summary(&self) -> String {
         let mut parts = vec![format!("{} problems", self.diagnostics.len())];
+        if let Some(warning) = self.recovery_warning.as_ref() {
+            parts.push(warning.clone());
+        }
         if let Some(status) = self.lsp_status.as_deref() {
             parts.push(status.to_string());
         }
@@ -2038,7 +2080,9 @@ impl EditorPanel {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.dirty
+        // The legacy opening snapshot omits Fresh's modified state. Treat a
+        // pending authoritative sync as potentially dirty until it replies.
+        self.dirty || self.sync_request_id.is_some()
     }
 
     pub fn is_unsaved(&self) -> bool {
@@ -2407,7 +2451,7 @@ impl EditorPanel {
         self.pending_format = false;
         self.save_request_id = None;
         self.save_sent_text = None;
-        self.lsp_status = Some("Untitled draft kept; reconnect recovery is not available yet".into());
+        self.lsp_status = Some("Untitled draft kept locally; awaiting daemon reattachment".into());
         cx.notify();
     }
 
@@ -2687,6 +2731,7 @@ impl EditorPanel {
         self.path = path;
         self.unsaved = false;
         self.unsaved_title = None;
+        self.recovery_warning = None;
         self.rev = rev;
         self.save_request_id = None;
         let saved_text = self.save_sent_text.take();
@@ -2744,6 +2789,12 @@ impl Focusable for EditorPanel {
 }
 
 impl BasePanel for EditorPanel {
+    // Native dock close actions are captured by Workspace. Refuse any direct
+    // dock removal that bypasses its asynchronous retention/prompt guard.
+    fn closable(&self, cx: &App) -> bool {
+        !self.is_dirty() || self.recovery_guaranteed(cx)
+    }
+
     fn panel_name(&self) -> &'static str {
         "Editor"
     }
@@ -2827,7 +2878,7 @@ impl DockPanel for EditorPanel {
         cx: &mut Context<Self>,
     ) -> PopupMenu {
         let panel_id = PanelId::from(cx.entity().entity_id());
-        with_close_items(menu, self.workspace.clone(), panel_id, false, cx)
+        with_close_items(menu, self.workspace.clone(), panel_id, true, cx)
     }
 
     fn zoom_control(&self, _: &App) -> Option<PanelControl> {
@@ -3684,6 +3735,12 @@ pub(super) fn with_close_items(
                 },
             ),
         );
+    }
+    if workspace.read_with(cx, |workspace, cx| workspace.tab_has_dirty_draft(panel_id, cx)).unwrap_or(false) {
+        let discard_workspace = workspace.clone();
+        menu = menu.item(PopupMenuItem::new("Discard Draft and Close").on_click(move |_, window, cx| {
+            discard_workspace.update(cx, |workspace, cx| workspace.discard_panel_id(panel_id, window, cx)).ok();
+        }));
     }
     let workspace_others = workspace.clone();
     let workspace_right = workspace.clone();

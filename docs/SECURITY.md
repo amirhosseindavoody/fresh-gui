@@ -17,3 +17,5 @@ Workspace metadata is saved separately in the daemon's state directory. It conta
 `--allow-no-auth` is intended for local tests and only works with a loopback bind. The daemon rejects combining it with a non-loopback address.
 
 For install and remote connection commands, see the [README](../README.md).
+
+Daemon recovery copies contain unsaved editor text and are stored beside workspace state in `workspaces.drafts/`. On Unix the recovery directory is created with mode `0700` and recovery files with mode `0600`; Windows uses the state directory’s inherited ACLs. Local and SSH clients access these copies through the authenticated ADE protocol, scoped to their attached workspace.

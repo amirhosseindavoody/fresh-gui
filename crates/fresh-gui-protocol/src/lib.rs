@@ -20,6 +20,8 @@ pub const CAP_WORKSPACE_SET_ROOT: &str = "workspace_set_root";
 pub const CAP_EDITOR: &str = "editor";
 /// Revisioned Fresh-backed editor transactions and actions.
 pub const CAP_EDITOR_RANGE_EDITS: &str = "editor.range-edits";
+/// Durable daemon-owned dirty-buffer recovery.
+pub const CAP_EDITOR_DRAFT_RECOVERY: &str = "editor.draft-recovery";
 pub const CAP_LSP: &str = "lsp";
 pub const CAP_SCENE: &str = "scene";
 /// Workspace git status, diff, and stage/commit/pull/push. Absent on older daemons.
@@ -72,8 +74,15 @@ pub struct WorkspaceLayoutExtra {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LayoutNode {
-    Split { axis: String, children: Vec<LayoutNode>, sizes: Vec<Option<f32>> },
-    Tabs { tabs: Vec<u32>, active: u32 },
+    Split {
+        axis: String,
+        children: Vec<LayoutNode>,
+        sizes: Vec<Option<f32>>,
+    },
+    Tabs {
+        tabs: Vec<u32>,
+        active: u32,
+    },
 }
 
 /// UI section mirrored from `config.json` → `Hello.ui`.
@@ -570,6 +579,34 @@ pub enum Message {
     EditorNew {
         request_id: String,
     },
+    /// List recoverable drafts for the subscribed workspace.
+    EditorDraftList {
+        request_id: String,
+    },
+    /// Recovery metadata. Content is returned only by `EditorDraftRestore`.
+    EditorDrafts {
+        request_id: String,
+        drafts: Vec<EditorDraftInfo>,
+    },
+    /// Open a persisted draft in Fresh, retaining its dirty state.
+    EditorDraftRestore {
+        request_id: String,
+        draft_id: String,
+    },
+    /// Permanently remove the recovery copy for a saved/discarded buffer.
+    EditorDraftDiscard {
+        request_id: String,
+        buffer_id: String,
+    },
+    EditorDraftDiscarded {
+        request_id: String,
+        buffer_id: String,
+    },
+    /// The on-disk source differs from the base used when the draft was made.
+    EditorDraftWarning {
+        buffer_id: String,
+        message: String,
+    },
     /// Client → backend: open a path in the Fresh editor (capability `editor`).
     ///
     /// `path` may include a Fresh-style `:line` / `:line:col` suffix. Optional
@@ -604,6 +641,9 @@ pub enum Message {
     EditorOpened {
         request_id: String,
         buffer_id: String,
+        /// Stable daemon recovery identity, distinct from Fresh's process-local buffer id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        draft_id: Option<String>,
         path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         language: Option<String>,
@@ -867,6 +907,14 @@ pub enum Message {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EditorDraftInfo {
+    pub draft_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub source_changed: bool,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
     #[error("unsupported protocol version: {0}")]
@@ -914,6 +962,7 @@ impl Hello {
             CAP_WORKSPACE_SET_ROOT.to_owned(),
             CAP_EDITOR.to_owned(),
             CAP_EDITOR_RANGE_EDITS.to_owned(),
+            CAP_EDITOR_DRAFT_RECOVERY.to_owned(),
             CAP_LSP.to_owned(),
             CAP_SCENE.to_owned(),
             CAP_GIT.to_owned(),
@@ -929,6 +978,7 @@ impl Hello {
             CAP_WORKSPACE.to_owned(),
             CAP_EDITOR.to_owned(),
             CAP_EDITOR_RANGE_EDITS.to_owned(),
+            CAP_EDITOR_DRAFT_RECOVERY.to_owned(),
             CAP_LSP.to_owned(),
             CAP_SCENE.to_owned(),
             CAP_GIT.to_owned(),
@@ -952,9 +1002,18 @@ mod tests {
 
     #[test]
     fn config_reload_and_legacy_config_updated_roundtrip() {
-        assert_eq!(Message::from_json(&Message::ConfigReload.to_json().unwrap()).unwrap(), Message::ConfigReload);
+        assert_eq!(
+            Message::from_json(&Message::ConfigReload.to_json().unwrap()).unwrap(),
+            Message::ConfigReload
+        );
         let old = r#"{"type":"config_updated","shortkeys":[]}"#;
-        assert_eq!(Message::from_json(old).unwrap(), Message::ConfigUpdated { shortkeys: Vec::new(), ui: None });
+        assert_eq!(
+            Message::from_json(old).unwrap(),
+            Message::ConfigUpdated {
+                shortkeys: Vec::new(),
+                ui: None
+            }
+        );
     }
 
     #[test]
@@ -977,7 +1036,11 @@ mod tests {
                 buffer_id: "b1".into(),
                 view_id: "v1".into(),
                 base_rev: 7,
-                edits: vec![RangeEdit { start: 0, end: 4, text: "你好".into() }],
+                edits: vec![RangeEdit {
+                    start: 0,
+                    end: 4,
+                    text: "你好".into(),
+                }],
                 selection,
             },
             Message::BufferAction {
@@ -1005,10 +1068,21 @@ mod tests {
             },
         ];
         for message in messages {
-            assert_eq!(Message::from_json(&message.to_json().unwrap()).unwrap(), message);
+            assert_eq!(
+                Message::from_json(&message.to_json().unwrap()).unwrap(),
+                message
+            );
         }
-        assert!(Hello::default_backend_caps().iter().any(|c| c == CAP_EDITOR_RANGE_EDITS));
-        assert!(Hello::default_client_caps().iter().any(|c| c == CAP_EDITOR_RANGE_EDITS));
+        assert!(
+            Hello::default_backend_caps()
+                .iter()
+                .any(|c| c == CAP_EDITOR_RANGE_EDITS)
+        );
+        assert!(
+            Hello::default_client_caps()
+                .iter()
+                .any(|c| c == CAP_EDITOR_RANGE_EDITS)
+        );
     }
 
     #[test]
@@ -1025,9 +1099,17 @@ mod tests {
             workspace_id: info.id.clone(),
             root: "/tmp/beta".into(),
         };
-        assert_eq!(Message::from_json(&set_root.to_json().unwrap()).unwrap(), set_root);
-        let root_set = Message::WorkspaceRootSet { workspace: info.clone() };
-        assert_eq!(Message::from_json(&root_set.to_json().unwrap()).unwrap(), root_set);
+        assert_eq!(
+            Message::from_json(&set_root.to_json().unwrap()).unwrap(),
+            set_root
+        );
+        let root_set = Message::WorkspaceRootSet {
+            workspace: info.clone(),
+        };
+        assert_eq!(
+            Message::from_json(&root_set.to_json().unwrap()).unwrap(),
+            root_set
+        );
         let listed = Message::WorkspaceListed {
             workspaces: vec![info.clone()],
             focused_id: Some("w1".into()),
@@ -1203,7 +1285,10 @@ mod tests {
             path: "/tmp/a.txt".into(),
             name: "b.txt".into(),
         };
-        assert_eq!(Message::from_json(&rename.to_json().unwrap()).unwrap(), rename);
+        assert_eq!(
+            Message::from_json(&rename.to_json().unwrap()).unwrap(),
+            rename
+        );
         let del = Message::FsDelete {
             request_id: "c4".into(),
             paths: vec!["/tmp/a.txt".into()],
@@ -1237,6 +1322,7 @@ mod tests {
         let opened = Message::EditorOpened {
             request_id: "e2".into(),
             buffer_id: "1".into(),
+            draft_id: Some("draft-1".into()),
             path: "/tmp/proj/src/lib.rs".into(),
             language: Some("rust".into()),
             line: Some(1),
@@ -1246,6 +1332,38 @@ mod tests {
             Message::from_json(&opened.to_json().unwrap()).unwrap(),
             opened
         );
+    }
+
+    #[test]
+    fn draft_recovery_messages_round_trip_and_older_opened_payload_defaults() {
+        let drafts = Message::EditorDrafts {
+            request_id: "list-1".into(),
+            drafts: vec![EditorDraftInfo {
+                draft_id: "untitled:stable".into(),
+                path: None,
+                source_changed: true,
+            }],
+        };
+        assert_eq!(
+            Message::from_json(&drafts.to_json().unwrap()).unwrap(),
+            drafts
+        );
+        for message in [
+            Message::EditorDraftList { request_id: "list".into() },
+            Message::EditorDraftRestore { request_id: "restore".into(), draft_id: "untitled:stable".into() },
+            Message::EditorDraftDiscard { request_id: "discard".into(), buffer_id: "3".into() },
+            Message::EditorDraftDiscarded { request_id: "discard".into(), buffer_id: "3".into() },
+            Message::EditorDraftWarning { buffer_id: "3".into(), message: "Source changed".into() },
+        ] {
+            assert_eq!(Message::from_json(&message.to_json().unwrap()).unwrap(), message);
+        }
+        assert!(Hello::default_client_caps().iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
+        assert!(Hello::default_backend_caps().iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
+        let old_opened = r#"{"type":"editor_opened","request_id":"r","buffer_id":"1","path":"","language":null,"line":null,"column":null}"#;
+        assert!(matches!(
+            Message::from_json(old_opened).unwrap(),
+            Message::EditorOpened { draft_id: None, .. }
+        ));
     }
 
     #[test]
@@ -1278,7 +1396,8 @@ mod tests {
             request
         );
         assert_eq!(
-            Message::from_json(r#"{"type":"git_status","request_id":"g3","workspace_id":"w1"}"#).unwrap(),
+            Message::from_json(r#"{"type":"git_status","request_id":"g3","workspace_id":"w1"}"#)
+                .unwrap(),
             Message::GitStatus {
                 request_id: "g3".into(),
                 workspace_id: "w1".into(),
@@ -1304,7 +1423,10 @@ mod tests {
             status: None,
             text: None,
         };
-        assert_eq!(Message::from_json(&state.to_json().unwrap()).unwrap(), state);
+        assert_eq!(
+            Message::from_json(&state.to_json().unwrap()).unwrap(),
+            state
+        );
         let formatted = Message::BufferFormatted {
             request_id: "format-1".into(),
             buffer_id: "42".into(),
@@ -1312,6 +1434,9 @@ mod tests {
             text: Some("value = 1\n".into()),
             status: None,
         };
-        assert_eq!(Message::from_json(&formatted.to_json().unwrap()).unwrap(), formatted);
+        assert_eq!(
+            Message::from_json(&formatted.to_json().unwrap()).unwrap(),
+            formatted
+        );
     }
 }

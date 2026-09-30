@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use fresh_gui_client::{Client, ConnectOptions};
 use fresh_gui_protocol::{
-    CAP_LSP, CAP_EDITOR_RANGE_EDITS, CAP_WORKSPACE, ByteSelection, RangeEdit, EditorAction, BufferDiagnostic, FsEntry, GitFile, Hello, Message, PtyInfo, WorkspaceInfo, WorkspaceTab,
+    CAP_LSP, CAP_EDITOR_RANGE_EDITS, CAP_WORKSPACE, EditorDraftInfo, ByteSelection, RangeEdit, EditorAction, BufferDiagnostic, FsEntry, GitFile, Hello, Message, PtyInfo, WorkspaceInfo, WorkspaceTab,
 };
 
 use super::connect::ConnectTarget;
@@ -46,6 +46,9 @@ pub enum AdeCmd {
         line: Option<u32>,
         column: Option<u32>,
     },
+    ListDrafts { request_id: String },
+    RestoreDraft { request_id: String, draft_id: String },
+    DiscardDraft { request_id: String, buffer_id: String },
     NewBuffer {
         request_id: String,
     },
@@ -276,9 +279,12 @@ pub enum AdeEvent {
         path: String,
         entries: Vec<FsEntry>,
     },
+    Drafts { request_id: String, drafts: Vec<EditorDraftInfo> },
+    DraftWarning { buffer_id: String, message: String },
     EditorOpened {
         request_id: String,
         buffer_id: String,
+        draft_id: Option<String>,
         path: String,
         language: Option<String>,
         line: Option<u32>,
@@ -556,6 +562,9 @@ async fn ade_loop(
 
 async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
     match cmd {
+        AdeCmd::ListDrafts { request_id } => client.send(Message::EditorDraftList { request_id }).await?,
+        AdeCmd::RestoreDraft { request_id, draft_id } => client.send(Message::EditorDraftRestore { request_id, draft_id }).await?,
+        AdeCmd::DiscardDraft { request_id, buffer_id } => client.send(Message::EditorDraftDiscard { request_id, buffer_id }).await?,
         AdeCmd::OpenPty { cols, rows, cwd } => {
             client
                 .send(Message::PtyOpen {
@@ -1133,9 +1142,12 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             path,
             entries,
         }),
+        Message::EditorDrafts { request_id, drafts } => Some(AdeEvent::Drafts { request_id, drafts }),
+        Message::EditorDraftWarning { buffer_id, message } => Some(AdeEvent::DraftWarning { buffer_id, message }),
         Message::EditorOpened {
             request_id,
             buffer_id,
+            draft_id,
             path,
             language,
             line,
@@ -1143,6 +1155,7 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
         } => Some(AdeEvent::EditorOpened {
             request_id,
             buffer_id,
+            draft_id,
             path,
             language,
             line,
