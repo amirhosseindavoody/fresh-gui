@@ -655,7 +655,7 @@ fn run_loop(
                     continue;
                 }
                 _ = external_ticks.tick() => {
-                    if let Err(err) = poll_external_changes(&mut editor, &mut tracked, &external_tx) { warn!(%err, "external file reconciliation failed"); }
+                    if let Err(err) = poll_external_changes(&mut editor, &mut tracked, &external_tx, &drafts) { warn!(%err, "external file reconciliation failed"); }
                     continue;
                 }
                 cmd = rx.recv() => match cmd { Some(cmd) => cmd, None => break },
@@ -894,12 +894,20 @@ fn run_loop(
                     let _ = reply.send(result);
                 }
                 Cmd::CheckExternal { buffer_id, reply } => {
-                    let result = poll_external_changes(&mut editor, &mut tracked, &external_tx)
+                    let result = poll_external_changes(&mut editor, &mut tracked, &external_tx, &drafts)
                         .and_then(|()| {
                             tracked
                                 .get(&buffer_id)
                                 .context("unknown buffer")
-                                .map(|entry| entry.external.clone())
+                                .map(|entry| entry.external.as_ref().map(|saved| ExternalChange {
+                                    buffer_id: buffer_id.clone(),
+                                    path: saved.path.clone(),
+                                    rev: entry.rev,
+                                    generation: saved.generation.clone(),
+                                    text: entry.text.clone(),
+                                    disk_text: saved.disk_text.clone(),
+                                    dirty: entry.dirty || saved.dirty,
+                                }))
                         });
                     let _ = reply.send(result);
                 }
@@ -1758,6 +1766,7 @@ fn poll_external_changes(
     editor: &mut Editor,
     tracked: &mut HashMap<String, TrackedBuffer>,
     tx: &tokio::sync::broadcast::Sender<ExternalChange>,
+    drafts: &DraftStore,
 ) -> Result<()> {
     let ids: Vec<String> = tracked
         .iter()
@@ -1792,9 +1801,15 @@ fn poll_external_changes(
         }
         let _ = sync_fresh_text(editor, tracked, &id);
         let dirty = tracked.get(&id).is_some_and(|e| e.dirty);
+        if generation.text.is_none() && !dirty {
+            activate_tracked(editor, tracked, &id)?;
+            editor.active_state_mut().buffer.set_modified(true);
+            tracked.get_mut(&id).expect("tracked").dirty = true;
+        }
         if dirty || generation.text.is_none() {
             let notice = external_notice(&id, tracked.get(&id).expect("tracked"), &generation);
             tracked.get_mut(&id).expect("tracked").external = Some(notice.clone());
+            checkpoint(drafts, tracked, &id)?;
             let _ = tx.send(notice);
             continue;
         }
@@ -1836,9 +1851,10 @@ fn poll_external_changes(
         entry.dirty = false;
         entry.base_text = Some(entry.text.clone());
         entry.disk = Some(generation.clone());
-        entry.external = None;
+        let notice = external_notice(&id, entry, &generation);
+        entry.external = Some(notice.clone());
         entry.overwrite_generation = None;
-        let _ = tx.send(external_notice(&id, entry, &generation));
+        let _ = tx.send(notice);
     }
     Ok(())
 }
@@ -1886,12 +1902,16 @@ fn resolve_external(
         ExternalResolution::Keep => {
             let entry = tracked.get_mut(buffer_id).unwrap();
             entry.overwrite_generation = None;
-            entry.external = Some(pending.clone());
+            let mut pending = pending.clone();
+            pending.dirty = true;
+            entry.external = Some(pending);
         }
         ExternalResolution::Overwrite => {
             let entry = tracked.get_mut(buffer_id).unwrap();
             entry.overwrite_generation = Some(generation.to_owned());
-            entry.external = Some(pending.clone());
+            let mut pending = pending.clone();
+            pending.dirty = true;
+            entry.external = Some(pending);
         }
         ExternalResolution::Reload => {
             let target = pending
@@ -1984,10 +2004,9 @@ fn save_buffer(
                 .disk
                 .as_ref()
                 .is_some_and(|known| known.signature != current_disk.signature)
-                || entry
-                    .external
-                    .as_ref()
-                    .is_some_and(|external| external.path == dest.display().to_string())
+                || entry.external.as_ref().is_some_and(|external| {
+                    external.dirty && external.path == dest.display().to_string()
+                })
         } else {
             current_disk.text.is_some()
         };
@@ -2033,7 +2052,9 @@ fn save_buffer(
     let entry = tracked.get_mut(buffer_id).expect("tracked");
     entry.text = text;
     entry.base_text = Some(entry.text.clone());
-    entry.disk = Some(disk_generation(dest)?);
+    entry.disk = Some(disk_generation(
+        entry.path.as_deref().context("saved buffer path")?,
+    )?);
     entry.external = None;
     entry.overwrite_generation = None;
     entry.dirty = false;
