@@ -1784,7 +1784,15 @@ fn poll_external_changes(
         else {
             continue;
         };
-        let generation = disk_generation(&path)?;
+        let generation = match disk_generation(&path) {
+            Ok(generation) => generation,
+            Err(error) => {
+                // One unavailable/oversized path must not stop reconciliation
+                // for all other open files. Saving it still returns this error.
+                warn!(path = %path.display(), %error, "cannot inspect external file");
+                continue;
+            }
+        };
         let changed = tracked
             .get(&id)
             .and_then(|e| e.disk.as_ref())
@@ -2087,6 +2095,7 @@ mod external_generation_tests {
         let tmp = root.join("buffer.tmp");
         std::fs::write(&path, "old text").unwrap();
         let initial = disk_generation(&path).unwrap();
+        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
         std::fs::write(&tmp, "new text").unwrap();
         #[cfg(windows)]
         {
@@ -2097,6 +2106,12 @@ mod external_generation_tests {
         }
         #[cfg(not(windows))]
         std::fs::rename(&tmp, &path).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(original_mtime))
+            .unwrap();
         let replaced = disk_generation(&path).unwrap();
         assert_ne!(
             initial.signature, replaced.signature,
@@ -2169,7 +2184,11 @@ mod external_worker_behavior_tests {
             let mut events = editor.subscribe_external();
 
             // A clean buffer follows disk changes automatically and reports its new revision.
-            std::fs::write(&path, "clean reload").unwrap();
+            let replacement = root.join("source.tmp");
+            std::fs::write(&replacement, "clean reload").unwrap();
+            #[cfg(windows)]
+            std::fs::remove_file(&path).unwrap();
+            std::fs::rename(&replacement, &path).unwrap();
             let clean = next_for(&mut events, &opened.buffer_id).await;
             assert!(!clean.dirty);
             assert_eq!(clean.text, "clean reload");

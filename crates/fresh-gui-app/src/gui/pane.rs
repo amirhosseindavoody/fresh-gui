@@ -2731,11 +2731,11 @@ impl EditorPanel {
             let request_pending = self.edit_request_id.is_some()
                 || self.sync_request_id.is_some()
                 || self.save_request_id.is_some()
-                || self.format_inflight;
+                || self.format_inflight || self.external_request.is_some();
             if !request_pending && (rev > self.rev || self.edit_sync.is_none()) {
                 let draft = self.current_text(cx);
                 if let Some(sync) = self.edit_sync.as_mut() {
-                    match sync.reconcile_snapshot(rev, text.clone(), &draft) {
+                    match sync.reconcile_protected_snapshot(rev, text.clone(), &draft, self.dirty) {
                         SnapshotReconciliation::Adopted => {
                             if draft != text {
                                 let selection = map_selection_through_edits(&draft, &text, self.byte_selection(cx));
