@@ -22,6 +22,8 @@ pub const CAP_EDITOR: &str = "editor";
 pub const CAP_EDITOR_RANGE_EDITS: &str = "editor.range-edits";
 /// Durable daemon-owned dirty-buffer recovery.
 pub const CAP_EDITOR_DRAFT_RECOVERY: &str = "editor.draft-recovery";
+/// Revisioned external file change checks and resolution.
+pub const CAP_EDITOR_EXTERNAL_CHANGES: &str = "editor.external-changes";
 pub const CAP_LSP: &str = "lsp";
 pub const CAP_SCENE: &str = "scene";
 /// Workspace git status, diff, and stage/commit/pull/push. Absent on older daemons.
@@ -147,6 +149,15 @@ fn hello_ui_line_wrap() -> bool {
 pub enum PeerRole {
     Client,
     Backend,
+}
+
+/// Explicit user choice for reconciling a changed file on disk.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalResolution {
+    Reload,
+    Keep,
+    Overwrite,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -734,6 +745,56 @@ pub enum Message {
         path: String,
         rev: u64,
     },
+    /// Client → backend: inspect current disk state for an open buffer.
+    /// Requires `editor.external-changes`; used after reconnect and explorer refresh.
+    BufferExternalCheck {
+        request_id: String,
+        buffer_id: String,
+    },
+    /// Backend → client: the current disk generation and editor draft.
+    BufferExternalChecked {
+        request_id: String,
+        buffer_id: String,
+        found: bool,
+        path: String,
+        rev: u64,
+        generation: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disk_text: Option<String>,
+        dirty: bool,
+    },
+    /// Client → backend: reconcile an already-observed disk generation.
+    BufferExternalResolve {
+        request_id: String,
+        buffer_id: String,
+        base_rev: u64,
+        generation: String,
+        resolution: ExternalResolution,
+    },
+    /// Backend → client: authoritative state after an explicit resolution.
+    BufferExternalResolved {
+        request_id: String,
+        buffer_id: String,
+        rev: u64,
+        generation: String,
+        text: String,
+        selection: ByteSelection,
+        accepted: bool,
+        dirty: bool,
+        resolution: ExternalResolution,
+    },
+    /// Backend → client: unsolicited disk generation change for an open buffer.
+    BufferExternalChanged {
+        buffer_id: String,
+        path: String,
+        rev: u64,
+        generation: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disk_text: Option<String>,
+        dirty: bool,
+    },
     /// Client → backend: fetch the latest LSP state for an open buffer.
     /// The backend also includes a snapshot when asynchronous formatting changed it.
     BufferLspGet {
@@ -963,6 +1024,7 @@ impl Hello {
             CAP_EDITOR.to_owned(),
             CAP_EDITOR_RANGE_EDITS.to_owned(),
             CAP_EDITOR_DRAFT_RECOVERY.to_owned(),
+            CAP_EDITOR_EXTERNAL_CHANGES.to_owned(),
             CAP_LSP.to_owned(),
             CAP_SCENE.to_owned(),
             CAP_GIT.to_owned(),
@@ -979,6 +1041,7 @@ impl Hello {
             CAP_EDITOR.to_owned(),
             CAP_EDITOR_RANGE_EDITS.to_owned(),
             CAP_EDITOR_DRAFT_RECOVERY.to_owned(),
+            CAP_EDITOR_EXTERNAL_CHANGES.to_owned(),
             CAP_LSP.to_owned(),
             CAP_SCENE.to_owned(),
             CAP_GIT.to_owned(),
@@ -1219,6 +1282,49 @@ mod tests {
     }
 
     #[test]
+    fn external_change_messages_roundtrip_and_old_messages_remain_valid() {
+        let changed = Message::BufferExternalChanged {
+            buffer_id: "b1".into(),
+            path: "/tmp/a.rs".into(),
+            rev: 7,
+            generation: "g2".into(),
+            text: "draft".into(),
+            disk_text: Some("disk".into()),
+            dirty: true,
+        };
+        assert_eq!(
+            Message::from_json(&changed.to_json().unwrap()).unwrap(),
+            changed
+        );
+
+        let resolve = Message::BufferExternalResolve {
+            request_id: "r1".into(),
+            buffer_id: "b1".into(),
+            base_rev: 7,
+            generation: "g2".into(),
+            resolution: ExternalResolution::Overwrite,
+        };
+        let json = resolve.to_json().unwrap();
+        assert!(json.contains("\"resolution\":\"overwrite\""));
+        assert_eq!(Message::from_json(&json).unwrap(), resolve);
+
+        let legacy = r#"{"type":"buffer_save","request_id":"r4","buffer_id":"1","base_rev":3}"#;
+        assert!(
+            matches!(Message::from_json(legacy).unwrap(), Message::BufferSave { path, .. } if path.is_empty())
+        );
+        assert!(
+            Hello::default_client_caps()
+                .iter()
+                .any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES)
+        );
+        assert!(
+            Hello::default_backend_caps()
+                .iter()
+                .any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES)
+        );
+    }
+
+    #[test]
     fn scene_snapshot_roundtrips() {
         let msg = Message::SceneSnapshot {
             request_id: "s1".into(),
@@ -1349,16 +1455,41 @@ mod tests {
             drafts
         );
         for message in [
-            Message::EditorDraftList { request_id: "list".into() },
-            Message::EditorDraftRestore { request_id: "restore".into(), draft_id: "untitled:stable".into() },
-            Message::EditorDraftDiscard { request_id: "discard".into(), buffer_id: "3".into() },
-            Message::EditorDraftDiscarded { request_id: "discard".into(), buffer_id: "3".into() },
-            Message::EditorDraftWarning { buffer_id: "3".into(), message: "Source changed".into() },
+            Message::EditorDraftList {
+                request_id: "list".into(),
+            },
+            Message::EditorDraftRestore {
+                request_id: "restore".into(),
+                draft_id: "untitled:stable".into(),
+            },
+            Message::EditorDraftDiscard {
+                request_id: "discard".into(),
+                buffer_id: "3".into(),
+            },
+            Message::EditorDraftDiscarded {
+                request_id: "discard".into(),
+                buffer_id: "3".into(),
+            },
+            Message::EditorDraftWarning {
+                buffer_id: "3".into(),
+                message: "Source changed".into(),
+            },
         ] {
-            assert_eq!(Message::from_json(&message.to_json().unwrap()).unwrap(), message);
+            assert_eq!(
+                Message::from_json(&message.to_json().unwrap()).unwrap(),
+                message
+            );
         }
-        assert!(Hello::default_client_caps().iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
-        assert!(Hello::default_backend_caps().iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
+        assert!(
+            Hello::default_client_caps()
+                .iter()
+                .any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY)
+        );
+        assert!(
+            Hello::default_backend_caps()
+                .iter()
+                .any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY)
+        );
         let old_opened = r#"{"type":"editor_opened","request_id":"r","buffer_id":"1","path":"","language":null,"line":null,"column":null}"#;
         assert!(matches!(
             Message::from_json(old_opened).unwrap(),

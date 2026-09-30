@@ -236,6 +236,7 @@ pub struct DiffPanel {
     ready: bool,
     word_wrap: bool,
     binary: bool,
+    comparison_only: bool,
     note: String,
     focus: FocusHandle,
     workspace: WeakEntity<Workspace>,
@@ -333,6 +334,7 @@ impl DiffPanel {
             ready: false,
             word_wrap: true,
             binary: false,
+            comparison_only: false,
             note: "Loading diff…".into(),
             focus: cx.focus_handle(),
             workspace,
@@ -381,6 +383,22 @@ impl DiffPanel {
         cx.notify();
     }
 
+    pub fn show_external_comparison(
+        &mut self, disk: String, draft: String, deleted: bool,
+        window: &mut Window, cx: &mut Context<Self>,
+    ) {
+        self.comparison_only = true;
+        self.show_sides(disk, draft.clone(), false, false, window, cx);
+        self.editor.update(cx, |state, cx| state.set_value(draft, window, cx));
+        self.dirty = false;
+        self.ready = true;
+        self.note = if deleted { "Disk: deleted · Right: retained draft (comparison snapshot)" }
+            else { "Left: disk · Right: local draft (comparison snapshot)" }.into();
+        let text = self.editor.read(cx).value().to_string();
+        self.right_diff_decorations.set(build_right_diff_decorations(&text, &self.rows, cx), cx);
+        cx.notify();
+    }
+
     pub fn set_buffer(&mut self, buffer_id: String) { self.buffer_id = Some(buffer_id); }
     pub fn set_word_wrap(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.word_wrap == enabled { return; }
@@ -423,6 +441,9 @@ impl DiffPanel {
     }
 
     fn label(&self) -> String {
+        if self.comparison_only {
+            return format!("{} (disk / draft)", path_basename(&display_path(&self.title_path)).unwrap_or(&self.title_path));
+        }
         let shown = display_path(&self.title_path);
         let name = path_basename(&shown).unwrap_or(self.rel.as_str());
         if self.pinned {
@@ -621,7 +642,7 @@ impl Render for DiffPanel {
                                 .into_any_element()
                         } else {
                             div().w(relative(0.5)).h_full().min_w_0()
-                                .child(Editor::new(&self.editor).bordered(false).p_0().size_full().text_size(px(12.)).font_family(cx.theme().mono_font_family.clone()))
+                                .child(Editor::new(&self.editor).readonly(self.comparison_only).bordered(false).p_0().size_full().text_size(px(12.)).font_family(cx.theme().mono_font_family.clone()))
                                 .into_any_element()
                         }))
             )

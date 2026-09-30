@@ -1,12 +1,14 @@
 //! Tokio ADE worker thread. GPUI talks to it through channels.
 
+use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
-use std::collections::HashMap;
 
 use fresh_gui_client::{Client, ConnectOptions};
 use fresh_gui_protocol::{
-    CAP_LSP, CAP_EDITOR_RANGE_EDITS, CAP_WORKSPACE, EditorDraftInfo, ByteSelection, RangeEdit, EditorAction, BufferDiagnostic, FsEntry, GitFile, Hello, Message, PtyInfo, WorkspaceInfo, WorkspaceTab,
+    BufferDiagnostic, ByteSelection, CAP_EDITOR_EXTERNAL_CHANGES, CAP_EDITOR_RANGE_EDITS, CAP_LSP,
+    CAP_WORKSPACE, EditorAction, EditorDraftInfo, ExternalResolution, FsEntry, GitFile, Hello,
+    Message, PtyInfo, RangeEdit, WorkspaceInfo, WorkspaceTab,
 };
 
 use super::connect::ConnectTarget;
@@ -46,9 +48,17 @@ pub enum AdeCmd {
         line: Option<u32>,
         column: Option<u32>,
     },
-    ListDrafts { request_id: String },
-    RestoreDraft { request_id: String, draft_id: String },
-    DiscardDraft { request_id: String, buffer_id: String },
+    ListDrafts {
+        request_id: String,
+    },
+    RestoreDraft {
+        request_id: String,
+        draft_id: String,
+    },
+    DiscardDraft {
+        request_id: String,
+        buffer_id: String,
+    },
     NewBuffer {
         request_id: String,
     },
@@ -84,6 +94,17 @@ pub enum AdeCmd {
         request_id: String,
         buffer_id: String,
         view_id: String,
+    },
+    CheckExternal {
+        request_id: String,
+        buffer_id: String,
+    },
+    ResolveExternal {
+        request_id: String,
+        buffer_id: String,
+        base_rev: u64,
+        generation: String,
+        resolution: ExternalResolution,
     },
     SaveBuffer {
         request_id: String,
@@ -279,8 +300,14 @@ pub enum AdeEvent {
         path: String,
         entries: Vec<FsEntry>,
     },
-    Drafts { request_id: String, drafts: Vec<EditorDraftInfo> },
-    DraftWarning { buffer_id: String, message: String },
+    Drafts {
+        request_id: String,
+        drafts: Vec<EditorDraftInfo>,
+    },
+    DraftWarning {
+        buffer_id: String,
+        message: String,
+    },
     EditorOpened {
         request_id: String,
         buffer_id: String,
@@ -310,6 +337,25 @@ pub enum AdeEvent {
         selection: ByteSelection,
         accepted: bool,
         dirty: bool,
+    },
+    ExternalChanged {
+        buffer_id: String,
+        path: String,
+        rev: u64,
+        generation: String,
+        text: String,
+        disk_text: Option<String>,
+        dirty: bool,
+    },
+    ExternalResolved {
+        request_id: String,
+        buffer_id: String,
+        rev: u64,
+        generation: String,
+        text: String,
+        accepted: bool,
+        dirty: bool,
+        resolution: ExternalResolution,
     },
     BufferSaved {
         request_id: String,
@@ -474,7 +520,10 @@ async fn ade_loop(
     };
 
     let lsp_enabled = hello.capabilities.iter().any(|cap| cap == CAP_LSP);
-    let range_enabled = hello.capabilities.iter().any(|cap| cap == CAP_EDITOR_RANGE_EDITS);
+    let range_enabled = hello
+        .capabilities
+        .iter()
+        .any(|cap| cap == CAP_EDITOR_RANGE_EDITS);
     let _ = evt_tx
         .send(AdeEvent::Connected {
             hello: Box::new(hello),
@@ -562,9 +611,31 @@ async fn ade_loop(
 
 async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
     match cmd {
-        AdeCmd::ListDrafts { request_id } => client.send(Message::EditorDraftList { request_id }).await?,
-        AdeCmd::RestoreDraft { request_id, draft_id } => client.send(Message::EditorDraftRestore { request_id, draft_id }).await?,
-        AdeCmd::DiscardDraft { request_id, buffer_id } => client.send(Message::EditorDraftDiscard { request_id, buffer_id }).await?,
+        AdeCmd::ListDrafts { request_id } => {
+            client.send(Message::EditorDraftList { request_id }).await?
+        }
+        AdeCmd::RestoreDraft {
+            request_id,
+            draft_id,
+        } => {
+            client
+                .send(Message::EditorDraftRestore {
+                    request_id,
+                    draft_id,
+                })
+                .await?
+        }
+        AdeCmd::DiscardDraft {
+            request_id,
+            buffer_id,
+        } => {
+            client
+                .send(Message::EditorDraftDiscard {
+                    request_id,
+                    buffer_id,
+                })
+                .await?
+        }
         AdeCmd::OpenPty { cols, rows, cwd } => {
             client
                 .send(Message::PtyOpen {
@@ -588,7 +659,9 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
             client.send(Message::FsList { request_id, path }).await?;
         }
         AdeCmd::AuthorizeDir { request_id, path } => {
-            client.send(Message::FsAuthorize { request_id, path }).await?;
+            client
+                .send(Message::FsAuthorize { request_id, path })
+                .await?;
         }
         AdeCmd::OpenEditor {
             request_id,
@@ -706,6 +779,42 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
                 .await?;
         }
 
+        AdeCmd::CheckExternal {
+            request_id,
+            buffer_id,
+        } => {
+            anyhow::ensure!(
+                client.supports_capability(CAP_EDITOR_EXTERNAL_CHANGES),
+                "daemon does not support external changes"
+            );
+            client
+                .send(Message::BufferExternalCheck {
+                    request_id,
+                    buffer_id,
+                })
+                .await?;
+        }
+        AdeCmd::ResolveExternal {
+            request_id,
+            buffer_id,
+            base_rev,
+            generation,
+            resolution,
+        } => {
+            anyhow::ensure!(
+                client.supports_capability(CAP_EDITOR_EXTERNAL_CHANGES),
+                "daemon does not support external changes"
+            );
+            client
+                .send(Message::BufferExternalResolve {
+                    request_id,
+                    buffer_id,
+                    base_rev,
+                    generation,
+                    resolution,
+                })
+                .await?;
+        }
         AdeCmd::SaveBuffer {
             request_id,
             buffer_id,
@@ -1142,8 +1251,12 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             path,
             entries,
         }),
-        Message::EditorDrafts { request_id, drafts } => Some(AdeEvent::Drafts { request_id, drafts }),
-        Message::EditorDraftWarning { buffer_id, message } => Some(AdeEvent::DraftWarning { buffer_id, message }),
+        Message::EditorDrafts { request_id, drafts } => {
+            Some(AdeEvent::Drafts { request_id, drafts })
+        }
+        Message::EditorDraftWarning { buffer_id, message } => {
+            Some(AdeEvent::DraftWarning { buffer_id, message })
+        }
         Message::EditorOpened {
             request_id,
             buffer_id,
@@ -1160,6 +1273,54 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             language,
             line,
             column,
+        }),
+        Message::BufferExternalChanged {
+            buffer_id,
+            path,
+            rev,
+            generation,
+            text,
+            disk_text,
+            dirty,
+        }
+        | Message::BufferExternalChecked {
+            buffer_id,
+            path,
+            rev,
+            generation,
+            text,
+            disk_text,
+            dirty,
+            found: true,
+            ..
+        } => Some(AdeEvent::ExternalChanged {
+            buffer_id,
+            path,
+            rev,
+            generation,
+            text,
+            disk_text,
+            dirty,
+        }),
+        Message::BufferExternalResolved {
+            request_id,
+            buffer_id,
+            rev,
+            generation,
+            text,
+            accepted,
+            dirty,
+            resolution,
+            ..
+        } => Some(AdeEvent::ExternalResolved {
+            request_id,
+            buffer_id,
+            rev,
+            generation,
+            text,
+            accepted,
+            dirty,
+            resolution,
         }),
         Message::BufferSnapshot {
             buffer_id,
@@ -1181,8 +1342,25 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             buffer_id,
             rev,
         }),
-        Message::BufferEditResult { request_id, buffer_id, view_id, rev, text, selection, accepted, dirty } =>
-            Some(AdeEvent::BufferEditResult { request_id, buffer_id, view_id, rev, text, selection, accepted, dirty }),
+        Message::BufferEditResult {
+            request_id,
+            buffer_id,
+            view_id,
+            rev,
+            text,
+            selection,
+            accepted,
+            dirty,
+        } => Some(AdeEvent::BufferEditResult {
+            request_id,
+            buffer_id,
+            view_id,
+            rev,
+            text,
+            selection,
+            accepted,
+            dirty,
+        }),
         Message::ConfigUpdated { shortkeys, ui } => Some(AdeEvent::ConfigUpdated { shortkeys, ui }),
         Message::BufferSaved {
             request_id,
@@ -1195,10 +1373,32 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             path,
             rev,
         }),
-        Message::BufferLspState { buffer_id, rev, text, diagnostics, status } =>
-            Some(AdeEvent::BufferLspState { buffer_id, rev, text, diagnostics, status }),
-        Message::BufferFormatted { request_id, buffer_id, rev, text, status } =>
-            Some(AdeEvent::BufferFormatted { request_id, buffer_id, rev, text, status }),
+        Message::BufferLspState {
+            buffer_id,
+            rev,
+            text,
+            diagnostics,
+            status,
+        } => Some(AdeEvent::BufferLspState {
+            buffer_id,
+            rev,
+            text,
+            diagnostics,
+            status,
+        }),
+        Message::BufferFormatted {
+            request_id,
+            buffer_id,
+            rev,
+            text,
+            status,
+        } => Some(AdeEvent::BufferFormatted {
+            request_id,
+            buffer_id,
+            rev,
+            text,
+            status,
+        }),
         Message::FsCopied {
             request_id,
             entries,

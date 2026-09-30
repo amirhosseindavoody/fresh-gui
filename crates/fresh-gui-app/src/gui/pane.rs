@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use alacritty_terminal::vte::ansi::CursorShape;
-use fresh_gui_client::edit_sync::{EditSync, SnapshotReconciliation, contiguous_diff};
-use fresh_gui_protocol::{BufferDiagnostic, ByteSelection, EditorAction};
+use fresh_gui_client::edit_sync::{EditSync, SnapshotReconciliation, contiguous_diff, external_reconciliation, ExternalSnapshotReconciliation};
+use fresh_gui_protocol::{BufferDiagnostic, ByteSelection, EditorAction, ExternalResolution};
 
 use gpui_kit::base::ElementExt as _;
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent, PanelId};
@@ -1669,6 +1669,12 @@ pub struct EditorPanel {
     action_sent_text: Option<String>,
     action_sent_selection: Option<ByteSelection>,
     conflict: bool,
+    external_changes: bool,
+    external: Option<ExternalNotice>,
+    external_generation: Option<String>,
+    external_pending: Option<ExternalResolution>,
+    external_request: Option<(String, String, String)>,
+    external_save_path: Option<String>,
     sync_paused: bool,
     save_request_id: Option<String>,
     save_sent_text: Option<String>,
@@ -1689,6 +1695,29 @@ pub struct EditorPanel {
     inline_markdown_edit: Option<MarkdownInlineEdit>,
     inline_markdown_subscription: Option<Subscription>,
     _subscription: Subscription,
+}
+
+fn reload_response_can_replace(sent_draft: &str, current_draft: &str) -> bool {
+    sent_draft == current_draft
+}
+
+#[cfg(test)]
+mod external_reload_tests {
+    use super::reload_response_can_replace;
+
+    #[test]
+    fn reload_discards_only_the_reviewed_draft() {
+        assert!(reload_response_can_replace("reviewed draft", "reviewed draft"));
+        assert!(!reload_response_can_replace("reviewed draft", "new typing after reload"));
+    }
+}
+
+#[derive(Clone)]
+struct ExternalNotice {
+    path: String,
+    generation: String,
+    disk_text: Option<String>,
+    kept: bool,
 }
 
 struct MarkdownInlineEdit {
@@ -1772,6 +1801,12 @@ impl EditorPanel {
             action_sent_text: None,
             action_sent_selection: None,
             conflict: false,
+            external_changes: false,
+            external: None,
+            external_generation: None,
+            external_pending: None,
+            external_request: None,
+            external_save_path: None,
             sync_paused: false,
             save_request_id: None,
             save_sent_text: None,
@@ -1831,10 +1866,139 @@ impl EditorPanel {
         self.draft_recovery = enabled;
     }
 
+    pub fn configure_external_changes(&mut self, enabled: bool) {
+        self.external_changes = enabled;
+    }
+
+    pub fn check_external(&self) {
+        if self.external_changes && !self.unsaved {
+            self.ade.send(AdeCmd::CheckExternal {
+                request_id: format!("external-{}", self.view_id),
+                buffer_id: self.buffer_id.clone(),
+            });
+        }
+    }
+
+    pub fn apply_external_change(
+        &mut self, path: String, rev: u64, generation: String, text: String, disk_text: Option<String>,
+        server_dirty: bool, window: &mut Window, cx: &mut Context<Self>,
+    ) {
+        if self.external.is_none() && self.external_generation.as_deref() == Some(generation.as_str()) {
+            return;
+        }
+        let decision = external_reconciliation(self.dirty, self.rev, rev, disk_text.is_some(), server_dirty);
+        if decision == ExternalSnapshotReconciliation::Ignore { return; }
+        if decision == ExternalSnapshotReconciliation::Reload {
+            self.external = None;
+            self.external_generation = Some(generation);
+            self.apply_snapshot(rev, text, self.path.clone(), window, cx);
+            self.dirty = false;
+        } else {
+            let kept = self.external.as_ref().is_some_and(|notice| notice.generation == generation && notice.kept);
+            self.external = Some(ExternalNotice { path, generation, disk_text, kept });
+            // The snapshot is the daemon draft, never disk text. Reconcile only
+            // when no edit acknowledgement is outstanding; that reply owns its base.
+            if self.edit_request_id.is_none() && self.sync_request_id.is_none() {
+                self.apply_snapshot(rev, text, self.path.clone(), window, cx);
+            }
+            self.dirty = true;
+            cx.notify();
+        }
+    }
+
+    fn request_external_resolution(&mut self, resolution: ExternalResolution, cx: &mut Context<Self>) {
+        if self.external.is_none() || self.external_request.is_some() { return; }
+        if self.conflict {
+            // Keeping or explicitly discarding a divergent draft also resolves
+            // its stale transaction base, before submitting the disk decision.
+            self.resolve_keep_local(cx);
+        }
+        self.external_pending = Some(resolution);
+        self.sync_paused = false;
+        self.pending_actions.clear();
+        self.pending_format = false;
+        self.flush_pending(cx);
+    }
+
+    pub fn apply_external_resolution(
+        &mut self, request_id: &str, rev: u64, generation: String, text: String,
+        accepted: bool, server_dirty: bool, resolution: ExternalResolution,
+        window: &mut Window, cx: &mut Context<Self>,
+    ) {
+        let Some((pending_id, sent_draft, sent_generation)) = self.external_request.take() else { return; };
+        if pending_id != request_id {
+            self.external_request = Some((pending_id, sent_draft, sent_generation));
+            return;
+        }
+        if !accepted {
+            self.external_save_path = None;
+            self.lsp_status = Some("File or draft changed again; review the current version".into());
+            self.check_external();
+            cx.notify();
+            return;
+        }
+        let current = self.current_text(cx);
+        self.rev = rev;
+        self.edit_sync = Some(EditSync::new(text.clone(), rev));
+        self.conflict = false;
+        if resolution == ExternalResolution::Reload {
+            self.external_generation = Some(generation.clone());
+            self.external = None;
+            self.external_save_path = None;
+            if reload_response_can_replace(&sent_draft, &current) {
+                let selection = map_selection_through_edits(&current, &text, self.byte_selection(cx));
+                self.set_editor_text_and_selection(&text, Some(selection), window, cx);
+                self.dirty = server_dirty;
+            } else {
+                // Typing after clicking Reload belongs to a newer draft.
+                self.dirty = true;
+            }
+        } else {
+            if let Some(notice) = self.external.as_mut()
+                && notice.generation == generation && sent_generation == generation {
+                notice.kept = true;
+            }
+            self.dirty = server_dirty || current != text;
+            if resolution == ExternalResolution::Overwrite {
+                self.external_generation = Some(generation);
+                self.external = None;
+                self.pending_save = self.external_save_path.take();
+            }
+        }
+        self.flush_pending(cx);
+        cx.notify();
+    }
+
+    pub fn external_target_path(&self) -> Option<String> {
+        self.external.as_ref().map(|notice| notice.path.clone())
+    }
+
+    pub fn reattach_reloaded_path(&mut self, path: String, cx: &mut Context<Self>) -> Option<String> {
+        let previous = (self.path != path).then(|| self.path.clone());
+        self.path = path;
+        self.unsaved = false;
+        self.unsaved_title = None;
+        cx.notify();
+        previous
+    }
+
+    fn compare_external(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(notice) = &self.external {
+            let disk = notice.disk_text.clone().unwrap_or_default();
+            let draft = self.current_text(cx);
+            let path = self.path.clone();
+            let deleted = notice.disk_text.is_none();
+            let _ = self.workspace.update(cx, |workspace, cx| {
+                workspace.compare_external(path, disk, draft, deleted, window, cx);
+            });
+        }
+    }
+
     /// Retention is established by a durable daemon acknowledgement for exactly
     /// the visible text. Capability negotiation alone never authorizes closing.
     pub fn recovery_guaranteed(&self, cx: &App) -> bool {
         self.draft_recovery && self.transport_connected && !self.conflict
+            && self.external_request.is_none() && self.external_pending.is_none()
             && !self.sync_paused && self.edit_request_id.is_none()
             && self.sync_request_id.is_none() && !self.action_inflight
             && self.save_request_id.is_none() && !self.format_inflight
@@ -1917,6 +2081,7 @@ impl EditorPanel {
     fn flush_pending(&mut self, cx: &mut Context<Self>) {
         if !self.transport_connected
             || self.closed
+            || self.external_request.is_some()
             || self.conflict
             || self.sync_paused
             || self.edit_request_id.is_some()
@@ -1972,6 +2137,7 @@ impl EditorPanel {
     fn drain_pending(&mut self, cx: &mut Context<Self>) {
         if !self.transport_connected
             || self.closed
+            || self.external_request.is_some()
             || self.conflict
             || self.sync_paused
             || self.edit_request_id.is_some()
@@ -1989,6 +2155,16 @@ impl EditorPanel {
             .is_some_and(|sync| sync.acknowledged().0 != draft);
         if dirty_against_server {
             self.flush_pending(cx);
+            return;
+        }
+        if let Some(resolution) = self.external_pending.take() {
+            if let Some(notice) = self.external.clone() {
+                let request_id = self.next_edit_request("external-resolve");
+                let base_rev = self.edit_sync.as_ref().map_or(self.rev, |sync| sync.acknowledged().1);
+                self.external_request = Some((request_id.clone(), draft, notice.generation.clone()));
+                self.ade.send(AdeCmd::ResolveExternal { request_id, buffer_id: self.buffer_id.clone(),
+                    base_rev, generation: notice.generation, resolution });
+            }
             return;
         }
         if let Some(action) = self.pending_actions.pop_front() {
@@ -2009,6 +2185,12 @@ impl EditorPanel {
                 action,
                 selection: self.action_sent_selection.expect("just recorded"),
             });
+            return;
+        }
+        if self.external.is_some() && self.pending_save.is_some() {
+            self.external_save_path = self.pending_save.take();
+            self.lsp_status = Some("Disk differs from this draft. Review, then choose Overwrite disk to save.".into());
+            cx.notify();
             return;
         }
         if let Some(path) = self.pending_save.take() {
@@ -2201,13 +2383,14 @@ impl EditorPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if rev < self.rev { return; }
         if !path.is_empty() {
             self.path = path;
         }
         self.diagnostics.clear();
         let draft = self.current_text(cx);
         if let Some(sync) = self.edit_sync.as_mut() {
-            match sync.reconcile_snapshot(rev, text.clone(), &draft) {
+            match sync.reconcile_protected_snapshot(rev, text.clone(), &draft, self.dirty) {
                 SnapshotReconciliation::Adopted => {
                     self.rev = rev;
                     if draft != text || self.pending.is_some() {
@@ -2267,9 +2450,11 @@ impl EditorPanel {
         self.inline_markdown_edit = None;
         self.inline_markdown_subscription = None;
         self.editor.update(cx, |state, cx| {
+            let scroll = state.scroll_offset();
             state.set_value(text, window, cx);
             if let Some(selection) = selection {
                 state.set_selected_range(selection.anchor..selection.head, cx);
+                state.set_scroll_offset(scroll, cx);
             }
         });
         if let Some(jump) = self.pending.take()
@@ -2303,7 +2488,7 @@ impl EditorPanel {
             self.sync_request_id = None;
             let draft = self.current_text(cx);
             let outcome = if let Some(sync) = self.edit_sync.as_mut() {
-                sync.reconcile_snapshot(rev, text.clone(), &draft)
+                sync.reconcile_protected_snapshot(rev, text.clone(), &draft, self.dirty)
             } else {
                 let (sync, outcome) =
                     EditSync::from_initial_snapshot(text.clone(), rev, &draft, self.dirty);
@@ -2330,7 +2515,7 @@ impl EditorPanel {
                     self.lsp_status = Some("Server and local edits conflict; local draft kept".into());
                 }
             }
-            self.dirty = server_dirty || self.current_text(cx) != text || self.conflict;
+            self.dirty = server_dirty || self.external.is_some() || self.current_text(cx) != text || self.conflict;
             self.flush_pending(cx);
             cx.notify();
             return;
@@ -2399,7 +2584,7 @@ impl EditorPanel {
                 state.set_selected_range(selection.anchor..selection.head, cx);
             });
         }
-        self.dirty = server_dirty || self.current_text(cx) != text || self.conflict;
+        self.dirty = server_dirty || self.external.is_some() || self.current_text(cx) != text || self.conflict;
         if self.conflict {
             self.lsp_status = Some("Server and local edits conflict; local draft kept".into());
             self.pending_save = None;
@@ -2427,6 +2612,9 @@ impl EditorPanel {
     }
 
     pub fn detach_transport(&mut self) {
+        self.external_pending = None;
+        self.external_request = None;
+        self.external_save_path = None;
         self.transport_connected = false;
         self.edit_request_id = None;
         self.legacy_sent_text = None;
@@ -2441,6 +2629,9 @@ impl EditorPanel {
     }
 
     pub fn keep_detached_draft(&mut self, cx: &mut Context<Self>) {
+        self.external_pending = None;
+        self.external_request = None;
+        self.external_save_path = None;
         self.transport_connected = false;
         self.sync_paused = true;
         self.closed = true;
@@ -2456,6 +2647,9 @@ impl EditorPanel {
     }
 
     pub fn reconnect(&mut self, ade: AdeHandle, range_edits: bool, cx: &mut Context<Self>) {
+        self.external_request = None;
+        self.external_pending = None;
+        self.external_save_path = None;
         self.ade = ade;
         self.transport_connected = true;
         self.sync_paused = false;
@@ -2481,6 +2675,12 @@ impl EditorPanel {
 
     pub fn request_save(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_markdown_inline_edit(window, cx);
+        if self.external.is_some() {
+            self.external_save_path = Some(path);
+            self.lsp_status = Some("Disk differs from this draft. Review, then choose Overwrite disk to save.".into());
+            cx.notify();
+            return;
+        }
         if self.conflict {
             self.lsp_status = Some("Resolve the edit conflict before saving".into());
             cx.notify();
@@ -2531,11 +2731,11 @@ impl EditorPanel {
             let request_pending = self.edit_request_id.is_some()
                 || self.sync_request_id.is_some()
                 || self.save_request_id.is_some()
-                || self.format_inflight;
+                || self.format_inflight || self.external_request.is_some();
             if !request_pending && (rev > self.rev || self.edit_sync.is_none()) {
                 let draft = self.current_text(cx);
                 if let Some(sync) = self.edit_sync.as_mut() {
-                    match sync.reconcile_snapshot(rev, text.clone(), &draft) {
+                    match sync.reconcile_protected_snapshot(rev, text.clone(), &draft, self.dirty) {
                         SnapshotReconciliation::Adopted => {
                             if draft != text {
                                 let selection = map_selection_through_edits(&draft, &text, self.byte_selection(cx));
@@ -2665,6 +2865,14 @@ impl EditorPanel {
         message: &str,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.external_request.as_ref().is_some_and(|(id, _, _)| id == request_id) {
+            self.external_request = None;
+            self.external_save_path = None;
+            self.lsp_status = Some(format!("Reconciliation failed: {message}"));
+            self.check_external();
+            cx.notify();
+            return true;
+        }
         if self.edit_request_id.as_deref() == Some(request_id) {
             self.edit_request_id = None;
             self.legacy_sent_text = None;
@@ -2729,6 +2937,8 @@ impl EditorPanel {
     pub fn mark_saved(&mut self, path: String, rev: u64, cx: &mut Context<Self>) -> Option<String> {
         let previous = (self.path != path).then(|| self.path.clone());
         self.path = path;
+        self.external = None;
+        self.external_save_path = None;
         self.unsaved = false;
         self.unsaved_title = None;
         self.recovery_warning = None;
@@ -3061,6 +3271,34 @@ impl Render for EditorPanel {
                             .text_size(px(self.font_px))
                             .font_family(cx.theme().mono_font_family.clone()),
                     ),
+            );
+        }
+        if let Some(notice) = &self.external {
+            let panel = cx.entity();
+            let deleted = notice.disk_text.is_none();
+            let label = if deleted { "Deleted on disk; draft retained" }
+                else if notice.kept { "Draft differs from disk" }
+                else { "File changed on disk; draft retained" };
+            root = root.child(
+                h_flex().w_full().min_h_9().px_2().gap_2().items_center().border_t_1()
+                    .border_color(cx.theme().border)
+                    .child(div().flex_1().text_xs().text_color(cx.theme().danger).child(label))
+                    .child(Button::new("external-compare").ghost().xsmall().label("Compare")
+                        .on_click({ let panel = panel.clone(); move |_, window, cx| {
+                            panel.update(cx, |this, cx| this.compare_external(window, cx));
+                        }}))
+                    .when(!deleted, |bar| bar.child(Button::new("external-reload").ghost().xsmall().label("Reload")
+                        .on_click({ let panel = panel.clone(); move |_, _, cx| {
+                            panel.update(cx, |this, cx| this.request_external_resolution(ExternalResolution::Reload, cx));
+                        }})))
+                    .child(Button::new("external-keep").ghost().xsmall().label("Keep")
+                        .on_click({ let panel = panel.clone(); move |_, _, cx| {
+                            panel.update(cx, |this, cx| this.request_external_resolution(ExternalResolution::Keep, cx));
+                        }}))
+                    .when(self.external_save_path.is_some(), |bar| bar.child(Button::new("external-overwrite").ghost().xsmall().label("Overwrite disk")
+                        .on_click(move |_, _, cx| {
+                            panel.update(cx, |this, cx| this.request_external_resolution(ExternalResolution::Overwrite, cx));
+                        })))
             );
         }
         if self.conflict {
