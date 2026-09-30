@@ -3674,7 +3674,9 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     fn open_settings(&mut self, cx: &mut Context<Self>) {
         let supported = self.capabilities.iter().any(|cap| cap == fresh_gui_protocol::CAP_SETTINGS_EDITOR);
         self.settings_open = true;
-        self.settings.update(cx, |settings, cx| settings.open(self.active_workspace_id.clone(), supported, self.config_path.clone().unwrap_or_default(), cx));
+        let base = self.server_ui.clone().unwrap_or_else(|| serde_json::from_value(serde_json::json!({})).expect("UI defaults"));
+        let inherited = serde_json::json!({"ui": base});
+        self.settings.update(cx, |settings, cx| settings.open(self.active_workspace_id.clone(), supported, self.config_path.clone().unwrap_or_default(), inherited, cx));
         cx.notify();
     }
 

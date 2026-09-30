@@ -44,6 +44,7 @@ pub struct SettingsEditor {
     selected: Option<Vec<String>>,
     text: String,
     defaults: Value,
+    client_defaults: Value,
     path: String,
     daemon_path: String,
     json: Entity<TextareaState>,
@@ -99,6 +100,7 @@ impl SettingsEditor {
             selected: None,
             text: "{}".into(),
             defaults: Value::Null,
+            client_defaults: serde_json::json!({"ui": serde_json::from_value::<HelloUi>(serde_json::json!({})).expect("UI defaults")}),
             path: String::new(),
             daemon_path: String::new(),
             json: cx.new(|cx| TextareaState::new(window, cx)),
@@ -116,11 +118,13 @@ impl SettingsEditor {
         workspace: Option<String>,
         supported: bool,
         daemon_path: String,
+        client_defaults: Value,
         cx: &mut Context<Self>,
     ) {
         self.workspace = workspace;
         self.supported = supported;
         self.daemon_path = daemon_path;
+        self.client_defaults = client_defaults;
         self.scope = Scope::Client;
         self.keybindings = false;
         self.selected = None;
@@ -148,7 +152,7 @@ impl SettingsEditor {
                 Ok(text) => {
                     self.text = text;
                     self.path = client_config::client_config_path().display().to_string();
-                    self.defaults = serde_json::json!({"ui": serde_json::from_value::<HelloUi>(serde_json::json!({})).expect("UI defaults")});
+                    self.defaults = self.client_defaults.clone();
                     self.ready = true;
                     self.status = "Local client presentation · changes apply live".into();
                 }
@@ -796,6 +800,20 @@ mod tests {
         );
         assert_eq!(setting_path(&path, "").unwrap(), path);
         assert!(setting_path(&["editor".into(), "line_numbers".into()], "rust").is_err());
+    }
+
+    #[gpui::test]
+    fn local_reset_displays_the_inherited_daemon_default(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (editor, cx) = cx.add_window_view(SettingsEditor::new);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.text = "{}".into();
+            editor.defaults = serde_json::json!({"ui":{"theme":"dark","editorFontSize":18}});
+            editor.select(vec!["ui".into(), "theme".into()], window, cx);
+            assert_eq!(editor.value.read(cx).value(), "dark");
+            editor.select(vec!["ui".into(), "editorFontSize".into()], window, cx);
+            assert_eq!(editor.value.read(cx).value(), "18");
+        });
     }
 
     #[gpui::test]
