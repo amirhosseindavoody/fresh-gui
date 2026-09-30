@@ -170,7 +170,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     Some(rx) => rx.recv().await,
                     None => std::future::pending().await,
                 }
-            }, if client_external_changes => {
+            }, if authed && client_external_changes => {
                 match external {
                     Ok(change) => {
                         let owned_here = if let Some(editor) = state.editor.as_ref() {

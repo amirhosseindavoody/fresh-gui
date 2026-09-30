@@ -356,3 +356,35 @@ async fn external_change_requests_from_peer_without_capability_are_rejected() {
     drop(_backend);
     let _ = std::fs::remove_dir_all(scratch);
 }
+
+#[tokio::test]
+async fn external_notifications_require_authentication() {
+    let scratch =
+        std::env::temp_dir().join(format!("fresh-external-auth-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let path = scratch.join("private.txt");
+    std::fs::write(&path, "original private text").unwrap();
+    let addr = free_addr();
+    let backend = start(addr, &scratch);
+    wait_health(addr);
+    let url = format!("ws://{addr}/ws");
+    let mut owner =
+        Client::connect(ConnectOptions::new(&url).with_token("external-change-test-token"))
+            .await
+            .unwrap();
+    let (buffer_id, _, _, _, _) = owner.open_editor("private.txt", false).await.unwrap();
+    // Hello negotiates the capability before authentication. It must never
+    // allow an unauthenticated subscriber to receive draft or disk text.
+    let mut unauthenticated = Client::connect(ConnectOptions::new(&url)).await.unwrap();
+    std::fs::write(&path, "private agent update").unwrap();
+    let _ = external_change(&mut owner, &buffer_id).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), unauthenticated.recv())
+            .await
+            .is_err()
+    );
+    drop(unauthenticated);
+    drop(owner);
+    drop(backend);
+    let _ = std::fs::remove_dir_all(scratch);
+}
