@@ -1,7 +1,8 @@
 //! Native settings presentation; daemon settings are edited exclusively through ADE.
 use super::client_config;
 use fresh_gui_protocol::settings::{
-    SettingEffect, SettingOwner, SettingScope, catalog, read_jsonc, validate_value,
+    SettingEffect, SettingOwner, SettingScope, SettingValueType, catalog, read_jsonc,
+    validate_value,
 };
 use fresh_gui_protocol::{HelloUi, Message};
 use gpui_kit::component::{
@@ -216,7 +217,16 @@ impl SettingsEditor {
             .unwrap_or(Value::Null);
         self.value.update(cx, |state, cx| {
             state.set_value(
-                if self.keybindings {
+                if self.keybindings
+                    || catalog().iter().any(|definition| {
+                        definition
+                            .path
+                            .iter()
+                            .copied()
+                            .eq(path.iter().map(String::as_str))
+                            && definition.value_type == SettingValueType::String
+                    })
+                {
                     value.as_str().unwrap_or("").to_string()
                 } else {
                     value.to_string()
@@ -300,14 +310,7 @@ impl SettingsEditor {
                 object.insert("shortkey".into(), Value::String(key));
                 return Ok(Some(binding));
             }
-            let value: Value = serde_json::from_str(&self.value.read(cx).value())?;
-            let entries = catalog();
-            if let Some(def) = entries
-                .iter()
-                .find(|d| d.path.iter().copied().eq(path.iter().map(String::as_str)))
-            {
-                validate_value(def, &value)?;
-            }
+            let value = parse_setting_value(&path, &self.value.read(cx).value())?;
             path = setting_path(&path, &self.language.read(cx).value())?;
             Ok(Some(value))
         })();
@@ -364,6 +367,28 @@ fn normalize_key(key: &str) -> anyhow::Result<String> {
         .collect::<anyhow::Result<Vec<_>>>()
         .map(|keys| keys.join(" "))
 }
+fn parse_setting_value(path: &[String], text: &str) -> anyhow::Result<Value> {
+    let definition = catalog().into_iter().find(|definition| {
+        definition
+            .path
+            .iter()
+            .copied()
+            .eq(path.iter().map(String::as_str))
+    });
+    let value = if definition
+        .as_ref()
+        .is_some_and(|definition| definition.value_type == SettingValueType::String)
+    {
+        Value::String(text.to_owned())
+    } else {
+        serde_json::from_str(text)?
+    };
+    if let Some(definition) = definition {
+        validate_value(&definition, &value)?;
+    }
+    Ok(value)
+}
+
 fn setting_path(path: &[String], language: &str) -> anyhow::Result<Vec<String>> {
     if language.is_empty() || path.first().map(String::as_str) != Some("editor") {
         return Ok(path.to_vec());
@@ -397,6 +422,37 @@ fn contexts_overlap(a: &str, b: &str) -> bool {
 }
 impl Render for SettingsEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected_definition = self.selected.as_ref().and_then(|path| {
+            catalog().into_iter().find(|definition| {
+                definition
+                    .path
+                    .iter()
+                    .copied()
+                    .eq(path.iter().map(String::as_str))
+            })
+        });
+        let mut value_controls = h_flex().gap_2();
+        if !self.keybindings
+            && let Some(definition) = selected_definition
+        {
+            let choices = if definition.value_type == SettingValueType::Boolean {
+                vec!["true".to_owned(), "false".to_owned()]
+            } else {
+                definition.choices
+            };
+            for choice in choices {
+                let value = choice.clone();
+                value_controls = value_controls.child(
+                    Button::new(format!("setting-choice-{choice}"))
+                        .label(choice)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.value
+                                .update(cx, |state, cx| state.set_value(value.clone(), window, cx));
+                            cx.notify();
+                        })),
+                );
+            }
+        }
         let query = self.search.read(cx).value().to_lowercase();
         let doc = read_jsonc(&self.text).unwrap_or_default();
         let mut rows = v_flex().gap_1();
@@ -641,6 +697,7 @@ impl Render for SettingsEditor {
                             v_flex()
                                 .gap_2()
                                 .child(Input::new(&self.value))
+                                .child(value_controls)
                                 .when(self.keybindings, |view| {
                                     view.child(Input::new(&self.action))
                                         .child(Input::new(&self.context))
@@ -689,7 +746,10 @@ impl Render for SettingsEditor {
 }
 #[cfg(test)]
 mod tests {
-    use super::{SettingsEditor, contexts_overlap, keys_overlap, normalize_key, setting_path};
+    use super::{
+        SettingsEditor, contexts_overlap, keys_overlap, normalize_key, parse_setting_value,
+        setting_path,
+    };
     use crate::gui::actions::SaveBuffer;
     use gpui::{
         Context, Entity, InteractiveElement, ParentElement, Render, Styled, TestAppContext, Window,
@@ -704,6 +764,27 @@ mod tests {
         assert!(keys_overlap("ctrl-k", "ctrl-k ctrl-s"));
         assert!(!keys_overlap("ctrl-k ctrl-x", "ctrl-k ctrl-s"));
         assert!(!keys_overlap("", "ctrl-k"));
+    }
+
+    #[test]
+    fn typed_controls_parse_plain_strings_and_validate_numeric_values() {
+        let theme = vec!["ui".into(), "theme".into()];
+        assert_eq!(
+            parse_setting_value(&theme, "dark").unwrap(),
+            serde_json::json!("dark")
+        );
+        assert!(parse_setting_value(&theme, "unknown-theme").is_err());
+        let font = vec!["ui".into(), "editorFontSize".into()];
+        assert_eq!(
+            parse_setting_value(&font, "18").unwrap(),
+            serde_json::json!(18)
+        );
+        assert!(parse_setting_value(&font, "1000").is_err());
+        assert!(parse_setting_value(&font, "abc").is_err());
+        assert_eq!(
+            parse_setting_value(&["editor".into(), "use_tabs".into()], "false").unwrap(),
+            serde_json::json!(false)
+        );
     }
 
     #[test]
