@@ -125,7 +125,18 @@ impl FileSystem for EditorFileSystem {
         if result.is_err() {
             let _ = self.inner.remove_file(&temp_path);
         }
-        result
+        result.map_err(|error| {
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                // Fresh's pinned save_to_file retries PermissionDenied by
+                // flattening the recipe into a full Vec for sudo. Keep the
+                // paged save bounded and report the underlying cause instead.
+                io::Error::other(format!(
+                    "streaming patched save failed (sudo fallback is unavailable): {error}"
+                ))
+            } else {
+                error
+            }
+        })
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
