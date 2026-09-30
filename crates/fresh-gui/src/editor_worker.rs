@@ -1498,6 +1498,36 @@ fn read_page(
         bail!("page start exceeds buffer length");
     }
     if len == 0 {
+        if start > 0 && start < total {
+            let mut probe_start = start.saturating_sub(4);
+            let probe_end = start.saturating_add(4).min(total);
+            let mut bytes = editor
+                .active_state_mut()
+                .buffer
+                .get_text_range_mut(probe_start, probe_end - probe_start)
+                .context("validate empty page boundary")?;
+            while probe_start > 0 && bytes.first().is_some_and(|byte| byte & 0xc0 == 0x80) {
+                probe_start -= 1;
+                bytes = editor
+                    .active_state_mut()
+                    .buffer
+                    .get_text_range_mut(probe_start, probe_end - probe_start)
+                    .context("align empty page boundary")?;
+            }
+            let valid_len = match std::str::from_utf8(&bytes) {
+                Ok(_) => bytes.len(),
+                Err(error) if error.error_len().is_none() => error.valid_up_to(),
+                Err(_) => bail!("Fresh page contains invalid UTF-8"),
+            };
+            let probe =
+                std::str::from_utf8(&bytes[..valid_len]).context("invalid UTF-8 boundary probe")?;
+            if start < probe_start
+                || start - probe_start > probe.len()
+                || !probe.is_char_boundary(start - probe_start)
+            {
+                bail!("empty viewport start is not a UTF-8 boundary");
+            }
+        }
         let entry = tracked.get(buffer_id).context("unknown buffer_id")?;
         return Ok(ReadPage {
             rev: entry.rev,
@@ -1731,9 +1761,7 @@ fn paged_range_edit(
     }
     let viewport = viewport.context("paged edits require a viewport")?;
     let current = tracked.get(buffer_id).context("unknown buffer_id")?;
-    if (viewport.len == 0 && viewport.start != current.total_bytes.unwrap_or(0))
-        || viewport.len > MAX_PAGE_BYTES
-    {
+    if viewport.start > current.total_bytes.unwrap_or(0) || viewport.len > MAX_PAGE_BYTES {
         bail!("invalid paged edit viewport length");
     }
     if current.rev != base_rev {
@@ -1921,15 +1949,14 @@ fn paged_range_edit(
         entry.total_bytes = Some(editor.active_state().buffer.total_bytes());
     }
     let mut result = transaction_result(tracked, editor, buffer_id, true)?;
-    if changed {
-        result.page = Some(read_page(
-            editor,
-            tracked,
-            buffer_id,
-            initial.start,
-            working.len().max(1),
-        )?);
-    }
+    let entry = tracked.get(buffer_id).context("unknown buffer_id")?;
+    result.page = Some(ReadPage {
+        rev: entry.rev,
+        start: initial.start,
+        total_bytes: editor.active_state().buffer.total_bytes(),
+        text: working,
+        dirty: entry.dirty,
+    });
     Ok(result)
 }
 
@@ -2894,6 +2921,90 @@ mod paged_file_tests {
     }
 
     #[test]
+    fn deleting_a_full_page_returns_empty_without_exposing_following_text() {
+        let root =
+            std::env::temp_dir().join(format!("fresh-paged-empty-page-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("large.txt");
+        let recovery = root.join("recovery");
+        std::fs::write(&path, vec![b'x'; 3 * 1024 * 1024]).unwrap();
+        let editor = EditorHandle::spawn_with_recovery_dir(
+            root.clone(),
+            crate::config::Config::default(),
+            recovery,
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let opened = editor.open(path.clone(), false).await.unwrap();
+            let page = editor
+                .read_page(opened.buffer_id.clone(), 0, MAX_PAGE_BYTES)
+                .await
+                .unwrap();
+            let deleted = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "empty-page".into(),
+                    opened.rev,
+                    vec![RangeEdit {
+                        start: page.start,
+                        end: page.start + page.text.len(),
+                        text: String::new(),
+                    }],
+                    Some(ByteRange {
+                        start: page.start,
+                        len: page.text.len(),
+                    }),
+                    ByteSelection {
+                        anchor: page.start,
+                        head: page.start,
+                    },
+                )
+                .await
+                .unwrap();
+            let empty = deleted.page.unwrap();
+            assert!(empty.text.is_empty());
+            let following = editor
+                .read_page(opened.buffer_id.clone(), page.start, 1)
+                .await
+                .unwrap();
+            assert_eq!(following.text, "x");
+
+            let inserted = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "empty-page".into(),
+                    deleted.rev,
+                    vec![RangeEdit {
+                        start: page.start,
+                        end: page.start,
+                        text: "Q".into(),
+                    }],
+                    Some(ByteRange {
+                        start: page.start,
+                        len: 0,
+                    }),
+                    ByteSelection {
+                        anchor: page.start + 1,
+                        head: page.start + 1,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(inserted.page.unwrap().text, "Q");
+            let following = editor
+                .read_page(opened.buffer_id, page.start + 1, 1)
+                .await
+                .unwrap();
+            assert_eq!(following.text, "x");
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn paged_recovery_replays_incremental_edits_after_reopen() {
         let root =
             std::env::temp_dir().join(format!("fresh-paged-recovery-{}", uuid::Uuid::new_v4()));
@@ -2917,7 +3028,7 @@ mod paged_file_tests {
         rt.block_on(async {
             let opened = editor.open(path.clone(), false).await.unwrap();
             let page = editor
-                .read_page(opened.buffer_id.clone(), at, MAX_PAGE_BYTES)
+                .read_page(opened.buffer_id.clone(), at, MAX_PAGE_BYTES / 2)
                 .await
                 .unwrap();
             let target = at;
