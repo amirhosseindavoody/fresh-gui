@@ -14,6 +14,22 @@ pub struct Draft {
     pub text: String,
     /// Original bytes as text when opened; used to flag changes at restore.
     pub base_text: Option<String>,
+    /// Ordered revisioned edits for a lazily loaded source. The source is
+    /// identified by a content generation and replayed only when it matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paged: Option<PagedDraft>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PagedDraft {
+    pub generation: String,
+    pub edits: Vec<PagedEditTransaction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PagedEditTransaction {
+    pub viewport: fresh_gui_protocol::ByteRange,
+    pub edits: Vec<fresh_gui_protocol::RangeEdit>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -38,9 +54,10 @@ fn hex_id(value: &str) -> String {
 /// Isolate foreground daemons that do not opt into workspace persistence.
 pub fn temporary_root(root: &Path) -> PathBuf {
     let key = hex_id(&root.to_string_lossy());
-    key.as_bytes().chunks(100).fold(std::env::temp_dir().join("fresh-gui-drafts"), |path, chunk| {
-        path.join(std::str::from_utf8(chunk).expect("hex is ASCII"))
-    })
+    key.as_bytes().chunks(100).fold(
+        std::env::temp_dir().join("fresh-gui-drafts"),
+        |path, chunk| path.join(std::str::from_utf8(chunk).expect("hex is ASCII")),
+    )
 }
 
 pub fn named_draft_id(workspace_id: &str, path: &Path) -> String {
@@ -168,6 +185,13 @@ impl DraftStore {
     }
 
     pub fn source_changed(draft: &Draft) -> bool {
+        if let Some(paged) = draft.paged.as_ref() {
+            return draft
+                .path
+                .as_deref()
+                .and_then(|path| crate::editor_worker::disk_generation(Path::new(path)).ok())
+                .is_none_or(|current| current.signature != paged.generation);
+        }
         match (&draft.path, &draft.base_text) {
             (Some(path), Some(base)) => std::fs::read_to_string(Path::new(path))
                 .map(|current| current != *base)
@@ -190,6 +214,7 @@ mod tests {
             path: None,
             text: "draft".into(),
             base_text: None,
+            paged: None,
         };
         store.checkpoint("workspace-a", draft.clone()).unwrap();
         assert_eq!(store.get("workspace-a", "untitled-1").unwrap(), Some(draft));
@@ -212,6 +237,7 @@ mod tests {
             path: Some(source.display().to_string()),
             text: "draft".into(),
             base_text: Some("original".into()),
+            paged: None,
         };
         assert!(DraftStore::source_changed(&draft));
         std::fs::remove_file(source).unwrap();
@@ -228,6 +254,7 @@ mod tests {
             path: None,
             text: "durable old copy".into(),
             base_text: None,
+            paged: None,
         };
         store.checkpoint("workspace", draft.clone()).unwrap();
         let path = store.path("workspace");
