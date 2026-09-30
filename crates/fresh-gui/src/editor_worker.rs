@@ -878,7 +878,7 @@ fn run_loop(
                     let _ = reply.send(result);
                 }
                 Cmd::ResolveExternal { buffer_id, base_rev, generation, resolution, reply } => {
-                    let result = resolve_external(&mut editor, &mut tracked, &buffer_id, base_rev, &generation, resolution);
+                    let result = resolve_external(&mut editor, &mut tracked, &buffer_id, base_rev, &generation, resolution, &drafts);
                     let _ = reply.send(result);
                 }
                 Cmd::Scene { reply } => {
@@ -1781,6 +1781,7 @@ fn resolve_external(
     base_rev: u64,
     generation: &str,
     resolution: ExternalResolution,
+    drafts: &DraftStore,
 ) -> Result<BufferTransactionResult> {
     let _ = sync_fresh_text(editor, tracked, buffer_id)?;
     let current = tracked.get(buffer_id).context("unknown buffer")?;
@@ -1838,6 +1839,7 @@ fn resolve_external(
             });
             editor.active_event_log_mut().mark_saved();
             let entry = tracked.get_mut(buffer_id).unwrap();
+            drafts.discard(&entry.workspace_id, &entry.draft_id)?;
             entry.text = target.to_owned();
             entry.rev += 1;
             entry.dirty = false;
@@ -1963,6 +1965,14 @@ mod external_generation_tests {
         std::fs::write(&path, "old text").unwrap();
         let initial = disk_generation(&path);
         std::fs::write(&tmp, "new text").unwrap();
+        #[cfg(windows)]
+        {
+            let old = root.join("buffer.old");
+            std::fs::rename(&path, &old).unwrap();
+            std::fs::rename(&tmp, &path).unwrap();
+            std::fs::remove_file(old).unwrap();
+        }
+        #[cfg(not(windows))]
         std::fs::rename(&tmp, &path).unwrap();
         let replaced = disk_generation(&path);
         assert_ne!(
@@ -1984,6 +1994,206 @@ mod external_generation_tests {
             disk_generation(&path).signature,
             "duplicate notifications coalesce to one generation"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod external_worker_behavior_tests {
+    use super::*;
+
+    async fn next_for(
+        events: &mut tokio::sync::broadcast::Receiver<ExternalChange>,
+        buffer_id: &str,
+    ) -> ExternalChange {
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                if let Ok(event) = events.recv().await {
+                    if event.buffer_id == buffer_id {
+                        break event;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("daemon reports external file change")
+    }
+
+    #[test]
+    fn worker_reconciles_external_changes_without_losing_drafts() {
+        let root =
+            std::env::temp_dir().join(format!("fresh-external-worker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("source.txt");
+        let recovery = root.join("recovery");
+        std::fs::write(&path, "initial").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let editor = EditorHandle::spawn_with_recovery_dir(
+            root.clone(),
+            crate::config::Config::default(),
+            recovery,
+        )
+        .expect("worker starts");
+
+        runtime.block_on(async {
+            let opened = editor
+                .open_in_workspace(path.clone(), false, "external-test".into())
+                .await
+                .unwrap();
+            let mut events = editor.subscribe_external();
+
+            // A clean buffer follows disk changes automatically and reports its new revision.
+            std::fs::write(&path, "clean reload").unwrap();
+            let clean = next_for(&mut events, &opened.buffer_id).await;
+            assert!(!clean.dirty);
+            assert_eq!(clean.text, "clean reload");
+            assert_eq!(clean.disk_text.as_deref(), Some("clean reload"));
+            let mut rev = clean.rev;
+
+            // A dirty buffer retains its draft and rejects an implicit save over disk.
+            rev = editor
+                .edit(opened.buffer_id.clone(), rev, "local draft".into())
+                .await
+                .unwrap();
+            std::fs::write(&path, "external two").unwrap();
+            let changed = next_for(&mut events, &opened.buffer_id).await;
+            assert!(changed.dirty);
+            assert_eq!(changed.text, "local draft");
+            assert_eq!(
+                editor
+                    .save(opened.buffer_id.clone(), rev, None)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "file changed on disk; resolve the external change before saving"
+            );
+            let pending = editor
+                .check_external(opened.buffer_id.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            editor
+                .resolve_external(
+                    opened.buffer_id.clone(),
+                    rev,
+                    pending.generation,
+                    ExternalResolution::Keep,
+                )
+                .await
+                .unwrap();
+            assert!(
+                editor
+                    .save(opened.buffer_id.clone(), rev, None)
+                    .await
+                    .is_err(),
+                "Keep must not authorize an overwrite"
+            );
+
+            // Overwrite authorizes one exact generation. A later disk write invalidates it.
+            editor
+                .resolve_external(
+                    opened.buffer_id.clone(),
+                    rev,
+                    changed.generation,
+                    ExternalResolution::Overwrite,
+                )
+                .await
+                .unwrap();
+            std::fs::write(&path, "external three").unwrap();
+            assert!(
+                editor
+                    .save(opened.buffer_id.clone(), rev, None)
+                    .await
+                    .is_err()
+            );
+            let latest = editor
+                .check_external(opened.buffer_id.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(latest.disk_text.as_deref(), Some("external three"));
+            editor
+                .resolve_external(
+                    opened.buffer_id.clone(),
+                    rev,
+                    latest.generation,
+                    ExternalResolution::Overwrite,
+                )
+                .await
+                .unwrap();
+            let (saved_path, saved_rev) = editor
+                .save(opened.buffer_id.clone(), rev, None)
+                .await
+                .unwrap();
+            assert_eq!(saved_path, path.display().to_string());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "local draft");
+
+            // Reload accepts the current disk generation and removes the recovered draft.
+            rev = editor
+                .edit(opened.buffer_id.clone(), saved_rev, "second draft".into())
+                .await
+                .unwrap();
+            std::fs::write(&path, "reload target").unwrap();
+            let reload_notice = next_for(&mut events, &opened.buffer_id).await;
+            let reloaded = editor
+                .resolve_external(
+                    opened.buffer_id.clone(),
+                    rev,
+                    reload_notice.generation,
+                    ExternalResolution::Reload,
+                )
+                .await
+                .unwrap();
+            assert_eq!(reloaded.text, "reload target");
+            assert!(!reloaded.dirty);
+            assert!(
+                editor
+                    .draft_list("external-test".into())
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|draft| draft.draft_id != opened.draft_id)
+            );
+
+            // A dirty draft survives deletion and recreation, and duplicate checks coalesce.
+            rev = editor
+                .edit(
+                    opened.buffer_id.clone(),
+                    reloaded.rev,
+                    "survives delete".into(),
+                )
+                .await
+                .unwrap();
+            std::fs::remove_file(&path).unwrap();
+            let deleted = next_for(&mut events, &opened.buffer_id).await;
+            assert!(deleted.dirty);
+            assert!(deleted.disk_text.is_none());
+            std::fs::write(&path, "recreated").unwrap();
+            let recreated = next_for(&mut events, &opened.buffer_id).await;
+            assert!(recreated.dirty);
+            assert_eq!(recreated.disk_text.as_deref(), Some("recreated"));
+            assert_eq!(recreated.text, "survives delete");
+            let current = editor
+                .check_external(opened.buffer_id.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.generation, recreated.generation);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(800), events.recv())
+                    .await
+                    .is_err(),
+                "unchanged generation should not be broadcast repeatedly"
+            );
+            let kept = editor.sync(opened.buffer_id.clone()).await.unwrap();
+            assert_eq!(kept.rev, rev);
+            assert_eq!(kept.text, "survives delete");
+        });
+
+        drop(editor);
         let _ = std::fs::remove_dir_all(root);
     }
 }
