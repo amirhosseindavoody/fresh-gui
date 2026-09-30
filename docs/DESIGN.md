@@ -12,6 +12,8 @@ A local `fresh-gui` command attaches to or starts the daemon and opens the windo
 
 Dirty editor buffers are checkpointed by the daemon into durable recovery storage partitioned by workspace identity. The daemon remains the authority for both local and SSH sessions; the client negotiates `editor.draft-recovery` and can list, restore, or discard drafts. A restore keeps the buffer dirty and flags a named draft when its source file is missing or differs from the saved base. Recovery stores editor text only: terminal tabs reopen as new shells after restart, and running processes are not persisted. The accepted edit is checkpointed after it reaches Fresh; because the client coalesces keystrokes for 75 ms, a crash before that edit is delivered and acknowledged can still lose the newest keystrokes.
 
+Named editor buffers also reconcile disk changes through the negotiated `editor.external-changes` capability. The daemon checks file generations every 350 ms using modification time, size, and a content hash, so local and SSH sessions use the daemon host's filesystem view. A clean buffer reloads automatically. A dirty buffer retains its draft and shows Compare, Reload, and Keep actions; a save conflict requires a conscious **Overwrite disk** action. Older daemons do not send external-change notices, but the client still guards dirty drafts from being replaced by a snapshot.
+
 ## Client chrome
 
 The GPUI window follows the daemon's theme setting (`system`, `light`, or `dark`). On a light theme the client darkens borders and split handles so they stay visible on a bright background. The split git diff draws a center rule with that same border color.
