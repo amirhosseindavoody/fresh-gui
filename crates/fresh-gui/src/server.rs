@@ -59,7 +59,7 @@ fn hello_ui(cfg: &Config) -> HelloUi {
         show_dotfiles: cfg.ui.show_dotfiles,
         show_git_dirs: cfg.ui.show_git_dirs,
         editor_minimap: cfg.ui.editor_minimap,
-        editor_line_wrap: cfg.ui.editor_line_wrap,
+        editor_line_wrap: cfg.editor.line_wrap.unwrap_or(cfg.ui.editor_line_wrap),
     }
 }
 
@@ -374,8 +374,12 @@ async fn handle_client_msg(
             require_settings_cap(*client_settings_editor, &request_id)?;
             let path = crate::settings::target_path(&state.config_path, &state.workspaces, workspace_id.as_deref())
                 .await.map_err(|err| settings_error("settings_read_failed", &request_id, err))?;
-            let snapshot = crate::settings::read_snapshot(&path, workspace_id, request_id.clone())
+            let mut snapshot = crate::settings::read_snapshot(&path, workspace_id.clone(), request_id.clone())
                 .map_err(|err| settings_error("settings_read_failed", &request_id, err))?;
+            if let Message::SettingsSnapshot { defaults, .. } = &mut snapshot {
+                *defaults = crate::settings::layer_defaults(&state.config_path, workspace_id.is_some())
+                    .map_err(|err| settings_error("settings_read_failed", &request_id, err))?;
+            }
             send_msg(sink, &snapshot).await.map_err(|_| Message::Error { code: "send_failed".into(), message: "failed to send settings snapshot".into() })?;
             Ok(())
         }
@@ -388,7 +392,8 @@ async fn handle_client_msg(
                 .map_err(|err| settings_error("settings_patch_failed", &request_id, err))?;
             if workspace_id.is_none() {
                 let cfg = Config::load_from_path(&state.config_path).map_err(|err| settings_error("settings_patch_failed", &request_id, err))?;
-                if let Some(editor) = state.editor.as_ref() {
+                if matches!(parts.first().map(String::as_str), Some("lsp" | "languages"))
+                    && let Some(editor) = state.editor.as_ref() {
                     editor.reconfigure(cfg.clone()).await.map_err(|err| settings_error("settings_patch_failed", &request_id, err))?;
                 }
                 let shortkeys = cfg.shortkeys.iter().map(|key| fresh_gui_protocol::Shortkey { action: key.action.clone(), shortkey: key.shortkey.clone(), when: key.when.clone() }).collect();
@@ -396,7 +401,9 @@ async fn handle_client_msg(
                 *state.config.write().expect("config lock") = cfg;
                 let _ = out_tx.send(Message::ConfigUpdated { shortkeys, ui: Some(ui) });
             }
-            let snapshot = Message::SettingsSnapshot { request_id, workspace_id, path: path.display().to_string(), text, defaults: crate::settings::defaults_value() };
+            let defaults = crate::settings::layer_defaults(&state.config_path, workspace_id.is_some())
+                .map_err(|err| settings_error("settings_patch_failed", &request_id, err))?;
+            let snapshot = Message::SettingsSnapshot { request_id, workspace_id, path: path.display().to_string(), text, defaults };
             send_msg(sink, &snapshot).await.map_err(|_| Message::Error { code: "send_failed".into(), message: "failed to send settings snapshot".into() })?;
             Ok(())
         }
@@ -2070,6 +2077,13 @@ fn settings_error(code: &str, request_id: &str, error: impl std::fmt::Display) -
 mod settings_capability_tests {
     use super::{require_settings_cap, settings_error};
     use fresh_gui_protocol::Message;
+
+    #[test]
+    fn fresh_line_wrap_maps_to_live_native_ui_and_reset_uses_host_default() {
+        let cfg = crate::config::Config::parse(r#"{"editor":{"line_wrap":false}}"#).unwrap();
+        assert!(!super::hello_ui(&cfg).editor_line_wrap);
+        assert!(super::hello_ui(&crate::config::Config::default()).editor_line_wrap);
+    }
 
     #[test]
     fn settings_capability_is_required_and_errors_keep_request_id() {

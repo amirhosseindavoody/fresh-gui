@@ -185,6 +185,7 @@ pub enum AdeCmd {
         extra: fresh_gui_protocol::WorkspaceLayoutExtra,
     },
     ReloadConfig,
+    Settings(Message),
     GitStatus {
         request_id: String,
         workspace_id: String,
@@ -261,6 +262,7 @@ pub enum AdeEvent {
         /// Present when the daemon advertises `workspace` and a workspace is attached.
         attached: Option<Box<AttachedWorkspace>>,
     },
+    SettingsSnapshot { request_id: String, workspace_id: Option<String>, path: String, text: String, defaults: serde_json::Value },
     ConfigUpdated {
         shortkeys: Vec<fresh_gui_protocol::Shortkey>,
         ui: Option<fresh_gui_protocol::HelloUi>,
@@ -998,6 +1000,7 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
         AdeCmd::Flush(ack) => {
             let _ = ack.send(());
         }
+        AdeCmd::Settings(message) => { client.send(message).await?; }
         AdeCmd::ReloadConfig => {
             client.send(Message::ConfigReload).await?;
         }
@@ -1379,6 +1382,7 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             accepted,
             dirty,
         }),
+        Message::SettingsSnapshot { request_id, workspace_id, path, text, defaults } => Some(AdeEvent::SettingsSnapshot { request_id, workspace_id, path, text, defaults }),
         Message::ConfigUpdated { shortkeys, ui } => Some(AdeEvent::ConfigUpdated { shortkeys, ui }),
         Message::BufferSaved {
             request_id,

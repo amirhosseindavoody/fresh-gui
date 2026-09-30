@@ -876,6 +876,17 @@ mod tests {
     }
 
     #[test]
+    fn jsonc_config_retains_unicode_values_and_accepts_trailing_commas() {
+        let config = Config::parse(r#"{
+            // Native and Fresh fields use the same JSONC parser.
+            "ui": {"fontFamily": "日本語",},
+            "languages": {"custom": {"filenames": ["Build.テスト"],}},
+        }"#).unwrap();
+        assert_eq!(config.ui.font_family, "日本語");
+        assert_eq!(config.languages["custom"].filenames.as_ref().unwrap()[0], "Build.テスト");
+    }
+
+    #[test]
     fn sparse_fresh_editor_and_language_overrides_keep_other_defaults() {
         let cfg = Config::parse(
             r#"{"editor":{"tab_size":9},"languages":{"rust":{"use_tabs":true,"tab_size":8}}}"#,

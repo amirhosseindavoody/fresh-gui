@@ -42,6 +42,8 @@ pub enum SettingEffect {
     NextBuffer,
     NextSave,
     NextTerminal,
+    /// Fresh view preferences whose native rendering bridge is not yet available.
+    BackendOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -160,9 +162,18 @@ pub fn catalog() -> Vec<SettingDefinition> {
             effect: SettingEffect::NextTerminal,
             ..daemon(&["terminal", "shell", "args"], Array, None)
         },
-        fresh(&["editor", "line_numbers"], Boolean),
-        fresh(&["editor", "line_wrap"], Boolean),
-        fresh(&["editor", "wrap_column"], OptionalInteger),
+        SettingDefinition {
+            effect: SettingEffect::BackendOnly,
+            ..fresh(&["editor", "line_numbers"], Boolean)
+        },
+        SettingDefinition {
+            effect: SettingEffect::Immediate,
+            ..fresh(&["editor", "line_wrap"], Boolean)
+        },
+        SettingDefinition {
+            effect: SettingEffect::BackendOnly,
+            ..fresh(&["editor", "wrap_column"], OptionalInteger)
+        },
         fresh(&["editor", "use_tabs"], Boolean),
         bounded(fresh(&["editor", "tab_size"], Integer), 1, 32),
         fresh(&["editor", "auto_indent"], Boolean),
@@ -266,8 +277,10 @@ pub fn patch_jsonc(
                 } else {
                     node.remove();
                 }
-            } else if value.is_some() && index == nodes.len() {
-                array.append(to_cst(value.unwrap()));
+            } else if let Some(value) = value
+                && index == nodes.len()
+            {
+                array.append(to_cst(value));
             } else if index > nodes.len() || value.is_some() {
                 return Err(SettingsError::InvalidPath(path.join(".")));
             }
@@ -373,17 +386,17 @@ pub fn validate_value(setting: &SettingDefinition, value: &Value) -> Result<(), 
     if !valid {
         return Err(SettingsError::InvalidValue);
     }
-    if let Some(number) = value.as_i64() {
-        if number < 0 && setting.minimum.is_some() {
-            return Err(SettingsError::InvalidValue);
-        }
+    if let Some(number) = value.as_i64()
+        && number < 0
+        && setting.minimum.is_some()
+    {
+        return Err(SettingsError::InvalidValue);
     }
-    if let Some(number) = value.as_u64() {
-        if setting.minimum.is_some_and(|min| number < min)
-            || setting.maximum.is_some_and(|max| number > max)
-        {
-            return Err(SettingsError::InvalidValue);
-        }
+    if let Some(number) = value.as_u64()
+        && (setting.minimum.is_some_and(|min| number < min)
+            || setting.maximum.is_some_and(|max| number > max))
+    {
+        return Err(SettingsError::InvalidValue);
     }
     if !setting.choices.is_empty()
         && !value

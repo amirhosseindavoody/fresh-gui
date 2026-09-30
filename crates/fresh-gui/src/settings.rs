@@ -87,11 +87,10 @@ pub fn apply_patch(
                     .zip(parts)
                     .all(|(expected, actual)| *expected == actual)
         })
+        && let Some(value) = &value
     {
-        if let Some(value) = &value {
-            fresh_gui_protocol::settings::validate_value(setting, value)
-                .map_err(|error| anyhow::anyhow!("{error}"))?;
-        }
+        fresh_gui_protocol::settings::validate_value(setting, value)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
     let text = fresh_gui_protocol::settings::patch_jsonc(&current, parts, value.as_ref())
         .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -134,6 +133,17 @@ fn validate(root: &Value, workspace: bool) -> Result<()> {
     Ok(())
 }
 
+/// Values inherited when removing an override from the selected layer.
+pub fn layer_defaults(config_path: &Path, workspace: bool) -> Result<Value> {
+    if !workspace {
+        return Ok(defaults_value());
+    }
+    let config = Config::load_from_path(config_path)?;
+    let mut fresh = fresh::config::Config::default();
+    config.apply_fresh(&mut fresh);
+    serde_json::to_value(fresh).context("serialize inherited Fresh settings")
+}
+
 pub fn defaults_value() -> Value {
     let mut fresh = serde_json::to_value(fresh::config::Config::default()).unwrap_or(Value::Null);
     let host = serde_json::to_value(Config::default()).unwrap_or(Value::Null);
@@ -144,14 +154,12 @@ pub fn defaults_value() -> Value {
             }
         }
     }
-    if let Some(target) = fresh.as_object_mut() {
-        if let Ok(template) =
+    if let Some(target) = fresh.as_object_mut()
+        && let Ok(template) =
             fresh_gui_protocol::settings::read_jsonc(crate::config::DEFAULT_CONFIG_TEMPLATE)
-        {
-            if let Some(bindings) = template.get("shortkeys") {
-                target.insert("shortkeys".into(), bindings.clone());
-            }
-        }
+        && let Some(bindings) = template.get("shortkeys")
+    {
+        target.insert("shortkeys".into(), bindings.clone());
     }
     fresh
 }
@@ -191,6 +199,30 @@ mod tests {
     }
 
     #[test]
+    fn workspace_reset_inherits_daemon_user_values_and_native_defaults() {
+        let root =
+            std::env::temp_dir().join(format!("fresh-gui-defaults-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{"editor":{"tab_size":9},"languages":{"rust":{"use_tabs":true}}}"#,
+        )
+        .unwrap();
+        let inherited = layer_defaults(&config_path, true).unwrap();
+        assert_eq!(inherited["editor"]["tab_size"], 9);
+        assert_eq!(inherited["languages"]["rust"]["use_tabs"], true);
+        let native = defaults_value();
+        assert!(
+            native["shortkeys"]
+                .as_array()
+                .is_some_and(|v| !v.is_empty())
+        );
+        assert_eq!(native["ui"]["editorFontSize"], 14);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn compare_and_swap_rejects_stale_text() {
         let dir = std::env::temp_dir().join(format!("fresh-gui-settings-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -222,7 +254,13 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    apply_patch(&path, source, &[label.to_owned()], Some(Value::Bool(true)), false)
+                    apply_patch(
+                        &path,
+                        source,
+                        &[label.to_owned()],
+                        Some(Value::Bool(true)),
+                        false,
+                    )
                 })
             })
             .collect();
@@ -244,8 +282,14 @@ mod tests {
         let source = "{\"editor\":{\"tab_size\":4,\"line_wrap\":true}}\n";
         std::fs::write(&path, source).unwrap();
         for (parts, value) in [
-            (vec!["editor".to_owned(), "tab_size".to_owned()], Value::from(33)),
-            (vec!["editor".to_owned(), "line_wrap".to_owned()], Value::from(3)),
+            (
+                vec!["editor".to_owned(), "tab_size".to_owned()],
+                Value::from(33),
+            ),
+            (
+                vec!["editor".to_owned(), "line_wrap".to_owned()],
+                Value::from(3),
+            ),
         ] {
             assert!(apply_patch(&path, source, &parts, Some(value), false).is_err());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
