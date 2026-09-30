@@ -33,6 +33,8 @@ fresh-gui close             # stop the daemon session
 
 The app starts a local daemon if needed and reuses it next time. Closing the window leaves the daemon running; `fresh-gui close` stops it.
 
+Files above 2 MiB open in a paged editor. Scroll within a page, use **Previous page** / **Next page**, or enter a zero-based **Go to byte** offset. Typing and Save use the daemon's Fresh buffer; only the requested page and edits cross the connection. Find and line numbers currently refer to the displayed page. See [large-file behavior and measured limits](./docs/FRESH.md#large-files) for recovery and feature limitations.
+
 ## Open a Linux server over SSH
 
 From your Windows or Linux laptop:

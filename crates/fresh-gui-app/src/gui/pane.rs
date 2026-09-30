@@ -1974,6 +1974,15 @@ impl EditorPanel {
         &mut self, path: String, rev: u64, generation: String, text: String, disk_text: Option<String>,
         server_dirty: bool, window: &mut Window, cx: &mut Context<Self>,
     ) {
+        if self.page.is_some() {
+            // Lazy pieces still use the source file. Never install the legacy
+            // empty notice text as a page, or offer unsafe overwrite/reload.
+            self.dirty |= server_dirty;
+            self.sync_paused = true;
+            self.lsp_status = Some("File changed on disk; paged reads, edits and save are blocked. Recovery journal retained; close and reopen after reviewing the disk change.".into());
+            cx.notify();
+            return;
+        }
         if self.external.is_none() && self.external_generation.as_deref() == Some(generation.as_str()) {
             return;
         }
