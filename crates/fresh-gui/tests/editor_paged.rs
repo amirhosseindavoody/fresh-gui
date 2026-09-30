@@ -457,6 +457,75 @@ async fn older_client_without_paged_capability_gets_explicit_rejection() {
 }
 
 #[tokio::test]
+async fn paged_buffers_remain_scoped_to_their_workspace() {
+    let root = temp_root("workspace-daemon-root");
+    let alpha_root = temp_root("workspace-alpha");
+    let beta_root = temp_root("workspace-beta");
+    let mut alpha_text = fixture_bytes();
+    alpha_text[..5].copy_from_slice(b"alpha");
+    let mut beta_text = fixture_bytes();
+    beta_text[..4].copy_from_slice(b"beta");
+    fs::write(alpha_root.join("same.txt"), alpha_text).expect("write alpha");
+    fs::write(beta_root.join("same.txt"), beta_text).expect("write beta");
+    let addr = free_loopback();
+    let _backend = spawn_backend(addr, &root);
+    wait_health(addr);
+    let mut client = connect(addr).await;
+    let alpha = client
+        .create_workspace(Some("paged alpha".into()), Some(alpha_root.display().to_string()))
+        .await
+        .expect("create alpha workspace");
+    let beta = client
+        .create_workspace(Some("paged beta".into()), Some(beta_root.display().to_string()))
+        .await
+        .expect("create beta workspace");
+
+    client.switch_workspace(&alpha.id).await.expect("switch alpha");
+    let alpha_buffer = open_paged(&mut client, "same.txt", "alpha-open").await;
+    let (_, _, _, alpha_page) =
+        read_page(&mut client, &alpha_buffer.buffer_id, 0, 64, "alpha-read").await;
+    assert!(alpha_page.contains("alpha contents"));
+
+    client.switch_workspace(&beta.id).await.expect("switch beta");
+    client
+        .send(Message::BufferRead {
+            request_id: "cross-workspace-read".into(),
+            buffer_id: alpha_buffer.buffer_id,
+            view_id: "paged-test-view".into(),
+            start: 0,
+            len: 64,
+        })
+        .await
+        .expect("send cross-workspace read");
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match client.recv().await.expect("receive workspace isolation response") {
+                Message::Error { message, .. } if message.starts_with("cross-workspace-read") => {
+                    assert!(message.contains("workspace"), "unexpected error: {message}");
+                    break;
+                }
+                Message::PtyData { .. }
+                | Message::PtyClosed { .. }
+                | Message::Pong { .. }
+                | Message::Ping { .. }
+                | Message::FsChanged { .. } => {}
+                other => panic!("unexpected workspace isolation response: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("workspace isolation response timed out");
+
+    let beta_buffer = open_paged(&mut client, "same.txt", "beta-open").await;
+    let (_, _, _, beta_page) =
+        read_page(&mut client, &beta_buffer.buffer_id, 0, 64, "beta-read").await;
+    assert!(beta_page.contains("beta contents"));
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(alpha_root);
+    let _ = fs::remove_dir_all(beta_root);
+}
+
+#[tokio::test]
 #[ignore = "measurement harness; run with LARGE_FILE_MIB=100 and --ignored --nocapture"]
 async fn measure_large_file_open_range_edit_and_daemon_rss() {
     let mib = std::env::var("LARGE_FILE_MIB")
