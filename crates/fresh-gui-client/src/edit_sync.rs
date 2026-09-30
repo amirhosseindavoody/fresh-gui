@@ -24,6 +24,41 @@ pub enum SnapshotReconciliation {
     Conflict,
 }
 
+/// Decision for a filesystem snapshot that may be newer than the editor
+/// buffer. `Deleted` deliberately does not imply that the caller should close
+/// the editor: a dirty draft still needs to remain visible while the missing
+/// file is resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalSnapshotReconciliation {
+    Reload,
+    Prompt,
+    Deleted,
+    Ignore,
+}
+
+/// Decide whether an external disk snapshot can replace the client buffer.
+/// A daemon-side dirty bit matters even when this client has no pending text:
+/// the client may have acknowledged a draft which has not been written to disk.
+pub fn external_reconciliation(
+    local_dirty: bool,
+    local_rev: u64,
+    incoming_rev: u64,
+    disk_present: bool,
+    server_dirty: bool,
+) -> ExternalSnapshotReconciliation {
+    if incoming_rev < local_rev {
+        return ExternalSnapshotReconciliation::Ignore;
+    }
+    if !disk_present {
+        return ExternalSnapshotReconciliation::Deleted;
+    }
+    if local_dirty || server_dirty {
+        ExternalSnapshotReconciliation::Prompt
+    } else {
+        ExternalSnapshotReconciliation::Reload
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditSync {
     acknowledged_text: String,
@@ -161,6 +196,34 @@ impl EditSync {
         });
         SnapshotReconciliation::Conflict
     }
+
+    /// Reconcile a snapshot while honoring the daemon's dirty state. A dirty
+    /// daemon buffer can differ from disk even when the client draft equals
+    /// its acknowledged text, so the ordinary three-way reconciliation must
+    /// not adopt disk text over that retained daemon draft.
+    pub fn reconcile_protected_snapshot(
+        &mut self,
+        revision: u64,
+        authoritative_text: String,
+        draft: &str,
+        server_dirty: bool,
+    ) -> SnapshotReconciliation {
+        if server_dirty
+            && draft != authoritative_text
+            && authoritative_text != self.acknowledged_text
+            && self.sent_text.as_deref() != Some(authoritative_text.as_str())
+        {
+            self.conflict = Some(ConflictSnapshot {
+                base_rev: self.revision,
+                base_text: self.acknowledged_text.clone(),
+                rev: revision,
+                text: authoritative_text,
+            });
+            self.sent_text = None;
+            return SnapshotReconciliation::Conflict;
+        }
+        self.reconcile_snapshot(revision, authoritative_text, draft)
+    }
 }
 
 pub fn contiguous_diff(old: &str, new: &str) -> Vec<RangeEdit> {
@@ -238,6 +301,52 @@ mod tests {
             assert_eq!(sync.conflict().unwrap().text, "server");
             assert!(sync.begin_edit(draft).is_none());
         }
+    }
+
+    #[test]
+    fn external_snapshot_decision_protects_dirty_drafts_and_stale_revisions() {
+        assert_eq!(
+            external_reconciliation(false, 4, 5, true, false),
+            ExternalSnapshotReconciliation::Reload
+        );
+        assert_eq!(
+            external_reconciliation(true, 4, 5, true, false),
+            ExternalSnapshotReconciliation::Prompt
+        );
+        // An acknowledged daemon draft is still dirty relative to disk.
+        assert_eq!(
+            external_reconciliation(false, 4, 5, true, true),
+            ExternalSnapshotReconciliation::Prompt
+        );
+        assert_eq!(
+            external_reconciliation(true, 5, 4, true, false),
+            ExternalSnapshotReconciliation::Ignore
+        );
+        assert_eq!(
+            external_reconciliation(true, 4, 5, false, true),
+            ExternalSnapshotReconciliation::Deleted
+        );
+    }
+
+    #[test]
+    fn protected_snapshot_keeps_acknowledged_daemon_draft_on_reconnect() {
+        let mut sync = EditSync::new("draft already acknowledged".into(), 7);
+        assert_eq!(
+            sync.reconcile_snapshot(8, "new disk text".into(), "draft already acknowledged"),
+            SnapshotReconciliation::Adopted
+        );
+
+        let mut sync = EditSync::new("draft already acknowledged".into(), 7);
+        assert_eq!(
+            sync.reconcile_protected_snapshot(
+                8,
+                "new disk text".into(),
+                "draft already acknowledged",
+                true,
+            ),
+            SnapshotReconciliation::Conflict
+        );
+        assert_eq!(sync.conflict().unwrap().text, "new disk text");
     }
 
     #[test]
