@@ -75,9 +75,15 @@ fn temp_root(tag: &str) -> std::path::PathBuf {
     root
 }
 
+fn json_size(message: &Message) -> usize {
+    serde_json::to_vec(message)
+        .expect("serialize protocol message")
+        .len()
+}
+
 async fn connect(addr: SocketAddr) -> Client {
     let url = format!("ws://{addr}/ws");
-    let mut client = Client::connect(ConnectOptions::new(url))
+    let client = Client::connect(ConnectOptions::new(url))
         .await
         .expect("connect to daemon");
     assert!(client.supports_capability(CAP_EDITOR_PAGED_READS));
@@ -88,24 +94,29 @@ struct PagedOpen {
     buffer_id: String,
     rev: u64,
     total_bytes: usize,
+    wire_bytes: usize,
 }
 
 async fn open_paged(client: &mut Client, path: &str, request_id: &str) -> PagedOpen {
+    let request = Message::EditorOpen {
+        request_id: request_id.to_owned(),
+        path: path.to_owned(),
+        preview: false,
+        cwd: None,
+        line: None,
+        column: None,
+    };
+    let mut wire_bytes = json_size(&request);
     client
-        .send(Message::EditorOpen {
-            request_id: request_id.to_owned(),
-            path: path.to_owned(),
-            preview: false,
-            cwd: None,
-            line: None,
-            column: None,
-        })
+        .send(request)
         .await
         .expect("send EditorOpen");
     tokio::time::timeout(Duration::from_secs(30), async {
         let mut opened = None;
         loop {
-            match client.recv().await.expect("receive open response") {
+            let message = client.recv().await.expect("receive open response");
+            wire_bytes += json_size(&message);
+            match message {
                 Message::EditorOpened {
                     request_id: rid,
                     buffer_id,
@@ -121,6 +132,7 @@ async fn open_paged(client: &mut Client, path: &str, request_id: &str) -> PagedO
                         buffer_id,
                         rev,
                         total_bytes,
+                        wire_bytes,
                     }
                 }
                 Message::Error { code, message } => {
@@ -145,20 +157,24 @@ async fn read_page(
     start: usize,
     len: usize,
     request_id: &str,
-) -> (u64, usize, usize, String) {
+) -> (u64, usize, usize, String, usize) {
+    let request = Message::BufferRead {
+        request_id: request_id.to_owned(),
+        buffer_id: buffer_id.to_owned(),
+        view_id: "paged-test-view".into(),
+        start,
+        len,
+    };
+    let mut wire_bytes = json_size(&request);
     client
-        .send(Message::BufferRead {
-            request_id: request_id.to_owned(),
-            buffer_id: buffer_id.to_owned(),
-            view_id: "paged-test-view".into(),
-            start,
-            len,
-        })
+        .send(request)
         .await
         .expect("send BufferRead");
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            match client.recv().await.expect("receive page") {
+            let message = client.recv().await.expect("receive page");
+            wire_bytes += json_size(&message);
+            match message {
                 Message::BufferPage {
                     request_id: rid,
                     rev,
@@ -169,7 +185,7 @@ async fn read_page(
                     ..
                 } if rid == request_id => {
                     assert!(accepted, "page request was rejected");
-                    return (rev, start, total_bytes, text);
+                    return (rev, start, total_bytes, text, wire_bytes);
                 }
                 Message::Error { code, message } if message.starts_with(request_id) => {
                     panic!("page request failed: {code}: {message}")
@@ -193,32 +209,36 @@ async fn range_edit(
     base_rev: u64,
     edit: RangeEdit,
     request_id: &str,
-) -> (u64, bool, String) {
+) -> (u64, bool, String, usize) {
+    let request = Message::BufferRangeEdit {
+        request_id: request_id.to_owned(),
+        buffer_id: buffer_id.to_owned(),
+        view_id: "paged-test-view".into(),
+        base_rev,
+        edits: vec![edit],
+        viewport: Some(ByteRange {
+            start: 0,
+            len: 128,
+        }),
+        selection: ByteSelection { anchor: 0, head: 0 },
+    };
+    let mut wire_bytes = json_size(&request);
     client
-        .send(Message::BufferRangeEdit {
-            request_id: request_id.to_owned(),
-            buffer_id: buffer_id.to_owned(),
-            view_id: "paged-test-view".into(),
-            base_rev,
-            edits: vec![edit],
-            viewport: Some(ByteRange {
-                start: 0,
-                len: 128,
-            }),
-            selection: ByteSelection { anchor: 0, head: 0 },
-        })
+        .send(request)
         .await
         .expect("send range edit");
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            match client.recv().await.expect("receive edit result") {
+            let message = client.recv().await.expect("receive edit result");
+            wire_bytes += json_size(&message);
+            match message {
                 Message::BufferPage {
                     request_id: rid,
                     rev,
                     accepted,
                     text,
                     ..
-                } if rid == request_id => return (rev, accepted, text),
+                } if rid == request_id => return (rev, accepted, text, wire_bytes),
                 Message::Error { code, message } if message.starts_with(request_id) => {
                     panic!("range edit failed: {code}: {message}")
                 }
@@ -242,7 +262,8 @@ fn fixture_bytes() -> Vec<u8> {
     let mut bytes = vec![b'x'; 3 * 1024 * 1024];
     bytes[0..8].copy_from_slice(b"start---");
     bytes[65_533..65_543].copy_from_slice("🦀界e\u{301}".as_bytes());
-    bytes[bytes.len() - 8..].copy_from_slice(b"---end!!");
+    let end = bytes.len();
+    bytes[end - 8..].copy_from_slice(b"---end!!");
     bytes
 }
 
@@ -260,7 +281,7 @@ async fn paged_reads_and_incremental_edits_preserve_large_utf8_file() {
     let opened = open_paged(&mut client, "large.txt", "paged-open").await;
     assert_eq!(opened.total_bytes, original.len());
 
-    let (_, start, total, page) = read_page(
+    let (_, start, total, page, _) = read_page(
         &mut client,
         &opened.buffer_id,
         0,
@@ -292,7 +313,7 @@ async fn paged_reads_and_incremental_edits_preserve_large_utf8_file() {
         end: 8,
         text: "paged-edit-🦀".into(),
     };
-    let (rev, accepted, viewport) = range_edit(
+    let (rev, accepted, viewport, _) = range_edit(
         &mut client,
         &opened.buffer_id,
         opened.rev,
@@ -305,7 +326,7 @@ async fn paged_reads_and_incremental_edits_preserve_large_utf8_file() {
     assert!(viewport.starts_with("start---paged-edit-🦀"));
 
     let before_bad_edit = fs::read(&file).expect("read original disk file");
-    let (stale_rev, stale_accepted, _) = range_edit(
+    let (stale_rev, stale_accepted, _, _) = range_edit(
         &mut client,
         &opened.buffer_id,
         opened.rev,
@@ -357,7 +378,7 @@ async fn paged_reads_and_incremental_edits_preserve_large_utf8_file() {
     })
     .await
     .expect("malformed-edit response timed out");
-    let (unchanged_rev, _, _, unchanged_page) = read_page(
+    let (unchanged_rev, _, _, unchanged_page, _) = read_page(
         &mut client,
         &opened.buffer_id,
         0,
@@ -482,7 +503,7 @@ async fn paged_buffers_remain_scoped_to_their_workspace() {
 
     client.switch_workspace(&alpha.id).await.expect("switch alpha");
     let alpha_buffer = open_paged(&mut client, "same.txt", "alpha-open").await;
-    let (_, _, _, alpha_page) =
+    let (_, _, _, alpha_page, _) =
         read_page(&mut client, &alpha_buffer.buffer_id, 0, 64, "alpha-read").await;
     assert!(alpha_page.contains("alpha contents"));
 
@@ -517,7 +538,7 @@ async fn paged_buffers_remain_scoped_to_their_workspace() {
     .expect("workspace isolation response timed out");
 
     let beta_buffer = open_paged(&mut client, "same.txt", "beta-open").await;
-    let (_, _, _, beta_page) =
+    let (_, _, _, beta_page, _) =
         read_page(&mut client, &beta_buffer.buffer_id, 0, 64, "beta-read").await;
     assert!(beta_page.contains("beta contents"));
     let _ = fs::remove_dir_all(root);
@@ -548,14 +569,13 @@ async fn measure_large_file_open_range_edit_and_daemon_rss() {
     let mut backend = spawn_backend(addr, &root);
     wait_health(addr);
     let pid = backend.0.id();
-    let client = connect(addr).await;
-    let mut client = client;
+    let mut client = connect(addr).await;
 
     let start = Instant::now();
     let opened = open_paged(&mut client, "measurement.txt", "measure-open").await;
     let open_ms = start.elapsed().as_millis();
     let start = Instant::now();
-    let (rev, page_start, reported_total, viewport) = read_page(
+    let (rev, _page_start, reported_total, viewport, page_transfer_bytes) = read_page(
         &mut client,
         &opened.buffer_id,
         bytes / 2,
@@ -568,7 +588,7 @@ async fn measure_large_file_open_range_edit_and_daemon_rss() {
     assert!(viewport.len() <= MAX_PAGE_BYTES);
 
     let start = Instant::now();
-    let (edit_rev, accepted, _) = range_edit(
+    let (edit_rev, accepted, _, edit_transfer_bytes) = range_edit(
         &mut client,
         &opened.buffer_id,
         rev,
@@ -586,22 +606,9 @@ async fn measure_large_file_open_range_edit_and_daemon_rss() {
     // /proc reports the child's high-water resident set; sample too, so this
     // still records a useful peak if the daemon has not updated VmHWM yet.
     let peak_rss_kib = peak_rss_kib(pid);
-    let transfer_bytes = serde_json::to_vec(&Message::BufferPage {
-        request_id: "measure-range".into(),
-        buffer_id: opened.buffer_id.clone(),
-        view_id: "paged-test-view".into(),
-        rev,
-        start: page_start,
-        total_bytes: bytes,
-        text: viewport.clone(),
-        selection: ByteSelection { anchor: 0, head: 0 },
-        accepted: true,
-        dirty: false,
-    })
-    .expect("serialize page")
-    .len();
+    let transfer_bytes = opened.wire_bytes + page_transfer_bytes + edit_transfer_bytes;
     println!(
-        "LARGE_FILE_RESULT {{\"fixture_bytes\":{bytes},\"open_ms\":{open_ms},\"page_ms\":{page_ms},\"edit_ack_ms\":{edit_ms},\"page_payload_bytes\":{},\"page_wire_json_bytes\":{transfer_bytes},\"daemon_peak_rss_kib\":{peak_rss_kib},\"resulting_rev\":{edit_rev}}}",
+        "LARGE_FILE_RESULT {{\"fixture_bytes\":{bytes},\"open_ms\":{open_ms},\"page_ms\":{page_ms},\"edit_ack_ms\":{edit_ms},\"page_payload_bytes\":{},\"measured_full_duplex_json_bytes\":{transfer_bytes},\"daemon_peak_rss_kib\":{peak_rss_kib},\"resulting_rev\":{edit_rev}}}",
         viewport.len()
     );
 
