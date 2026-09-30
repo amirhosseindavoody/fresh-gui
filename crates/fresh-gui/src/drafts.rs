@@ -77,8 +77,21 @@ impl DraftStore {
         self.root.join(format!("{}.json", hex_id(workspace_id)))
     }
 
-    fn read(&self, workspace_id: &str) -> Result<DraftFile> {
-        let path = self.path(workspace_id);
+    fn paged_path(&self, workspace_id: &str) -> PathBuf {
+        self.root
+            .join(format!("{}.paged.json", hex_id(workspace_id)))
+    }
+
+    fn partition_path(&self, workspace_id: &str, paged: bool) -> PathBuf {
+        if paged {
+            self.paged_path(workspace_id)
+        } else {
+            self.path(workspace_id)
+        }
+    }
+
+    fn read_partition(&self, workspace_id: &str, paged: bool) -> Result<DraftFile> {
+        let path = self.partition_path(workspace_id, paged);
         let read_path = if path.exists() {
             path.clone()
         } else {
@@ -96,8 +109,8 @@ impl DraftStore {
         }
     }
 
-    fn write(&self, workspace_id: &str, state: &DraftFile) -> Result<()> {
-        let path = self.path(workspace_id);
+    fn write_partition(&self, workspace_id: &str, state: &DraftFile, paged: bool) -> Result<()> {
+        let path = self.partition_path(workspace_id, paged);
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
@@ -141,8 +154,48 @@ impl DraftStore {
         Ok(())
     }
 
+    fn read(&self, workspace_id: &str) -> Result<DraftFile> {
+        let ordinary = self.read_partition(workspace_id, false)?;
+        let paged = self.read_partition(workspace_id, true)?;
+        let mut drafts = ordinary.drafts;
+        for draft in paged.drafts {
+            if let Some(existing) = drafts
+                .iter_mut()
+                .find(|item| item.draft_id == draft.draft_id)
+            {
+                *existing = draft;
+            } else {
+                drafts.push(draft);
+            }
+        }
+        Ok(DraftFile { version: 1, drafts })
+    }
+
+    fn remove_from_partition(&self, workspace_id: &str, draft_id: &str, paged: bool) -> Result<()> {
+        let mut state = self.read_partition(workspace_id, paged)?;
+        let before = state.drafts.len();
+        state.drafts.retain(|draft| draft.draft_id != draft_id);
+        if state.drafts.len() == before {
+            return Ok(());
+        }
+        if state.drafts.is_empty() {
+            let path = self.partition_path(workspace_id, paged);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err).with_context(|| format!("remove {}", path.display())),
+            }
+            let _ = std::fs::remove_file(path.with_extension("json.bak"));
+            Ok(())
+        } else {
+            self.write_partition(workspace_id, &state, paged)
+        }
+    }
+
     pub fn checkpoint(&self, workspace_id: &str, draft: Draft) -> Result<()> {
-        let mut state = self.read(workspace_id)?;
+        let paged = draft.paged.is_some();
+        let draft_id = draft.draft_id.clone();
+        let mut state = self.read_partition(workspace_id, paged)?;
         if let Some(existing) = state
             .drafts
             .iter_mut()
@@ -153,7 +206,8 @@ impl DraftStore {
             state.drafts.push(draft);
         }
         state.version = 1;
-        self.write(workspace_id, &state)
+        self.write_partition(workspace_id, &state, paged)?;
+        self.remove_from_partition(workspace_id, &draft_id, !paged)
     }
 
     pub fn list(&self, workspace_id: &str) -> Result<Vec<Draft>> {
@@ -169,19 +223,8 @@ impl DraftStore {
     }
 
     pub fn discard(&self, workspace_id: &str, draft_id: &str) -> Result<()> {
-        let mut state = self.read(workspace_id)?;
-        state.drafts.retain(|draft| draft.draft_id != draft_id);
-        if state.drafts.is_empty() {
-            let path = self.path(workspace_id);
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err).context("remove empty draft store"),
-            }
-            let _ = std::fs::remove_file(path.with_extension("json.bak"));
-            return Ok(());
-        }
-        self.write(workspace_id, &state)
+        self.remove_from_partition(workspace_id, draft_id, false)?;
+        self.remove_from_partition(workspace_id, draft_id, true)
     }
 
     pub fn source_changed(draft: &Draft) -> bool {
@@ -260,6 +303,87 @@ mod tests {
         let path = store.path("workspace");
         std::fs::rename(&path, path.with_extension("json.bak")).unwrap();
         assert_eq!(store.get("workspace", "named").unwrap(), Some(draft));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn paged_journals_stay_out_of_the_legacy_workspace_file() {
+        let root =
+            std::env::temp_dir().join(format!("draft-paged-partition-{}", uuid::Uuid::new_v4()));
+        let store = DraftStore::new(root.clone());
+        let ordinary = Draft {
+            draft_id: "ordinary-buffer".into(),
+            path: None,
+            text: "ordinary recovery".into(),
+            base_text: None,
+            paged: None,
+        };
+        let paged = Draft {
+            draft_id: "large-buffer".into(),
+            path: Some("/tmp/large.txt".into()),
+            text: String::new(),
+            base_text: None,
+            paged: Some(PagedDraft {
+                generation: "source-generation".into(),
+                edits: vec![PagedEditTransaction {
+                    viewport: fresh_gui_protocol::ByteRange {
+                        start: 1024,
+                        len: 4096,
+                    },
+                    edits: vec![fresh_gui_protocol::RangeEdit {
+                        start: 2048,
+                        end: 2049,
+                        text: "z".into(),
+                    }],
+                }],
+            }),
+        };
+        store.checkpoint("workspace", ordinary.clone()).unwrap();
+        store.checkpoint("workspace", paged.clone()).unwrap();
+
+        let legacy_path = store.path("workspace");
+        let legacy_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&legacy_path).unwrap()).unwrap();
+        let legacy_drafts = legacy_json["drafts"].as_array().unwrap();
+        assert_eq!(legacy_drafts.len(), 1);
+        assert_eq!(legacy_drafts[0]["draft_id"], "ordinary-buffer");
+        assert!(legacy_drafts[0].get("paged").is_none());
+        assert!(store.paged_path("workspace").exists());
+
+        assert_eq!(store.list("workspace").unwrap().len(), 2);
+        assert_eq!(store.get("workspace", "large-buffer").unwrap(), Some(paged));
+        store.discard("workspace", "large-buffer").unwrap();
+        assert_eq!(store.list("workspace").unwrap(), vec![ordinary]);
+        assert!(legacy_path.exists());
+        assert!(!store.paged_path("workspace").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn switching_draft_kind_removes_the_obsolete_partition_entry() {
+        let root = std::env::temp_dir().join(format!("draft-kind-switch-{}", uuid::Uuid::new_v4()));
+        let store = DraftStore::new(root.clone());
+        let paged = Draft {
+            draft_id: "same-id".into(),
+            path: Some("/tmp/large.txt".into()),
+            text: String::new(),
+            base_text: None,
+            paged: Some(PagedDraft {
+                generation: "g".into(),
+                edits: vec![],
+            }),
+        };
+        store.checkpoint("workspace", paged).unwrap();
+        let ordinary = Draft {
+            draft_id: "same-id".into(),
+            path: None,
+            text: "ordinary".into(),
+            base_text: None,
+            paged: None,
+        };
+        store.checkpoint("workspace", ordinary.clone()).unwrap();
+        assert_eq!(store.list("workspace").unwrap(), vec![ordinary]);
+        assert!(!store.paged_path("workspace").exists());
         let _ = std::fs::remove_dir_all(root);
     }
 }
