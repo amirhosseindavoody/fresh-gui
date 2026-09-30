@@ -867,7 +867,16 @@ fn run_loop(
                             });
                     let _ = reply.send(result);
                 }
-                Cmd::CheckExternal { buffer_id, reply } => { let _ = reply.send(Ok(tracked.get(&buffer_id).and_then(|e| e.external.clone()))); }
+                Cmd::CheckExternal { buffer_id, reply } => {
+                    let result = poll_external_changes(&mut editor, &mut tracked, &external_tx)
+                        .and_then(|()| {
+                            tracked
+                                .get(&buffer_id)
+                                .context("unknown buffer")
+                                .map(|entry| entry.external.clone())
+                        });
+                    let _ = reply.send(result);
+                }
                 Cmd::ResolveExternal { buffer_id, base_rev, generation, resolution, reply } => {
                     let result = resolve_external(&mut editor, &mut tracked, &buffer_id, base_rev, &generation, resolution);
                     let _ = reply.send(result);
