@@ -205,7 +205,7 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
     let config_path = root.join("config.json");
     let target_name = if cfg!(windows) { "target name😀.py" } else { "target name😀.py:12" };
     let target_path = root.join(target_name);
-    let target_uri = fresh::app::types::file_path_to_lsp_uri(&target_path).unwrap().to_string();
+    let mut target_uri = None;
     let paged_path = root.join("paged.py");
     let config = serde_json::json!({
         "lsp": { "python": [
@@ -338,15 +338,19 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
                 format!("file://{}", root.join("sample.py").display())
             );
         } else {
-            assert_eq!(
-                result.navigation_targets[0].uri,
-                target_uri.clone()
+            let wire = fresh::app::types::LspUri::from_wire(
+                serde_json::from_value(serde_json::json!(result.navigation_targets[0].uri)).unwrap(),
             );
+            assert_eq!(wire.to_host_path(None).unwrap(), target_path);
+            if feature == LspRequestFeature::Definition {
+                target_uri = Some(result.navigation_targets[0].uri.clone());
+            }
             assert_eq!(result.navigation_targets[0].line, 0);
             assert_eq!(result.navigation_targets[0].character, 3);
         }
     }
 
+    let target_uri = target_uri.expect("definition returns a target URI");
     client
         .send(Message::EditorOpenLocation {
             request_id: "lsp-location-open".into(),
