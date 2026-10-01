@@ -15,7 +15,7 @@ use axum::routing::get;
 use base64::Engine;
 use fresh_gui_protocol::{
     CAP_EDITOR, CAP_EDITOR_DRAFT_RECOVERY, CAP_EDITOR_EXTERNAL_CHANGES, CAP_EDITOR_PAGED_READS,
-    CAP_EDITOR_RANGE_EDITS, CAP_LSP, CAP_LSP_REQUESTS, CAP_SCENE, CAP_SETTINGS_EDITOR, ByteSelection,
+    CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_SEARCH, CAP_LSP, CAP_LSP_REQUESTS, CAP_SCENE, CAP_SETTINGS_EDITOR, ByteSelection,
     EditorDraftInfo, ExternalResolution, Hello, HelloUi, Message, MAX_PAGE_BYTES, PROTOCOL_VERSION,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -135,6 +135,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 && c != CAP_EDITOR_PAGED_READS
                 && c != CAP_EDITOR_DRAFT_RECOVERY
                 && c != CAP_EDITOR_EXTERNAL_CHANGES
+                && c != CAP_EDITOR_SEARCH
                 && c != CAP_LSP
                 && c != CAP_LSP_REQUESTS
                 && c != CAP_SCENE
@@ -169,6 +170,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut client_external_changes = false;
     let mut client_settings_editor = false;
     let mut client_lsp_requests = false;
+    let mut client_editor_search = false;
     let mut session_id: Option<String> = None;
     let socket_id = uuid::Uuid::new_v4().to_string();
     let mut lsp_request_map: HashMap<u64, (u64, String, String)> = HashMap::new();
@@ -266,6 +268,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     &mut client_lsp_requests,
                     &mut lsp_request_map,
                     &socket_id,
+                    &mut client_editor_search,
                     &mut session_id,
                     out_tx.clone(),
                     &mut sink,
@@ -302,6 +305,7 @@ async fn handle_client_msg(
     client_lsp_requests: &mut bool,
     lsp_request_map: &mut HashMap<u64, (u64, String, String)>,
     socket_id: &str,
+    client_editor_search: &mut bool,
     session_id: &mut Option<String>,
     out_tx: mpsc::UnboundedSender<Message>,
     sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
@@ -329,6 +333,10 @@ async fn handle_client_msg(
                 .iter()
                 .any(|cap| cap == CAP_SETTINGS_EDITOR);
             *client_lsp_requests = client_hello.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS);
+            *client_editor_search = client_hello
+                .capabilities
+                .iter()
+                .any(|cap| cap == CAP_EDITOR_SEARCH);
             if client_hello.protocol_version != PROTOCOL_VERSION {
                 return Err(Message::Error {
                     code: "protocol_mismatch".into(),
@@ -1193,6 +1201,52 @@ async fn handle_client_msg(
                     code: "editor_close_failed".into(),
                     message: err.to_string(),
                 })?;
+            Ok(())
+        }
+        Message::BufferSearch {
+            request_id,
+            text,
+            query,
+            replacement,
+            options,
+            scope,
+        } => {
+            require_auth(*authed)?;
+            if !*client_editor_search {
+                return Err(Message::Error {
+                    code: "capability_unavailable".into(),
+                    message: format!("{request_id}: client did not negotiate {CAP_EDITOR_SEARCH}"),
+                });
+            }
+            if state.editor.is_none() {
+                return Err(Message::Error {
+                    code: "capability_unavailable".into(),
+                    message: format!("{request_id}: server did not advertise {CAP_EDITOR_SEARCH}"),
+                });
+            }
+            let preview = tokio::task::spawn_blocking(move || {
+                crate::search::preview(&text, &query, &replacement, &options, scope)
+            })
+            .await;
+            let (matches, capped, error) = match preview {
+                Ok(Ok((matches, capped))) => (matches, capped, None),
+                Ok(Err(error)) => (Vec::new(), false, Some(error)),
+                Err(error) => (Vec::new(), false, Some(format!("search preview failed: {error}"))),
+            };
+            send_msg(
+                sink,
+                &Message::BufferSearchResult {
+                    request_id,
+                    matches,
+                    error,
+                    capped,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send BufferSearchResult".into(),
+            })?;
             Ok(())
         }
         Message::BufferEdit {

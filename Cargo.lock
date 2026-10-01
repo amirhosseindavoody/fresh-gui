@@ -2483,6 +2483,7 @@ dependencies = [
  "libc",
  "notify 7.0.0",
  "portable-pty",
+ "regex",
  "serde",
  "serde_json",
  "tokio",

@@ -6,6 +6,8 @@ A daemon can hold several project workspaces. Each workspace has a name, root fo
 
 The daemon saves workspace names, roots, order, focused workspace, tab titles and order, active tab, editor paths, and expanded explorer folders. It does not save running processes or terminal scrollback. After a daemon restart, terminal tabs return as new shells in their workspace root.
 
+In-buffer search saves only intentionally changed case-sensitive, whole-word, and regex options in the workspace layout. Search queries, replacement text, and selection scope are transient and are never persisted. **Reset options** removes the workspace's saved search override. Search option state follows the active workspace and is independent of the Fresh `.fresh/config.json` settings layer.
+
 Settings has a **Workspace** scope that edits Fresh's `<workspace-root>/.fresh/config.json` on the daemon. At Fresh editor startup, project and session layers for the daemon's startup working directory merge above daemon user Fresh settings. The daemon does not resolve a separate Fresh config on each workspace switch, so workspace-specific settings do not update when switching the active workspace. Local client UI settings are stored on the machine running the window; daemon user Fresh settings, terminal defaults, and shortkeys are stored on the daemon host. Fresh editor settings require a daemon restart to apply.
 
 On Linux, the file is `workspaces.json` in `$XDG_STATE_HOME/fresh-gui/` (normally `~/.local/state/fresh-gui/`). On Windows it is under `%LOCALAPPDATA%\fresh-gui\`. `FRESH_GUI_WORKSPACES_FILE` overrides the location and enables persistence in foreground mode.

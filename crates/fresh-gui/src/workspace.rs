@@ -841,6 +841,7 @@ mod tests {
             .create(&sessions, Some("beta".into()), "/work/beta".into())
             .await;
         let extra = WorkspaceLayoutExtra {
+            search_options: Some(fresh_gui_protocol::SearchOptions { case_sensitive: false, whole_word: true, use_regex: true }),
             explorer_scroll: 17,
             sidebar_collapsed: true,
             pinned: vec!["file:/work/beta/lib.rs".into()],
@@ -906,6 +907,7 @@ mod tests {
             vec!["/work/beta/src".to_string()]
         );
         assert_eq!(beta_now.extra, extra);
+        assert_eq!(restored.focus(&alpha.id).await.unwrap().extra.search_options, None);
 
         // The restored store keeps saving: closing a workspace sticks.
         restored.close(&alpha.id).await.unwrap();

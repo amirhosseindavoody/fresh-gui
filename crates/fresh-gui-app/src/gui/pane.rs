@@ -1651,7 +1651,11 @@ struct PendingLsp {
     reply: async_channel::Sender<LspResult>,
 }
 
+#[path = "editor_search.rs"]
+mod editor_search;
+
 pub struct EditorPanel {
+    search: editor_search::SearchUi,
     buffer_id: String,
     path: String,
     /// Buffer has no file yet. `path` is a client key, not a disk path.
@@ -1789,12 +1793,14 @@ impl EditorPanel {
         }
         let byte_offset_input = cx.new(|cx| InputState::new(window, cx).placeholder("Byte offset"));
         let hover_decoration = editor.update(cx, |state, cx| state.create_decorations_collection(Vec::new(), cx));
+        let search = editor_search::SearchUi::new(&editor, window, cx);
         let subscription = cx.subscribe(&editor, |this, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Change) {
                 let completion_accepted = this.on_lsp_text_change(cx);
                 this.dirty = true;
                 if completion_accepted { this.flush_pending(cx); }
                 else { this.schedule_edit_flush(cx); }
+                this.refresh_search(cx);
                 cx.notify();
             } else if matches!(ev, InputEvent::Blur) {
                 this.cancel_lsp_requests();
@@ -1837,6 +1843,7 @@ impl EditorPanel {
                 .unwrap_or_default().as_nanos(),
             NEXT_EDITOR_VIEW.fetch_add(1, Ordering::Relaxed));
         Self {
+            search,
             buffer_id,
             path,
             unsaved,
@@ -1985,6 +1992,7 @@ impl EditorPanel {
         if view_id != self.view_id { return; }
         if self.page_request.as_deref() == Some(request_id) {
             self.page_request = None;
+            self.reset_search_scope(cx);
             self.page = Some(PageView { start, total_bytes });
             self.rev = rev;
             let draft = self.current_text(cx);
@@ -2360,7 +2368,7 @@ impl EditorPanel {
     /// Retention is established by a durable daemon acknowledgement for exactly
     /// the visible text. Capability negotiation alone never authorizes closing.
     pub fn recovery_guaranteed(&self, cx: &App) -> bool {
-        self.draft_recovery && self.transport_connected && !self.conflict
+        !self.search_has_accepted() && self.draft_recovery && self.transport_connected && !self.conflict
             && self.external_request.is_none() && self.external_pending.is_none()
             && !self.sync_paused && self.edit_request_id.is_none()
             && self.sync_request_id.is_none() && !self.action_inflight
@@ -2369,6 +2377,7 @@ impl EditorPanel {
     }
 
     pub fn flush_for_recovery(&mut self, cx: &mut Context<Self>) {
+        self.checkpoint_search_review(cx);
         self.flush_pending(cx);
     }
 
@@ -2650,7 +2659,7 @@ impl EditorPanel {
     pub fn is_dirty(&self) -> bool {
         // The legacy opening snapshot omits Fresh's modified state. Treat a
         // pending authoritative sync as potentially dirty until it replies.
-        self.dirty || self.sync_request_id.is_some()
+        self.dirty || self.search_has_accepted() || self.sync_request_id.is_some()
     }
 
     pub fn is_unsaved(&self) -> bool {
@@ -2833,6 +2842,7 @@ impl EditorPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let changed = self.current_text(cx) != text;
         self.inline_markdown_edit = None;
         self.inline_markdown_subscription = None;
         self.editor.update(cx, |state, cx| {
@@ -2843,6 +2853,7 @@ impl EditorPanel {
                 state.set_scroll_offset(scroll, cx);
             }
         });
+        if changed { self.refresh_search(cx); }
         if let Some(jump) = self.pending.take()
             && let Some(line) = jump.line
         {
@@ -3075,6 +3086,7 @@ impl EditorPanel {
     }
 
     pub fn request_save(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_search_review(window, cx);
         self.commit_markdown_inline_edit(window, cx);
         if self.external.is_some() {
             self.external_save_path = Some(path);
@@ -3527,12 +3539,27 @@ impl Render for EditorPanel {
             Some("md" | "markdown")
         );
         let mut root = div().key_context("Editor").size_full().flex().flex_col()
-                    .capture_action::<gpui_kit::component::input::Undo>(cx.listener(|this, _, _, cx| {
+            .capture_action::<gpui_kit::component::input::Search>(cx.listener(|this, _, window, cx| {
+                this.open_search(false, window, cx); cx.stop_propagation();
+            }))
+            .capture_action::<gpui_kit::component::input::Replace>(cx.listener(|this, _, window, cx| {
+                this.open_search(true, window, cx); cx.stop_propagation();
+            }))
+            .on_action(cx.listener(Self::on_query_replace))
+            .on_action(cx.listener(Self::on_clear_search))
+            .on_action(cx.listener(Self::on_next_match))
+            .on_action(cx.listener(Self::on_previous_match))
+            .capture_key_down(cx.listener(Self::search_key_down))
+                    .capture_action::<gpui_kit::component::input::Undo>(cx.listener(|this, _, window, cx| {
+                        if this.search_input_focused(window, cx) { return; }
+                        if this.search.review.is_some() { cx.stop_propagation(); return; }
                         if this.request_editor_action(EditorAction::Undo, cx) {
                             cx.stop_propagation();
                         }
                     }))
-                    .capture_action::<gpui_kit::component::input::Redo>(cx.listener(|this, _, _, cx| {
+                    .capture_action::<gpui_kit::component::input::Redo>(cx.listener(|this, _, window, cx| {
+                        if this.search_input_focused(window, cx) { return; }
+                        if this.search.review.is_some() { cx.stop_propagation(); return; }
                         if this.request_editor_action(EditorAction::Redo, cx) {
                             cx.stop_propagation();
                         }
@@ -3568,11 +3595,12 @@ impl Render for EditorPanel {
                 .child(Button::new("dismiss-signature").ghost().xsmall().label("Dismiss (Esc)")
                     .on_click(cx.listener(|this, _, _, cx| { this.signature_help = None; this.signature_active = false; this.signature_snapshot = None; cx.notify(); }))));
         }
+        if self.search.open { root = root.child(self.render_search(cx)); }
         if let Some(page) = &self.page {
             let start = page.start;
             let end = start + self.editor.read(cx).value().len();
             let total = page.total_bytes;
-            let busy = self.page_request.is_some() || self.sync_request_id.is_some() || !self.transport_connected;
+            let busy = self.search.review.is_some() || self.page_request.is_some() || self.sync_request_id.is_some() || !self.transport_connected;
             let previous = start.saturating_sub(PAGE_VIEW_BYTES);
             root = root.child(h_flex().w_full().min_h_9().px_2().gap_2().items_center()
                 .border_b_1().border_color(cx.theme().border)
@@ -3745,7 +3773,7 @@ impl Render for EditorPanel {
                     })
                     .child(
                         Editor::new(&self.editor)
-                            .disabled(self.page_request.is_some() || (self.page.is_some() && self.sync_request_id.is_some()))
+                            .disabled(self.search.review.is_some() || self.page_request.is_some() || (self.page.is_some() && self.sync_request_id.is_some()))
                             .bordered(false)
                             .p_0()
                             .flex_1()

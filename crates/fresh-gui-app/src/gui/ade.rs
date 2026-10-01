@@ -191,6 +191,7 @@ pub enum AdeCmd {
     },
     ReloadConfig,
     Settings(Message),
+    Search(Message),
     GitStatus {
         request_id: String,
         workspace_id: String,
@@ -274,6 +275,7 @@ pub enum AdeEvent {
         text: String,
         defaults: serde_json::Value,
     },
+    SearchResult { request_id: String, matches: Vec<fresh_gui_protocol::SearchMatch>, error: Option<String>, capped: bool },
     ConfigUpdated {
         shortkeys: Vec<fresh_gui_protocol::Shortkey>,
         ui: Option<fresh_gui_protocol::HelloUi>,
@@ -452,6 +454,12 @@ pub struct AdeHandle {
 }
 
 impl AdeHandle {
+    #[cfg(test)]
+    pub(super) fn test_channel() -> (Self, async_channel::Receiver<AdeCmd>) {
+        let (tx, rx) = async_channel::unbounded();
+        (Self { tx }, rx)
+    }
+
     pub fn send(&self, cmd: AdeCmd) {
         let _ = self.tx.try_send(cmd);
     }
@@ -587,7 +595,7 @@ async fn ade_loop(
                             AdeCmd::LspRequest { request } => Some(request.clone()),
                             _ => None,
                         };
-                        if let Err(err) = dispatch_cmd(&mut client, cmd).await {
+                        if let Err(err) = dispatch_cmd(&mut client, cmd, &evt_tx).await {
                             if let Some(request) = lsp_request {
                                 // Complete the waiting provider even when an older daemon or a
                                 // transport failure prevents the request from being sent.
@@ -652,7 +660,7 @@ async fn ade_loop(
     }
 }
 
-async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
+async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd, evt_tx: &async_channel::Sender<AdeEvent>) -> anyhow::Result<()> {
     match cmd {
         AdeCmd::ListDrafts { request_id } => {
             client.send(Message::EditorDraftList { request_id }).await?
@@ -1045,6 +1053,13 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
         }
         AdeCmd::Flush(ack) => {
             let _ = ack.send(());
+        }
+        AdeCmd::Search(message) => {
+            if client.supports_capability(fresh_gui_protocol::CAP_EDITOR_SEARCH) {
+                client.send(message).await?;
+            } else if let Message::BufferSearch { request_id, .. } = message {
+                let _ = evt_tx.send(AdeEvent::SearchResult { request_id, matches: Vec::new(), error: Some("This daemon does not support Fresh search; upgrade the daemon".into()), capped: false }).await;
+            }
         }
         AdeCmd::Settings(message) => {
             client.send(message).await?;
@@ -1443,6 +1458,7 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             text,
             defaults,
         }),
+        Message::BufferSearchResult { request_id, matches, error, capped } => Some(AdeEvent::SearchResult { request_id, matches, error, capped }),
         Message::ConfigUpdated { shortkeys, ui } => Some(AdeEvent::ConfigUpdated { shortkeys, ui }),
         Message::BufferSaved {
             request_id,

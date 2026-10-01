@@ -26,10 +26,16 @@ pub const CAP_EDITOR_RANGE_EDITS: &str = "editor.range-edits";
 pub const CAP_EDITOR_PAGED_READS: &str = "editor.paged-reads";
 /// Maximum requested or returned editor page size.
 pub const MAX_PAGE_BYTES: usize = 64 * 1024;
+/// Existing full-buffer range-edit and snapshot limit. Larger files use pages.
+pub const MAX_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 /// Durable daemon-owned dirty-buffer recovery.
 pub const CAP_EDITOR_DRAFT_RECOVERY: &str = "editor.draft-recovery";
 /// Revisioned external file change checks and resolution.
 pub const CAP_EDITOR_EXTERNAL_CHANGES: &str = "editor.external-changes";
+/// Fresh-compatible in-buffer find and replacement preview.
+pub const CAP_EDITOR_SEARCH: &str = "editor.search";
+pub const MAX_SEARCH_DRAFT_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_SEARCH_MATCHES: usize = 10_000;
 pub const CAP_LSP: &str = "lsp";
 /// Revision-aware completion, hover and signature-help requests.
 pub const CAP_LSP_REQUESTS: &str = "lsp.requests";
@@ -81,6 +87,9 @@ pub struct WorkspaceLayoutExtra {
     pub pinned: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub center: Option<LayoutNode>,
+    /// Intentional toolbar overrides only; query/replacement text is never persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_options: Option<SearchOptions>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -347,6 +356,24 @@ pub struct RangeEdit {
     pub start: usize,
     pub end: usize,
     pub text: String,
+}
+
+/// Fresh workspace find and replace options.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchOptions {
+    #[serde(default)]
+    pub case_sensitive: bool,
+    #[serde(default)]
+    pub whole_word: bool,
+    #[serde(default)]
+    pub use_regex: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub start: usize,
+    pub end: usize,
+    pub replacement: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -799,6 +826,24 @@ pub enum Message {
         text: String,
         path: String,
     },
+    /// Client → backend: find and preview replacements in the supplied UTF-8 draft.
+    /// Requires `editor.search`; this request never mutates the buffer.
+    BufferSearch {
+        request_id: String,
+        text: String,
+        query: String,
+        replacement: String,
+        options: SearchOptions,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<ByteRange>,
+    },
+    /// Backend → client: bounded find and replacement preview.
+    BufferSearchResult {
+        request_id: String,
+        matches: Vec<SearchMatch>,
+        error: Option<String>,
+        capped: bool,
+    },
     /// Client → backend: replace full buffer text when `base_rev` matches (CAS).
     BufferEdit {
         request_id: String,
@@ -1166,6 +1211,7 @@ impl Hello {
             CAP_EDITOR_PAGED_READS.to_owned(),
             CAP_EDITOR_DRAFT_RECOVERY.to_owned(),
             CAP_EDITOR_EXTERNAL_CHANGES.to_owned(),
+            CAP_EDITOR_SEARCH.to_owned(),
             CAP_LSP.to_owned(),
             CAP_LSP_REQUESTS.to_owned(),
             CAP_SCENE.to_owned(),
@@ -1186,6 +1232,7 @@ impl Hello {
             CAP_EDITOR_PAGED_READS.to_owned(),
             CAP_EDITOR_DRAFT_RECOVERY.to_owned(),
             CAP_EDITOR_EXTERNAL_CHANGES.to_owned(),
+            CAP_EDITOR_SEARCH.to_owned(),
             CAP_LSP.to_owned(),
             CAP_LSP_REQUESTS.to_owned(),
             CAP_SCENE.to_owned(),
@@ -1853,5 +1900,51 @@ mod tests {
             Message::from_json(legacy).unwrap(),
             Message::BufferRangeEdit { viewport: None, .. }
         ));
+    }
+
+
+    #[test]
+    fn search_workspace_overrides_are_optional_and_retain_explicit_false() {
+        let old: WorkspaceLayoutExtra = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.search_options, None);
+        let configured = WorkspaceLayoutExtra {
+            search_options: Some(SearchOptions { case_sensitive: false, whole_word: true, use_regex: false }),
+            ..Default::default()
+        };
+        let saved = serde_json::to_value(&configured).unwrap();
+        assert_eq!(saved["search_options"]["case_sensitive"], false);
+        assert_eq!(serde_json::from_value::<WorkspaceLayoutExtra>(saved).unwrap(), configured);
+        assert!(serde_json::to_value(&old).unwrap().get("search_options").is_none());
+    }
+    #[test]
+    fn buffer_search_roundtrips_and_search_cap_is_additive() {
+        let request = Message::BufferSearch {
+            request_id: "search-1".into(),
+            text: "é foo".into(),
+            query: "(foo)".into(),
+            replacement: "$1\\n".into(),
+            options: SearchOptions {
+                case_sensitive: true,
+                whole_word: true,
+                use_regex: true,
+            },
+            scope: Some(ByteRange { start: 3, len: 3 }),
+        };
+        assert_eq!(Message::from_json(&request.to_json().unwrap()).unwrap(), request);
+        let response = Message::BufferSearchResult {
+            request_id: "search-1".into(),
+            matches: vec![SearchMatch {
+                start: 3,
+                end: 6,
+                replacement: "foo\n".into(),
+            }],
+            error: None,
+            capped: false,
+        };
+        assert_eq!(Message::from_json(&response.to_json().unwrap()).unwrap(), response);
+
+        let old = Hello::client("old", Vec::new());
+        assert!(!old.capabilities.contains(&CAP_EDITOR_SEARCH.to_owned()));
+        assert!(Hello::default_client_caps().contains(&CAP_EDITOR_SEARCH.to_owned()));
     }
 }

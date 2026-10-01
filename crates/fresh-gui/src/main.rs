@@ -19,6 +19,7 @@ mod open_external;
 mod path_open;
 mod pty;
 mod server;
+mod search;
 mod settings;
 mod session;
 mod shell_resolve;

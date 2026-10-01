@@ -38,6 +38,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::actions::{FindInBuffer, ReplaceInBuffer, QueryReplace, ClearSearchHighlights, NextSearchMatch, PreviousSearchMatch};
 use super::actions::{
     ClearExplorerInput, CloseAllEditors, CloseAllOtherTabs, CloseAllOtherTerminals,
     CloseAllTerminals, CloseTab, CloseWorkspace, CopyExplorer, DeleteExplorer, Disconnect, FilterExplorer,
@@ -822,6 +823,9 @@ impl Render for ExplorerDragPreview {
     }
 }
 
+#[path = "workspace_search.rs"]
+mod workspace_search;
+
 pub struct Workspace {
     target: ConnectTarget,
     ade: AdeHandle,
@@ -887,6 +891,7 @@ pub struct Workspace {
     last_saved_panel: Option<PanelId>,
     pinned_tabs: HashSet<String>,
     restore_extra: Option<WorkspaceLayoutExtra>,
+    search_options: Option<fresh_gui_protocol::SearchOptions>,
     restore_tabs: Vec<WorkspaceTab>,
     restore_scroll_index: Option<usize>,
     next_terminal_number: u32,
@@ -983,6 +988,7 @@ impl Workspace {
         let mut prompt_needed = false;
         for panel in self.editors.values() {
             let unretained = panel.update(cx, |panel, cx| {
+                panel.finish_search_review(window, cx);
                 if !close_requires_prompt(panel.is_dirty(), panel.recovery_guaranteed(cx)) { return false; }
                 panel.flush_for_recovery(cx);
                 close_requires_prompt(panel.is_dirty(), panel.recovery_guaranteed(cx))
@@ -1459,6 +1465,7 @@ impl Workspace {
             last_saved_panel: None,
             pinned_tabs: HashSet::new(),
             restore_extra: None,
+            search_options: None,
             restore_tabs: Vec::new(),
             restore_scroll_index: None,
             next_terminal_number: 1,
@@ -1568,6 +1575,7 @@ impl Workspace {
                     self.restore_workspace(*attached, window, cx);
                 } else {
                     self.active_workspace_id = None;
+                    self.search_options = None;
                     self.pty_opens_pending = 1;
                     self.ade.send(AdeCmd::OpenPty {
                         cols: 80,
@@ -1576,6 +1584,11 @@ impl Workspace {
                     });
                     self.list_dir("");
                     self.refresh_git();
+                }
+            }
+            AdeEvent::SearchResult { request_id, matches, error, capped } => {
+                for panel in self.editors.values() {
+                    panel.update(cx, |panel, cx| panel.apply_search_result(&request_id, &matches, error.as_deref(), capped, window, cx));
                 }
             }
             AdeEvent::SettingsSnapshot {
@@ -1650,6 +1663,7 @@ impl Workspace {
                 if was_active {
                     self.release_dock(window, cx);
                     self.active_workspace_id = None;
+                    self.search_options = None;
                     self.session_id = None;
                     self.pty_opens_pending = 0;
                     self.pending_editors.clear();
@@ -2068,6 +2082,7 @@ impl Workspace {
             panel.update(cx, |panel, cx| {
                 panel.configure_range_edits(range_edits, cx);
                 panel.configure_lsp_requests(self.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS), cx);
+                panel.configure_search(self.search_options.clone(), cx);
                 panel.configure_draft_recovery(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
                 panel.configure_external_changes(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES));
             });
@@ -2250,6 +2265,7 @@ impl Workspace {
             )
         });
         panel.update(cx, |panel, cx| {
+            panel.configure_search(self.search_options.clone(), cx);
             panel.configure_range_edits(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_RANGE_EDITS), cx);
             panel.configure_lsp_requests(self.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS), cx);
                 panel.configure_draft_recovery(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
@@ -2831,6 +2847,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             sidebar_collapsed: self.sidebar_collapsed,
             pinned,
             center,
+            search_options: self.search_options.clone(),
         }
     }
 
@@ -2988,6 +3005,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             explorer_expanded,
             extra,
         } = attached;
+        self.search_options = extra.search_options.clone();
         self.sidebar_collapsed = extra.sidebar_collapsed;
         self.restore_scroll_index = Some(extra.explorer_scroll as usize);
         self.pinned_tabs = extra.pinned.iter().cloned().collect();
@@ -3489,6 +3507,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         let mut prompt_needed = false;
         for panel in self.editors.values().filter(|panel| ids.contains(&PanelId::from(panel.entity_id()))) {
             let unretained = panel.update(cx, |panel, cx| {
+                panel.finish_search_review(window, cx);
                 if !close_requires_prompt(panel.is_dirty(), panel.recovery_guaranteed(cx)) { return false; }
                 panel.flush_for_recovery(cx);
                 close_requires_prompt(panel.is_dirty(), panel.recovery_guaranteed(cx))
@@ -3816,6 +3835,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.release_dock(window, cx);
         self.workspaces.clear();
         self.active_workspace_id = None;
+        self.search_options = None;
         self.session_id = None;
         self.pty_opens_pending = 0;
         self.pending_split = None;
@@ -6662,6 +6682,12 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             ("Show Hover", Box::new(ShowHover)),
             ("Signature Help", Box::new(SignatureHelp)),
             ("Format Document", Box::new(FormatDocument)),
+            ("Find in Buffer", Box::new(FindInBuffer)),
+            ("Replace in Buffer", Box::new(ReplaceInBuffer)),
+            ("Query Replace", Box::new(QueryReplace)),
+            ("Clear Search Highlights", Box::new(ClearSearchHighlights)),
+            ("Next Search Match", Box::new(NextSearchMatch)),
+            ("Previous Search Match", Box::new(PreviousSearchMatch)),
             ("Toggle Word Wrap", Box::new(ToggleWordWrap)),
             ("New Workspace", Box::new(NewWorkspace)),
             ("Rename Workspace", Box::new(RenameWorkspace)),
@@ -7187,6 +7213,12 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_show_hover))
             .on_action(cx.listener(Self::on_signature_help))
             .on_action(cx.listener(Self::on_format_document))
+            .on_action(cx.listener(Self::on_find_in_buffer))
+            .on_action(cx.listener(Self::on_replace_in_buffer))
+            .on_action(cx.listener(Self::on_query_replace))
+            .on_action(cx.listener(Self::on_clear_search))
+            .on_action(cx.listener(Self::on_next_search))
+            .on_action(cx.listener(Self::on_previous_search))
             .on_action(cx.listener(Self::on_toggle_word_wrap))
             .on_action(cx.listener(Self::on_new_workspace))
             .on_action(cx.listener(Self::on_rename_workspace))

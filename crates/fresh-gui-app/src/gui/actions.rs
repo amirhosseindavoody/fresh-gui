@@ -49,6 +49,12 @@ actions!(
         ShowHover,
         SignatureHelp,
         ToggleWordWrap,
+        FindInBuffer,
+        ReplaceInBuffer,
+        QueryReplace,
+        ClearSearchHighlights,
+        NextSearchMatch,
+        PreviousSearchMatch,
         TerminalInputTab,
         TerminalInputBacktab,
         CloseTab,
@@ -128,6 +134,12 @@ pub fn apply_shortkeys(cx: &mut App, shortkeys: &[Shortkey]) {
             "ShowHover" => KeyBinding::new(key, ShowHover, when),
             "SignatureHelp" => KeyBinding::new(key, SignatureHelp, when),
             "FormatDocument" => KeyBinding::new(key, FormatDocument, when),
+            "FindInBuffer" => KeyBinding::new(key, FindInBuffer, when),
+            "ReplaceInBuffer" => KeyBinding::new(key, ReplaceInBuffer, when),
+            "QueryReplace" => KeyBinding::new(key, QueryReplace, when),
+            "ClearSearchHighlights" => KeyBinding::new(key, ClearSearchHighlights, when),
+            "NextSearchMatch" => KeyBinding::new(key, NextSearchMatch, when),
+            "PreviousSearchMatch" => KeyBinding::new(key, PreviousSearchMatch, when),
             "ToggleWordWrap" => KeyBinding::new(key, ToggleWordWrap, when),
             "CloseTab" => KeyBinding::new(key, CloseTab, when),
             "CloseAllEditors" => KeyBinding::new(key, CloseAllEditors, when),
@@ -195,6 +207,12 @@ pub fn known_action(action: &str) -> bool {
             | "Complete"
             | "ShowHover"
             | "SignatureHelp"
+            | "FindInBuffer"
+            | "ReplaceInBuffer"
+            | "QueryReplace"
+            | "ClearSearchHighlights"
+            | "NextSearchMatch"
+            | "PreviousSearchMatch"
             | "ToggleWordWrap"
             | "CloseTab"
             | "CloseAllEditors"
