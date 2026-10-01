@@ -5145,7 +5145,8 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     fn goto_matches(&self, query: &str) -> Vec<String> {
         let path = goto_completion_path(query);
         let Some(parts) = self.goto_parts(&path) else { return Vec::new() };
-        if !self.finder.paths.is_empty() {
+        if self.capabilities.iter().any(|cap| cap == fresh_gui_protocol::CAP_FILE_FINDER)
+            && !path.ends_with(['/', '\\']) && !goto_is_absolute(&path) {
             return self.finder.paths.clone();
         }
         self.explorer_cache.get(&parts.parent)

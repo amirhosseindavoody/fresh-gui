@@ -54,7 +54,12 @@ pub fn scan(root: PathBuf, query: &str, cancel: Arc<AtomicBool>) -> Result<Finde
         let Ok(relative) = entry.path().strip_prefix(&root) else {
             continue;
         };
-        let path = relative.to_string_lossy().replace('\\', "/");
+        let path = relative.to_string_lossy().into_owned();
+        let path = if std::path::MAIN_SEPARATOR == '\\' {
+            path.replace('\\', "/")
+        } else {
+            path
+        };
         let matched = matcher.match_target(&path);
         if !matched.matched {
             continue;

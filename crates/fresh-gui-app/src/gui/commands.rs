@@ -417,13 +417,7 @@ pub fn builtin_commands() -> Vec<CommandDescriptor> {
         command!("RestartServer", "Restart Server", RestartServer),
         command!("ReloadConfig", "Reload Config", ReloadConfig),
         command!("QuitClient", "Quit Client", QuitClient),
-        command!(
-            "SwitchBuffer",
-            "Switch Buffer",
-            SwitchBuffer,
-            Some(CommandContext::Editor),
-            None
-        ),
+        command!("SwitchBuffer", "Switch Buffer", SwitchBuffer),
         command!(
             "GoToLine",
             "Go to Line…",

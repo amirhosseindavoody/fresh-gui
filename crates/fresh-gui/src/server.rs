@@ -1366,16 +1366,16 @@ async fn handle_client_msg(
             Ok(())
         }
         Message::FileFinder { request_id, query } => {
-            require_file_finder_cap(*client_file_finder, state.editor.is_some(), &request_id)?;
             require_auth(*authed)?;
+            require_file_finder_cap(*client_file_finder, state.editor.is_some(), &request_id)?;
             let workspace = current_workspace_id(state, session_id).await?;
             let root = project_root(state, &workspace).await?;
             finder.start(request_id, root, query, finder_tx);
             Ok(())
         }
         Message::FileFinderCancel { request_id } => {
-            require_file_finder_cap(*client_file_finder, state.editor.is_some(), &request_id)?;
             require_auth(*authed)?;
+            require_file_finder_cap(*client_file_finder, state.editor.is_some(), &request_id)?;
             finder.cancel(&request_id);
             send_msg(sink, &Message::FileFinderResults { request_id, paths: Vec::new(), truncated: false, cancelled: true, error: None }).await.map_err(|_| settings_error("send_failed", "file finder", "socket closed"))?;
             Ok(())
