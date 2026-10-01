@@ -173,6 +173,13 @@ enum Cmd {
         workspace_id: String,
         reply: oneshot::Sender<Result<OpenedBuffer>>,
     },
+    OpenLocation {
+        path: PathBuf,
+        workspace_id: String,
+        line: u32,
+        character: u32,
+        reply: oneshot::Sender<Result<(OpenedBuffer, usize)>>,
+    },
     New {
         workspace_id: String,
         reply: oneshot::Sender<Result<OpenedBuffer>>,
@@ -436,6 +443,27 @@ impl EditorHandle {
             .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
         reply_rx
             .await
+            .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+    }
+
+    pub async fn open_location_in_workspace(
+        &self,
+        path: PathBuf,
+        workspace_id: String,
+        line: u32,
+        character: u32,
+    ) -> Result<(OpenedBuffer, usize)> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::OpenLocation {
+                path,
+                workspace_id,
+                line,
+                character,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        rx.await
             .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
     }
 
@@ -790,6 +818,27 @@ fn run_loop(
                         open_buffer(&mut editor, &mut tracked, &path, preview, &workspace_id);
                     let _ = reply.send(result);
                 }
+                Cmd::OpenLocation { path, workspace_id, line, character, reply } => {
+                    let result = open_buffer(&mut editor, &mut tracked, &path, false, &workspace_id)
+                        .and_then(|opened| {
+                            let id = opened.buffer_id.parse::<usize>().expect("Fresh buffer id");
+                            let buffer = &mut editor.active_window_mut().buffers.get_mut(&BufferId(id)).expect("Fresh buffer").buffer;
+                            if opened.total_bytes.is_some()
+                                && let Some(entry) = tracked.get(&opened.buffer_id)
+                                && let Some(path) = entry.path.as_deref()
+                                && entry.paged_generation.as_deref() != Some(disk_generation(path)?.signature.as_str())
+                            {
+                                bail!("file changed on disk; paged reads are blocked until external change is resolved");
+                            }
+                            let offset = if opened.total_bytes.is_some() {
+                                lsp_position_to_byte_bounded(buffer, line as usize, character as usize)?
+                            } else {
+                                buffer.lsp_position_to_byte(line as usize, character as usize)
+                            };
+                            Ok((opened, offset))
+                        });
+                    let _ = reply.send(result);
+                }
                 Cmd::New {
                     workspace_id,
                     reply,
@@ -1089,6 +1138,151 @@ fn run_loop(
     drop(editor);
 }
 
+/// Convert a daemon-owned LSP UTF-16 position without materializing a long
+/// lazy line. Fresh's pinned converter reads an entire line at once, so page
+/// through the piece tree in bounded chunks for location opens.
+fn lsp_position_to_byte_bounded(
+    buffer: &mut fresh::model::buffer::TextBuffer,
+    wanted_line: usize,
+    wanted_character: usize,
+) -> Result<usize> {
+    use fresh::model::piece_tree::BufferData;
+
+    fn scan(
+        bytes: &[u8],
+        base: usize,
+        wanted_line: usize,
+        wanted_character: usize,
+        line: &mut usize,
+        utf16: &mut usize,
+    ) -> Result<Option<usize>> {
+        let valid_len = match std::str::from_utf8(bytes) {
+            Ok(_) => bytes.len(),
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            Err(error) => anyhow::bail!(
+                "LSP target buffer contains invalid UTF-8 at byte {}",
+                base + error.valid_up_to()
+            ),
+        };
+        let text = std::str::from_utf8(&bytes[..valid_len]).expect("validated UTF-8 prefix");
+        for (relative, character) in text.char_indices() {
+            if *line == wanted_line && *utf16 >= wanted_character {
+                return Ok(Some(base + relative));
+            }
+            if character == '\n' {
+                if *line == wanted_line {
+                    return Ok(Some(base + relative));
+                }
+                *line += 1;
+                *utf16 = 0;
+            } else if *line == wanted_line {
+                *utf16 += character.len_utf16();
+            }
+        }
+        Ok(None)
+    }
+
+    let total = buffer.total_bytes();
+    let leaves = buffer.piece_tree_leaves();
+    let mut document_offset = 0usize;
+    let mut line = 0usize;
+    let mut utf16 = 0usize;
+    let mut carry = Vec::new();
+    const CHUNK: usize = 32 * 1024;
+
+    for leaf in leaves {
+        let leaf_io = buffer.leaf_io_params(&leaf);
+        let mut within_leaf = 0usize;
+        while within_leaf < leaf.bytes {
+            let length = (leaf.bytes - within_leaf).min(CHUNK);
+            let loaded_bytes;
+            let bytes = if let Some((path, file_offset, _)) = &leaf_io {
+                loaded_bytes = buffer.filesystem().read_range(
+                    path,
+                    *file_offset + within_leaf as u64,
+                    length,
+                )?;
+                loaded_bytes.as_slice()
+            } else {
+                let data = buffer
+                    .buffer_slice()
+                    .get(leaf.location.buffer_id())
+                    .context("Fresh piece tree references a missing string buffer")?;
+                let BufferData::Loaded { data, .. } = &data.data else {
+                    anyhow::bail!("Fresh piece tree leaf has unloaded data without I/O metadata");
+                };
+                let start = leaf.offset + within_leaf;
+                let end = start.saturating_add(length).min(data.len());
+                anyhow::ensure!(
+                    end - start == length,
+                    "Fresh piece tree data range is truncated"
+                );
+                &data[start..end]
+            };
+            anyhow::ensure!(
+                !bytes.is_empty(),
+                "Fresh filesystem returned an empty range during LSP location scan"
+            );
+            let prefix = std::mem::take(&mut carry);
+            let base = document_offset.saturating_sub(prefix.len());
+            let mut combined = prefix;
+            combined.extend_from_slice(bytes);
+            let valid_len = match std::str::from_utf8(&combined) {
+                Ok(_) => combined.len(),
+                Err(error) if error.error_len().is_none() => error.valid_up_to(),
+                Err(error) => anyhow::bail!(
+                    "LSP target buffer contains invalid UTF-8 at byte {}",
+                    base + error.valid_up_to()
+                ),
+            };
+            if let Some(found) = scan(
+                &combined[..valid_len],
+                base,
+                wanted_line,
+                wanted_character,
+                &mut line,
+                &mut utf16,
+            )? {
+                return Ok(found);
+            }
+            carry.extend_from_slice(&combined[valid_len..]);
+            document_offset += bytes.len();
+            within_leaf += bytes.len();
+            anyhow::ensure!(
+                within_leaf <= leaf.bytes,
+                "Fresh filesystem returned more data than requested"
+            );
+        }
+    }
+    anyhow::ensure!(carry.is_empty(), "LSP target ends inside a UTF-8 character");
+    Ok(total)
+}
+
+#[cfg(test)]
+mod lsp_location_tests {
+    use super::*;
+
+    #[test]
+    fn distant_paged_utf16_position_reads_without_materializing_backing_chunks() {
+        let root =
+            std::env::temp_dir().join(format!("fresh-lsp-location-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("paged.rs");
+        std::fs::write(&path, "a😀x\n".repeat(400_000)).unwrap();
+        let mut buffer = fresh::model::buffer::TextBuffer::load_from_file_force_text(
+            &path,
+            MAX_SNAPSHOT_BYTES,
+            Arc::new(StdFileSystem),
+        )
+        .unwrap();
+        let resident_before = buffer.resident_bytes();
+        let offset = lsp_position_to_byte_bounded(&mut buffer, 350_000, 3).unwrap();
+        assert_eq!(offset, 350_000 * 7 + 5);
+        assert_eq!(buffer.resident_bytes(), resident_before);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
 #[derive(Clone)]
 struct PendingLspRequest {
     request: LspRequest,
@@ -1230,6 +1424,7 @@ fn begin_lsp_request(
             offset: request.offset,
             feature: request.feature,
             responses: Vec::new(),
+            navigation_targets: Vec::new(),
             completion_triggers: all_completion_triggers,
             signature_triggers: all_signature_triggers,
             status: None,
@@ -1244,13 +1439,20 @@ fn begin_lsp_request(
         | LspRequestFeature::CompletionResolve => LspFeature::Completion,
         LspRequestFeature::Hover => LspFeature::Hover,
         LspRequestFeature::SignatureHelp => LspFeature::SignatureHelp,
+        LspRequestFeature::Definition
+        | LspRequestFeature::Declaration
+        | LspRequestFeature::TypeDefinition => LspFeature::Definition,
+        LspRequestFeature::Implementation => LspFeature::Implementation,
+        LspRequestFeature::References => LspFeature::References,
+        LspRequestFeature::DocumentSymbols => LspFeature::DocumentSymbols,
+        LspRequestFeature::WorkspaceSymbols => LspFeature::WorkspaceSymbols,
     };
     let lsp = &editor.active_window().lsp;
     let mut eligible = lsp
         .handles_for_feature(language, route_feature)
         .into_iter()
         .filter(|server| {
-            uri.is_some()
+            (uri.is_some() || request.feature == LspRequestFeature::WorkspaceSymbols)
                 && (request.feature != LspRequestFeature::CompletionResolve
                     || (server.name == request.server.as_deref().unwrap_or("")
                         && server.capabilities.completion_resolve))
@@ -1279,12 +1481,22 @@ fn begin_lsp_request(
             offset: request.offset,
             feature: request.feature,
             responses: response,
+            navigation_targets: Vec::new(),
             completion_triggers: all_completion_triggers,
             signature_triggers: all_signature_triggers,
-            status: if language.is_empty() {
+            status: if language.is_empty() && is_navigation_feature(request.feature) {
+                Some("buffer has no language mode".into())
+            } else if language.is_empty() {
                 Some("buffer has no language mode; using buffer words".into())
             } else if uri.is_none() {
-                Some("buffer has no file URI; using buffer words".into())
+                Some(
+                    if is_navigation_feature(request.feature) {
+                        "buffer has no file URI"
+                    } else {
+                        "buffer has no file URI; using buffer words"
+                    }
+                    .into(),
+                )
             } else {
                 Some("no eligible language server".into())
             },
@@ -1313,6 +1525,15 @@ fn begin_lsp_request(
                 .item
                 .clone()
                 .map(crate::lsp_bridge::resolve_item_params)
+        } else if is_navigation_feature(request.feature) {
+            let uri = uri.as_deref().unwrap_or("");
+            Some(crate::lsp_bridge::navigation_params(
+                uri,
+                line,
+                character,
+                request.feature,
+                request.item.as_ref(),
+            ))
         } else {
             let is_signature = request.feature == LspRequestFeature::SignatureHelp;
             let Some(uri) = uri.as_deref() else { continue };
@@ -1371,6 +1592,36 @@ fn begin_lsp_request(
                 status: None,
             },
         );
+    }
+}
+
+fn is_navigation_feature(feature: LspRequestFeature) -> bool {
+    matches!(
+        feature,
+        LspRequestFeature::Definition
+            | LspRequestFeature::Declaration
+            | LspRequestFeature::TypeDefinition
+            | LspRequestFeature::Implementation
+            | LspRequestFeature::References
+            | LspRequestFeature::DocumentSymbols
+            | LspRequestFeature::WorkspaceSymbols
+    )
+}
+
+fn lsp_route_feature(feature: LspRequestFeature) -> LspFeature {
+    match feature {
+        LspRequestFeature::Capabilities
+        | LspRequestFeature::Completion
+        | LspRequestFeature::CompletionResolve => LspFeature::Completion,
+        LspRequestFeature::Hover => LspFeature::Hover,
+        LspRequestFeature::SignatureHelp => LspFeature::SignatureHelp,
+        LspRequestFeature::Definition
+        | LspRequestFeature::Declaration
+        | LspRequestFeature::TypeDefinition => LspFeature::Definition,
+        LspRequestFeature::Implementation => LspFeature::Implementation,
+        LspRequestFeature::References => LspFeature::References,
+        LspRequestFeature::DocumentSymbols => LspFeature::DocumentSymbols,
+        LspRequestFeature::WorkspaceSymbols => LspFeature::WorkspaceSymbols,
     }
 }
 
@@ -1453,6 +1704,7 @@ fn send_lsp_status(
         offset: request.offset,
         feature: request.feature,
         responses: Vec::new(),
+        navigation_targets: Vec::new(),
         completion_triggers: Vec::new(),
         signature_triggers: Vec::new(),
         status: Some(status.into()),
@@ -1486,13 +1738,7 @@ fn cancel_lsp_request(
             bridge.request_ids.entry(request_id).or_default().push(id);
             continue;
         }
-        let feature = match entry.request.feature {
-            LspRequestFeature::Capabilities
-            | LspRequestFeature::Completion
-            | LspRequestFeature::CompletionResolve => LspFeature::Completion,
-            LspRequestFeature::Hover => LspFeature::Hover,
-            LspRequestFeature::SignatureHelp => LspFeature::SignatureHelp,
-        };
+        let feature = lsp_route_feature(entry.request.feature);
         if let Some(server) = editor
             .active_window_mut()
             .lsp
@@ -1619,6 +1865,11 @@ fn finish_lsp_aggregate(
         .get(&aggregate.request.buffer_id)
         .map(|entry| entry.rev);
     let stale = current != Some(aggregate.request.base_rev);
+    let source_uri = tracked
+        .get(&aggregate.request.buffer_id)
+        .and_then(|entry| entry.path.as_deref())
+        .and_then(fresh::app::types::file_path_to_lsp_uri)
+        .map(|uri| uri.to_string());
     let _ = results.send(LspResult {
         request_id: aggregate.request.request_id,
         buffer_id: aggregate.request.buffer_id,
@@ -1626,6 +1877,11 @@ fn finish_lsp_aggregate(
         rev: current.unwrap_or(aggregate.request.base_rev),
         offset: aggregate.request.offset,
         feature: aggregate.request.feature,
+        navigation_targets: if stale || !is_navigation_feature(aggregate.request.feature) {
+            Vec::new()
+        } else {
+            crate::lsp_bridge::navigation_targets(&aggregate.responses, source_uri.as_deref())
+        },
         responses: if stale {
             Vec::new()
         } else {
@@ -1663,13 +1919,7 @@ fn expire_lsp_aggregates(
         if let Some(ids) = bridge.request_ids.remove(&id) {
             for lsp_id in ids {
                 if let Some(entry) = bridge.pending.remove(&lsp_id) {
-                    let route_feature = match entry.request.feature {
-                        LspRequestFeature::Capabilities
-                        | LspRequestFeature::Completion
-                        | LspRequestFeature::CompletionResolve => LspFeature::Completion,
-                        LspRequestFeature::Hover => LspFeature::Hover,
-                        LspRequestFeature::SignatureHelp => LspFeature::SignatureHelp,
-                    };
+                    let route_feature = lsp_route_feature(entry.request.feature);
                     if let Some(server) = editor
                         .active_window_mut()
                         .lsp
@@ -1713,6 +1963,7 @@ fn cancel_buffer_lsp_requests(editor: &mut Editor, buffer_id: &str, bridge: &mut
                 offset: request.offset,
                 feature: request.feature,
                 responses: Vec::new(),
+                navigation_targets: Vec::new(),
                 completion_triggers: Vec::new(),
                 signature_triggers: Vec::new(),
                 status: Some("buffer closed while request was pending".into()),
@@ -1781,6 +2032,7 @@ fn cancel_stale_lsp_requests(
                 offset: request.offset,
                 feature: request.feature,
                 responses: Vec::new(),
+                navigation_targets: Vec::new(),
                 completion_triggers: Vec::new(),
                 signature_triggers: Vec::new(),
                 status: Some("buffer revision changed while request was pending".into()),
@@ -3374,11 +3626,16 @@ fn save_buffer(
         }
     }
     if let Some(dest) = save_path.as_deref() {
-        if tracked.get(buffer_id).is_some_and(|entry| entry.total_bytes.is_some())
-            && !StdFileSystem.is_owner(dest) {
+        if tracked
+            .get(buffer_id)
+            .is_some_and(|entry| entry.total_bytes.is_some())
+            && !StdFileSystem.is_owner(dest)
+        {
             // Fresh's ownership-preserving path bypasses write_patched and
             // materializes Copy operations. Keep paged saves bounded.
-            bail!("paged saves to files owned by another user are unavailable; Save As to a new file");
+            bail!(
+                "paged saves to files owned by another user are unavailable; Save As to a new file"
+            );
         }
         let current_disk = disk_generation(dest)?;
         let entry = tracked.get(buffer_id).expect("tracked");

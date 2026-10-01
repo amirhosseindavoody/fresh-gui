@@ -39,6 +39,8 @@ pub const MAX_SEARCH_MATCHES: usize = 10_000;
 pub const CAP_LSP: &str = "lsp";
 /// Revision-aware completion, hover and signature-help requests.
 pub const CAP_LSP_REQUESTS: &str = "lsp.requests";
+/// Definition, references, implementation, and symbol navigation requests.
+pub const CAP_LSP_NAVIGATION: &str = "lsp.navigation";
 pub const CAP_SCENE: &str = "scene";
 /// Workspace git status, diff, and stage/commit/pull/push. Absent on older daemons.
 pub const CAP_GIT: &str = "git";
@@ -301,6 +303,13 @@ pub enum LspRequestFeature {
     Hover,
     SignatureHelp,
     CompletionResolve,
+    Definition,
+    Declaration,
+    TypeDefinition,
+    Implementation,
+    References,
+    DocumentSymbols,
+    WorkspaceSymbols,
 }
 
 /// Short name used by the native editor client.
@@ -321,6 +330,8 @@ pub struct LspResult {
     pub offset: usize,
     pub feature: LspRequestFeature,
     pub responses: Vec<LspServerResponse>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub navigation_targets: Vec<LspNavigationTarget>,
     #[serde(default)]
     pub completion_triggers: Vec<String>,
     #[serde(default)]
@@ -329,6 +340,17 @@ pub struct LspResult {
     pub status: Option<String>,
     #[serde(default)]
     pub stale: bool,
+}
+
+/// Location returned by a navigation request. `uri` remains opaque to the
+/// host; it must be sent back to the daemon for file resolution and opening.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LspNavigationTarget {
+    pub uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub line: u32,
+    pub character: u32,
 }
 
 /// Buffer selection positions and range edit offsets are UTF-8 byte offsets
@@ -760,6 +782,21 @@ pub enum Message {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         column: Option<u32>,
     },
+    /// Open an opaque LSP file URI and UTF-16 position through daemon authority.
+    EditorOpenLocation {
+        request_id: String,
+        uri: String,
+        line: u32,
+        character: u32,
+    },
+    /// Completion of EditorOpenLocation. Sent after EditorOpened and the
+    /// corresponding snapshot or paged metadata message.
+    EditorLocationOpened {
+        request_id: String,
+        buffer_id: String,
+        path: String,
+        offset: usize,
+    },
     /// Client → backend: Ctrl+click open — detect a path in `line_text` at
     /// `column` via Fresh `path_link::detect_link_at`, then open it.
     EditorOpenLink {
@@ -987,9 +1024,13 @@ pub enum Message {
         text: Option<String>,
     },
     /// Client → backend: issue a revision-checked LSP request.
-    BufferLspRequest { request: LspRequest },
+    BufferLspRequest {
+        request: LspRequest,
+    },
     /// Backend → client: asynchronous responses from eligible language servers.
-    BufferLspResult { result: LspResult },
+    BufferLspResult {
+        result: LspResult,
+    },
     /// Client → backend: cancel one outstanding LSP request.
     BufferLspCancel {
         request_id: u64,
@@ -1214,6 +1255,7 @@ impl Hello {
             CAP_EDITOR_SEARCH.to_owned(),
             CAP_LSP.to_owned(),
             CAP_LSP_REQUESTS.to_owned(),
+            CAP_LSP_NAVIGATION.to_owned(),
             CAP_SCENE.to_owned(),
             CAP_GIT.to_owned(),
             CAP_SETTINGS_EDITOR.to_owned(),
@@ -1235,6 +1277,7 @@ impl Hello {
             CAP_EDITOR_SEARCH.to_owned(),
             CAP_LSP.to_owned(),
             CAP_LSP_REQUESTS.to_owned(),
+            CAP_LSP_NAVIGATION.to_owned(),
             CAP_SCENE.to_owned(),
             CAP_GIT.to_owned(),
             CAP_SETTINGS_EDITOR.to_owned(),
@@ -1818,49 +1861,139 @@ mod tests {
 
     #[test]
     fn revision_aware_lsp_requests_results_and_capabilities_roundtrip() {
-        let request = Message::BufferLspRequest { request: LspRequest {
+        let request = Message::BufferLspRequest {
+            request: LspRequest {
+                request_id: 19,
+                buffer_id: "42".into(),
+                view_id: "view-a".into(),
+                base_rev: 7,
+                offset: 12,
+                feature: LspRequestFeature::Capabilities,
+                trigger_character: None,
+                item: None,
+                server: None,
+            },
+        };
+        assert_eq!(
+            Message::from_json(&request.to_json().unwrap()).unwrap(),
+            request
+        );
+
+        let result = Message::BufferLspResult {
+            result: LspResult {
+                request_id: 19,
+                buffer_id: "42".into(),
+                view_id: "view-a".into(),
+                rev: 7,
+                offset: 12,
+                feature: LspRequestFeature::Capabilities,
+                responses: Vec::new(),
+                navigation_targets: Vec::new(),
+                completion_triggers: vec![".".into()],
+                signature_triggers: vec!["(".into()],
+                status: None,
+                stale: false,
+            },
+        };
+        assert_eq!(
+            Message::from_json(&result.to_json().unwrap()).unwrap(),
+            result
+        );
+
+        let cancel = Message::BufferLspCancel {
             request_id: 19,
             buffer_id: "42".into(),
             view_id: "view-a".into(),
-            base_rev: 7,
-            offset: 12,
-            feature: LspRequestFeature::Capabilities,
-            trigger_character: None,
-            item: None,
-            server: None,
-        }};
-        assert_eq!(Message::from_json(&request.to_json().unwrap()).unwrap(), request);
-
-        let result = Message::BufferLspResult { result: LspResult {
-            request_id: 19,
-            buffer_id: "42".into(),
-            view_id: "view-a".into(),
-            rev: 7,
-            offset: 12,
-            feature: LspRequestFeature::Capabilities,
-            responses: Vec::new(),
-            completion_triggers: vec![".".into()],
-            signature_triggers: vec!["(".into()],
-            status: None,
-            stale: false,
-        }};
-        assert_eq!(Message::from_json(&result.to_json().unwrap()).unwrap(), result);
-
-        let cancel = Message::BufferLspCancel { request_id: 19, buffer_id: "42".into(), view_id: "view-a".into() };
-        assert_eq!(Message::from_json(&cancel.to_json().unwrap()).unwrap(), cancel);
-        assert!(Hello::default_client_caps().iter().any(|cap| cap == CAP_LSP_REQUESTS));
+        };
+        assert_eq!(
+            Message::from_json(&cancel.to_json().unwrap()).unwrap(),
+            cancel
+        );
+        assert!(
+            Hello::default_client_caps()
+                .iter()
+                .any(|cap| cap == CAP_LSP_REQUESTS)
+        );
+        assert!(
+            Hello::default_client_caps()
+                .iter()
+                .any(|cap| cap == CAP_LSP_NAVIGATION)
+        );
+        let location = Message::EditorOpenLocation {
+            request_id: "loc-1".into(),
+            uri: "file:///daemon/file.rs".into(),
+            line: 2,
+            character: 5,
+        };
+        assert_eq!(
+            Message::from_json(&location.to_json().unwrap()).unwrap(),
+            location
+        );
+        let opened = Message::EditorLocationOpened {
+            request_id: "loc-1".into(),
+            buffer_id: "7".into(),
+            path: "/daemon/file.rs".into(),
+            offset: 19,
+        };
+        assert_eq!(
+            Message::from_json(&opened.to_json().unwrap()).unwrap(),
+            opened
+        );
 
         let legacy = r#"{"type":"buffer_lsp_request","request":{"request_id":1,"buffer_id":"b","view_id":"v","base_rev":1,"offset":0,"feature":"hover","future_field":true}}"#;
-        assert_eq!(Message::from_json(legacy).unwrap(), Message::BufferLspRequest { request: LspRequest {
-            request_id: 1, buffer_id: "b".into(), view_id: "v".into(), base_rev: 1, offset: 0,
-            feature: LspRequestFeature::Hover, trigger_character: None, item: None, server: None,
-        }});
+        assert_eq!(
+            Message::from_json(legacy).unwrap(),
+            Message::BufferLspRequest {
+                request: LspRequest {
+                    request_id: 1,
+                    buffer_id: "b".into(),
+                    view_id: "v".into(),
+                    base_rev: 1,
+                    offset: 0,
+                    feature: LspRequestFeature::Hover,
+                    trigger_character: None,
+                    item: None,
+                    server: None,
+                }
+            }
+        );
         let legacy_result = r#"{"type":"buffer_lsp_result","result":{"request_id":1,"buffer_id":"b","view_id":"v","rev":1,"offset":0,"feature":"capabilities","responses":[]}}"#;
-        assert_eq!(Message::from_json(legacy_result).unwrap(), Message::BufferLspResult { result: LspResult {
-            request_id: 1, buffer_id: "b".into(), view_id: "v".into(), rev: 1, offset: 0,
-            feature: LspRequestFeature::Capabilities, responses: Vec::new(), completion_triggers: Vec::new(),
-            signature_triggers: Vec::new(), status: None, stale: false,
-        }});
+        assert_eq!(
+            Message::from_json(legacy_result).unwrap(),
+            Message::BufferLspResult {
+                result: LspResult {
+                    request_id: 1,
+                    buffer_id: "b".into(),
+                    view_id: "v".into(),
+                    rev: 1,
+                    offset: 0,
+                    feature: LspRequestFeature::Capabilities,
+                    responses: Vec::new(),
+                    navigation_targets: Vec::new(),
+                    completion_triggers: Vec::new(),
+                    signature_triggers: Vec::new(),
+                    status: None,
+                    stale: false,
+                }
+            }
+        );
+        for feature in [
+            "definition",
+            "declaration",
+            "type_definition",
+            "implementation",
+            "references",
+            "document_symbols",
+            "workspace_symbols",
+        ] {
+            let encoded = format!(
+                r#"{{"type":"buffer_lsp_request","request":{{"request_id":2,"buffer_id":"b","view_id":"v","base_rev":1,"offset":0,"feature":"{feature}"}}}}"#
+            );
+            assert!(matches!(
+                Message::from_json(&encoded),
+                Ok(Message::BufferLspRequest { .. })
+            ));
+        }
     }
 
     #[test]
@@ -1872,7 +2005,10 @@ mod tests {
             path: "/tmp/large.txt".into(),
             dirty: false,
         };
-        assert_eq!(Message::from_json(&opened.to_json().unwrap()).unwrap(), opened);
+        assert_eq!(
+            Message::from_json(&opened.to_json().unwrap()).unwrap(),
+            opened
+        );
         let read = Message::BufferRead {
             request_id: "read-1".into(),
             buffer_id: "b1".into(),

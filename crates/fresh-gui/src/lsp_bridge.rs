@@ -1,6 +1,6 @@
 //! Wire helpers for the daemon's revision-aware LSP request bridge.
 
-use fresh_gui_protocol::{LspRequestFeature, LspServerResponse};
+use fresh_gui_protocol::{LspNavigationTarget, LspRequestFeature, LspServerResponse};
 use serde_json::{Value, json};
 
 pub(crate) fn method(feature: LspRequestFeature) -> &'static str {
@@ -10,7 +10,37 @@ pub(crate) fn method(feature: LspRequestFeature) -> &'static str {
         LspRequestFeature::Hover => "textDocument/hover",
         LspRequestFeature::SignatureHelp => "textDocument/signatureHelp",
         LspRequestFeature::CompletionResolve => "completionItem/resolve",
+        LspRequestFeature::Definition => "textDocument/definition",
+        LspRequestFeature::Declaration => "textDocument/declaration",
+        LspRequestFeature::TypeDefinition => "textDocument/typeDefinition",
+        LspRequestFeature::Implementation => "textDocument/implementation",
+        LspRequestFeature::References => "textDocument/references",
+        LspRequestFeature::DocumentSymbols => "textDocument/documentSymbol",
+        LspRequestFeature::WorkspaceSymbols => "workspace/symbol",
     }
+}
+
+pub(crate) fn navigation_params(
+    uri: &str,
+    line: u32,
+    character: u32,
+    feature: LspRequestFeature,
+    item: Option<&Value>,
+) -> Value {
+    if feature == LspRequestFeature::WorkspaceSymbols {
+        return json!({ "query": item.and_then(|value| value.get("query")).and_then(Value::as_str).unwrap_or("") });
+    }
+    if feature == LspRequestFeature::DocumentSymbols {
+        return json!({ "textDocument": { "uri": uri } });
+    }
+    let mut params = json!({
+        "textDocument": { "uri": uri },
+        "position": { "line": line, "character": character },
+    });
+    if feature == LspRequestFeature::References {
+        params["context"] = json!({ "includeDeclaration": true });
+    }
+    params
 }
 
 pub(crate) fn position_params(
@@ -186,6 +216,76 @@ pub(crate) fn one_response(server: String, result: Value) -> LspServerResponse {
     LspServerResponse { server, result }
 }
 
+pub(crate) fn navigation_targets(
+    responses: &[LspServerResponse],
+    source_uri: Option<&str>,
+) -> Vec<LspNavigationTarget> {
+    fn add(value: &Value, fallback_uri: Option<&str>, output: &mut Vec<LspNavigationTarget>) {
+        if let Some(items) = value.as_array() {
+            for item in items {
+                add(item, fallback_uri, output);
+            }
+            return;
+        }
+        if let Some(children) = value.get("children").and_then(Value::as_array) {
+            for child in children {
+                add(child, fallback_uri, output);
+            }
+        }
+        let uri = value
+            .get("targetUri")
+            .or_else(|| value.get("uri"))
+            .and_then(Value::as_str)
+            .or(fallback_uri);
+        let range = value
+            .get("targetSelectionRange")
+            .or_else(|| value.get("selectionRange"))
+            .or_else(|| value.get("targetRange"))
+            .or_else(|| value.get("range"));
+        let start = range.and_then(|range| range.get("start"));
+        if let (Some(uri), Some(line), Some(character)) = (
+            uri,
+            start.and_then(|p| p.get("line")).and_then(Value::as_u64),
+            start
+                .and_then(|p| p.get("character"))
+                .and_then(Value::as_u64),
+        ) {
+            output.push(LspNavigationTarget {
+                uri: uri.to_owned(),
+                name: value
+                    .get("name")
+                    .or_else(|| value.get("label"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                line: line.min(u32::MAX as u64) as u32,
+                character: character.min(u32::MAX as u64) as u32,
+            });
+        } else if let Some(location) = value.get("location") {
+            add(location, fallback_uri, output);
+            if let Some(name) = value.get("name").and_then(Value::as_str)
+                && let Some(target) = output.last_mut()
+            {
+                target.name = Some(name.to_owned());
+            }
+        }
+    }
+
+    let mut targets = Vec::new();
+    for response in responses {
+        add(&response.result, source_uri, &mut targets);
+    }
+    let mut unique = std::collections::HashSet::new();
+    targets.retain(|target| {
+        unique.insert((
+            target.uri.clone(),
+            target.name.clone(),
+            target.line,
+            target.character,
+        ))
+    });
+    targets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +348,58 @@ mod tests {
         let resolved_from_gui = resolve_item_params(gui_wrapped);
         assert_eq!(resolved_from_gui["textEditText"], "call($1)\n$0");
         assert_eq!(resolved_from_gui["data"]["resolveKey"], "kept");
+    }
+
+    #[test]
+    fn navigation_params_and_targets_support_links_symbols_and_deduplication() {
+        let params = navigation_params(
+            "file:///source.rs",
+            2,
+            4,
+            LspRequestFeature::References,
+            None,
+        );
+        assert_eq!(params["context"]["includeDeclaration"], true);
+        let workspace = navigation_params(
+            "",
+            0,
+            0,
+            LspRequestFeature::WorkspaceSymbols,
+            Some(&json!({"query": "Foo"})),
+        );
+        assert_eq!(workspace["query"], "Foo");
+        let responses = vec![
+            one_response(
+                "one".into(),
+                json!([{
+                    "targetUri": "file:///target.rs",
+                    "targetSelectionRange": {"start": {"line": 4, "character": 6}},
+                    "targetRange": {"start": {"line": 4, "character": 0}},
+                }]),
+            ),
+            one_response(
+                "two".into(),
+                json!([{
+                    "name": "Foo",
+                    "location": {"uri": "file:///target.rs", "range": {"start": {"line": 4, "character": 6}}}
+                }]),
+            ),
+            one_response(
+                "doc".into(),
+                json!([{
+                    "name": "Nested",
+                    "selectionRange": {"start": {"line": 8, "character": 2}},
+                    "children": [{"name": "Child", "selectionRange": {"start": {"line": 9, "character": 3}}}]
+                }]),
+            ),
+        ];
+        let targets = navigation_targets(&responses, Some("file:///source.rs"));
+        assert_eq!(targets.len(), 4);
+        assert_eq!(targets[0].line, 4);
+        assert_eq!(targets[0].character, 6);
+        assert_eq!(targets[1].name.as_deref(), Some("Foo"));
+        assert_eq!(targets[2].name.as_deref(), Some("Nested"));
+        assert_eq!(targets[3].name.as_deref(), Some("Child"));
     }
 
     #[test]

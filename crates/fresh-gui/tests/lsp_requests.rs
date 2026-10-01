@@ -203,15 +203,19 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
     let beta_log = root.join("beta.log");
     let slow_log = root.join("slow.log");
     let config_path = root.join("config.json");
+    let target_path = root.join("target.py");
+    let paged_path = root.join("paged.py");
     let config = serde_json::json!({
         "lsp": { "python": [
             {"name":"Alpha","command":"python3","args":[fixture.display().to_string(),"Alpha",alpha_log.display().to_string(), "0"],"only_features":["completion"]},
-            {"name":"Beta","command":"python3","args":[fixture.display().to_string(),"Beta",beta_log.display().to_string(), "0"],"except_features":["completion"]},
+            {"name":"Beta","command":"python3","args":[fixture.display().to_string(),"Beta",beta_log.display().to_string(), "0", target_path.display().to_string(), paged_path.display().to_string()],"except_features":["completion"]},
             {"name":"Slow","command":"python3","args":[fixture.display().to_string(),"Slow",slow_log.display().to_string(), "0.6"],"only_features":["hover"]}
         ], "rust": [{"name":"MissingBinary","command":"fresh-gui-missing-language-server-145","only_features":["completion"]}]}
     });
     fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
     fs::write(root.join("sample.py"), "a😀b\ncallme\n").unwrap();
+    fs::write(&target_path, "a😀target\nsecond\n").unwrap();
+    fs::write(&paged_path, "a😀x\n".repeat(400_000)).unwrap();
     fs::write(root.join("words.rs"), "pref\nprefix_word\n").unwrap();
 
     let addr = free_loopback();
@@ -222,6 +226,7 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
         .await
         .expect("connect daemon");
     assert!(client.supports_capability(CAP_LSP_REQUESTS));
+    assert!(client.supports_capability(fresh_gui_protocol::CAP_LSP_NAVIGATION));
 
     let (buffer_id, _, _, mut rev, text) = client
         .open_editor("sample.py", false)
@@ -284,6 +289,199 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
         completion_item["data"]["_fresh_original"]["data"]["completionToken"],
         "Alpha"
     );
+
+    // Navigation and symbol requests use the same revision-aware bridge and
+    // preserve opaque daemon-side URIs with UTF-16 positions.
+    let navigation_features = [
+        LspRequestFeature::Definition,
+        LspRequestFeature::Declaration,
+        LspRequestFeature::TypeDefinition,
+        LspRequestFeature::Implementation,
+        LspRequestFeature::References,
+        LspRequestFeature::DocumentSymbols,
+        LspRequestFeature::WorkspaceSymbols,
+    ];
+    let mut paged_target = None;
+    for (index, feature) in navigation_features.into_iter().enumerate() {
+        let mut message = request(200 + index as u64, &buffer_id, rev, 0, feature);
+        if let Message::BufferLspRequest { request } = &mut message
+            && feature == LspRequestFeature::WorkspaceSymbols
+        {
+            request.item = Some(serde_json::json!({"query": "target"}));
+        }
+        client.send(message).await.unwrap();
+        let result = wait_lsp(&mut client, 200 + index as u64).await;
+        assert_eq!(result.responses.len(), 1, "{feature:?}: {result:?}");
+        assert_eq!(result.responses[0].server, "Beta");
+        let expected_targets = if feature == LspRequestFeature::References {
+            2
+        } else {
+            1
+        };
+        assert_eq!(
+            result.navigation_targets.len(),
+            expected_targets,
+            "{feature:?}: {result:?}"
+        );
+        if feature == LspRequestFeature::References {
+            paged_target = result.navigation_targets.get(1).cloned();
+        }
+        if feature == LspRequestFeature::DocumentSymbols {
+            assert_eq!(
+                result.navigation_targets[0].name.as_deref(),
+                Some("symbol-from-Beta")
+            );
+            assert_eq!(
+                result.navigation_targets[0].uri,
+                format!("file://{}", root.join("sample.py").display())
+            );
+        } else {
+            assert_eq!(
+                result.navigation_targets[0].uri,
+                format!("file://{}", target_path.display())
+            );
+            assert_eq!(result.navigation_targets[0].line, 0);
+            assert_eq!(result.navigation_targets[0].character, 3);
+        }
+    }
+
+    client
+        .send(Message::EditorOpenLocation {
+            request_id: "lsp-location-open".into(),
+            uri: format!("file://{}", target_path.display()),
+            line: 0,
+            character: 3,
+        })
+        .await
+        .unwrap();
+    let (opened_path, opened_offset, opened_text) =
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut opened_text = None;
+            loop {
+                match client.recv().await.expect("receive location open response") {
+                    Message::EditorOpened { request_id, .. }
+                        if request_id == "lsp-location-open" => {}
+                    Message::BufferSnapshot { text, path, .. } if path.ends_with("target.py") => {
+                        opened_text = Some(text)
+                    }
+                    Message::EditorLocationOpened {
+                        request_id,
+                        path,
+                        offset,
+                        ..
+                    } if request_id == "lsp-location-open" => {
+                        return (
+                            path,
+                            offset,
+                            opened_text.expect("snapshot precedes location completion"),
+                        );
+                    }
+                    Message::PtyData { .. }
+                    | Message::FsChanged { .. }
+                    | Message::Pong { .. }
+                    | Message::Ping { .. }
+                    | Message::BufferLspState { .. }
+                    | Message::BufferLspResult { .. }
+                    | Message::BufferChanged { .. }
+                    | Message::BufferPaged { .. }
+                    | Message::BufferEditResult { .. }
+                    | Message::EditorOpened { .. }
+                    | Message::BufferSnapshot { .. } => {}
+                    other => panic!("unexpected location-open response: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("location open timed out");
+    assert!(opened_path.ends_with("target.py"));
+    assert_eq!(
+        opened_offset, 5,
+        "UTF-16 character 3 follows `a😀` (five UTF-8 bytes)"
+    );
+    assert_eq!(opened_text, "a😀target\nsecond\n");
+
+    let paged_target = paged_target.expect("references include the paged destination");
+    client
+        .send(Message::EditorOpenLocation {
+            request_id: "lsp-paged-location-open".into(),
+            uri: paged_target.uri,
+            line: paged_target.line,
+            character: paged_target.character,
+        })
+        .await
+        .unwrap();
+    let paged_offset = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut saw_paged = false;
+        loop {
+            match client
+                .recv()
+                .await
+                .expect("receive paged location open response")
+            {
+                Message::BufferPaged { path, .. } if path.ends_with("paged.py") => saw_paged = true,
+                Message::EditorLocationOpened {
+                    request_id,
+                    offset,
+                    path,
+                    ..
+                } if request_id == "lsp-paged-location-open" => {
+                    assert!(
+                        saw_paged,
+                        "paged metadata precedes location completion for {path}"
+                    );
+                    return offset;
+                }
+                Message::PtyData { .. }
+                | Message::FsChanged { .. }
+                | Message::Pong { .. }
+                | Message::Ping { .. }
+                | Message::BufferLspState { .. }
+                | Message::BufferLspResult { .. }
+                | Message::BufferChanged { .. }
+                | Message::BufferSnapshot { .. }
+                | Message::BufferEditResult { .. }
+                | Message::EditorOpened { .. } => {}
+                other => panic!("unexpected paged location-open response: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("paged location open timed out");
+    assert_eq!(paged_offset, 350_000 * 7 + 5);
+
+    client
+        .send(Message::EditorOpenLocation {
+            request_id: "lsp-non-file-location".into(),
+            uri: "untitled:external".into(),
+            line: 0,
+            character: 0,
+        })
+        .await
+        .unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.recv().await.expect("receive non-file URI error") {
+                Message::Error { code, message } => return (code, message),
+                Message::PtyData { .. }
+                | Message::FsChanged { .. }
+                | Message::Pong { .. }
+                | Message::Ping { .. }
+                | Message::BufferLspState { .. }
+                | Message::BufferLspResult { .. }
+                | Message::BufferChanged { .. }
+                | Message::BufferPaged { .. }
+                | Message::BufferSnapshot { .. }
+                | Message::BufferEditResult { .. }
+                | Message::EditorOpened { .. }
+                | Message::EditorLocationOpened { .. } => {}
+                other => panic!("unexpected response to non-file URI: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("non-file URI error timed out");
+    assert_eq!(error.0, "editor_open_failed");
+    assert!(error.1.contains("not a file URI"));
 
     let alpha_request = fs::read_to_string(&alpha_log)
         .unwrap()
