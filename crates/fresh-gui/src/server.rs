@@ -1224,15 +1224,14 @@ async fn handle_client_msg(
                     message: format!("{request_id}: server did not advertise {CAP_EDITOR_SEARCH}"),
                 });
             }
-            let (matches, capped, error) = match crate::search::preview(
-                &text,
-                &query,
-                &replacement,
-                &options,
-                scope,
-            ) {
-                Ok((matches, capped)) => (matches, capped, None),
-                Err(error) => (Vec::new(), false, Some(error)),
+            let preview = tokio::task::spawn_blocking(move || {
+                crate::search::preview(&text, &query, &replacement, &options, scope)
+            })
+            .await;
+            let (matches, capped, error) = match preview {
+                Ok(Ok((matches, capped))) => (matches, capped, None),
+                Ok(Err(error)) => (Vec::new(), false, Some(error)),
+                Err(error) => (Vec::new(), false, Some(format!("search preview failed: {error}"))),
             };
             send_msg(
                 sink,

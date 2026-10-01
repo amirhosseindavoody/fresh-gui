@@ -4,8 +4,38 @@ use fresh_gui_protocol::{
     ByteRange, SearchMatch, SearchOptions, MAX_SEARCH_DRAFT_BYTES, MAX_SEARCH_MATCHES,
 };
 
-#[path = "../../../vendor/fresh/crates/fresh-editor/src/app/regex_replace.rs"]
-mod fresh_regex_replace;
+#[allow(dead_code)] // The pinned Fresh module exposes more helpers than ADE needs.
+mod fresh_regex_replace {
+    include!("../../../vendor/fresh/crates/fresh-editor/src/app/regex_replace.rs");
+
+    pub fn collect_bounded(
+        regex: &regex::bytes::Regex,
+        haystack: &str,
+        template: &str,
+        limit: usize,
+    ) -> Vec<ReplaceMatch> {
+        let escaped = interpret_escapes(template);
+        let normalized = normalize_replacement(&escaped);
+        regex
+            .captures_iter(haystack.as_bytes())
+            .filter(|captures| {
+                let matched = captures.get(0).expect("capture set has whole match");
+                haystack.is_char_boundary(matched.start()) && haystack.is_char_boundary(matched.end())
+            })
+            .take(limit)
+            .map(|captures| {
+                let matched = captures.get(0).expect("capture set has whole match");
+                let mut expanded = Vec::new();
+                captures.expand(normalized.as_bytes(), &mut expanded);
+                ReplaceMatch {
+                    offset: matched.start(),
+                    len: matched.len(),
+                    replacement: String::from_utf8_lossy(&expanded).into_owned(),
+                }
+            })
+            .collect()
+    }
+}
 
 pub fn preview(
     text: &str,
@@ -56,16 +86,16 @@ pub fn preview(
             options.case_sensitive,
         )
         .ok_or_else(|| "invalid regular expression".to_owned())?;
-        for captures in replace.captures_iter(haystack.as_bytes()).take(limit) {
-            let matched = captures.get(0).expect("capture set has whole match");
+        for matched in fresh_regex_replace::collect_bounded(
+            &replace,
+            haystack,
+            replacement,
+            limit,
+        ) {
             matches.push(SearchMatch {
-                start: base + matched.start(),
-                end: base + matched.end(),
-                replacement: fresh_regex_replace::expand_replacement(
-                    &replace,
-                    matched.as_bytes(),
-                    replacement,
-                ),
+                start: base + matched.offset,
+                end: base + matched.offset + matched.len,
+                replacement: matched.replacement,
             });
         }
     } else {
@@ -112,12 +142,38 @@ mod tests {
     }
 
     #[test]
+    fn zero_width_word_boundary_capture_uses_original_haystack_context() {
+        let (found, _) = preview("é x", r"(\b)", "<$1>", &opts(true), None).unwrap();
+        assert!(!found.is_empty());
+        assert!(found.iter().all(|item| item.replacement == "<>"));
+    }
+
+    #[test]
+    fn zero_width_unicode_matches_never_report_interior_byte_offsets() {
+        let (found, _) = preview("éx", "()", "x", &opts(true), None).unwrap();
+        assert_eq!(found.iter().map(|item| item.start).collect::<Vec<_>>(), [0, 2, 3]);
+    }
+
+    #[test]
     fn unicode_offsets_selection_scope_and_anchors_are_respected() {
         let options = SearchOptions { whole_word: false, ..opts(true) };
         let text = "é\nfoo\nfoo";
         let (found, _) = preview(text, "^foo$", "x", &options, Some(ByteRange { start: 3, len: 4 })).unwrap();
         assert_eq!((found[0].start, found[0].end), (3, 6));
         assert!(preview(text, "foo", "x", &options, Some(ByteRange { start: 1, len: 2 })).is_err());
+    }
+
+    #[test]
+    fn unicode_case_folding_and_whole_word_matching_follow_fresh_options() {
+        let mut options = opts(false);
+        options.case_sensitive = false;
+        let (case_match, _) = preview("Ångström", "ång", "x", &options, None).unwrap();
+        assert_eq!((case_match[0].start, case_match[0].end), (0, 4));
+
+        options.whole_word = true;
+        let (word_matches, _) = preview("promote mot", "mot", "x", &options, None).unwrap();
+        assert_eq!(word_matches.len(), 1);
+        assert_eq!(word_matches[0].start, 8);
     }
 
     #[test]
