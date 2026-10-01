@@ -1667,6 +1667,7 @@ impl Workspace {
                 self.upsert_workspace(workspace);
             }
             AdeEvent::WorkspaceClosed { id, focused_id } => {
+                self.forget_navigation_workspace(&id);
                 let was_active = self.active_workspace_id.as_deref() == Some(id.as_str());
                 self.terminal_mru.remove(&id);
                 self.terminal_cwds.remove(&id);

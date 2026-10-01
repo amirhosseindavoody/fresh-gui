@@ -2234,6 +2234,10 @@ impl EditorPanel {
         }
     }
 
+    pub(crate) fn focus_navigation_source(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |editor, cx| editor.focus(window, cx));
+    }
+
     pub(crate) fn navigation_snapshot(&self, cx: &App) -> (String, usize) {
         (self.current_text(cx), self.byte_selection(cx).head)
     }
@@ -3847,9 +3851,13 @@ impl Render for EditorPanel {
                     })
                     .child(
                         Editor::new(&self.editor)
-                            .context_menu(|menu, _, _| {
+                            .context_menu({
+                                let editor = self.editor.clone();
+                                move |menu, _, cx| {
+                                let capabilities = editor.read(cx).context_menu_capabilities();
+                                let editable = !capabilities.is_disabled() && !capabilities.is_readonly();
                                 use super::actions::*;
-                                use gpui_kit::component::input::{Cut, Copy, Paste, Undo, Redo};
+                                use gpui_kit::component::input::{Cut, Copy, Paste, SelectAll, Undo, Redo};
                                 menu.menu("Go to Definition", Box::new(GoToDefinition))
                                     .menu("Go to Declaration", Box::new(GoToDeclaration))
                                     .menu("Go to Type Definition", Box::new(GoToTypeDefinition))
@@ -3861,9 +3869,13 @@ impl Render for EditorPanel {
                                     .menu("Navigate Back", Box::new(NavigateBack))
                                     .menu("Navigate Forward", Box::new(NavigateForward))
                                     .separator()
-                                    .menu("Cut", Box::new(Cut)).menu("Copy", Box::new(Copy))
-                                    .menu("Paste", Box::new(Paste)).separator()
-                                    .menu("Undo", Box::new(Undo)).menu("Redo", Box::new(Redo))
+                                    .menu_with_disabled("Cut", !(editable && capabilities.is_copyable()), Box::new(Cut))
+                                    .menu_with_disabled("Copy", !capabilities.is_copyable(), Box::new(Copy))
+                                    .menu_with_disabled("Paste", !(editable && cx.read_from_clipboard().is_some()), Box::new(Paste))
+                                    .menu("Select All", Box::new(SelectAll)).separator()
+                                    .menu_with_disabled("Undo", !editable, Box::new(Undo))
+                                    .menu_with_disabled("Redo", !editable, Box::new(Redo))
+                                }
                             })
                             .disabled(self.search.review.is_some() || self.page_request.is_some() || (self.page.is_some() && self.sync_request_id.is_some()))
                             .bordered(false)

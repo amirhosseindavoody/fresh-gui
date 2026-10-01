@@ -51,6 +51,17 @@ impl Workspace {
         cx.notify();
     }
 
+    fn cancel_navigation_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let source = self.navigation.source.clone();
+        self.dismiss_navigation(cx);
+        if let Some(panel) = source { panel.update(cx, |panel, cx| panel.focus_navigation_source(window, cx)); }
+        self.status = "Navigation cancelled".into();
+    }
+
+    pub(super) fn forget_navigation_workspace(&mut self, workspace: &str) {
+        self.navigation.histories.remove(workspace);
+    }
+
     fn start_navigation(&mut self, feature: LspRequestFeature, window: &mut Window, cx: &mut Context<Self>) {
         self.dismiss_navigation(cx);
         if !self.capabilities.iter().any(|cap| cap == CAP_LSP_NAVIGATION) {
@@ -232,14 +243,14 @@ impl Workspace {
         let query_view = view.clone();
         let cancel = view.clone();
         div().absolute().inset_0().flex().justify_center().pt_12().bg(gpui::black().opacity(0.3))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.dismiss_navigation(cx)))
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.cancel_navigation_picker(window, cx)))
             .child(v_flex().w(self.ui_px(680.)).max_h(self.ui_px(540.)).gap_2().p_2()
                 .bg(cx.theme().background).border_1().border_color(cx.theme().border).rounded(cx.theme().radius)
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(h_flex().gap_2().items_center()
                     .child(div().flex_1().text_sm().child(self.navigation.status.clone()))
                     .child(Button::new("cancel-navigation").ghost().small().label("Cancel")
-                        .on_click(cx.listener(|this, _, _, cx| { this.dismiss_navigation(cx); this.status = "Navigation cancelled".into(); }))))
+                        .on_click(cx.listener(|this, _, window, cx| this.cancel_navigation_picker(window, cx)))))
                 .child(Command::new(&self.navigation_state).bordered(true)
                     .placeholder(if workspace_symbols { "Search workspace symbols…" } else { "Filter destinations…" })
                     .filterable(!workspace_symbols)
@@ -256,6 +267,6 @@ impl Workspace {
                         if this.navigation.generation == generation
                             && let Some(target) = targets.get(index.row).cloned() { this.open_navigation_target(target, cx); }
                     }); })
-                    .on_cancel(move |_, cx| { cancel.update(cx, |this, cx| { this.dismiss_navigation(cx); this.status = "Navigation cancelled".into(); }); })))
+                    .on_cancel(move |window, cx| { cancel.update(cx, |this, cx| this.cancel_navigation_picker(window, cx)); })))
     }
 }

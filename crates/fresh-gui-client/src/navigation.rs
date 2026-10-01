@@ -124,6 +124,25 @@ mod tests {
     }
 
     #[test]
+    fn history_restores_the_original_view_and_daemon_path() {
+        let origin = EditorLocation::new("/remote/project/a.rs", "pane-left", 9).with_buffer_id("a");
+        let target = EditorLocation::new("/remote/project/b.rs", "pane-right", 3_000_004).with_buffer_id("b");
+        let mut history = NavigationHistory::new();
+        history.record_jump(origin.clone(), target.clone());
+        assert_eq!(history.back(target.clone()), Some(origin.clone()));
+        assert_eq!(history.forward(origin), Some(target));
+    }
+
+    #[test]
+    fn repeated_identical_jumps_do_not_add_history_entries() {
+        let mut history = NavigationHistory::new();
+        history.record_jump(location("a", 10), location("a", 10));
+        assert_eq!(history.len(), 1);
+        assert!(!history.can_go_back());
+        assert!(!history.can_go_forward());
+    }
+
+    #[test]
     fn history_is_bounded_and_keeps_absolute_offsets_and_view_identity() {
         let mut history = NavigationHistory::with_capacity(2);
         history.record_jump(location("a", 1), location("b", 2));
