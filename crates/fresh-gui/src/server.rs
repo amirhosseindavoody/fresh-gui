@@ -2423,6 +2423,7 @@ async fn handle_client_msg(
         Message::WorkspaceSetRoot { workspace_id, root } => {
             require_auth(*authed)?;
             project.clear();
+            finder.clear();
             if root.trim().is_empty() {
                 return Err(Message::Error {
                     code: "workspace_set_root_failed".into(),
@@ -2589,6 +2590,19 @@ fn require_project_cap(client: bool, editor: bool, request_id: &str) -> Result<(
 
 fn require_file_finder_cap(client: bool, editor: bool, request_id: &str) -> Result<(), Message> {
     if client && editor { Ok(()) } else { Err(settings_error("capability_unavailable", request_id, "project.file-finder capability not negotiated")) }
+}
+
+#[cfg(test)]
+mod file_finder_capability_tests {
+    use super::require_file_finder_cap;
+    use fresh_gui_protocol::Message;
+
+    #[test]
+    fn file_finder_requires_client_negotiation_and_editor_daemon() {
+        assert!(require_file_finder_cap(true, true, "finder-1").is_ok());
+        assert!(matches!(require_file_finder_cap(false, true, "finder-1"), Err(Message::Error { code, .. }) if code == "capability_unavailable"));
+        assert!(matches!(require_file_finder_cap(true, false, "finder-1"), Err(Message::Error { code, .. }) if code == "capability_unavailable"));
+    }
 }
 
 async fn project_root(state: &AppState, workspace: &str) -> Result<PathBuf, Message> {
