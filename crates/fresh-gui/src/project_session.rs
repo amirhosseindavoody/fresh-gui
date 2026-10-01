@@ -37,10 +37,10 @@ impl ProjectSession {
     }
     pub fn cancel(&self, id: &str) {
         let mut current = self.current.lock().expect("project session");
-        if current.as_ref().is_some_and(|s| s.id == id) {
-            if let Some(old) = current.take() {
-                old.cancel.store(true, Ordering::Relaxed);
-            }
+        if current.as_ref().is_some_and(|s| s.id == id)
+            && let Some(old) = current.take()
+        {
+            old.cancel.store(true, Ordering::Relaxed);
         }
     }
     pub fn start(
@@ -63,7 +63,7 @@ impl ProjectSession {
         });
         let current = self.current.clone();
         tokio::spawn(async move {
-            let buffers = match editor.project_snapshots(workspace).await {
+            let buffers = match editor.project_snapshots(workspace, root.clone()).await {
                 Ok(buffers) => buffers,
                 Err(error) => {
                     let _ = tx
@@ -102,10 +102,9 @@ impl ProjectSession {
                     );
                     let mut state = current.lock().expect("project session");
                     if let Some(state) = state.as_mut().filter(|s| Arc::ptr_eq(&s.cancel, &cancel))
+                        && !result.cancelled
                     {
-                        if !result.cancelled {
-                            state.result = Some(result);
-                        }
+                        state.result = Some(result);
                     }
                     summary
                 }

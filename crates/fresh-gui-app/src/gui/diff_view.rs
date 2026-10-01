@@ -428,6 +428,13 @@ impl DiffPanel {
         }
         cx.notify();
     }
+    pub fn apply_project_update(&mut self, update: &fresh_gui_protocol::ProjectBufferUpdate, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.dirty || self.rev != update.base_rev { return false; }
+        self.apply_snapshot(&update.buffer_id, update.rev, &update.text, window, cx);
+        self.dirty = update.dirty;
+        true
+    }
+
     pub fn save_data(&self, cx: &App) -> Option<(String, u64, String)> {
         if !self.ready || !self.dirty { return None; }
         Some((self.buffer_id.clone()?, self.rev, self.editor.read(cx).value().to_string()))

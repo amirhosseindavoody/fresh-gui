@@ -245,6 +245,7 @@ enum Cmd {
     },
     ProjectSnapshots {
         workspace_id: String,
+        root: PathBuf,
         reply: oneshot::Sender<Result<Vec<ProjectBufferSnapshot>>>,
     },
     ProjectReplace {
@@ -596,10 +597,15 @@ impl EditorHandle {
     pub async fn project_snapshots(
         &self,
         workspace_id: String,
+        root: PathBuf,
     ) -> Result<Vec<ProjectBufferSnapshot>> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Cmd::ProjectSnapshots { workspace_id, reply })
+            .send(Cmd::ProjectSnapshots {
+                workspace_id,
+                root,
+                reply,
+            })
             .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
         rx.await
             .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
@@ -1010,12 +1016,13 @@ fn run_loop(
                     let result = read_page(&mut editor, &mut tracked, &buffer_id, start, len);
                     let _ = reply.send(result);
                 }
-                Cmd::ProjectSnapshots { workspace_id, reply } => {
+                Cmd::ProjectSnapshots { workspace_id, root, reply } => {
                     let result = project_snapshots(
                         &mut editor,
                         &mut tracked,
                         &drafts,
                         &workspace_id,
+                        &root,
                     );
                     let _ = reply.send(result);
                 }
@@ -3155,9 +3162,7 @@ fn sync_buffer(
 
 fn same_path(left: &Path, right: &Path) -> bool {
     left.canonicalize().unwrap_or_else(|_| left.to_path_buf())
-        == right
-            .canonicalize()
-            .unwrap_or_else(|_| right.to_path_buf())
+        == right.canonicalize().unwrap_or_else(|_| right.to_path_buf())
 }
 
 fn project_snapshots(
@@ -3165,14 +3170,45 @@ fn project_snapshots(
     tracked: &mut HashMap<String, TrackedBuffer>,
     drafts: &DraftStore,
     workspace_id: &str,
+    root: &Path,
 ) -> Result<Vec<ProjectBufferSnapshot>> {
     let recovered = drafts.list(workspace_id)?;
     let mut skipped_recovery = Vec::new();
     for draft in recovered {
-        if tracked
-            .values()
-            .any(|entry| entry.workspace_id == workspace_id && entry.draft_id == draft.draft_id)
-        {
+        if draft.path.as_deref().is_some_and(|path| {
+            crate::project_search::confined_path(root, Path::new(path)).is_none()
+        }) {
+            continue;
+        }
+        if tracked.values().any(|entry| {
+            entry.workspace_id == workspace_id && entry.draft_id == draft.draft_id && entry.dirty
+        }) {
+            continue;
+        }
+        // Searching must not replay an older recovery copy over an already
+        // opened source, even when it belongs to another workspace.
+        let already_open = draft.path.as_deref().is_some_and(|path| {
+            tracked.values().any(|entry| {
+                entry.draft_id != draft.draft_id
+                    && entry
+                        .path
+                        .as_deref()
+                        .is_some_and(|open| same_path(open, Path::new(path)))
+            })
+        });
+        if already_open {
+            skipped_recovery.push(ProjectBufferSnapshot {
+                buffer_id: format!("recovery:{}", draft.draft_id),
+                draft_id: draft.draft_id,
+                path: None,
+                rev: 0,
+                total_bytes: Some(draft.text.len()),
+                dirty: true,
+                text: None,
+                skipped_reason: Some(
+                    "older recovery copy preserved; its source is already open".into(),
+                ),
+            });
             continue;
         }
         if let Err(error) = restore_draft(editor, tracked, drafts, workspace_id, &draft.draft_id) {
@@ -3193,7 +3229,13 @@ fn project_snapshots(
     let mut snapshot_bytes = 0usize;
     let mut snapshots = tracked
         .iter()
-        .filter(|(_, entry)| entry.workspace_id == workspace_id)
+        .filter(|(_, entry)| {
+            entry.workspace_id == workspace_id
+                && entry
+                    .path
+                    .as_deref()
+                    .is_none_or(|path| crate::project_search::confined_path(root, path).is_some())
+        })
         .map(|(buffer_id, entry)| {
             let path = entry.path.as_ref().map(|path| path.display().to_string());
             let text_bytes = entry.text.len();
@@ -3214,7 +3256,9 @@ fn project_snapshots(
                 path,
                 rev: entry.rev,
                 text: skipped_reason.is_none().then(|| entry.text.clone()),
-                total_bytes: entry.total_bytes.or(skipped_reason.as_ref().map(|_| text_bytes)),
+                total_bytes: entry
+                    .total_bytes
+                    .or(skipped_reason.as_ref().map(|_| text_bytes)),
                 dirty: entry.dirty,
                 skipped_reason,
             }
@@ -3240,13 +3284,13 @@ fn project_replace(
     if expected_text.len() > MAX_SNAPSHOT_BYTES {
         bail!("project replacement source exceeds snapshot limit");
     }
-    let open = tracked.iter().find(|(buffer_id, entry)| {
-        match (entry.path.as_deref(), path) {
+    let open = tracked
+        .iter()
+        .find(|(buffer_id, entry)| match (entry.path.as_deref(), path) {
             (Some(open_path), Some(path)) => same_path(open_path, path),
             (None, None) => expected_buffer_id == Some(buffer_id.as_str()),
             _ => false,
-        }
-    });
+        });
     let (buffer_id, save_unopened) = match (expected_buffer_id, open) {
         (Some(expected_id), Some((buffer_id, entry)))
             if expected_id == buffer_id
@@ -3262,7 +3306,9 @@ fn project_replace(
             (buffer_id.clone(), false)
         }
         (Some(_), _) => bail!("open project buffer changed or closed since search"),
-        (None, Some(_)) => bail!("file was opened after project search; rerun search before replacing"),
+        (None, Some(_)) => {
+            bail!("file was opened after project search; rerun search before replacing")
+        }
         (None, None) if path.is_none() => bail!("pathless draft is no longer open"),
         (None, None) => {
             if expected_rev.is_some() {
@@ -3277,15 +3323,28 @@ fn project_replace(
                 bail!("file changed on disk since project search");
             }
             let opened = open_buffer(editor, tracked, path, false, workspace_id)?;
-            let entry = tracked.get(&opened.buffer_id).context("opened project file is untracked")?;
+            let entry = tracked
+                .get(&opened.buffer_id)
+                .context("opened project file is untracked")?;
             if entry.total_bytes.is_some() || entry.text != expected_text {
                 bail!("file changed or became paged while opening project search result");
+            }
+            let current_disk = disk_generation(path)?;
+            if current_disk.signature != generation.signature
+                || entry
+                    .disk
+                    .as_ref()
+                    .is_none_or(|disk| disk.signature != generation.signature)
+            {
+                bail!("file changed on disk while opening project search result");
             }
             (opened.buffer_id, true)
         }
     };
 
-    let entry = tracked.get(&buffer_id).context("project buffer closed during replacement")?;
+    let entry = tracked
+        .get(&buffer_id)
+        .context("project buffer closed during replacement")?;
     if entry.workspace_id != workspace_id
         || match (entry.path.as_deref(), path) {
             (Some(open_path), Some(path)) => !same_path(open_path, path),
@@ -3314,14 +3373,18 @@ fn project_replace(
     }
     if save_unopened {
         save_buffer(editor, tracked, &buffer_id, outcome.rev, None)?;
-        let entry = tracked.get(&buffer_id).context("saved project buffer vanished")?;
+        let entry = tracked
+            .get(&buffer_id)
+            .context("saved project buffer vanished")?;
         drafts.discard(&entry.workspace_id, &entry.draft_id)?;
         outcome = transaction_result(tracked, editor, &buffer_id, true)?;
         close_buffer(editor, tracked, &buffer_id)?;
     }
     Ok(ProjectReplaceResult {
         buffer_id,
-        path: path.map(|path| path.display().to_string()).unwrap_or_default(),
+        path: path
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
         base_rev,
         rev: outcome.rev,
         text: outcome.text,
@@ -4916,7 +4979,7 @@ mod tests {
             crate::config::Config::default(),
             recovery.clone(),
         )
-            .expect("Fresh worker starts");
+        .expect("Fresh worker starts");
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -4931,7 +4994,10 @@ mod tests {
                 .edit(draft.buffer_id.clone(), draft.rev, "draft match".into())
                 .await
                 .unwrap();
-            let snapshot = editor.project_snapshots("project-test".into()).await.unwrap();
+            let snapshot = editor
+                .project_snapshots("project-test".into(), root.clone())
+                .await
+                .unwrap();
             let draft_snapshot = snapshot
                 .iter()
                 .find(|buffer| buffer.buffer_id == draft.buffer_id)
@@ -4945,24 +5011,34 @@ mod tests {
                     Some(draft.buffer_id.clone()),
                     Some(rev),
                     "draft match".into(),
-                    vec![RangeEdit { start: 6, end: 11, text: "updated".into() }],
+                    vec![RangeEdit {
+                        start: 6,
+                        end: 11,
+                        text: "updated".into(),
+                    }],
                 )
                 .await
                 .unwrap();
             assert!(applied.dirty);
             assert!(!applied.saved);
             assert_eq!(applied.text, "draft updated");
-            assert!(editor
-                .project_replace(
-                    "project-test".into(),
-                    None,
-                    Some(draft.buffer_id.clone()),
-                    Some(rev),
-                    "draft match".into(),
-                    vec![RangeEdit { start: 6, end: 11, text: "stale".into() }],
-                )
-                .await
-                .is_err());
+            assert!(
+                editor
+                    .project_replace(
+                        "project-test".into(),
+                        None,
+                        Some(draft.buffer_id.clone()),
+                        Some(rev),
+                        "draft match".into(),
+                        vec![RangeEdit {
+                            start: 6,
+                            end: 11,
+                            text: "stale".into()
+                        }],
+                    )
+                    .await
+                    .is_err()
+            );
 
             let disk_replaced = editor
                 .project_replace(
@@ -4971,7 +5047,11 @@ mod tests {
                     None,
                     None,
                     "from disk".into(),
-                    vec![RangeEdit { start: 5, end: 9, text: "Fresh".into() }],
+                    vec![RangeEdit {
+                        start: 5,
+                        end: 9,
+                        text: "Fresh".into(),
+                    }],
                 )
                 .await
                 .unwrap();
@@ -4988,56 +5068,151 @@ mod tests {
         )
         .expect("Fresh worker restarts");
         rt.block_on(async {
-            let (draft, changed) = editor
-                .draft_restore("project-test".into(), draft_id)
+            let recovered = editor
+                .project_snapshots("project-test".into(), root.clone())
                 .await
                 .unwrap();
-            assert!(!changed);
-            let recovered = editor.project_snapshots("project-test".into()).await.unwrap();
             let snapshot = recovered
                 .iter()
-                .find(|buffer| buffer.buffer_id == draft.buffer_id)
+                .find(|buffer| buffer.draft_id == draft_id)
                 .unwrap();
+            let draft = snapshot.clone();
             assert!(snapshot.path.is_none());
             assert_eq!(snapshot.text.as_deref(), Some("draft updated"));
             assert!(snapshot.dirty);
             let externally_changed = root.join("external.txt");
             std::fs::write(&externally_changed, "before").unwrap();
             std::fs::write(&externally_changed, "after").unwrap();
-            assert!(editor
-                .project_replace(
-                    "project-test".into(),
-                    Some(externally_changed.display().to_string()),
-                    None,
-                    None,
-                    "before".into(),
-                    vec![RangeEdit { start: 0, end: 6, text: "lost".into() }],
-                )
-                .await
-                .is_err());
+            assert!(
+                editor
+                    .project_replace(
+                        "project-test".into(),
+                        Some(externally_changed.display().to_string()),
+                        None,
+                        None,
+                        "before".into(),
+                        vec![RangeEdit {
+                            start: 0,
+                            end: 6,
+                            text: "lost".into()
+                        }],
+                    )
+                    .await
+                    .is_err()
+            );
 
             let newly_opened = root.join("opened-after-search.txt");
             std::fs::write(&newly_opened, "search text").unwrap();
             editor
-                .open_in_workspace(
-                    newly_opened.clone(),
-                    false,
-                    "project-test".into(),
+                .open_in_workspace(newly_opened.clone(), false, "project-test".into())
+                .await
+                .unwrap();
+            assert!(
+                editor
+                    .project_replace(
+                        "project-test".into(),
+                        Some(newly_opened.display().to_string()),
+                        None,
+                        None,
+                        "search text".into(),
+                        vec![RangeEdit {
+                            start: 0,
+                            end: 6,
+                            text: "changed".into()
+                        }],
+                    )
+                    .await
+                    .is_err()
+            );
+            editor.draft_discard(draft.buffer_id).await.unwrap();
+        });
+        drop(editor);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_search_never_replays_older_recovery_over_an_open_draft() {
+        let root =
+            std::env::temp_dir().join(format!("fresh-project-recovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("source.txt");
+        std::fs::write(&path, "disk").unwrap();
+        let recovery = root.join("recovery");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let old = EditorHandle::spawn_with_recovery_dir(
+            root.clone(),
+            crate::config::Config::default(),
+            recovery.clone(),
+        )
+        .unwrap();
+        let old_id = rt.block_on(async {
+            let opened = old
+                .open_in_workspace(path.clone(), false, "project".into())
+                .await
+                .unwrap();
+            old.edit(opened.buffer_id, opened.rev, "older recovery draft".into())
+                .await
+                .unwrap();
+            opened.draft_id
+        });
+        drop(old);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let editor = EditorHandle::spawn_with_recovery_dir(
+            root.clone(),
+            crate::config::Config::default(),
+            recovery,
+        )
+        .unwrap();
+        rt.block_on(async {
+            let opened = editor
+                .open_in_workspace(path.clone(), false, "project".into())
+                .await
+                .unwrap();
+            assert_eq!(opened.draft_id, old_id);
+            let recovered = editor
+                .project_snapshots("project".into(), root.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                recovered
+                    .iter()
+                    .find(|s| s.buffer_id == opened.buffer_id)
+                    .unwrap()
+                    .text
+                    .as_deref(),
+                Some("older recovery draft")
+            );
+            let restored_rev = recovered
+                .iter()
+                .find(|s| s.buffer_id == opened.buffer_id)
+                .unwrap()
+                .rev;
+            editor
+                .edit(
+                    opened.buffer_id.clone(),
+                    restored_rev,
+                    "newer visible draft".into(),
                 )
                 .await
                 .unwrap();
-            assert!(editor
-                .project_replace(
-                    "project-test".into(),
-                    Some(newly_opened.display().to_string()),
-                    None,
-                    None,
-                    "search text".into(),
-                    vec![RangeEdit { start: 0, end: 6, text: "changed".into() }],
-                )
+            let snapshots = editor
+                .project_snapshots("project".into(), root.clone())
                 .await
-                .is_err());
-            editor.draft_discard(draft.buffer_id).await.unwrap();
+                .unwrap();
+            assert_eq!(
+                snapshots
+                    .iter()
+                    .find(|s| s.buffer_id == opened.buffer_id)
+                    .unwrap()
+                    .text
+                    .as_deref(),
+                Some("newer visible draft")
+            );
+            assert!(!snapshots.iter().any(|s| s.skipped_reason.is_some()));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "disk");
         });
         drop(editor);
         let _ = std::fs::remove_dir_all(root);

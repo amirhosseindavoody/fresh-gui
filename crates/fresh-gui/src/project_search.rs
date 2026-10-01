@@ -12,9 +12,7 @@ use std::{
 };
 
 use crate::editor_worker::ProjectBufferSnapshot;
-use fresh_gui_protocol::{
-    ProjectSearchFile, ProjectSearchMatch, ProjectSearchRequest, SearchOptions,
-};
+use fresh_gui_protocol::{ProjectSearchFile, ProjectSearchMatch, ProjectSearchRequest};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::{
     Match, WalkBuilder,
@@ -124,25 +122,27 @@ pub fn scan(
         } else {
             None
         };
-        if let Some((file, text)) = buffer_result(
+        let Some((file, text)) = buffer_result(
             &root,
             relative.as_deref(),
             &buffer,
             request,
             max_matches - total_matches,
             &mut result,
-        )? {
-            if !cache_and_emit(
-                &mut result,
-                &mut total_matches,
-                &mut cache_bytes,
-                max_matches,
-                file,
-                text,
-                &mut emit,
-            ) {
-                return Ok(finish(result));
-            }
+        )?
+        else {
+            continue;
+        };
+        if !cache_and_emit(
+            &mut result,
+            &mut total_matches,
+            &mut cache_bytes,
+            max_matches,
+            file,
+            text,
+            &mut emit,
+        ) {
+            return Ok(finish(result));
         }
     }
 
@@ -172,30 +172,34 @@ pub fn scan(
             _ => continue,
         };
         if open_paths.contains(&canonical) {
-            if let Some(buffer) = overlays.remove(&canonical) {
-                let relative = canonical.strip_prefix(&root).ok();
-                if relative.is_some_and(|path| matches_globs(&globs, path)) {
-                    if let Some((file, text)) = buffer_result(
-                        &root,
-                        relative,
-                        &buffer,
-                        request,
-                        max_matches - total_matches,
-                        &mut result,
-                    )? {
-                        if !cache_and_emit(
-                            &mut result,
-                            &mut total_matches,
-                            &mut cache_bytes,
-                            max_matches,
-                            file,
-                            text,
-                            &mut emit,
-                        ) {
-                            break;
-                        }
-                    }
-                }
+            let Some(buffer) = overlays.remove(&canonical) else {
+                continue;
+            };
+            let relative = canonical.strip_prefix(&root).ok();
+            if !relative.is_some_and(|path| matches_globs(&globs, path)) {
+                continue;
+            }
+            let Some((file, text)) = buffer_result(
+                &root,
+                relative,
+                &buffer,
+                request,
+                max_matches - total_matches,
+                &mut result,
+            )?
+            else {
+                continue;
+            };
+            if !cache_and_emit(
+                &mut result,
+                &mut total_matches,
+                &mut cache_bytes,
+                max_matches,
+                file,
+                text,
+                &mut emit,
+            ) {
+                break;
             }
             continue;
         }
@@ -235,18 +239,13 @@ pub fn scan(
             Ok(text) => text,
             Err(_) => continue,
         };
-        let rel = canonical.strip_prefix(&root).unwrap();
-        let label = path_string(rel);
         let file = make_file_result(
             Some(&canonical),
-            Some(&label),
             None,
             None,
             None,
             &text,
-            &request.query,
-            &request.replacement,
-            &request.options,
+            request,
             max_matches.saturating_sub(total_matches),
         )?;
         if file.matches.is_empty() {
@@ -322,18 +321,14 @@ fn buffer_result(
     if !valid_text(text) {
         return Ok(None);
     }
-    let label = relative.map(path_string);
     let absolute = relative.map(|path| root.join(path));
     let file = make_file_result(
         absolute.as_deref(),
-        label.as_deref(),
         Some(buffer.buffer_id.clone()),
         Some(buffer.draft_id.clone()),
         Some(buffer.rev),
         text,
-        &request.query,
-        &request.replacement,
-        &request.options,
+        request,
         remaining_matches,
     )?;
     if file.matches.is_empty() {
@@ -413,17 +408,20 @@ fn file_payload_bytes(file: &ProjectSearchFile, text_bytes: usize) -> usize {
 
 fn make_file_result(
     absolute: Option<&Path>,
-    label: Option<&str>,
     buffer_id: Option<String>,
     draft_id: Option<String>,
     rev: Option<u64>,
     text: &str,
-    query: &str,
-    replacement: &str,
-    options: &SearchOptions,
+    request: &ProjectSearchRequest,
     limit: usize,
 ) -> Result<ProjectSearchFile, String> {
-    let (matches, _) = crate::search::preview(text, query, replacement, options, None)?;
+    let (matches, _) = crate::search::preview(
+        text,
+        &request.query,
+        &request.replacement,
+        &request.options,
+        None,
+    )?;
     let newline_offsets = text
         .bytes()
         .enumerate()
@@ -464,7 +462,14 @@ fn make_file_result(
         id: buffer_id
             .as_ref()
             .map(|id| format!("buffer:{id}"))
-            .unwrap_or_else(|| format!("file:{}", label.unwrap_or_default())),
+            .unwrap_or_else(|| {
+                format!(
+                    "file:{}",
+                    absolute
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default()
+                )
+            }),
         path: absolute.map(|path| path.to_string_lossy().into_owned()),
         buffer_id,
         draft_id,
@@ -478,9 +483,6 @@ fn should_stop(cancel: &AtomicBool) -> bool {
 }
 fn valid_text(text: &str) -> bool {
     !text.as_bytes().contains(&0)
-}
-fn path_string(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
 }
 
 fn warn(result: &mut ScanResult, message: String) {
@@ -598,6 +600,7 @@ fn is_ignore_match(result: Match<&ignore::gitignore::Glob>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fresh_gui_protocol::SearchOptions;
     use uuid::Uuid;
 
     fn fixture() -> PathBuf {
@@ -846,7 +849,8 @@ mod tests {
         )
         .unwrap();
         let matched = &result.files[0].result.matches[0];
-        assert_eq!(matched.column, "é".len() as u32 + 1);
+        assert_eq!(matched.column, ("é".len() + 500) as u32 + 1);
+        assert_eq!(matched.start, "é".len() + 500);
         assert!(matched.preview.len() < 500);
         fs::remove_dir_all(root).unwrap();
     }

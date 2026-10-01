@@ -1318,6 +1318,7 @@ async fn handle_client_msg(
             require_auth(*authed)?;
             require_project_cap(*client_project_search, state.editor.is_some(), &request_id)?;
             project.cancel(&request_id);
+            send_msg(sink, &Message::ProjectSearchDone { request_id: request_id.clone(), truncated: false, cancelled: true, warnings: Vec::new(), error: None }).await.map_err(|_| settings_error("send_failed", &request_id, "socket closed"))?;
             Ok(())
         }
         Message::ProjectReplace {
@@ -2320,8 +2321,8 @@ async fn handle_client_msg(
             Ok(())
         }
         Message::WorkspaceSetRoot { workspace_id, root } => {
-            project.clear();
             require_auth(*authed)?;
+            project.clear();
             if root.trim().is_empty() {
                 return Err(Message::Error {
                     code: "workspace_set_root_failed".into(),

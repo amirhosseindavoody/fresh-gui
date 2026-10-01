@@ -24,15 +24,14 @@ const PROJECT_SEARCH_LIMIT: usize = 2_000;
 fn build_selections(selected: &HashMap<String, HashSet<usize>>) -> Vec<ProjectSearchSelection> {
     selected
         .iter()
-        .filter_map(|(file_id, indices)| {
-            (!indices.is_empty()).then(|| {
-                let mut match_indices = indices.iter().copied().collect::<Vec<_>>();
-                match_indices.sort_unstable();
-                ProjectSearchSelection {
-                    file_id: file_id.clone(),
-                    match_indices,
-                }
-            })
+        .filter(|(_, indices)| !indices.is_empty())
+        .map(|(file_id, indices)| {
+            let mut match_indices = indices.iter().copied().collect::<Vec<_>>();
+            match_indices.sort_unstable();
+            ProjectSearchSelection {
+                file_id: file_id.clone(),
+                match_indices,
+            }
         })
         .collect()
 }
@@ -320,61 +319,6 @@ impl ProjectSearchPanel {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use core::prelude::v1::test;
-    use gpui::TestAppContext;
-
-    #[test]
-    fn selections_are_sorted_and_empty_files_are_omitted() {
-        let selected = HashMap::from([
-            ("file-a".into(), HashSet::from([4, 1, 2])),
-            ("file-empty".into(), HashSet::new()),
-        ]);
-        assert_eq!(
-            build_selections(&selected),
-            vec![ProjectSearchSelection {
-                file_id: "file-a".into(),
-                match_indices: vec![1, 2, 4],
-            }]
-        );
-    }
-
-    #[gpui::test]
-    fn stale_streams_do_not_complete_current_search_and_cancel_disables_apply(
-        cx: &mut TestAppContext,
-    ) {
-        cx.update(gpui_kit::init);
-        let (panel, test_cx) = cx.add_window_view(|window, cx| {
-            ProjectSearchPanel::new("/workspace".into(), true, window, cx)
-        });
-        panel.update_in(test_cx, |panel, _, cx| {
-            panel.request_id = Some("new".into());
-            panel.running = true;
-            panel.handle_message(
-                &Message::ProjectSearchDone {
-                    request_id: "old".into(),
-                    truncated: false,
-                    cancelled: false,
-                    warnings: vec![],
-                    error: None,
-                },
-                cx,
-            );
-            assert!(panel.running);
-            panel.search_complete = true;
-            panel.selected.insert("file".into(), HashSet::from([0]));
-            assert!(panel.can_apply());
-            panel.cancel(cx);
-            assert!(!panel.can_apply());
-            panel.set_error("preflight failed", cx);
-            assert!(!panel.running);
-            assert!(!panel.can_apply());
-        });
-    }
-}
-
 impl Render for ProjectSearchPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_count = self.selected.values().map(HashSet::len).sum::<usize>();
@@ -591,5 +535,60 @@ impl Render for ProjectSearchPanel {
                 .overflow_y_scrollbar()
                 .child(results),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::prelude::v1::test;
+    use gpui::TestAppContext;
+
+    #[test]
+    fn selections_are_sorted_and_empty_files_are_omitted() {
+        let selected = HashMap::from([
+            ("file-a".into(), HashSet::from([4, 1, 2])),
+            ("file-empty".into(), HashSet::new()),
+        ]);
+        assert_eq!(
+            build_selections(&selected),
+            vec![ProjectSearchSelection {
+                file_id: "file-a".into(),
+                match_indices: vec![1, 2, 4],
+            }]
+        );
+    }
+
+    #[gpui::test]
+    fn stale_streams_do_not_complete_current_search_and_cancel_disables_apply(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (panel, test_cx) = cx.add_window_view(|window, cx| {
+            ProjectSearchPanel::new("/workspace".into(), true, window, cx)
+        });
+        panel.update_in(test_cx, |panel, _, cx| {
+            panel.request_id = Some("new".into());
+            panel.running = true;
+            panel.handle_message(
+                &Message::ProjectSearchDone {
+                    request_id: "old".into(),
+                    truncated: false,
+                    cancelled: false,
+                    warnings: vec![],
+                    error: None,
+                },
+                cx,
+            );
+            assert!(panel.running);
+            panel.search_complete = true;
+            panel.selected.insert("file".into(), HashSet::from([0]));
+            assert!(panel.can_apply());
+            panel.cancel(cx);
+            assert!(!panel.can_apply());
+            panel.set_error("preflight failed", cx);
+            assert!(!panel.running);
+            assert!(!panel.can_apply());
+        });
     }
 }

@@ -1580,6 +1580,10 @@ impl Workspace {
                     for update in files.iter().filter_map(|file| file.buffer.as_ref()) {
                         if let Some(panel) = self.editor_by_buffer(&update.buffer_id, cx) {
                             panel.update(cx, |panel, cx| panel.apply_project_update(update, window, cx));
+                        } else if let Some(panel) = self.diffs.values().find(|panel| panel.read(cx).buffer_id() == Some(update.buffer_id.as_str())).cloned() {
+                            if !panel.update(cx, |panel, cx| panel.apply_project_update(update, window, cx)) {
+                                self.status = "Project edit changed the daemon buffer; newer diff draft kept. Reopen in an editor to review.".into();
+                            }
                         }
                     }
                 }
@@ -1870,8 +1874,9 @@ impl Workspace {
                         buffer_id, draft_id, path.clone(), language, line, column, activate, window, cx,
                     );
                     self.history_editor_opened(&request_id, &path, window, cx);
-                    if let Some((start, end)) = project_location {
-                        if let Some(panel) = self.editor_by_buffer(&opened_id, cx) { panel.update(cx, |panel, cx| panel.reveal_project_match(start, end, cx)); }
+                    if let Some((start, end)) = project_location
+                        && let Some(panel) = self.editor_by_buffer(&opened_id, cx) {
+                        panel.update(cx, |panel, cx| panel.reveal_project_match(start, end, cx));
                     }
                     self.finish_restore_if_idle(window, cx);
                 }
@@ -3882,6 +3887,10 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         message: fresh_gui_protocol::Message,
         cx: &mut Context<Self>,
     ) {
+        if self.diffs.values().any(|panel| panel.read(cx).is_dirty()) {
+            if let Some(panel) = &self.project_search { panel.update(cx, |panel, cx| panel.set_error("Save or close dirty Source Control diff drafts before project search", cx)); }
+            return;
+        }
         let workspace = self.active_workspace_id.clone();
         self.project_send_task = Some(cx.spawn(async move |this, cx| {
             for _ in 0..50 {
