@@ -2,6 +2,7 @@
 
 pub mod edit_sync;
 pub mod lsp_sync;
+pub mod search;
 
 use std::time::Duration;
 
