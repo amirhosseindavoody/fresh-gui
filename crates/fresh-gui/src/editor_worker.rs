@@ -3503,6 +3503,20 @@ fn apply_smart_edit_action(editor: &mut Editor, action: EditorAction) -> Result<
         EditorAction::Undo | EditorAction::Redo => unreachable!("handled by caller"),
     };
 
+    if let FreshAction::InsertChar(delimiter) = fresh_action {
+        let state = editor.active_state();
+        if editor.active_cursors().primary().anchor.is_some()
+            && fresh::input::actions::get_auto_close_char(
+                delimiter,
+                state.buffer_settings.auto_surround,
+                &state.language,
+            )
+            .is_none()
+        {
+            bail!("surround is disabled or this delimiter is unsupported for the buffer language");
+        }
+    }
+
     match action {
         EditorAction::SmartHome
         | EditorAction::ToggleComment
@@ -3513,10 +3527,7 @@ fn apply_smart_edit_action(editor: &mut Editor, action: EditorAction) -> Result<
             editor.dispatch_action_for_tests(fresh_action);
         }
         _ => {
-            if let Some(events) = editor
-                .active_window_mut()
-                .action_to_events(fresh_action)
-            {
+            if let Some(events) = editor.active_window_mut().action_to_events(fresh_action) {
                 let added_bytes = events.iter().fold(0usize, |total, event| {
                     total.saturating_add(match event {
                         Event::Insert { text, .. } => text.len(),
@@ -3535,15 +3546,12 @@ fn apply_smart_edit_action(editor: &mut Editor, action: EditorAction) -> Result<
                     .len()
                     .saturating_sub(removed_bytes)
                     .saturating_add(added_bytes);
-                if resulting_len
-                    > MAX_SNAPSHOT_BYTES
-                {
+                if resulting_len > MAX_SNAPSHOT_BYTES {
                     bail!("smart edit exceeds the full-buffer editing limit");
                 }
-                if let Some(event) = editor.apply_events_as_bulk_edit(
-                    events,
-                    format!("Fresh action: {action:?}"),
-                ) {
+                if let Some(event) =
+                    editor.apply_events_as_bulk_edit(events, format!("Fresh action: {action:?}"))
+                {
                     editor.active_event_log_mut().append(event);
                 }
             }
@@ -3581,16 +3589,12 @@ fn unique_selected_lines(
     let low = selection.anchor.min(selection.head);
     let high = selection.anchor.max(selection.head);
     let first = line_at(low);
-    let last = if high > low {
-        line_at(high - 1)
-    } else {
-        first
-    };
+    let last = if high > low { line_at(high - 1) } else { first };
     use std::collections::HashSet;
     let mut seen = HashSet::<&str>::new();
     let mut keep = Vec::new();
-    for index in first..=last {
-        let mut key = lines[index];
+    for (index, line) in lines.iter().enumerate().take(last + 1).skip(first) {
+        let mut key = *line;
         if let Some(stripped) = key.strip_suffix('\n') {
             key = stripped.strip_suffix('\r').unwrap_or(stripped);
         }
@@ -3607,12 +3611,13 @@ fn unique_selected_lines(
     for index in &keep {
         transformed.push_str(lines[*index]);
     }
-    if !text.ends_with('\n') && last + 1 == lines.len() {
-        if let Some(without_lf) = transformed.strip_suffix('\n') {
-            transformed.truncate(without_lf.len());
-            if transformed.ends_with('\r') {
-                transformed.pop();
-            }
+    if !text.ends_with('\n')
+        && last + 1 == lines.len()
+        && let Some(without_lf) = transformed.strip_suffix('\n')
+    {
+        transformed.truncate(without_lf.len());
+        if transformed.ends_with('\r') {
+            transformed.pop();
         }
     }
     let transformed_end = selected_start + transformed.len();
@@ -6182,8 +6187,9 @@ mod tests {
         std::fs::write(&markdown, "hello λ🙂\n").unwrap();
         let rust = root.join("indent.rs");
         std::fs::write(&rust, "    λ🙂\n").unwrap();
-        let editor = EditorHandle::spawn(root.clone(), crate::config::Config::default())
-            .expect("Fresh worker starts");
+        let mut config = crate::config::Config::default();
+        config.languages.entry("markdown".into()).or_default().auto_surround = Some(true);
+        let editor = EditorHandle::spawn(root.clone(), config).expect("Fresh worker starts");
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6256,6 +6262,27 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(restored.text, "    λ🙂\n");
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_surround_preserves_text_when_language_rules_disable_pairing() {
+        let root = std::env::temp_dir().join(format!("fresh-gui-surround-disabled-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("disabled.md");
+        std::fs::write(&path, "λ🙂").unwrap();
+        let editor = EditorHandle::spawn(root.clone(), crate::config::Config::default()).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let opened = editor.open(path, false).await.unwrap();
+            let result = editor.action(opened.buffer_id.clone(), "view-disabled".into(), opened.rev,
+                EditorAction::SurroundBackticks, ByteSelection { anchor: 0, head: 6 }).await;
+            assert!(result.is_err());
+            let retained = editor.sync(opened.buffer_id).await.unwrap();
+            assert_eq!(retained.text, "λ🙂");
+            assert_eq!(retained.rev, opened.rev);
+            assert!(!retained.dirty);
         });
         let _ = std::fs::remove_dir_all(root);
     }
@@ -6368,7 +6395,8 @@ mod tests {
                 FreshAction::MoveLineUp,
             ),
         ];
-        let config = crate::config::Config::default();
+        let mut config = crate::config::Config::default();
+        config.languages.entry("markdown".into()).or_default().auto_surround = Some(true);
         let mut expected = Vec::new();
         {
             let mut fresh = build_editor(&root, &config).unwrap();
@@ -6471,17 +6499,17 @@ mod tests {
 
         let (unique, unique_selection) = apply(
             "α\nβ\nα",
-            ByteSelection { anchor: 0, head: 5 },
+            ByteSelection { anchor: 0, head: 8 },
         );
         assert_eq!(unique, "α\nβ");
-        assert_eq!(unique_selection, ByteSelection { anchor: 0, head: 3 });
+        assert_eq!(unique_selection, ByteSelection { anchor: 0, head: 5 });
 
         let (reverse, reverse_selection) = apply(
             "α\nβ\nα",
-            ByteSelection { anchor: 5, head: 0 },
+            ByteSelection { anchor: 8, head: 0 },
         );
         assert_eq!(reverse, "α\nβ");
-        assert_eq!(reverse_selection, ByteSelection { anchor: 3, head: 0 });
+        assert_eq!(reverse_selection, ByteSelection { anchor: 5, head: 0 });
 
         let (crlf, crlf_selection) = apply(
             "keep\r\nx\r\ny\r\nx\r\nend",
@@ -6489,6 +6517,15 @@ mod tests {
         );
         assert_eq!(crlf, "keep\r\nx\r\ny\r\nend");
         assert_eq!(crlf_selection, ByteSelection { anchor: 6, head: 12 });
+
+        let (mixed, mixed_selection) = apply(
+            "keep\nx\r\nx\nend",
+            ByteSelection { anchor: 5, head: 10 },
+        );
+        assert_eq!(mixed, "keep\nx\r\nend");
+        assert_eq!(mixed_selection, ByteSelection { anchor: 5, head: 8 });
+        let (stray_cr, _) = apply("x\r\nx\r", ByteSelection { anchor: 0, head: 5 });
+        assert_eq!(stray_cr, "x\r\nx\r");
     }
 
     // A stdio LSP exercised through Fresh and the ADE worker, including
