@@ -14,8 +14,8 @@ use axum::routing::get;
 use base64::Engine;
 use fresh_gui_protocol::{
     CAP_EDITOR, CAP_EDITOR_DRAFT_RECOVERY, CAP_EDITOR_EXTERNAL_CHANGES, CAP_EDITOR_PAGED_READS,
-    CAP_EDITOR_RANGE_EDITS, CAP_LSP, CAP_SCENE, CAP_SETTINGS_EDITOR, ByteSelection, EditorDraftInfo,
-    ExternalResolution, Hello, HelloUi, Message, MAX_PAGE_BYTES, PROTOCOL_VERSION,
+    CAP_EDITOR_RANGE_EDITS, CAP_LSP, CAP_SCENE, CAP_SETTINGS_EDITOR, ByteSelection,
+    EditorDraftInfo, ExternalResolution, Hello, HelloUi, Message, MAX_PAGE_BYTES, PROTOCOL_VERSION,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
@@ -282,7 +282,10 @@ async fn handle_client_msg(
                 .capabilities
                 .iter()
                 .any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES);
-            *client_settings_editor = client_hello.capabilities.iter().any(|cap| cap == CAP_SETTINGS_EDITOR);
+            *client_settings_editor = client_hello
+                .capabilities
+                .iter()
+                .any(|cap| cap == CAP_SETTINGS_EDITOR);
             if client_hello.protocol_version != PROTOCOL_VERSION {
                 return Err(Message::Error {
                     code: "protocol_mismatch".into(),
@@ -369,42 +372,102 @@ async fn handle_client_msg(
             })?;
             Ok(())
         }
-        Message::SettingsRead { request_id, workspace_id } => {
+        Message::SettingsRead {
+            request_id,
+            workspace_id,
+        } => {
             require_auth(*authed)?;
             require_settings_cap(*client_settings_editor, &request_id)?;
-            let path = crate::settings::target_path(&state.config_path, &state.workspaces, workspace_id.as_deref())
-                .await.map_err(|err| settings_error("settings_read_failed", &request_id, err))?;
-            let mut snapshot = crate::settings::read_snapshot(&path, workspace_id.clone(), request_id.clone())
-                .map_err(|err| settings_error("settings_read_failed", &request_id, err))?;
-            if let Message::SettingsSnapshot { defaults, .. } = &mut snapshot {
-                *defaults = crate::settings::layer_defaults(&state.config_path, workspace_id.is_some())
+            let path = crate::settings::target_path(
+                &state.config_path,
+                &state.workspaces,
+                workspace_id.as_deref(),
+            )
+            .await
+            .map_err(|err| settings_error("settings_read_failed", &request_id, err))?;
+            let mut snapshot =
+                crate::settings::read_snapshot(&path, workspace_id.clone(), request_id.clone())
                     .map_err(|err| settings_error("settings_read_failed", &request_id, err))?;
+            if let Message::SettingsSnapshot { defaults, .. } = &mut snapshot {
+                *defaults =
+                    crate::settings::layer_defaults(&state.config_path, workspace_id.is_some())
+                        .map_err(|err| settings_error("settings_read_failed", &request_id, err))?;
             }
-            send_msg(sink, &snapshot).await.map_err(|_| Message::Error { code: "send_failed".into(), message: "failed to send settings snapshot".into() })?;
+            send_msg(sink, &snapshot)
+                .await
+                .map_err(|_| Message::Error {
+                    code: "send_failed".into(),
+                    message: "failed to send settings snapshot".into(),
+                })?;
             Ok(())
         }
-        Message::SettingsPatch { request_id, workspace_id, base_text, path: parts, value } => {
+        Message::SettingsPatch {
+            request_id,
+            workspace_id,
+            base_text,
+            path: parts,
+            value,
+        } => {
             require_auth(*authed)?;
             require_settings_cap(*client_settings_editor, &request_id)?;
-            let path = crate::settings::target_path(&state.config_path, &state.workspaces, workspace_id.as_deref())
-                .await.map_err(|err| settings_error("settings_patch_failed", &request_id, err))?;
-            let text = crate::settings::apply_patch(&path, &base_text, &parts, value, workspace_id.is_some())
-                .map_err(|err| settings_error("settings_patch_failed", &request_id, err))?;
+            let path = crate::settings::target_path(
+                &state.config_path,
+                &state.workspaces,
+                workspace_id.as_deref(),
+            )
+            .await
+            .map_err(|err| settings_error("settings_patch_failed", &request_id, err))?;
+            let text = crate::settings::apply_patch(
+                &path,
+                &base_text,
+                &parts,
+                value,
+                workspace_id.is_some(),
+            )
+            .map_err(|err| settings_error("settings_patch_failed", &request_id, err))?;
             if workspace_id.is_none() {
-                let cfg = Config::load_from_path(&state.config_path).map_err(|err| settings_error("settings_patch_failed", &request_id, err))?;
+                let cfg = Config::load_from_path(&state.config_path)
+                    .map_err(|err| settings_error("settings_patch_failed", &request_id, err))?;
                 if matches!(parts.first().map(String::as_str), Some("lsp" | "languages"))
-                    && let Some(editor) = state.editor.as_ref() {
-                    editor.reconfigure(cfg.clone()).await.map_err(|err| settings_error("settings_patch_failed", &request_id, err))?;
+                    && let Some(editor) = state.editor.as_ref()
+                {
+                    editor
+                        .reconfigure(cfg.clone())
+                        .await
+                        .map_err(|err| settings_error("settings_patch_failed", &request_id, err))?;
                 }
-                let shortkeys = cfg.shortkeys.iter().map(|key| fresh_gui_protocol::Shortkey { action: key.action.clone(), shortkey: key.shortkey.clone(), when: key.when.clone() }).collect();
+                let shortkeys = cfg
+                    .shortkeys
+                    .iter()
+                    .map(|key| fresh_gui_protocol::Shortkey {
+                        action: key.action.clone(),
+                        shortkey: key.shortkey.clone(),
+                        when: key.when.clone(),
+                    })
+                    .collect();
                 let ui = hello_ui(&cfg);
                 *state.config.write().expect("config lock") = cfg;
-                let _ = out_tx.send(Message::ConfigUpdated { shortkeys, ui: Some(ui) });
+                let _ = out_tx.send(Message::ConfigUpdated {
+                    shortkeys,
+                    ui: Some(ui),
+                });
             }
-            let defaults = crate::settings::layer_defaults(&state.config_path, workspace_id.is_some())
-                .map_err(|err| settings_error("settings_patch_failed", &request_id, err))?;
-            let snapshot = Message::SettingsSnapshot { request_id, workspace_id, path: path.display().to_string(), text, defaults };
-            send_msg(sink, &snapshot).await.map_err(|_| Message::Error { code: "send_failed".into(), message: "failed to send settings snapshot".into() })?;
+            let defaults =
+                crate::settings::layer_defaults(&state.config_path, workspace_id.is_some())
+                    .map_err(|err| settings_error("settings_patch_failed", &request_id, err))?;
+            let snapshot = Message::SettingsSnapshot {
+                request_id,
+                workspace_id,
+                path: path.display().to_string(),
+                text,
+                defaults,
+            };
+            send_msg(sink, &snapshot)
+                .await
+                .map_err(|_| Message::Error {
+                    code: "send_failed".into(),
+                    message: "failed to send settings snapshot".into(),
+                })?;
             Ok(())
         }
         Message::SessionCreate { layout } => {
@@ -2070,7 +2133,10 @@ fn require_settings_cap(enabled: bool, request_id: &str) -> Result<(), Message> 
 }
 
 fn settings_error(code: &str, request_id: &str, error: impl std::fmt::Display) -> Message {
-    Message::Error { code: code.into(), message: format!("{request_id}: {error}") }
+    Message::Error {
+        code: code.into(),
+        message: format!("{request_id}: {error}"),
+    }
 }
 
 #[cfg(test)]

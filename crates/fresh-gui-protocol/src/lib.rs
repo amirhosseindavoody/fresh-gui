@@ -1165,16 +1165,33 @@ mod tests {
         assert!(json.contains("\"scene\""));
         assert!(json.contains("\"workspace\""));
         assert!(json.contains("0.4.0"));
-        assert!(hello.capabilities.iter().any(|cap| cap == CAP_SETTINGS_EDITOR));
-        assert!(Hello::default_client_caps().iter().any(|cap| cap == CAP_SETTINGS_EDITOR));
+        assert!(
+            hello
+                .capabilities
+                .iter()
+                .any(|cap| cap == CAP_SETTINGS_EDITOR)
+        );
+        assert!(
+            Hello::default_client_caps()
+                .iter()
+                .any(|cap| cap == CAP_SETTINGS_EDITOR)
+        );
         let older = Hello::backend("old-daemon", vec![CAP_PING.to_owned()]);
-        assert!(!older.capabilities.iter().any(|cap| cap == CAP_SETTINGS_EDITOR));
+        assert!(
+            !older
+                .capabilities
+                .iter()
+                .any(|cap| cap == CAP_SETTINGS_EDITOR)
+        );
     }
 
     #[test]
     fn settings_messages_roundtrip_and_capability_is_explicit() {
         let messages = [
-            Message::SettingsRead { request_id: "settings-1".into(), workspace_id: Some("ws1".into()) },
+            Message::SettingsRead {
+                request_id: "settings-1".into(),
+                workspace_id: Some("ws1".into()),
+            },
             Message::SettingsPatch {
                 request_id: "settings-2".into(),
                 workspace_id: None,
@@ -1191,7 +1208,10 @@ mod tests {
             },
         ];
         for message in messages {
-            assert_eq!(Message::from_json(&message.to_json().unwrap()).unwrap(), message);
+            assert_eq!(
+                Message::from_json(&message.to_json().unwrap()).unwrap(),
+                message
+            );
         }
         let old = Hello::backend("old-daemon", vec![CAP_PING.to_owned()]);
         assert!(!old.capabilities.contains(&CAP_SETTINGS_EDITOR.to_owned()));

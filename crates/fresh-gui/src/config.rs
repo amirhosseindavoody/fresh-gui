@@ -259,18 +259,13 @@ impl Config {
         let dir_context = fresh::config_io::DirectoryContext::for_testing(
             &std::env::temp_dir().join(format!("fresh-gui-settings-{}", uuid::Uuid::new_v4())),
         );
-        let resolver = fresh::config_io::ConfigResolver::new(
-            dir_context,
-            working_dir.to_path_buf(),
-        );
+        let resolver =
+            fresh::config_io::ConfigResolver::new(dir_context, working_dir.to_path_buf());
         let mut higher = resolver
             .load_session_layer()
             .map_err(anyhow::Error::new)?
             .unwrap_or_default();
-        if let Some(project) = resolver
-            .load_project_layer()
-            .map_err(anyhow::Error::new)?
-        {
+        if let Some(project) = resolver.load_project_layer().map_err(anyhow::Error::new)? {
             higher.merge_from(&project);
         }
         higher.merge_from(&PartialConfig::from(&*fresh_config));
@@ -323,7 +318,8 @@ impl Config {
         if trimmed.is_empty() {
             return Ok(Self::default());
         }
-        let mut cfg: Config = jsonc_parser::parse_to_serde_value(trimmed, &Default::default()).context("parse config jsonc")?;
+        let mut cfg: Config = jsonc_parser::parse_to_serde_value(trimmed, &Default::default())
+            .context("parse config jsonc")?;
         cfg.normalize();
         Ok(cfg)
     }
@@ -485,7 +481,8 @@ fn home_dir() -> Option<PathBuf> {
 
 /// Parse JSONC into a [`serde_json::Value`] (comments / trailing commas via strip).
 fn parse_jsonc_value(text: &str) -> Result<serde_json::Value> {
-    jsonc_parser::parse_to_serde_value(text.trim(), &Default::default()).context("parse jsonc value")
+    jsonc_parser::parse_to_serde_value(text.trim(), &Default::default())
+        .context("parse jsonc value")
 }
 
 /// Recursively insert keys from `defaults` that are missing in `existing`.
@@ -877,13 +874,19 @@ mod tests {
 
     #[test]
     fn jsonc_config_retains_unicode_values_and_accepts_trailing_commas() {
-        let config = Config::parse(r#"{
+        let config = Config::parse(
+            r#"{
             // Native and Fresh fields use the same JSONC parser.
             "ui": {"fontFamily": "日本語",},
             "languages": {"custom": {"filenames": ["Build.テスト"],}},
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         assert_eq!(config.ui.font_family, "日本語");
-        assert_eq!(config.languages["custom"].filenames.as_ref().unwrap()[0], "Build.テスト");
+        assert_eq!(
+            config.languages["custom"].filenames.as_ref().unwrap()[0],
+            "Build.テスト"
+        );
     }
 
     #[test]
@@ -912,7 +915,8 @@ mod tests {
 
     #[test]
     fn applies_other_typed_fresh_partial_config_fields() {
-        let cfg = Config::parse(r#"{"theme":"noir","editor":{"restore_previous_session":false}}"#).unwrap();
+        let cfg = Config::parse(r#"{"theme":"noir","editor":{"restore_previous_session":false}}"#)
+            .unwrap();
         let mut fresh = fresh::config::Config::default();
         cfg.apply_fresh(&mut fresh);
         assert_eq!(fresh.theme.0, "noir");
@@ -921,10 +925,19 @@ mod tests {
 
     #[test]
     fn project_and_session_layers_override_daemon_user_settings() {
-        let root = std::env::temp_dir().join(format!("fresh-gui-layer-test-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("fresh-gui-layer-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join(".fresh")).unwrap();
-        std::fs::write(root.join(".fresh/config.json"), r#"{"editor":{"tab_size":9}}"#).unwrap();
-        std::fs::write(root.join(".fresh/session.json"), r#"{"editor":{"use_tabs":true}}"#).unwrap();
+        std::fs::write(
+            root.join(".fresh/config.json"),
+            r#"{"editor":{"tab_size":9}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".fresh/session.json"),
+            r#"{"editor":{"use_tabs":true}}"#,
+        )
+        .unwrap();
 
         let host = Config::parse(r#"{"editor":{"tab_size":4,"use_tabs":false}}"#).unwrap();
         let mut fresh = fresh::config::Config::default();

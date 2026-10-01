@@ -1250,27 +1250,37 @@ impl Workspace {
             }
         });
         let settings = cx.new(|cx| SettingsEditor::new(window, cx));
-        let settings_sub = cx.subscribe_in(&settings, window, |this, _, event: &SettingsEvent, window, cx| {
-            match event {
-                SettingsEvent::Wire(message) => this.ade.send(AdeCmd::Settings(*message.clone())),
-                SettingsEvent::OpenJson(path) => {
-                    if !path.is_empty() {
-                        this.open_path(path.clone(), false);
-                        this.close_settings(cx);
+        let settings_sub = cx.subscribe_in(
+            &settings,
+            window,
+            |this, _, event: &SettingsEvent, window, cx| {
+                match event {
+                    SettingsEvent::Wire(message) => {
+                        this.ade.send(AdeCmd::Settings(*message.clone()))
                     }
-                }
-                SettingsEvent::LocalApplied => {
-                    let base = this.server_ui.clone().unwrap_or_else(|| serde_json::from_value(serde_json::json!({})).expect("UI defaults"));
-                    match client_config::load_ui(&base) {
-                        Ok(ui) => this.apply_ui_config(&ui, window, cx),
-                        Err(error) => this.status = error.to_string().into(),
+                    SettingsEvent::OpenJson(path) => {
+                        if !path.is_empty() {
+                            this.open_path(path.clone(), false);
+                            this.close_settings(cx);
+                        }
                     }
-                    if this.target.local_daemon { this.ade.send(AdeCmd::ReloadConfig); }
+                    SettingsEvent::LocalApplied => {
+                        let base = this.server_ui.clone().unwrap_or_else(|| {
+                            serde_json::from_value(serde_json::json!({})).expect("UI defaults")
+                        });
+                        match client_config::load_ui(&base) {
+                            Ok(ui) => this.apply_ui_config(&ui, window, cx),
+                            Err(error) => this.status = error.to_string().into(),
+                        }
+                        if this.target.local_daemon {
+                            this.ade.send(AdeCmd::ReloadConfig);
+                        }
+                    }
+                    SettingsEvent::Close => this.close_settings(cx),
                 }
-                SettingsEvent::Close => this.close_settings(cx),
-            }
-            cx.notify();
-        });
+                cx.notify();
+            },
+        );
         let rename_sub = cx.subscribe(&rename_input, |this, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::PressEnter { .. }) && this.rename_pty.is_some() {
                 this.confirm_rename(cx);
@@ -1568,8 +1578,16 @@ impl Workspace {
                     self.refresh_git();
                 }
             }
-            AdeEvent::SettingsSnapshot { request_id, workspace_id: _, path, text, defaults } => {
-                self.settings.update(cx, |settings, cx| settings.snapshot(&request_id, path, text, defaults, cx));
+            AdeEvent::SettingsSnapshot {
+                request_id,
+                workspace_id: _,
+                path,
+                text,
+                defaults,
+            } => {
+                self.settings.update(cx, |settings, cx| {
+                    settings.snapshot(&request_id, path, text, defaults, cx)
+                });
             }
             AdeEvent::ConfigUpdated { shortkeys, ui } => {
                 super::actions::apply_shortkeys(cx, &shortkeys);
@@ -1904,7 +1922,8 @@ impl Workspace {
             AdeEvent::Error { code, message } => {
                 if code.starts_with("settings_") {
                     if let Some((request_id, detail)) = split_request_message(&message) {
-                        self.settings.update(cx, |settings, cx| settings.failure(request_id, detail, cx));
+                        self.settings
+                            .update(cx, |settings, cx| settings.failure(request_id, detail, cx));
                     }
                     cx.notify();
                     return;
@@ -2083,8 +2102,16 @@ impl Workspace {
         {
             let defaults = gpui_kit::component::Theme::default();
             let theme = gpui_kit::component::Theme::global_mut(cx);
-            theme.font_family = if ui.font_family.trim().is_empty() { defaults.font_family } else { ui.font_family.clone().into() };
-            theme.mono_font_family = if ui.mono_font_family.trim().is_empty() { defaults.mono_font_family } else { ui.mono_font_family.clone().into() };
+            theme.font_family = if ui.font_family.trim().is_empty() {
+                defaults.font_family
+            } else {
+                ui.font_family.clone().into()
+            };
+            theme.mono_font_family = if ui.mono_font_family.trim().is_empty() {
+                defaults.mono_font_family
+            } else {
+                ui.mono_font_family.clone().into()
+            };
             gpui_kit::component::Theme::sync_base(cx);
         }
         self.apply_zoom(window, cx);
@@ -3673,15 +3700,30 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_open = false;
-        self.settings.update(cx, |settings, cx| settings.deactivate(cx));
+        self.settings
+            .update(cx, |settings, cx| settings.deactivate(cx));
     }
 
     fn open_settings(&mut self, cx: &mut Context<Self>) {
-        let supported = self.capabilities.iter().any(|cap| cap == fresh_gui_protocol::CAP_SETTINGS_EDITOR);
+        let supported = self
+            .capabilities
+            .iter()
+            .any(|cap| cap == fresh_gui_protocol::CAP_SETTINGS_EDITOR);
         self.settings_open = true;
-        let base = self.server_ui.clone().unwrap_or_else(|| serde_json::from_value(serde_json::json!({})).expect("UI defaults"));
+        let base = self
+            .server_ui
+            .clone()
+            .unwrap_or_else(|| serde_json::from_value(serde_json::json!({})).expect("UI defaults"));
         let inherited = serde_json::json!({"ui": base});
-        self.settings.update(cx, |settings, cx| settings.open(self.active_workspace_id.clone(), supported, self.config_path.clone().unwrap_or_default(), inherited, cx));
+        self.settings.update(cx, |settings, cx| {
+            settings.open(
+                self.active_workspace_id.clone(),
+                supported,
+                self.config_path.clone().unwrap_or_default(),
+                inherited,
+                cx,
+            )
+        });
         cx.notify();
     }
 

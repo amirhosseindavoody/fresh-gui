@@ -3576,12 +3576,25 @@ mod tests {
 
     #[test]
     fn settings_layers_preserve_ade_lazy_file_boundary() {
-        let root = std::env::temp_dir().join(format!("fresh-gui-config-boundary-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!(
+            "fresh-gui-config-boundary-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(root.join(".fresh")).unwrap();
-        std::fs::write(root.join(".fresh/config.json"), r#"{"editor":{"large_file_threshold_bytes":99999999}}"#).unwrap();
-        let config = crate::config::Config::parse(r#"{"editor":{"large_file_threshold_bytes":999999999,"tab_size":9}}"#).unwrap();
+        std::fs::write(
+            root.join(".fresh/config.json"),
+            r#"{"editor":{"large_file_threshold_bytes":99999999}}"#,
+        )
+        .unwrap();
+        let config = crate::config::Config::parse(
+            r#"{"editor":{"large_file_threshold_bytes":999999999,"tab_size":9}}"#,
+        )
+        .unwrap();
         let editor = super::build_editor(&root, &config).unwrap();
-        assert_eq!(editor.config().editor.large_file_threshold_bytes, super::MAX_SNAPSHOT_BYTES as u64 + 1);
+        assert_eq!(
+            editor.config().editor.large_file_threshold_bytes,
+            super::MAX_SNAPSHOT_BYTES as u64 + 1
+        );
         assert_eq!(editor.config().editor.tab_size, 9);
         drop(editor);
         std::fs::remove_dir_all(root).unwrap();
