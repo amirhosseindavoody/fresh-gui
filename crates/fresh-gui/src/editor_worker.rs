@@ -740,16 +740,14 @@ fn run_loop(
         }
     };
 
-    // Give LspManager a daemon-owned inbox. Fresh drains its own editor/window
-    // queues during editor_tick, so sharing one would lose ADE replies between
-    // our drain and Fresh's drain. Its public runtime setter preserves the
-    // existing Authority while routing all server messages through this inbox.
-    let rt = fresh::services::runtime::LiveRuntime::new(rt);
-    let lsp_inbox = fresh::services::async_bridge::AsyncBridge::new();
-    editor
-        .active_window_mut()
-        .lsp
-        .set_runtime(rt.clone(), lsp_inbox.clone());
+    // LspManager retains Fresh's original runtime and response inbox. Fresh's
+    // dispatcher must drain a different queue: otherwise it can consume ADE
+    // replies between our poll and editor_tick. Forward non-ADE messages into
+    // the editor queue after filtering them, preserving Fresh's dispatch flow.
+    let lsp_inbox = std::mem::replace(
+        &mut editor.active_window_mut().bridge,
+        fresh::services::async_bridge::AsyncBridge::new(),
+    );
     let mut tracked: HashMap<String, TrackedBuffer> = HashMap::new();
     let mut lsp_bridge = LspBridgeState {
         inbox: lsp_inbox,
