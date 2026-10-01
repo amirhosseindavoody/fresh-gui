@@ -7,6 +7,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+pub mod settings;
+
 /// Protocol version negotiated in [`Hello`].
 pub const PROTOCOL_VERSION: &str = "0.4.0";
 
@@ -32,6 +34,8 @@ pub const CAP_LSP: &str = "lsp";
 pub const CAP_SCENE: &str = "scene";
 /// Workspace git status, diff, and stage/commit/pull/push. Absent on older daemons.
 pub const CAP_GIT: &str = "git";
+/// Read and patch daemon user or workspace Fresh settings.
+pub const CAP_SETTINGS_EDITOR: &str = "settings.editor.v1";
 
 /// First message after WebSocket connect. Client sends; backend replies with its own.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -317,6 +321,30 @@ pub enum Message {
     },
     /// Client → backend: reload the configured settings file from disk.
     ConfigReload,
+    /// Client → backend: read daemon user config, or a workspace Fresh layer.
+    SettingsRead {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+    },
+    /// Client → backend: compare-and-swap patch of one JSONC settings path.
+    SettingsPatch {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+        base_text: String,
+        path: Vec<String>,
+        value: Option<JsonValue>,
+    },
+    /// Backend → client: settings snapshot after read or save.
+    SettingsSnapshot {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+        path: String,
+        text: String,
+        defaults: JsonValue,
+    },
     /// Client → backend. Required before PTY/FS ops when the backend demands a token.
     Auth {
         token: String,
@@ -1073,6 +1101,7 @@ impl Hello {
             CAP_LSP.to_owned(),
             CAP_SCENE.to_owned(),
             CAP_GIT.to_owned(),
+            CAP_SETTINGS_EDITOR.to_owned(),
         ]
     }
 
@@ -1091,6 +1120,7 @@ impl Hello {
             CAP_LSP.to_owned(),
             CAP_SCENE.to_owned(),
             CAP_GIT.to_owned(),
+            CAP_SETTINGS_EDITOR.to_owned(),
         ]
     }
 }
@@ -1128,13 +1158,63 @@ mod tests {
     #[test]
     fn hello_includes_editor_and_scene() {
         let hello = Hello::backend("fresh-gui/test", Hello::default_backend_caps());
-        let json = Message::Hello(hello).to_json().unwrap();
+        let json = Message::Hello(hello.clone()).to_json().unwrap();
         assert!(json.contains("\"editor\""));
         assert!(json.contains("editor.range-edits"));
         assert!(json.contains(CAP_EDITOR_PAGED_READS));
         assert!(json.contains("\"scene\""));
         assert!(json.contains("\"workspace\""));
         assert!(json.contains("0.4.0"));
+        assert!(
+            hello
+                .capabilities
+                .iter()
+                .any(|cap| cap == CAP_SETTINGS_EDITOR)
+        );
+        assert!(
+            Hello::default_client_caps()
+                .iter()
+                .any(|cap| cap == CAP_SETTINGS_EDITOR)
+        );
+        let older = Hello::backend("old-daemon", vec![CAP_PING.to_owned()]);
+        assert!(
+            !older
+                .capabilities
+                .iter()
+                .any(|cap| cap == CAP_SETTINGS_EDITOR)
+        );
+    }
+
+    #[test]
+    fn settings_messages_roundtrip_and_capability_is_explicit() {
+        let messages = [
+            Message::SettingsRead {
+                request_id: "settings-1".into(),
+                workspace_id: Some("ws1".into()),
+            },
+            Message::SettingsPatch {
+                request_id: "settings-2".into(),
+                workspace_id: None,
+                base_text: "{}\n".into(),
+                path: vec!["shortkeys".into()],
+                value: Some(serde_json::json!([])),
+            },
+            Message::SettingsSnapshot {
+                request_id: "settings-3".into(),
+                workspace_id: None,
+                path: "/tmp/config.json".into(),
+                text: "{}\n".into(),
+                defaults: serde_json::json!({"editor":{"line_wrap":true}}),
+            },
+        ];
+        for message in messages {
+            assert_eq!(
+                Message::from_json(&message.to_json().unwrap()).unwrap(),
+                message
+            );
+        }
+        let old = Hello::backend("old-daemon", vec![CAP_PING.to_owned()]);
+        assert!(!old.capabilities.contains(&CAP_SETTINGS_EDITOR.to_owned()));
     }
 
     #[test]

@@ -49,6 +49,9 @@ pub struct Config {
     pub ui: UiConfig,
     #[serde(default)]
     pub terminal: TerminalConfig,
+    /// Sparse Fresh editor overrides, preserving Fresh defaults for omitted fields.
+    #[serde(default)]
+    pub editor: fresh::partial_config::PartialEditorConfig,
     /// Fresh-compatible LSP server configuration keyed by Fresh language name.
     /// Each value accepts either one server object or an array of servers.
     #[serde(default)]
@@ -56,9 +59,13 @@ pub struct Config {
     /// Fresh language definitions / file associations keyed by language id.
     /// These can add extensions or exact filenames for custom language ids.
     #[serde(default)]
-    pub languages: std::collections::HashMap<String, fresh::config::LanguageConfig>,
+    pub languages: std::collections::HashMap<String, fresh::partial_config::PartialLanguageConfig>,
     #[serde(default)]
     pub shortkeys: Vec<ShortkeyEntry>,
+    /// Other valid Fresh PartialConfig fields stored in the same top-level
+    /// document. Explicit host/Fresh fields above stay strongly typed.
+    #[serde(flatten, skip_serializing)]
+    pub fresh: fresh::partial_config::PartialConfig,
 }
 
 impl PartialEq for Config {
@@ -66,6 +73,8 @@ impl PartialEq for Config {
         self.ui == other.ui
             && self.terminal == other.terminal
             && self.shortkeys == other.shortkeys
+            && serde_json::to_value(&self.editor).ok() == serde_json::to_value(&other.editor).ok()
+            && serde_json::to_value(&self.fresh).ok() == serde_json::to_value(&other.fresh).ok()
             && serde_json::to_value(&self.lsp).ok() == serde_json::to_value(&other.lsp).ok()
             && serde_json::to_value(&self.languages).ok()
                 == serde_json::to_value(&other.languages).ok()
@@ -204,6 +213,66 @@ pub struct TerminalShellConfig {
 }
 
 impl Config {
+    /// Apply Fresh-owned settings to an already resolved Fresh config.
+    /// Fresh's `PartialConfig` merge semantics keep unspecified editor and
+    /// language fields at their resolved defaults.
+    pub fn apply_fresh(&self, fresh_config: &mut fresh::config::Config) {
+        use fresh::partial_config::{Merge, PartialConfig};
+
+        let mut overrides = self.fresh.clone();
+        overrides.editor = Some(self.editor.clone());
+        overrides.languages = Some(self.languages.clone());
+        overrides.lsp = Some(self.lsp.clone());
+        overrides.lsp_enabled = self.fresh.lsp_enabled.or(Some(!self.lsp.is_empty()));
+        // The value being mutated is the lower-precedence layer. Fresh's
+        // Merge contract keeps values already present in `self`, so start
+        // with the settings editor overrides and fill their gaps from the
+        // already-resolved daemon/workspace config.
+        let mut partial = overrides;
+        partial.merge_from(&PartialConfig::from(&*fresh_config));
+        // `fresh-gui` owns the daemon's LSP set. It intentionally replaces
+        // Fresh's discovered servers rather than inheriting unrelated ones.
+        partial.lsp = Some(self.lsp.clone());
+        partial.lsp_enabled = Some(!self.lsp.is_empty());
+        *fresh_config = partial.resolve();
+    }
+
+    /// Reconfigure the already supported language/server services without
+    /// overriding the active project's editor preferences during a live reload.
+    pub fn apply_fresh_services(&self, config: &mut fresh::config::Config) {
+        let mut services = self.clone();
+        services.editor = Default::default();
+        services.fresh = Default::default();
+        services.apply_fresh(config);
+    }
+
+    /// Apply Fresh's workspace and session layers above daemon user settings.
+    /// Fresh exposes these layer loaders independently; using them preserves
+    /// its precedence without reading unrelated native-user config locations.
+    pub fn apply_fresh_project(
+        &self,
+        fresh_config: &mut fresh::config::Config,
+        working_dir: &Path,
+    ) -> Result<()> {
+        use fresh::partial_config::{Merge, PartialConfig};
+
+        let dir_context = fresh::config_io::DirectoryContext::for_testing(
+            &std::env::temp_dir().join(format!("fresh-gui-settings-{}", uuid::Uuid::new_v4())),
+        );
+        let resolver =
+            fresh::config_io::ConfigResolver::new(dir_context, working_dir.to_path_buf());
+        let mut higher = resolver
+            .load_session_layer()
+            .map_err(anyhow::Error::new)?
+            .unwrap_or_default();
+        if let Some(project) = resolver.load_project_layer().map_err(anyhow::Error::new)? {
+            higher.merge_from(&project);
+        }
+        higher.merge_from(&PartialConfig::from(&*fresh_config));
+        *fresh_config = higher.resolve();
+        Ok(())
+    }
+
     /// Resolve the path that should be used (CLI override or default location).
     pub fn resolve_path(explicit: Option<&Path>) -> PathBuf {
         match explicit {
@@ -249,9 +318,8 @@ impl Config {
         if trimmed.is_empty() {
             return Ok(Self::default());
         }
-        // Strip // line comments and /* */ blocks so Fresh-style JSONC works.
-        let json = strip_jsonc(trimmed);
-        let mut cfg: Config = serde_json::from_str(&json).context("parse config json")?;
+        let mut cfg: Config = jsonc_parser::parse_to_serde_value(trimmed, &Default::default())
+            .context("parse config jsonc")?;
         cfg.normalize();
         Ok(cfg)
     }
@@ -413,8 +481,8 @@ fn home_dir() -> Option<PathBuf> {
 
 /// Parse JSONC into a [`serde_json::Value`] (comments / trailing commas via strip).
 fn parse_jsonc_value(text: &str) -> Result<serde_json::Value> {
-    let json = strip_jsonc(text.trim());
-    serde_json::from_str(&json).context("parse jsonc value")
+    jsonc_parser::parse_to_serde_value(text.trim(), &Default::default())
+        .context("parse jsonc value")
 }
 
 /// Recursively insert keys from `defaults` that are missing in `existing`.
@@ -512,57 +580,6 @@ fn json_value_to_cst_input(value: &serde_json::Value) -> jsonc_parser::cst::CstI
                 .collect(),
         ),
     }
-}
-
-/// Minimal JSONC stripper (line `//` and block `/* */`); strings are left intact.
-fn strip_jsonc(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    let mut in_string = false;
-    let mut escape = false;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if in_string {
-            out.push(c);
-            if escape {
-                escape = false;
-            } else if c == '\\' {
-                escape = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-        if c == '"' {
-            in_string = true;
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        if c == '/' && i + 1 < bytes.len() {
-            let next = bytes[i + 1] as char;
-            if next == '/' {
-                i += 2;
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-                continue;
-            }
-            if next == '*' {
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                i = (i + 2).min(bytes.len());
-                continue;
-            }
-        }
-        out.push(c);
-        i += 1;
-    }
-    out
 }
 
 #[cfg(test)]
@@ -851,8 +868,84 @@ mod tests {
         assert_eq!(python[0].only_features.as_ref().unwrap().len(), 2);
 
         let custom_language = cfg.languages.get("my_lang").unwrap();
-        assert_eq!(custom_language.extensions, ["ml"]);
-        assert_eq!(custom_language.filenames, ["Build.my"]);
+        assert_eq!(custom_language.extensions.as_deref().unwrap(), ["ml"]);
+        assert_eq!(custom_language.filenames.as_deref().unwrap(), ["Build.my"]);
+    }
+
+    #[test]
+    fn jsonc_config_retains_unicode_values_and_accepts_trailing_commas() {
+        let config = Config::parse(
+            r#"{
+            // Native and Fresh fields use the same JSONC parser.
+            "ui": {"fontFamily": "日本語",},
+            "languages": {"custom": {"filenames": ["Build.テスト"],}},
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(config.ui.font_family, "日本語");
+        assert_eq!(
+            config.languages["custom"].filenames.as_ref().unwrap()[0],
+            "Build.テスト"
+        );
+    }
+
+    #[test]
+    fn sparse_fresh_editor_and_language_overrides_keep_other_defaults() {
+        let cfg = Config::parse(
+            r#"{"editor":{"tab_size":9},"languages":{"rust":{"use_tabs":true,"tab_size":8}}}"#,
+        )
+        .unwrap();
+        let mut fresh = fresh::config::Config::default();
+        let default_line_wrap = fresh.editor.line_wrap;
+        let default_tab_size = fresh.editor.tab_size;
+        let default_rust_wrap = fresh.languages.get("rust").unwrap().line_wrap;
+        let default_rust_tabs = fresh.languages.get("rust").unwrap().use_tabs;
+        let default_rust_tab_size = fresh.languages.get("rust").unwrap().tab_size;
+        cfg.apply_fresh(&mut fresh);
+        assert_eq!(fresh.editor.tab_size, 9);
+        assert_ne!(fresh.editor.tab_size, default_tab_size);
+        assert_eq!(fresh.editor.line_wrap, default_line_wrap);
+        let rust = fresh.languages.get("rust").unwrap();
+        assert_eq!(rust.use_tabs, Some(true));
+        assert_ne!(rust.use_tabs, default_rust_tabs);
+        assert_eq!(rust.tab_size, Some(8));
+        assert_ne!(rust.tab_size, default_rust_tab_size);
+        assert_eq!(rust.line_wrap, default_rust_wrap);
+    }
+
+    #[test]
+    fn applies_other_typed_fresh_partial_config_fields() {
+        let cfg = Config::parse(r#"{"theme":"noir","editor":{"restore_previous_session":false}}"#)
+            .unwrap();
+        let mut fresh = fresh::config::Config::default();
+        cfg.apply_fresh(&mut fresh);
+        assert_eq!(fresh.theme.0, "noir");
+        assert!(!fresh.editor.restore_previous_session);
+    }
+
+    #[test]
+    fn project_and_session_layers_override_daemon_user_settings() {
+        let root =
+            std::env::temp_dir().join(format!("fresh-gui-layer-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".fresh")).unwrap();
+        std::fs::write(
+            root.join(".fresh/config.json"),
+            r#"{"editor":{"tab_size":9}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".fresh/session.json"),
+            r#"{"editor":{"use_tabs":true}}"#,
+        )
+        .unwrap();
+
+        let host = Config::parse(r#"{"editor":{"tab_size":4,"use_tabs":false}}"#).unwrap();
+        let mut fresh = fresh::config::Config::default();
+        host.apply_fresh(&mut fresh);
+        host.apply_fresh_project(&mut fresh, &root).unwrap();
+        assert_eq!(fresh.editor.tab_size, 9);
+        assert!(fresh.editor.use_tabs);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

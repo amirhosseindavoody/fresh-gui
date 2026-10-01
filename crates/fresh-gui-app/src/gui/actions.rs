@@ -177,3 +177,51 @@ pub fn apply_shortkeys(cx: &mut App, shortkeys: &[Shortkey]) {
         KeyBinding::new("shift-tab", TerminalInputBacktab, Some("Terminal")),
     ]);
 }
+
+/// Native actions understood by the shortkeys adapter.
+pub fn known_action(action: &str) -> bool {
+    matches!(
+        action,
+        "NewTerminal"
+            | "NewFile"
+            | "SplitTerminal"
+            | "FormatDocument"
+            | "ToggleWordWrap"
+            | "CloseTab"
+            | "CloseAllEditors"
+            | "CloseAllTerminals"
+            | "CloseAllOtherTerminals"
+            | "CloseAllOtherTabs"
+            | "SaveBuffer"
+            | "ToggleSidebar"
+            | "ToggleCommandPalette"
+            | "GoToFile"
+            | "OpenSettings"
+            | "OpenDefaultSettings"
+            | "Reconnect"
+            | "Disconnect"
+            | "NextTab"
+            | "PrevTab"
+            | "CopyExplorer"
+            | "PasteExplorer"
+            | "DeleteExplorer"
+            | "AskCopilot"
+            | "TerminalCopyOrInterrupt"
+            | "TogglePinTab"
+            | "FilterExplorer"
+            | "ClearExplorerInput"
+            | "NewWorkspace"
+            | "RenameWorkspace"
+            | "CloseWorkspace"
+            | "ZoomInContent"
+            | "ZoomOutContent"
+            | "ResetContentZoom"
+            | "ZoomInUi"
+            | "ZoomOutUi"
+            | "ResetUiZoom"
+            | "StopServer"
+            | "RestartServer"
+            | "ReloadConfig"
+            | "QuitClient"
+    )
+}

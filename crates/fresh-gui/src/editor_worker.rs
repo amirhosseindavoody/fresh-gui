@@ -652,7 +652,13 @@ fn build_editor(working_dir: &Path, gui_config: &crate::config::Config) -> Resul
     // fresh-gui are started on this daemon host.
     cfg.lsp = gui_config.lsp.clone();
     cfg.lsp_enabled = !cfg.lsp.is_empty();
-    apply_language_associations(&mut cfg, &gui_config.languages);
+    gui_config.apply_fresh(&mut cfg);
+    gui_config.apply_fresh_project(&mut cfg, working_dir)?;
+    cfg.editor.animations = false;
+    // Config layers cannot change the negotiated ADE lazy/snapshot boundary.
+    cfg.editor.large_file_threshold_bytes = MAX_SNAPSHOT_BYTES as u64 + 1;
+    cfg.lsp = gui_config.lsp.clone();
+    cfg.lsp_enabled = !cfg.lsp.is_empty();
     for language in cfg.lsp.keys() {
         if let Some(config) = cfg.languages.get_mut(language) {
             // The GUI's Format action should use the configured LSP server,
@@ -884,7 +890,9 @@ fn run_loop(
                     let mut fresh_config = editor.config().clone();
                     fresh_config.lsp = config.lsp.clone();
                     fresh_config.lsp_enabled = !fresh_config.lsp.is_empty();
-                    apply_language_associations(&mut fresh_config, &config.languages);
+                    // Editor preferences are applied at construction; existing buffers
+                    // retain their settings until server restart.
+                    config.apply_fresh_services(&mut fresh_config);
                     for language in fresh_config.lsp.keys() {
                         if let Some(config) = fresh_config.languages.get_mut(language) {
                             config.formatter = None;
@@ -1004,26 +1012,6 @@ fn run_loop(
         }
     });
     drop(editor);
-}
-
-fn apply_language_associations(
-    config: &mut Config,
-    associations: &HashMap<String, fresh::config::LanguageConfig>,
-) {
-    for (name, override_config) in associations {
-        if let Some(existing) = config.languages.get_mut(name) {
-            if !override_config.extensions.is_empty() {
-                existing.extensions = override_config.extensions.clone();
-            }
-            if !override_config.filenames.is_empty() {
-                existing.filenames = override_config.filenames.clone();
-            }
-        } else {
-            config
-                .languages
-                .insert(name.clone(), override_config.clone());
-        }
-    }
 }
 
 fn open_buffer(
@@ -3585,6 +3573,32 @@ mod external_recovery_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_layers_preserve_ade_lazy_file_boundary() {
+        let root = std::env::temp_dir().join(format!(
+            "fresh-gui-config-boundary-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join(".fresh")).unwrap();
+        std::fs::write(
+            root.join(".fresh/config.json"),
+            r#"{"editor":{"large_file_threshold_bytes":99999999}}"#,
+        )
+        .unwrap();
+        let config = crate::config::Config::parse(
+            r#"{"editor":{"large_file_threshold_bytes":999999999,"tab_size":9}}"#,
+        )
+        .unwrap();
+        let editor = super::build_editor(&root, &config).unwrap();
+        assert_eq!(
+            editor.config().editor.large_file_threshold_bytes,
+            super::MAX_SNAPSHOT_BYTES as u64 + 1
+        );
+        assert_eq!(editor.config().editor.tab_size, 9);
+        drop(editor);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn dirty_untitled_draft_survives_worker_restart_and_failed_save() {

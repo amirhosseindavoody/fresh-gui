@@ -14,6 +14,8 @@ Session metadata, including the token, is stored in a private runtime file so th
 
 Workspace metadata is saved separately in the daemon's state directory. It contains workspace names, roots, tab titles, and open explorer folders, but not file contents or the access token.
 
+Settings writes follow their authority: local client UI preferences are written by GPUI on the client machine, while daemon user settings and workspace `.fresh/config.json` files are read and written by the authenticated daemon. Workspace settings paths are derived from the selected workspace root. JSONC updates retain comments and unknown keys in the existing config document. As with other daemon filesystem operations, workspace roots are authorized paths rather than separate OS sandboxes. Workspace files are saved on the daemon host; Fresh loads project and session settings for the daemon's startup directory, while fresh-gui does not re-resolve them on each active-workspace change.
+
 `--allow-no-auth` is intended for local tests and only works with a loopback bind. The daemon rejects combining it with a non-loopback address.
 
 For install and remote connection commands, see the [README](../README.md).

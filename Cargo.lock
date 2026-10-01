@@ -2537,6 +2537,7 @@ dependencies = [
 name = "fresh-gui-protocol"
 version = "2026.930.5"
 dependencies = [
+ "jsonc-parser",
  "serde",
  "serde_json",
  "thiserror 2.0.19",

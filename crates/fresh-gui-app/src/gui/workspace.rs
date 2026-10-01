@@ -50,6 +50,7 @@ use super::ade::AttachedWorkspace;
 use super::ade::{AdeCmd, AdeEvent, AdeHandle};
 use super::chrome;
 use super::client_config;
+use super::settings::{SettingsEditor, SettingsEvent};
 use super::connect::{ConnectTarget, parse_goto_spec};
 use super::diff_view::{self, BinaryPanel, DiffPanel};
 use super::dock_a11y::install_workspace_dock;
@@ -968,6 +969,8 @@ pub struct Workspace {
     ws_root_input: Entity<InputState>,
     rename_pty: Option<String>,
     rename_input: Entity<InputState>,
+    settings: Entity<SettingsEditor>,
+    settings_open: bool,
     _subscriptions: Vec<Subscription>,
     _recv_task: Task<()>,
 }
@@ -1246,6 +1249,38 @@ impl Workspace {
                 cx.defer(move |cx| this.update(cx, |this, cx| this.publish_layout(cx)));
             }
         });
+        let settings = cx.new(|cx| SettingsEditor::new(window, cx));
+        let settings_sub = cx.subscribe_in(
+            &settings,
+            window,
+            |this, _, event: &SettingsEvent, window, cx| {
+                match event {
+                    SettingsEvent::Wire(message) => {
+                        this.ade.send(AdeCmd::Settings(*message.clone()))
+                    }
+                    SettingsEvent::OpenJson(path) => {
+                        if !path.is_empty() {
+                            this.open_path(path.clone(), false);
+                            this.close_settings(cx);
+                        }
+                    }
+                    SettingsEvent::LocalApplied => {
+                        let base = this.server_ui.clone().unwrap_or_else(|| {
+                            serde_json::from_value(serde_json::json!({})).expect("UI defaults")
+                        });
+                        match client_config::load_ui(&base) {
+                            Ok(ui) => this.apply_ui_config(&ui, window, cx),
+                            Err(error) => this.status = error.to_string().into(),
+                        }
+                        if this.target.local_daemon {
+                            this.ade.send(AdeCmd::ReloadConfig);
+                        }
+                    }
+                    SettingsEvent::Close => this.close_settings(cx),
+                }
+                cx.notify();
+            },
+        );
         let rename_sub = cx.subscribe(&rename_input, |this, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::PressEnter { .. }) && this.rename_pty.is_some() {
                 this.confirm_rename(cx);
@@ -1488,7 +1523,10 @@ impl Workspace {
             ws_root_input,
             rename_pty: None,
             rename_input,
+            settings,
+            settings_open: false,
             _subscriptions: vec![
+                settings_sub,
                 tree_sub,
                 dock_sub,
                 rename_sub,
@@ -1539,6 +1577,17 @@ impl Workspace {
                     self.list_dir("");
                     self.refresh_git();
                 }
+            }
+            AdeEvent::SettingsSnapshot {
+                request_id,
+                workspace_id: _,
+                path,
+                text,
+                defaults,
+            } => {
+                self.settings.update(cx, |settings, cx| {
+                    settings.snapshot(&request_id, path, text, defaults, cx)
+                });
             }
             AdeEvent::ConfigUpdated { shortkeys, ui } => {
                 super::actions::apply_shortkeys(cx, &shortkeys);
@@ -1616,6 +1665,7 @@ impl Workspace {
                 self.restore_workspace(*attached, window, cx);
             }
             AdeEvent::Disconnected { reason } => {
+                self.close_settings(cx);
                 for panel in self.editors.values() {
                     panel.update(cx, |panel, _| panel.detach_transport());
                 }
@@ -1870,6 +1920,14 @@ impl Workspace {
                 }
             }
             AdeEvent::Error { code, message } => {
+                if code.starts_with("settings_") {
+                    if let Some((request_id, detail)) = split_request_message(&message) {
+                        self.settings
+                            .update(cx, |settings, cx| settings.failure(request_id, detail, cx));
+                    }
+                    cx.notify();
+                    return;
+                }
                 self.pending_fs.clear();
                 if code == "fs_list_failed"
                     && let Some((request_id, _)) = split_request_message(&message)
@@ -2020,10 +2078,6 @@ impl Workspace {
 
     fn apply_received_ui_config(&mut self, ui: &fresh_gui_protocol::HelloUi, window: &mut Window, cx: &mut Context<Self>) {
         self.server_ui = Some(ui.clone());
-        if self.target.local_daemon {
-            self.apply_ui_config(ui, window, cx);
-            return;
-        }
         match client_config::load_ui(ui) {
             Ok(client_ui) => self.apply_ui_config(&client_ui, window, cx),
             Err(error) => {
@@ -2045,14 +2099,19 @@ impl Workspace {
         }
         self.terminal_font_base = (ui.terminal_font_size as f32).clamp(8.0, 64.0);
         chrome::apply_configured_theme(&ui.theme, Some(window), cx);
-        if !ui.font_family.trim().is_empty() || !ui.mono_font_family.trim().is_empty() {
+        {
+            let defaults = gpui_kit::component::Theme::default();
             let theme = gpui_kit::component::Theme::global_mut(cx);
-            if !ui.font_family.trim().is_empty() {
-                theme.font_family = ui.font_family.clone().into();
-            }
-            if !ui.mono_font_family.trim().is_empty() {
-                theme.mono_font_family = ui.mono_font_family.clone().into();
-            }
+            theme.font_family = if ui.font_family.trim().is_empty() {
+                defaults.font_family
+            } else {
+                ui.font_family.clone().into()
+            };
+            theme.mono_font_family = if ui.mono_font_family.trim().is_empty() {
+                defaults.mono_font_family
+            } else {
+                ui.mono_font_family.clone().into()
+            };
             gpui_kit::component::Theme::sync_base(cx);
         }
         self.apply_zoom(window, cx);
@@ -2871,6 +2930,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     }
 
     fn switch_to_ready(&mut self, id: String, cx: &mut Context<Self>) {
+        self.close_settings(cx);
         self.pending_save_close = None;
         let from = if self.restoring {
             None
@@ -2910,6 +2970,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.close_settings(cx);
         let AttachedWorkspace {
             info,
             tabs,
@@ -3637,12 +3698,33 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.open_editor(path, preview, true);
     }
 
-    fn open_settings(&mut self) {
-        if let Some(path) = self.config_path.clone() {
-            self.open_path(path, false);
-        } else {
-            self.status = "Backend did not send config_path".into();
-        }
+    fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        self.settings
+            .update(cx, |settings, cx| settings.deactivate(cx));
+    }
+
+    fn open_settings(&mut self, cx: &mut Context<Self>) {
+        let supported = self
+            .capabilities
+            .iter()
+            .any(|cap| cap == fresh_gui_protocol::CAP_SETTINGS_EDITOR);
+        self.settings_open = true;
+        let base = self
+            .server_ui
+            .clone()
+            .unwrap_or_else(|| serde_json::from_value(serde_json::json!({})).expect("UI defaults"));
+        let inherited = serde_json::json!({"ui": base});
+        self.settings.update(cx, |settings, cx| {
+            settings.open(
+                self.active_workspace_id.clone(),
+                supported,
+                self.config_path.clone().unwrap_or_default(),
+                inherited,
+                cx,
+            )
+        });
+        cx.notify();
     }
 
     fn open_default_settings(&mut self) {
@@ -4907,7 +4989,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     }
 
     fn on_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
-        self.open_settings();
+        self.open_settings(cx);
         cx.notify();
     }
 
@@ -5858,7 +5940,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                     .icon(IconName::Settings)
                     .tooltip("Settings")
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.open_settings();
+                        this.open_settings(cx);
                         cx.notify();
                     })),
             )
@@ -7195,6 +7277,7 @@ impl Render for Workspace {
                         ),
                 )
             })
+            .when(self.settings_open, |view| view.child(self.settings.clone()))
             .when(self.goto_open, |this| this.child(self.render_goto(window, cx)))
             .when(self.copilot_open, |this| this.child(self.render_copilot(cx)))
             .when(self.create_open, |this| {

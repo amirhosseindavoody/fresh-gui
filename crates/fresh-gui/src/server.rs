@@ -14,8 +14,8 @@ use axum::routing::get;
 use base64::Engine;
 use fresh_gui_protocol::{
     CAP_EDITOR, CAP_EDITOR_DRAFT_RECOVERY, CAP_EDITOR_EXTERNAL_CHANGES, CAP_EDITOR_PAGED_READS,
-    CAP_EDITOR_RANGE_EDITS, CAP_LSP, CAP_SCENE, ByteSelection, EditorDraftInfo,
-    ExternalResolution, Hello, HelloUi, Message, MAX_PAGE_BYTES, PROTOCOL_VERSION,
+    CAP_EDITOR_RANGE_EDITS, CAP_LSP, CAP_SCENE, CAP_SETTINGS_EDITOR, ByteSelection,
+    EditorDraftInfo, ExternalResolution, Hello, HelloUi, Message, MAX_PAGE_BYTES, PROTOCOL_VERSION,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
@@ -59,7 +59,7 @@ fn hello_ui(cfg: &Config) -> HelloUi {
         show_dotfiles: cfg.ui.show_dotfiles,
         show_git_dirs: cfg.ui.show_git_dirs,
         editor_minimap: cfg.ui.editor_minimap,
-        editor_line_wrap: cfg.ui.editor_line_wrap,
+        editor_line_wrap: cfg.editor.line_wrap.unwrap_or(cfg.ui.editor_line_wrap),
     }
 }
 
@@ -163,6 +163,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut client_paged_reads = false;
     let mut client_draft_recovery = false;
     let mut client_external_changes = false;
+    let mut client_settings_editor = false;
     let mut session_id: Option<String> = None;
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
     let mut external_rx = state.editor.as_ref().map(EditorHandle::subscribe_external);
@@ -229,6 +230,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     &mut client_paged_reads,
                     &mut client_draft_recovery,
                     &mut client_external_changes,
+                    &mut client_settings_editor,
                     &mut session_id,
                     out_tx.clone(),
                     &mut sink,
@@ -257,6 +259,7 @@ async fn handle_client_msg(
     client_paged_reads: &mut bool,
     client_draft_recovery: &mut bool,
     client_external_changes: &mut bool,
+    client_settings_editor: &mut bool,
     session_id: &mut Option<String>,
     out_tx: mpsc::UnboundedSender<Message>,
     sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
@@ -279,6 +282,10 @@ async fn handle_client_msg(
                 .capabilities
                 .iter()
                 .any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES);
+            *client_settings_editor = client_hello
+                .capabilities
+                .iter()
+                .any(|cap| cap == CAP_SETTINGS_EDITOR);
             if client_hello.protocol_version != PROTOCOL_VERSION {
                 return Err(Message::Error {
                     code: "protocol_mismatch".into(),
@@ -363,6 +370,104 @@ async fn handle_client_msg(
                 code: "send_failed".into(),
                 message: "failed to send ConfigUpdated".into(),
             })?;
+            Ok(())
+        }
+        Message::SettingsRead {
+            request_id,
+            workspace_id,
+        } => {
+            require_auth(*authed)?;
+            require_settings_cap(*client_settings_editor, &request_id)?;
+            let path = crate::settings::target_path(
+                &state.config_path,
+                &state.workspaces,
+                workspace_id.as_deref(),
+            )
+            .await
+            .map_err(|err| settings_error("settings_read_failed", &request_id, err))?;
+            let mut snapshot =
+                crate::settings::read_snapshot(&path, workspace_id.clone(), request_id.clone())
+                    .map_err(|err| settings_error("settings_read_failed", &request_id, err))?;
+            if let Message::SettingsSnapshot { defaults, .. } = &mut snapshot {
+                *defaults =
+                    crate::settings::layer_defaults(&state.config_path, workspace_id.is_some())
+                        .map_err(|err| settings_error("settings_read_failed", &request_id, err))?;
+            }
+            send_msg(sink, &snapshot)
+                .await
+                .map_err(|_| Message::Error {
+                    code: "send_failed".into(),
+                    message: "failed to send settings snapshot".into(),
+                })?;
+            Ok(())
+        }
+        Message::SettingsPatch {
+            request_id,
+            workspace_id,
+            base_text,
+            path: parts,
+            value,
+        } => {
+            require_auth(*authed)?;
+            require_settings_cap(*client_settings_editor, &request_id)?;
+            let path = crate::settings::target_path(
+                &state.config_path,
+                &state.workspaces,
+                workspace_id.as_deref(),
+            )
+            .await
+            .map_err(|err| settings_error("settings_patch_failed", &request_id, err))?;
+            let text = crate::settings::apply_patch(
+                &path,
+                &base_text,
+                &parts,
+                value,
+                workspace_id.is_some(),
+            )
+            .map_err(|err| settings_error("settings_patch_failed", &request_id, err))?;
+            if workspace_id.is_none() {
+                let cfg = Config::load_from_path(&state.config_path)
+                    .map_err(|err| settings_error("settings_patch_failed", &request_id, err))?;
+                if matches!(parts.first().map(String::as_str), Some("lsp" | "languages"))
+                    && let Some(editor) = state.editor.as_ref()
+                {
+                    editor
+                        .reconfigure(cfg.clone())
+                        .await
+                        .map_err(|err| settings_error("settings_patch_failed", &request_id, err))?;
+                }
+                let shortkeys = cfg
+                    .shortkeys
+                    .iter()
+                    .map(|key| fresh_gui_protocol::Shortkey {
+                        action: key.action.clone(),
+                        shortkey: key.shortkey.clone(),
+                        when: key.when.clone(),
+                    })
+                    .collect();
+                let ui = hello_ui(&cfg);
+                *state.config.write().expect("config lock") = cfg;
+                let _ = out_tx.send(Message::ConfigUpdated {
+                    shortkeys,
+                    ui: Some(ui),
+                });
+            }
+            let defaults =
+                crate::settings::layer_defaults(&state.config_path, workspace_id.is_some())
+                    .map_err(|err| settings_error("settings_patch_failed", &request_id, err))?;
+            let snapshot = Message::SettingsSnapshot {
+                request_id,
+                workspace_id,
+                path: path.display().to_string(),
+                text,
+                defaults,
+            };
+            send_msg(sink, &snapshot)
+                .await
+                .map_err(|_| Message::Error {
+                    code: "send_failed".into(),
+                    message: "failed to send settings snapshot".into(),
+                })?;
             Ok(())
         }
         Message::SessionCreate { layout } => {
@@ -2013,6 +2118,50 @@ async fn handle_client_msg(
             warn!(?other, "unexpected client message");
             Ok(())
         }
+    }
+}
+
+fn require_settings_cap(enabled: bool, request_id: &str) -> Result<(), Message> {
+    if enabled {
+        Ok(())
+    } else {
+        Err(Message::Error {
+            code: "capability_unavailable".into(),
+            message: format!("{request_id}: {CAP_SETTINGS_EDITOR} capability not negotiated"),
+        })
+    }
+}
+
+fn settings_error(code: &str, request_id: &str, error: impl std::fmt::Display) -> Message {
+    Message::Error {
+        code: code.into(),
+        message: format!("{request_id}: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod settings_capability_tests {
+    use super::{require_settings_cap, settings_error};
+    use fresh_gui_protocol::Message;
+
+    #[test]
+    fn fresh_line_wrap_maps_to_live_native_ui_and_reset_uses_host_default() {
+        let cfg = crate::config::Config::parse(r#"{"editor":{"line_wrap":false}}"#).unwrap();
+        assert!(!super::hello_ui(&cfg).editor_line_wrap);
+        assert!(super::hello_ui(&crate::config::Config::default()).editor_line_wrap);
+    }
+
+    #[test]
+    fn settings_capability_is_required_and_errors_keep_request_id() {
+        assert!(require_settings_cap(true, "settings-1").is_ok());
+        assert!(matches!(
+            require_settings_cap(false, "settings-1"),
+            Err(Message::Error { code, message }) if code == "capability_unavailable" && message.starts_with("settings-1:")
+        ));
+        assert!(matches!(
+            settings_error("settings_patch_failed", "settings-1", "stale config"),
+            Message::Error { code, message } if code == "settings_patch_failed" && message.starts_with("settings-1:")
+        ));
     }
 }
 

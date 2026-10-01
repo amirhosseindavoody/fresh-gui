@@ -9,6 +9,7 @@ mod ade;
 mod assets;
 mod chrome;
 mod client_config;
+mod settings;
 mod clipboard;
 mod connect;
 mod copilot;

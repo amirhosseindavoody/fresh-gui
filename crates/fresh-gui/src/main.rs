@@ -18,6 +18,7 @@ mod open_external;
 mod path_open;
 mod pty;
 mod server;
+mod settings;
 mod session;
 mod shell_resolve;
 mod workspace;
