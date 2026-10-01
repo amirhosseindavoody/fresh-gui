@@ -9,6 +9,7 @@ use fresh_gui_protocol::{
     BufferDiagnostic, ByteRange, ByteSelection, CAP_EDITOR_PAGED_READS, CAP_EDITOR_EXTERNAL_CHANGES, CAP_EDITOR_RANGE_EDITS, CAP_LSP,
     CAP_WORKSPACE, EditorAction, EditorDraftInfo, ExternalResolution, FsEntry, GitFile, Hello,
     LspRequest, LspResult, Message, PtyInfo, RangeEdit, WorkspaceInfo, WorkspaceTab,
+    WorkspaceEditPreview, WorkspaceBufferUpdate, CAP_LSP_WORKSPACE_EDITS,
     CAP_LSP_REQUESTS,
 };
 
@@ -127,6 +128,9 @@ pub enum AdeCmd {
     LspRequest { request: LspRequest },
     /// Cancel an outstanding language server request.
     LspCancel { request_id: u64, buffer_id: String, view_id: String },
+    WorkspaceEditPrepare { request_id: String, buffer_id: String, base_rev: u64, edit: serde_json::Value },
+    WorkspaceEditApply { request_id: String, buffer_id: String, token: String },
+    WorkspaceEditCancel { buffer_id: String, token: String },
     /// Client-local acknowledgement of an installed/reconciled poll snapshot.
     AcknowledgeBufferState {
         buffer_id: String,
@@ -395,6 +399,8 @@ pub enum AdeEvent {
         status: Option<String>,
     },
     LspResult { result: LspResult },
+    WorkspaceEditPreview { request_id: String, preview: WorkspaceEditPreview },
+    WorkspaceEditApplied { request_id: String, updates: Vec<WorkspaceBufferUpdate> },
     BufferFormatted {
         request_id: String,
         buffer_id: String,
@@ -920,6 +926,19 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd, evt_tx: &async_channel::
         AdeCmd::LspCancel { request_id, buffer_id, view_id } => {
             if client.supports_capability(CAP_LSP_REQUESTS) {
                 client.send(Message::BufferLspCancel { request_id, buffer_id, view_id }).await?;
+            }
+        }
+        AdeCmd::WorkspaceEditPrepare { request_id, buffer_id, base_rev, edit } => {
+            anyhow::ensure!(client.supports_capability(CAP_LSP_WORKSPACE_EDITS), "daemon does not support lsp.workspace-edits");
+            client.send(Message::WorkspaceEditPrepare { request_id, buffer_id, base_rev, edit }).await?;
+        }
+        AdeCmd::WorkspaceEditApply { request_id, buffer_id, token } => {
+            anyhow::ensure!(client.supports_capability(CAP_LSP_WORKSPACE_EDITS), "daemon does not support lsp.workspace-edits");
+            client.send(Message::WorkspaceEditApply { request_id, buffer_id, token }).await?;
+        }
+        AdeCmd::WorkspaceEditCancel { buffer_id, token } => {
+            if client.supports_capability(CAP_LSP_WORKSPACE_EDITS) {
+                client.send(Message::WorkspaceEditCancel { buffer_id, token }).await?;
             }
         }
         AdeCmd::AcknowledgeBufferState { .. } => {}
@@ -1503,6 +1522,8 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             status,
         }),
         Message::BufferLspResult { result } => Some(AdeEvent::LspResult { result }),
+        Message::WorkspaceEditPreview { request_id, preview } => Some(AdeEvent::WorkspaceEditPreview { request_id, preview }),
+        Message::WorkspaceEditApplied { request_id, updates } => Some(AdeEvent::WorkspaceEditApplied { request_id, updates }),
         Message::BufferFormatted {
             request_id,
             buffer_id,
