@@ -308,6 +308,17 @@ pub struct LanguageServerState {
     pub logs: Vec<String>,
 }
 
+/// Additional state after Fresh's on-save actions. Older daemons omit it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SaveOutcome {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dirty: bool,
+}
+
 /// An LSP request made against a revisioned editor buffer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LspRequest {
@@ -1103,9 +1114,8 @@ pub enum Message {
         buffer_id: String,
         path: String,
         rev: u64,
-        /// Authoritative text after on-save formatting (omitted for paged files).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        text: Option<String>,
+        #[serde(flatten)]
+        outcome: SaveOutcome,
     },
     /// Client → backend: inspect current disk state for an open buffer.
     /// Requires `editor.external-changes`; used after reconnect and explorer refresh.
@@ -1723,7 +1733,7 @@ mod tests {
             buffer_id: "1".into(),
             path: "/tmp/a.rs".into(),
             rev: 1,
-            text: None,
+            outcome: SaveOutcome::default(),
         };
         assert_eq!(
             Message::from_json(&saved.to_json().unwrap()).unwrap(),

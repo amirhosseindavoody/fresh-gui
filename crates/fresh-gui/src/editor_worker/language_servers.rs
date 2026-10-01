@@ -96,7 +96,11 @@ pub(super) fn language_servers(
     let globally_enabled = editor.config().lsp_enabled;
     let manager = &editor.active_window().lsp;
     let handles = manager.get_handles(language);
-    let workspace_count = tracked.values().map(|buffer| &buffer.workspace_id).collect::<std::collections::HashSet<_>>().len();
+    let workspace_count = tracked
+        .values()
+        .map(|buffer| &buffer.workspace_id)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     let progress = editor
         .active_window()
         .get_lsp_progress()
@@ -172,7 +176,7 @@ fn client_status(state: LspClientState) -> String {
 }
 
 fn executable(command: &str) -> &str {
-    command.split_whitespace().next().unwrap_or("")
+    command
 }
 
 fn start_block_reason(
@@ -220,7 +224,10 @@ mod tests {
 
     #[test]
     fn configured_executable_is_extracted_for_actionable_status() {
-        assert_eq!(executable("rust-analyzer --stdio"), "rust-analyzer");
+        assert_eq!(
+            executable(r"C:\Program Files\server.exe"),
+            r"C:\Program Files\server.exe"
+        );
         assert_eq!(executable(""), "");
     }
 

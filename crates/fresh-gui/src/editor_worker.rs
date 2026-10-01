@@ -119,6 +119,13 @@ pub struct LspState {
 }
 
 #[derive(Debug, Clone)]
+pub struct SavedBuffer {
+    pub path: String,
+    pub rev: u64,
+    pub outcome: fresh_gui_protocol::SaveOutcome,
+}
+
+#[derive(Debug, Clone)]
 pub struct FormatState {
     pub rev: u64,
     pub text: Option<String>,
@@ -274,7 +281,8 @@ enum Cmd {
         base_rev: u64,
         /// Destination for an unsaved buffer. `None` saves the existing path.
         path: Option<PathBuf>,
-        reply: oneshot::Sender<Result<(String, u64)>>,
+        on_save_actions: bool,
+        reply: oneshot::Sender<Result<SavedBuffer>>,
     },
     Close {
         buffer_id: String,
@@ -769,18 +777,27 @@ impl EditorHandle {
             .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
     }
 
+    #[cfg(test)]
     pub async fn save(
         &self,
         buffer_id: String,
         base_rev: u64,
         path: Option<PathBuf>,
     ) -> Result<(String, u64)> {
+        let saved = self.save_with_actions(buffer_id, base_rev, path, true).await?;
+        Ok((saved.path, saved.rev))
+    }
+
+    pub async fn save_with_actions(
+        &self, buffer_id: String, base_rev: u64, path: Option<PathBuf>, on_save_actions: bool,
+    ) -> Result<SavedBuffer> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(Cmd::Save {
                 buffer_id,
                 base_rev,
                 path,
+                on_save_actions,
                 reply: reply_tx,
             })
             .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
@@ -947,6 +964,7 @@ fn run_loop(
         drafts: drafts.clone(),
         workspace_tx,
         language_logs: HashMap::new(),
+        formatting: None,
     };
 
     // Borrow editor/tracked into the future (no `async move`) so `Editor` is
@@ -1133,6 +1151,7 @@ fn run_loop(
                     buffer_id,
                     base_rev,
                     path,
+                    on_save_actions,
                     reply,
                 } => {
                     let result = save_buffer(
@@ -1141,10 +1160,11 @@ fn run_loop(
                         &buffer_id,
                         base_rev,
                         path.as_deref(),
+                        on_save_actions,
                     )
                     .and_then(|saved| {
                         let entry = tracked.get(&buffer_id).expect("saved buffer");
-                        drafts.discard(&entry.workspace_id, &entry.draft_id)?;
+                        if entry.dirty { checkpoint(&drafts, &tracked, &buffer_id)?; } else { drafts.discard(&entry.workspace_id, &entry.draft_id)?; }
                         Ok(saved)
                     });
                     let _ = reply.send(result);
@@ -1519,6 +1539,14 @@ struct LspAggregate {
     revisions: HashMap<String, u64>,
 }
 
+struct PendingFormatting {
+    request_id: u64,
+    uri: String,
+    buffer_id: String,
+    rev: u64,
+    text: String,
+}
+
 struct LspBridgeState {
     inbox: fresh::services::async_bridge::AsyncBridge,
     pending: HashMap<u64, PendingLspRequest>,
@@ -1529,6 +1557,7 @@ struct LspBridgeState {
     drafts: DraftStore,
     workspace_tx: tokio::sync::broadcast::Sender<WorkspaceNotice>,
     language_logs: HashMap<(String, String), std::collections::VecDeque<String>>,
+    formatting: Option<PendingFormatting>,
 }
 
 fn begin_lsp_request(
@@ -2037,6 +2066,24 @@ fn poll_lsp_bridge(
     let sender = bridge.sender();
     for message in bridge_state.inbox.try_recv_all() {
         match message {
+            message @ AsyncMessage::LspFormatting { .. } => {
+                let (request_id, uri) = match &message {
+                    AsyncMessage::LspFormatting { request_id, uri, .. } => (*request_id, uri),
+                    _ => unreachable!(),
+                };
+                // Fresh's dispatcher applies formatting without a revision guard.
+                // Only the currently awaited ADE request can mutate the buffer;
+                // timed-out or superseded responses must never reach it.
+                let valid = bridge_state.formatting.as_ref().is_some_and(|request| {
+                    request.request_id == request_id && request.uri == *uri
+                        && tracked.get(&request.buffer_id).is_some_and(|buffer| buffer.rev == request.rev)
+                        && request.buffer_id.parse::<usize>().ok().and_then(|id| editor.active_window().buffers.get(&BufferId(id))).and_then(|state| state.buffer.to_string()).as_deref() == Some(request.text.as_str())
+                });
+                if valid {
+                    bridge_state.formatting = None;
+                    let _ = sender.send(message);
+                }
+            }
             message @ (AsyncMessage::LspLogMessage { .. } | AsyncMessage::LspWindowMessage { .. }) => {
                 let (language, message_type, body) = match &message {
                     AsyncMessage::LspLogMessage { language, message_type, message } | AsyncMessage::LspWindowMessage { language, message_type, message } => (language, message_type, message),
@@ -3608,7 +3655,7 @@ fn project_replace(
     }
     if save_unopened {
         check_scope()?;
-        save_buffer(editor, tracked, &buffer_id, outcome.rev, None)?;
+        save_buffer(editor, tracked, &buffer_id, outcome.rev, None, false)?;
         let entry = tracked
             .get(&buffer_id)
             .context("saved project buffer vanished")?;
@@ -3757,10 +3804,12 @@ fn lsp_state(
             start_character: d.range.start.character,
             end_line: d.range.end.line,
             end_character: d.range.end.character,
-            severity: d
-                .severity
-                .map(|s| format!("{s:?}").to_ascii_lowercase())
-                .unwrap_or_else(|| "info".into()),
+            severity: match d.severity {
+                Some(lsp_types::DiagnosticSeverity::ERROR) => "error",
+                Some(lsp_types::DiagnosticSeverity::WARNING) => "warning",
+                Some(lsp_types::DiagnosticSeverity::HINT) => "hint",
+                _ => "info",
+            }.into(),
             message: d.message,
             source: d.source,
             related_information: d.related_information.unwrap_or_default().into_iter().map(|info| fresh_gui_protocol::DiagnosticRelatedInformation {
@@ -3843,9 +3892,18 @@ async fn format_buffer(
         set_selection(editor, ByteSelection { anchor: range.start, head: end });
     }
     if range.is_none() { set_selection(editor, ByteSelection { anchor: prior_selection.head, head: prior_selection.head }); }
+    let before_request = editor.active_window().next_lsp_request_id;
     let format_result = editor.format_buffer();
     set_selection(editor, prior_selection);
     format_result.map_err(anyhow::Error::msg)?;
+    let requested_lsp = editor.active_window().next_lsp_request_id != before_request;
+    if requested_lsp {
+        bridge.formatting = Some(PendingFormatting {
+            request_id: editor.active_window().next_lsp_request_id,
+            uri: fresh::services::lsp::manager::path_to_uri(tracked[buffer_id].path.as_deref().context("formatting needs a saved path")?).context("invalid formatting file URI")?.to_string(),
+            buffer_id: buffer_id.to_owned(), rev: current, text: before.clone(),
+        });
+    }
     if let Some(status) = editor.get_status_message()
         && prior_status.as_ref() != Some(status)
         && (status.contains("Formatting not supported") || status.contains("LSP not available"))
@@ -3862,6 +3920,7 @@ async fn format_buffer(
             .to_string()
             .context("buffer has unloaded regions")?;
         if after != before {
+            bridge.formatting = None;
             let entry = tracked.get_mut(buffer_id).expect("tracked");
             entry.text = after.clone();
             entry.rev += 1;
@@ -3872,7 +3931,11 @@ async fn format_buffer(
                 status: None,
             });
         }
+        if !requested_lsp || bridge.formatting.is_none() {
+            return Ok(FormatState { rev: current, text: None, status: Some("No formatting changes".into()) });
+        }
         if tokio::time::Instant::now() >= deadline {
+            bridge.formatting = None;
             return Ok(FormatState {
                 rev: current,
                 text: None,
@@ -4189,7 +4252,8 @@ fn save_buffer(
     buffer_id: &str,
     base_rev: u64,
     dest: Option<&Path>,
-) -> Result<(String, u64)> {
+    on_save_actions: bool,
+) -> Result<SavedBuffer> {
     let _ = sync_fresh_text(editor, tracked, buffer_id)?;
     let current = tracked
         .get(buffer_id)
@@ -4296,9 +4360,12 @@ fn save_buffer(
     // Reuse Fresh's configured format-on-save and on-save actions after its
     // normal save has passed ADE's external-change checks. Fresh persists any
     // formatter output itself and refreshes its watched-file metadata.
-    if tracked.get(buffer_id).is_some_and(|entry| entry.total_bytes.is_none()) {
-        editor.run_on_save_actions().map_err(anyhow::Error::msg).context("Fresh on-save actions")?;
-    }
+    let status = if on_save_actions && tracked.get(buffer_id).is_some_and(|entry| entry.total_bytes.is_none()) {
+        match editor.run_on_save_actions() {
+            Ok(_) => editor.get_status_message().filter(|message| message.starts_with("Formatter ")).cloned(),
+            Err(error) => Some(format!("File written, but Fresh on-save actions failed: {error}")),
+        }
+    } else { None };
     let total_bytes = editor.active_state().buffer.total_bytes();
     let was_paged = tracked
         .get(buffer_id)
@@ -4312,7 +4379,6 @@ fn save_buffer(
     let entry = tracked.get_mut(buffer_id).expect("tracked");
     entry.text = text;
     entry.total_bytes = paged.then_some(total_bytes);
-    entry.base_text = (entry.total_bytes.is_none()).then(|| entry.text.clone());
     entry.disk = Some(disk_generation(
         entry.path.as_deref().context("saved buffer path")?,
     )?);
@@ -4322,18 +4388,15 @@ fn save_buffer(
     entry.paged_journal.clear();
     entry.external = None;
     entry.overwrite_generation = None;
-    entry.dirty = false;
-    // Bump rev so peers know disk matches this generation.
+    entry.base_text = entry.disk.as_ref().and_then(|disk| disk.text.clone());
+    entry.dirty = !paged && entry.base_text.as_deref() != Some(entry.text.as_str());
+    // Acknowledge the actual generation even if a later on-save action failed.
     entry.rev += 1;
-    Ok((
-        entry
-            .path
-            .as_ref()
-            .expect("saved buffer has a path")
-            .display()
-            .to_string(),
-        entry.rev,
-    ))
+    Ok(SavedBuffer {
+        path: entry.path.as_ref().expect("saved buffer has a path").display().to_string(),
+        rev: entry.rev,
+        outcome: fresh_gui_protocol::SaveOutcome { text: (!paged && on_save_actions).then(|| entry.text.clone()), status, dirty: entry.dirty },
+    })
 }
 
 #[cfg(test)]

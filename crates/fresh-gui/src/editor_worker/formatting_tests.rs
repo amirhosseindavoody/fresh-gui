@@ -48,7 +48,10 @@ fn external_formatter_without_lsp_and_format_on_save_refreshes_snapshot() {
     let editor = EditorHandle::spawn(root.clone(), cfg).unwrap();
     runtime().block_on(async {
         let opened = editor.open(path.clone(), false).await.unwrap();
-        let formatted = editor.format(opened.buffer_id.clone(), opened.rev).await.unwrap();
+        let formatted = editor
+            .format(opened.buffer_id.clone(), opened.rev)
+            .await
+            .unwrap();
         assert_eq!(formatted.text.as_deref(), Some("good = 1\n"));
 
         let dirty_rev = editor
@@ -61,7 +64,10 @@ fn external_formatter_without_lsp_and_format_on_save_refreshes_snapshot() {
             .unwrap();
         assert_eq!(saved_path, path.display().to_string());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "good = 2\n");
-        let snapshot = editor.lsp_get(opened.buffer_id.clone(), dirty_rev).await.unwrap();
+        let snapshot = editor
+            .lsp_get(opened.buffer_id.clone(), dirty_rev)
+            .await
+            .unwrap();
         assert_eq!(snapshot.rev, saved_rev);
         assert_eq!(snapshot.text.as_deref(), Some("good = 2\n"));
         editor.close(opened.buffer_id).await.unwrap();
@@ -99,9 +105,17 @@ fn format_range_uses_lsp_utf16_positions_and_replaces_only_the_range() {
         let opened = editor.open(path.clone(), false).await.unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            let state = editor.lsp_get(opened.buffer_id.clone(), opened.rev).await.unwrap();
-            if !state.diagnostics.is_empty() { break; }
-            assert!(tokio::time::Instant::now() < deadline, "range formatting server must initialize");
+            let state = editor
+                .lsp_get(opened.buffer_id.clone(), opened.rev)
+                .await
+                .unwrap();
+            if !state.diagnostics.is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "range formatting server must initialize"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         let invalid = editor
@@ -114,7 +128,11 @@ fn format_range_uses_lsp_utf16_positions_and_replaces_only_the_range() {
         assert!(invalid.is_err(), "range boundaries must align with UTF-8");
         // UTF-8 byte offset 5 is UTF-16 character offset 3 (`a` + surrogate pair).
         let formatted = editor
-            .format_range(opened.buffer_id.clone(), opened.rev, Some(ByteRange { start: 5, len: 1 }))
+            .format_range(
+                opened.buffer_id.clone(),
+                opened.rev,
+                Some(ByteRange { start: 5, len: 1 }),
+            )
             .await
             .unwrap();
         assert_eq!(formatted.text.as_deref(), Some("a😀X\n"));
@@ -134,7 +152,9 @@ fn format_range_uses_lsp_utf16_positions_and_replaces_only_the_range() {
 #[test]
 fn configured_servers_stop_stay_stopped_and_restart_with_language_logs() {
     use fresh_gui_protocol::LanguageServerAction as Action;
-    if !fresh::services::lsp::command_exists("python3") { return; }
+    if !fresh::services::lsp::command_exists("python3") {
+        return;
+    }
     let root = test_root("server-control");
     std::fs::create_dir_all(&root).unwrap();
     let script = root.join("server.py");
@@ -142,33 +162,204 @@ fn configured_servers_stop_stay_stopped_and_restart_with_language_logs() {
         "    elif method == 'initialized':\n        send({'jsonrpc':'2.0','method':'window/logMessage','params':{'type':3,'message':'fixture ready'}})\n    elif method in ('textDocument/didOpen', 'textDocument/didChange'):");
     std::fs::write(&script, source).unwrap();
     let cfg = crate::config::Config::parse(&serde_json::json!({ "lsp": { "python": { "name":"Fixture", "command":"python3", "args":[script.display().to_string(),"Fixture"] } } }).to_string()).unwrap();
-    let path = root.join("test.py"); std::fs::write(&path, "bad = 1\n").unwrap();
+    let path = root.join("test.py");
+    std::fs::write(&path, "bad = 1\n").unwrap();
     let editor = EditorHandle::spawn(root.clone(), cfg).unwrap();
     runtime().block_on(async {
         let opened = editor.open(path, false).await.unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            let states = editor.language_servers(opened.buffer_id.clone(), Action::Status).await.unwrap();
-            if states[0].status.starts_with("running") && states[0].logs.iter().any(|line| line.contains("fixture ready")) { break; }
-            assert!(tokio::time::Instant::now() < deadline, "configured server must run and expose language logs");
+            let states = editor
+                .language_servers(opened.buffer_id.clone(), Action::Status)
+                .await
+                .unwrap();
+            if states[0].status.starts_with("running")
+                && states[0]
+                    .logs
+                    .iter()
+                    .any(|line| line.contains("fixture ready"))
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "configured server must run and expose language logs"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        let states = editor.language_servers(opened.buffer_id.clone(), Action::Stop).await.unwrap();
+        let states = editor
+            .language_servers(opened.buffer_id.clone(), Action::Stop)
+            .await
+            .unwrap();
         assert!(states[0].status.starts_with("stopped"));
-        let rev = editor.edit(opened.buffer_id.clone(), opened.rev, "new = 2\n".into()).await.unwrap();
+        let rev = editor
+            .edit(opened.buffer_id.clone(), opened.rev, "new = 2\n".into())
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        assert!(editor.language_servers(opened.buffer_id.clone(), Action::Status).await.unwrap()[0].status.starts_with("stopped"), "editing must not auto-start a stopped language");
+        assert!(
+            editor
+                .language_servers(opened.buffer_id.clone(), Action::Status)
+                .await
+                .unwrap()[0]
+                .status
+                .starts_with("stopped"),
+            "editing must not auto-start a stopped language"
+        );
         for action in [Action::Start, Action::Restart] {
-            editor.language_servers(opened.buffer_id.clone(), action).await.unwrap();
+            editor
+                .language_servers(opened.buffer_id.clone(), action)
+                .await
+                .unwrap();
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
-                if editor.language_servers(opened.buffer_id.clone(), Action::Status).await.unwrap()[0].status.starts_with("running") { break; }
-                assert!(tokio::time::Instant::now() < deadline, "manual start/restart must initialize");
+                if editor
+                    .language_servers(opened.buffer_id.clone(), Action::Status)
+                    .await
+                    .unwrap()[0]
+                    .status
+                    .starts_with("running")
+                {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "manual start/restart must initialize"
+                );
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
         }
-        assert!(editor.lsp_get(opened.buffer_id.clone(), rev).await.unwrap().rev >= rev);
+        assert!(
+            editor
+                .lsp_get(opened.buffer_id.clone(), rev)
+                .await
+                .unwrap()
+                .rev
+                >= rev
+        );
         editor.close(opened.buffer_id).await.unwrap();
     });
-    drop(editor); let _ = std::fs::remove_dir_all(root);
+    drop(editor);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn failed_on_save_action_acknowledges_written_generation_and_legacy_clients_skip_it() {
+    if !fresh::services::lsp::command_exists("python3") {
+        return;
+    }
+    let root = test_root("save-failure");
+    std::fs::create_dir_all(&root).unwrap();
+    let formatter = root.join("fail.py");
+    std::fs::write(
+        &formatter,
+        "import sys\nsys.stderr.write('formatter failed')\nsys.exit(1)\n",
+    )
+    .unwrap();
+    let cfg = crate::config::Config::parse(&serde_json::json!({"languages":{"python":{"formatter":{"command":"python3","args":[formatter.display().to_string()],"stdin":true},"format_on_save":true}}}).to_string()).unwrap();
+    let path = root.join("sample.py");
+    std::fs::write(&path, "old\n").unwrap();
+    let editor = EditorHandle::spawn(root.clone(), cfg).unwrap();
+    runtime().block_on(async {
+        let opened = editor.open(path.clone(), false).await.unwrap();
+        let rev = editor
+            .edit(opened.buffer_id.clone(), opened.rev, "saved\n".into())
+            .await
+            .unwrap();
+        let saved = editor
+            .save_with_actions(opened.buffer_id.clone(), rev, None, true)
+            .await
+            .unwrap();
+        assert_eq!(saved.outcome.text.as_deref(), Some("saved\n"));
+        assert!(
+            saved
+                .outcome
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("on-save actions failed")
+        );
+        assert!(!saved.outcome.dirty);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "saved\n");
+        assert!(
+            editor
+                .check_external(opened.buffer_id.clone())
+                .await
+                .unwrap()
+                .is_none(),
+            "the saved disk generation must be reconciled despite an action error"
+        );
+        let rev = editor
+            .edit(opened.buffer_id.clone(), saved.rev, "legacy\n".into())
+            .await
+            .unwrap();
+        let legacy = editor
+            .save_with_actions(opened.buffer_id.clone(), rev, None, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            legacy.outcome,
+            fresh_gui_protocol::SaveOutcome::default(),
+            "unnegotiated clients must not receive asynchronous save formatting"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "legacy\n");
+        editor.close(opened.buffer_id).await.unwrap();
+    });
+    drop(editor);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn timed_out_formatting_cannot_overwrite_a_newer_revision() {
+    if !fresh::services::lsp::command_exists("python3") {
+        return;
+    }
+    let root = test_root("late-format");
+    std::fs::create_dir_all(&root).unwrap();
+    let script = root.join("server.py");
+    let source = super::tests::FAKE_LSP
+        .replace("import json, sys", "import json, sys, time")
+        .replace(
+            "    elif method == 'textDocument/formatting':",
+            "    elif method == 'textDocument/formatting':\n        time.sleep(5.3)",
+        );
+    std::fs::write(&script, source).unwrap();
+    let cfg = crate::config::Config::parse(&serde_json::json!({"languages":{"fixture":{"extensions":["ffmt"]}},"lsp":{"fixture":{"command":"python3","args":[script.display().to_string(),"Fixture"]}}}).to_string()).unwrap();
+    let path = root.join("sample.ffmt");
+    std::fs::write(&path, "old\n").unwrap();
+    let editor = EditorHandle::spawn(root.clone(), cfg).unwrap();
+    runtime().block_on(async {
+        let opened = editor.open(path, false).await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while editor
+            .lsp_get(opened.buffer_id.clone(), opened.rev)
+            .await
+            .unwrap()
+            .diagnostics
+            .is_empty()
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "server must initialize"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let result = editor
+            .format(opened.buffer_id.clone(), opened.rev)
+            .await
+            .unwrap();
+        assert!(result.text.is_none());
+        assert!(result.status.unwrap().contains("5 seconds"));
+        let rev = editor
+            .edit(opened.buffer_id.clone(), result.rev, "newer draft\n".into())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let state = editor.sync(opened.buffer_id.clone()).await.unwrap();
+        assert_eq!(state.text, "newer draft\n");
+        assert_eq!(state.rev, rev);
+        editor.close(opened.buffer_id).await.unwrap();
+    });
+    drop(editor);
+    let _ = std::fs::remove_dir_all(root);
 }

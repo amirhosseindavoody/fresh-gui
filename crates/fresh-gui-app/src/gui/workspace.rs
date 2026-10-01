@@ -1983,21 +1983,22 @@ impl Workspace {
                 buffer_id,
                 path,
                 rev,
-                text,
+                outcome,
             } => {
                 if let Some(panel) = self.diffs.values().find(|panel| panel.read(cx).buffer_id() == Some(buffer_id.as_str())).cloned() {
                     let panel_id = PanelId::from(panel.entity_id());
                     let saved_text = if self.diff_save_snapshots.get(&buffer_id).is_some_and(|(_, _, sent_id)| sent_id == &request_id) {
                         self.diff_save_snapshots.remove(&buffer_id).map(|(_, text, _)| text)
                     } else { None };
-                    panel.update(cx, |panel, cx| panel.mark_saved(rev, saved_text.as_deref(), cx));
+                    let save_status = outcome.status.clone().unwrap_or_else(|| "Saved".into());
+                    panel.update(cx, |panel, cx| panel.mark_saved(rev, saved_text.as_deref(), outcome, window, cx));
                     if let Some(pending) = self.pending_save_close.as_mut() {
                         pending.waiting_for_diff_saves.remove(&panel_id);
                     }
-                    self.status = "Saved".into();
+                    self.status = save_status.into();
                     self.resume_pending_save_close(window, cx);
                     cx.notify();
-                } else { self.on_buffer_saved(&request_id, &buffer_id, path, rev, text, window, cx); }
+                } else { self.on_buffer_saved(&request_id, &buffer_id, path, rev, outcome, window, cx); }
             }
             AdeEvent::LanguageServersState { request_id, buffer_id, servers } => {
                 self.receive_language_servers(request_id, buffer_id, servers, cx);
@@ -2415,11 +2416,12 @@ impl Workspace {
         }
     }
 
-    fn on_buffer_saved(&mut self, request_id: &str, buffer_id: &str, path: String, rev: u64, text: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_buffer_saved(&mut self, request_id: &str, buffer_id: &str, path: String, rev: u64, outcome: fresh_gui_protocol::SaveOutcome, window: &mut Window, cx: &mut Context<Self>) {
         let Some(panel) = self.editor_by_buffer(buffer_id, cx) else {
             return;
         };
-        let previous = panel.update(cx, |panel, cx| panel.finish_save(request_id, path.clone(), rev, text, window, cx));
+        let save_status = outcome.status.clone().unwrap_or_else(|| "Saved".into());
+        let previous = panel.update(cx, |panel, cx| panel.finish_save(request_id, path.clone(), rev, outcome, window, cx));
         if let Some(previous) = previous
             && let Some(entity) = self.editors.remove(&previous)
         {
@@ -2434,7 +2436,7 @@ impl Workspace {
                 self.anchor = Some(path.clone());
             }
         }
-        self.status = "Saved".into();
+        self.status = save_status.into();
         self.resume_pending_save_close(window, cx);
     }
 
@@ -7352,6 +7354,8 @@ impl Render for Workspace {
                                 .when(self.panes_empty(), |this| this.child(self.render_empty(cx)))),
                     ),
             )
+            .when(self.diagnostics.open, |this| this.child(self.render_problems(cx)))
+            .when(self.diagnostics.servers_open, |this| this.child(self.render_language_servers(cx)))
             .child(
                 StatusBar::new()
                     .h(self.ui_px(STATUS_BAR_H))
@@ -7396,8 +7400,6 @@ impl Render for Workspace {
             })
             .when(self.settings_open, |view| view.child(self.settings.clone()))
             .when(self.goto_open, |this| this.child(self.render_goto(window, cx)))
-            .when(self.diagnostics.open, |this| this.child(self.render_problems(cx)))
-            .when(self.diagnostics.servers_open, |this| this.child(self.render_language_servers(cx)))
             .when(self.navigation.is_open(), |this| this.child(self.render_navigation(cx)))
             .when(self.copilot_open, |this| this.child(self.render_copilot(cx)))
             .when(self.create_open, |this| {

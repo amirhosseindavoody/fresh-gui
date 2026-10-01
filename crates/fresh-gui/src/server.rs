@@ -1889,7 +1889,7 @@ async fn handle_client_msg(
                         }
                     })?)
                 };
-            let (path, rev) = match editor.save(buffer_id.clone(), base_rev, dest).await {
+            let saved = match editor.save_with_actions(buffer_id.clone(), base_rev, dest, *client_lsp_controls).await {
                 Ok(saved) => saved,
                 Err(err) => {
                     // A disk-generation conflict is returned as a save error to
@@ -1911,6 +1911,8 @@ async fn handle_client_msg(
                     });
                 }
             };
+            let path = saved.path;
+            let rev = saved.rev;
             if Config::path_matches(&state.config_path, &path) {
                 match Config::load_from_path(&state.config_path) {
                     Ok(cfg) => {
@@ -1958,7 +1960,6 @@ async fn handle_client_msg(
                     }
                 }
             }
-            let saved_text = editor.lsp_get(buffer_id.clone(), base_rev).await.map_err(|err| Message::Error { code: "buffer_save_failed".into(), message: format!("{request_id}: saved but snapshot unavailable: {err:#}") })?.text;
             send_msg(
                 sink,
                 &Message::BufferSaved {
@@ -1966,7 +1967,7 @@ async fn handle_client_msg(
                     buffer_id,
                     path,
                     rev,
-                    text: saved_text,
+                    outcome: saved.outcome,
                 },
             )
             .await
@@ -1987,6 +1988,7 @@ async fn handle_client_msg(
                     message: "editor capability not available".into(),
                 });
             };
+            ensure_editor_workspace(editor, state, session_id, &buffer_id, "lsp-get").await?;
             let lsp = editor
                 .lsp_get(buffer_id.clone(), known_rev)
                 .await

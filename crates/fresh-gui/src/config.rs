@@ -238,6 +238,9 @@ impl Config {
         partial.lsp = Some(self.lsp.clone());
         partial.lsp_enabled = self.fresh.lsp_enabled.or(Some(!self.lsp.is_empty()));
         *fresh_config = partial.resolve();
+        // resolve() merges Fresh's built-in servers. ADE only authorizes the
+        // explicitly configured daemon set, so replace it after resolution.
+        fresh_config.lsp = self.lsp.clone();
     }
 
     /// Reconfigure the already supported language/server services without

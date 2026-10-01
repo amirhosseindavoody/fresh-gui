@@ -3613,14 +3613,14 @@ impl EditorPanel {
         request_id: &str,
         path: String,
         rev: u64,
-        text: Option<String>,
+        outcome: fresh_gui_protocol::SaveOutcome,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
         if self.save_request_id.as_deref() != Some(request_id) {
             return None;
         }
-        if let Some(text) = text {
+        if let Some(text) = outcome.text {
             let draft = self.current_text(cx);
             let sent = self.save_sent_text.as_deref();
             if sent == Some(draft.as_str()) {
@@ -3638,7 +3638,11 @@ impl EditorPanel {
                 }
             }
         }
-        self.mark_saved(path, rev, cx)
+        let previous = self.mark_saved(path, rev, cx);
+        self.dirty |= outcome.dirty;
+        if let Some(status) = outcome.status { self.lsp_status = Some(status); }
+        cx.notify();
+        previous
     }
 
     fn label(&self) -> String {

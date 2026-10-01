@@ -392,7 +392,7 @@ pub enum AdeEvent {
         buffer_id: String,
         path: String,
         rev: u64,
-        text: Option<String>,
+        outcome: fresh_gui_protocol::SaveOutcome,
     },
     BufferLspState {
         buffer_id: String,
@@ -1516,13 +1516,13 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             buffer_id,
             path,
             rev,
-            text,
+            outcome,
         } => Some(AdeEvent::BufferSaved {
             request_id,
             buffer_id,
             path,
             rev,
-            text,
+            outcome,
         }),
         Message::BufferLspState {
             buffer_id,
