@@ -208,7 +208,13 @@ async fn finder_cancel_acknowledges_cancelled_request() {
         })
         .await
         .unwrap();
-    let (paths, truncated, cancelled) = await_results(&mut client, "finder-cancel").await;
+    // A completed result may precede a later cancel. Wait for the explicit ack.
+    let (paths, truncated, cancelled) = loop {
+        let result = await_results(&mut client, "finder-cancel").await;
+        if result.2 {
+            break result;
+        }
+    };
     assert!(paths.is_empty() && !truncated && cancelled);
     fs::remove_dir_all(root).unwrap();
 }

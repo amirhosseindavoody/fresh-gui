@@ -493,7 +493,7 @@ mod tests {
                 .iter()
                 .any(|c| c.id == "GoToDefinition")
         );
-        let caps = vec!["lsp.requests".to_owned()];
+        let caps = vec![CAP_LSP_NAVIGATION.to_owned()];
         assert!(
             registry
                 .available(Some(CommandContext::Editor), &caps)

@@ -2321,8 +2321,8 @@ impl EditorPanel {
                 self.navigate_page(offset.saturating_sub(PAGE_VIEW_BYTES / 4), cx);
                 return;
             }
-        } else if self.edit_sync.is_none() && self.range_edits {
-            return; // Initial snapshot will reveal it.
+        } else if self.edit_sync.is_none() {
+            return; // Initial snapshot will reveal it, including on older daemons.
         }
         self.apply_navigation_offset(window, cx);
     }

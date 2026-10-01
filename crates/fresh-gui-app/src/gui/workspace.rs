@@ -3346,7 +3346,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         }
         self.create_open = true;
         self.palette_open = false;
-        self.goto_open = false;
+        self.reset_finder(cx);
         self.rename_pty = None;
         self.renaming_id = None;
         self.relocating_id = None;
@@ -3759,7 +3759,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         let suggestion = save_target_path(&parent, &unused_file_name(&existing));
         self.save_open = true;
         self.palette_open = false;
-        self.goto_open = false;
+        self.reset_finder(cx);
         self.rename_pty = None;
         self.renaming_id = None;
         self.save_path_input.update(cx, |state, cx| {
@@ -4004,7 +4004,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.renaming_id = None;
         self.rename_pty = Some(pty_id.to_string());
         self.palette_open = false;
-        self.goto_open = false;
+        self.reset_finder(cx);
         self.rename_input.update(cx, |state, cx| {
             state.set_value(current, window, cx);
             state.focus(window, cx);

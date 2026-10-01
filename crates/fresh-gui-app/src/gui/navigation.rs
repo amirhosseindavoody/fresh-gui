@@ -161,6 +161,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_finder(window, cx);
         self.dismiss_navigation(cx);
         if !self
             .capabilities
