@@ -51,9 +51,7 @@ pub(super) fn language_servers(
                     config
                 })
                 .collect();
-            editor
-                .active_window_mut()
-                .set_lsp_config(language.to_string(), stopped_configs);
+            editor.set_lsp_config(language.to_string(), stopped_configs);
         } else {
             let globally_enabled = editor.config().lsp_enabled;
             for config in &configs {
