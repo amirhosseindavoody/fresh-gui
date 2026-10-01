@@ -23,6 +23,7 @@ mod server;
 mod search;
 mod project_search;
 mod project_session;
+mod file_finder;
 mod settings;
 mod session;
 mod shell_resolve;

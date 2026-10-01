@@ -12,6 +12,8 @@
 mod navigation;
 #[path = "workspace_edits.rs"]
 mod workspace_edits;
+#[path = "finder.rs"]
+mod finder;
 pub(super) use navigation::navigation_feature;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -50,7 +52,7 @@ use super::actions::{
     CloseAllTerminals, CloseTab, CloseWorkspace, CopyExplorer, DeleteExplorer, Disconnect, FilterExplorer,
     GoToDefinition, GoToDeclaration, GoToTypeDefinition, GoToImplementation, FindReferences, RenameSymbol, CodeActions,
     DocumentSymbols, WorkspaceSymbols, NavigateBack, NavigateForward,
-    AskCopilot, Complete, ShowHover, SignatureHelp, FormatDocument, GoToFile, NewFile, NewTerminal, NewWorkspace, NextTab, OpenDefaultSettings, OpenSettings, PasteExplorer,
+    AskCopilot, Complete, ShowHover, SignatureHelp, FormatDocument, GoToFile, GoToLine, SwitchBuffer, NewFile, NewTerminal, NewWorkspace, NextTab, OpenDefaultSettings, OpenSettings, PasteExplorer,
     PrevTab, QuitClient, Reconnect, RenameWorkspace, ResetContentZoom, ResetUiZoom, SaveBuffer,
     SplitTerminal, StopServer, RestartServer, ReloadConfig, TerminalCopyOrInterrupt, TogglePinTab, ToggleCommandPalette, ToggleSidebar, ToggleWordWrap, ZoomInContent, ZoomInUi, ZoomOutContent,
     ZoomOutUi,
@@ -146,13 +148,7 @@ fn goto_join(root: &str, path: &str) -> String {
     format!("{}{separator}{path}", root.trim_end_matches(['/', '\\']))
 }
 
-fn goto_initial_query(root: &str) -> String {
-    if root.is_empty() || root.ends_with(['/', '\\']) {
-        root.to_string()
-    } else {
-        format!("{}{sep}", root, sep = goto_separator(root))
-    }
-}
+
 
 /// Split a path using daemon path syntax, without changing its displayed spelling.
 /// Unknown home directories cannot be listed: `FsList` does not expand `~`.
@@ -217,7 +213,7 @@ fn goto_ghost_suffix<'a>(query: &str, completion: &'a str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod goto_match_tests {
-    use super::{goto_completion_path, goto_ghost_suffix, goto_initial_query, goto_list_matches, split_goto_query};
+    use super::{goto_completion_path, goto_ghost_suffix, goto_list_matches, split_goto_query};
     use crate::gui::connect::parse_goto_spec;
     use crate::gui::explorer::pick_goto_target;
     use fresh_gui_protocol::{FsEntry, FsKind};
@@ -253,12 +249,7 @@ mod goto_match_tests {
     }
 
     #[test]
-    fn initial_query_lists_the_full_root_on_either_daemon() {
-        assert_eq!(goto_initial_query("/home/ada/project"), "/home/ada/project/");
-        assert_eq!(goto_initial_query("/"), "/");
-        assert_eq!(goto_initial_query(r"C:\work"), "C:\\work\\");
-        assert_eq!(goto_initial_query("C:/work"), "C:/work/");
-        assert_eq!(goto_initial_query(r"\\server\share"), "\\\\server\\share\\");
+    fn directory_queries_follow_daemon_path_syntax() {
         assert_eq!(split_goto_query("/tmp/other/fi", Some("/home/ada/project"), None).unwrap().parent, "/tmp/other");
         assert_eq!(split_goto_query(r"D:\other\fi", Some("/home/ada/project"), None).unwrap().parent, r"D:\other");
     }
@@ -980,8 +971,10 @@ pub struct Workspace {
     navigation_state: Entity<CommandState>,
     workspace_edits: workspace_edits::WorkspaceEdits,
     palette_open: bool,
+    palette_context: Option<super::commands::CommandContext>,
     goto_open: bool,
     goto_input: Entity<InputState>,
+    finder: finder::Finder,
     create_name: Entity<InputState>,
     create_root: Entity<InputState>,
     ws_rename_input: Entity<InputState>,
@@ -1396,16 +1389,13 @@ impl Workspace {
                 _ => {}
             }
         });
-        let goto_sub = cx.subscribe(&goto_input, |this, _, ev: &InputEvent, cx| {
+        let goto_sub = cx.subscribe_in(&goto_input, window, |this, _, ev: &InputEvent, window, cx| {
             if !this.goto_open {
                 return;
             }
-            match ev {
-                InputEvent::Change => {
-                    this.request_goto_listing(cx);
-                    cx.notify();
-                }
-                _ => {}
+            if matches!(ev, InputEvent::Change) {
+                this.finder_changed(window, cx);
+                cx.notify();
             }
         });
         let commit_sub = cx.subscribe(&commit_input, |this, _, ev: &InputEvent, cx| {
@@ -1565,8 +1555,10 @@ impl Workspace {
             navigation_state,
             workspace_edits: workspace_edits::WorkspaceEdits::default(),
             palette_open: false,
+            palette_context: None,
             goto_open: false,
             goto_input,
+            finder: finder::Finder::default(),
             create_name,
             create_root,
             ws_rename_input,
@@ -1601,6 +1593,7 @@ impl Workspace {
     fn handle_event(&mut self, ev: AdeEvent, window: &mut Window, cx: &mut Context<Self>) {
         match ev {
             AdeEvent::Project(message) => {
+                self.handle_finder_message(&message, cx);
                 if let fresh_gui_protocol::Message::ProjectReplaceResult { files, .. } = &message {
                     for update in files.iter().filter_map(|file| file.buffer.as_ref()) {
                         if let Some(panel) = self.editor_by_buffer(&update.buffer_id, cx) {
@@ -1687,6 +1680,7 @@ impl Workspace {
                 self.upsert_workspace(workspace);
             }
             AdeEvent::WorkspaceRootSet { workspace } => {
+                self.cancel_finder(window, cx);
                 self.project_search = None;
                 self.project_send_task = None;
                 let active = self.active_workspace_id.as_deref() == Some(workspace.id.as_str());
@@ -1900,7 +1894,7 @@ impl Workspace {
                     self.begin_editor_tab(
                         buffer_id, draft_id, path.clone(), language, line, column, activate, window, cx,
                     );
-                    self.history_editor_opened(&request_id, &path, window, cx);
+                    self.history_editor_opened(&request_id, &path, &opened_id, window, cx);
                     if let Some((start, end)) = project_location
                         && let Some(panel) = self.editor_by_buffer(&opened_id, cx) {
                         panel.update(cx, |panel, cx| panel.reveal_project_match(start, end, cx));
@@ -1950,6 +1944,7 @@ impl Workspace {
             AdeEvent::BufferPage { request_id, buffer_id, view_id, rev, start, total_bytes, text, selection, accepted, dirty } => {
                 if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
                     panel.update(cx, |panel, cx| panel.apply_page(&request_id, &view_id, rev, start, total_bytes, text, selection, accepted, dirty, window, cx));
+                    self.record_opened_location(&panel, cx);
                 }
             }
             AdeEvent::BufferSnapshot {
@@ -2405,6 +2400,7 @@ impl Workspace {
             panel.apply_snapshot(rev, text, path, window, cx);
             panel.check_external();
         });
+        self.record_opened_location(&panel, cx);
         if !self.restoring {
             self.select_entity(&panel, window, cx);
         }
@@ -3347,7 +3343,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         }
         self.create_open = true;
         self.palette_open = false;
-        self.goto_open = false;
+        self.reset_finder(cx);
         self.rename_pty = None;
         self.renaming_id = None;
         self.relocating_id = None;
@@ -3760,7 +3756,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         let suggestion = save_target_path(&parent, &unused_file_name(&existing));
         self.save_open = true;
         self.palette_open = false;
-        self.goto_open = false;
+        self.reset_finder(cx);
         self.rename_pty = None;
         self.renaming_id = None;
         self.save_path_input.update(cx, |state, cx| {
@@ -3903,32 +3899,17 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                         end,
                     } => {
                         if let Some(path) = path {
-                            let request_id = next_id("project-open");
-                            this.pending_editors.insert(request_id.clone(), true);
-                            this.project_locations
-                                .insert(request_id.clone(), (*start, *end));
-                            this.ade.send(AdeCmd::OpenEditor {
-                                request_id,
-                                path: path.clone(),
-                                preview: false,
-                                line: Some(*line),
-                                column: Some(*column),
-                            });
+                            let request_id = this.open_file_location(path.clone(), Some(*line), Some(*column), Some(*start), cx);
+                            this.project_locations.insert(request_id, (*start, *end));
                         } else if let Some(buffer_id) = buffer_id {
                             if let Some(editor) = this.editor_by_buffer(buffer_id, cx) {
-                                editor.update(cx, |editor, cx| {
-                                    editor.reveal_project_match(*start, *end, cx)
-                                });
+                                let origin = this.current_location(cx);
+                                editor.update(cx, |editor, cx| editor.reveal_project_match(*start, *end, cx));
                                 this.select_entity(&editor, window, cx);
+                                if let Some(origin) = origin { this.record_location_jump(origin, editor.read(cx).navigation_location(cx)); }
                             } else if let Some(draft_id) = draft_id {
-                                let request_id = next_id("project-draft-open");
-                                this.pending_editors.insert(request_id.clone(), true);
-                                this.project_locations
-                                    .insert(request_id.clone(), (*start, *end));
-                                this.ade.send(AdeCmd::RestoreDraft {
-                                    request_id,
-                                    draft_id: draft_id.clone(),
-                                });
+                                let request_id = this.open_draft_location(draft_id.clone(), *start, cx);
+                                this.project_locations.insert(request_id, (*start, *end));
                             }
                         }
                         this.project_search = None;
@@ -4020,7 +4001,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.renaming_id = None;
         self.rename_pty = Some(pty_id.to_string());
         self.palette_open = false;
-        self.goto_open = false;
+        self.reset_finder(cx);
         self.rename_input.update(cx, |state, cx| {
             state.set_value(current, window, cx);
             state.focus(window, cx);
@@ -5058,16 +5039,30 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         cx.notify();
     }
 
+    fn command_context(&self, window: &Window) -> Option<super::commands::CommandContext> {
+        use super::commands::CommandContext;
+        if self.explorer_focus.is_focused(window) {
+            return Some(CommandContext::Explorer);
+        }
+        match &self.active {
+            Some(ActiveSurface::Editor(_)) | Some(ActiveSurface::Diff(_)) => Some(CommandContext::Editor),
+            Some(ActiveSurface::Terminal(_)) => Some(CommandContext::Terminal),
+            _ => None,
+        }
+    }
+
     fn on_toggle_palette(
         &mut self,
         _: &ToggleCommandPalette,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let context = self.command_context(window);
         self.palette_open = !self.palette_open;
         if self.palette_open {
+            self.palette_context = context;
             self.dismiss_navigation(cx);
-            self.goto_open = false;
+            self.cancel_finder(window, cx);
             self.rename_pty = None;
             self.command_state.update(cx, |state, cx| {
                 state.focus(window, cx);
@@ -5077,19 +5072,16 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     }
 
     fn on_goto_file(&mut self, _: &GoToFile, window: &mut Window, cx: &mut Context<Self>) {
-        self.goto_open = !self.goto_open;
-        if self.goto_open {
-            self.dismiss_navigation(cx);
-            self.palette_open = false;
-            self.rename_pty = None;
-            let query = self.workspace_root().map(|root| goto_initial_query(&display_path(&root))).unwrap_or_default();
-            self.goto_input.update(cx, |state, cx| state.set_value(query, window, cx));
-            self.request_goto_listing(cx);
-            self.goto_input.update(cx, |state, cx| {
-                state.focus(window, cx);
-            });
-        }
-        cx.notify();
+        if self.goto_open { self.cancel_finder(window, cx); }
+        else { self.start_finder("", window, cx); }
+    }
+
+    fn on_goto_line(&mut self, _: &GoToLine, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_finder(":", window, cx);
+    }
+
+    fn on_switch_buffer(&mut self, _: &SwitchBuffer, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_finder("@", window, cx);
     }
 
     fn goto_home(&self) -> Option<String> {
@@ -5111,30 +5103,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     }
 
     fn confirm_goto(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let query = self.goto_input.read(cx).value().to_string();
-        let (file, line, column) = parse_goto_spec(&query);
-        if file.is_empty() {
-            return;
-        }
-        if self.goto_path_is_dir(&file) {
-            self.complete_goto_path(file, window, cx);
-            return;
-        }
-        let matches = self.goto_matches(&file);
-        let target = pick_goto_target(&file, &matches);
-        if self.goto_path_is_dir(&target) {
-            self.complete_goto_path(target, window, cx);
-            return;
-        }
-        let resolved = self.resolve_goto_path(&target);
-        self.goto_open = false;
-        let target = match (line, column) {
-            (Some(line), Some(column)) => format!("{resolved}:{line}:{column}"),
-            (Some(line), None) => format!("{resolved}:{line}"),
-            _ => resolved,
-        };
-        self.open_path(target, false);
-        cx.notify();
+        self.confirm_finder(None, window, cx);
     }
 
     fn goto_path_is_dir(&self, path: &str) -> bool {
@@ -5192,6 +5161,10 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     fn goto_matches(&self, query: &str) -> Vec<String> {
         let path = goto_completion_path(query);
         let Some(parts) = self.goto_parts(&path) else { return Vec::new() };
+        if self.capabilities.iter().any(|cap| cap == fresh_gui_protocol::CAP_FILE_FINDER)
+            && !path.ends_with(['/', '\\']) && !goto_is_absolute(&path) {
+            return self.finder.paths.clone();
+        }
         self.explorer_cache.get(&parts.parent)
             .map(|entries| goto_list_matches(&parts, entries))
             .unwrap_or_default()
@@ -6928,62 +6901,13 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     fn render_palette(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let confirm = cx.entity();
         let cancel = cx.entity();
-        let items = vec![
-            ("Ask Copilot…", Box::new(AskCopilot) as Box<dyn Action>),
-            ("New Terminal", Box::new(NewTerminal) as Box<dyn Action>),
-            ("New File", Box::new(NewFile)),
-            ("Split Terminal Vertically", Box::new(SplitTerminal)),
-            ("Complete", Box::new(Complete)),
-            ("Show Hover", Box::new(ShowHover)),
-            ("Signature Help", Box::new(SignatureHelp)),
-            ("Go to Definition", Box::new(GoToDefinition)),
-            ("Go to Declaration", Box::new(GoToDeclaration)),
-            ("Go to Type Definition", Box::new(GoToTypeDefinition)),
-            ("Go to Implementation", Box::new(GoToImplementation)),
-            ("Find References", Box::new(FindReferences)),
-            ("Document Symbols", Box::new(DocumentSymbols)),
-            ("Workspace Symbols", Box::new(WorkspaceSymbols)),
-            ("Navigate Back", Box::new(NavigateBack)),
-            ("Navigate Forward", Box::new(NavigateForward)),
-            ("Format Document", Box::new(FormatDocument)),
-            ("Rename Symbol", Box::new(RenameSymbol)),
-            ("Code Actions", Box::new(CodeActions)),
-            ("Find in Buffer", Box::new(FindInBuffer)),
-            ("Replace in Buffer", Box::new(ReplaceInBuffer)),
-            ("Query Replace", Box::new(QueryReplace)),
-            ("Clear Search Highlights", Box::new(ClearSearchHighlights)),
-            ("Next Search Match", Box::new(NextSearchMatch)),
-            ("Previous Search Match", Box::new(PreviousSearchMatch)),
-            ("Toggle Word Wrap", Box::new(ToggleWordWrap)),
-            ("New Workspace", Box::new(NewWorkspace)),
-            ("Rename Workspace", Box::new(RenameWorkspace)),
-            ("Close Workspace", Box::new(CloseWorkspace)),
-            ("Close Tab", Box::new(CloseTab)),
-            ("Pin or Unpin Tab", Box::new(TogglePinTab)),
-            ("Close All Editors", Box::new(CloseAllEditors)),
-            ("Close All Terminals", Box::new(CloseAllTerminals)),
-            ("Close All Other Terminals", Box::new(CloseAllOtherTerminals)),
-            ("Close All Other Tabs", Box::new(CloseAllOtherTabs)),
-            ("Save", Box::new(SaveBuffer)),
-            ("Search in Workspace", Box::new(SearchProject)),
-            ("Toggle Sidebar", Box::new(ToggleSidebar)),
-            ("Go to File…", Box::new(GoToFile)),
-            ("Open Settings", Box::new(OpenSettings)),
-            ("Open Default Settings", Box::new(OpenDefaultSettings)),
-            ("Zoom In Panel", Box::new(ZoomInContent)),
-            ("Zoom Out Panel", Box::new(ZoomOutContent)),
-            ("Reset Panel Zoom", Box::new(ResetContentZoom)),
-            ("Zoom In UI", Box::new(ZoomInUi)),
-            ("Zoom Out UI", Box::new(ZoomOutUi)),
-            ("Reset UI Zoom", Box::new(ResetUiZoom)),
-            ("Reconnect", Box::new(Reconnect)),
-            ("Disconnect", Box::new(Disconnect)),
-            ("Restart Server", Box::new(RestartServer)),
-            ("Reload Config", Box::new(ReloadConfig)),
-            ("Stop Server", Box::new(StopServer)),
-            ("Quit Client", Box::new(QuitClient)),
-        ];
+        let query_view = cx.entity();
+        let query = self.command_state.read(cx).query(cx);
+        let items = fresh_gui_client::finder::ranked(&query,
+            super::commands::command_descriptors(self.palette_context, &self.capabilities), |command| command.label.as_str());
         Command::new(&self.command_state)
+            .filterable(false)
+            .on_query(move |_, _, cx| query_view.update(cx, |_, cx| cx.notify()))
             .placeholder("Type a command…")
             .bordered(true)
             .w(self.ui_px(520.))
@@ -6991,7 +6915,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                 CommandGroup::new().label("Commands").items(
                     items
                         .into_iter()
-                        .map(|(label, action)| CommandItem::new().label(label).action(action)),
+                        .map(|command| CommandItem::new().label(command.label.clone()).action(command.action())),
                 ),
             )
             .on_confirm(move |_, _, cx| {
@@ -7029,181 +6953,6 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         bar
     }
 
-    fn render_goto(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id("goto-overlay")
-            .absolute()
-            .inset_0()
-            .flex()
-            .justify_center()
-            .items_start()
-            .pt(px(80.))
-            .bg(cx.theme().background.opacity(0.45))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.goto_open = false;
-                    cx.notify();
-                }),
-            )
-            .child(
-                v_flex()
-                    .id("goto-dialog")
-                    .w(self.ui_px(480.))
-                    .gap_2()
-                    .p_3()
-                    .rounded(cx.theme().radius)
-                    .bg(cx.theme().background)
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                        if event.keystroke.key.eq_ignore_ascii_case("enter") {
-                            this.confirm_goto(window, cx);
-                            cx.stop_propagation();
-                        } else if event.keystroke.key.eq_ignore_ascii_case("tab") {
-                            this.complete_goto(window, cx);
-                            cx.stop_propagation();
-                        } else if event.keystroke.key.eq_ignore_ascii_case("right")
-                            || event.keystroke.key.eq_ignore_ascii_case("arrowright")
-                        {
-                            let modifiers = &event.keystroke.modifiers;
-                            if modifiers.control
-                                || modifiers.platform
-                                || modifiers.alt
-                                || modifiers.shift
-                            {
-                                return;
-                            }
-                            let query = this.goto_input.read(cx).value().to_string();
-                            if this.goto_input.read(cx).cursor() == query.len() {
-                                if let Some(path) = this.goto_matches(&query).into_iter().next() {
-                                    if goto_ghost_suffix(&query, &path).is_some() {
-                                        this.complete_goto_path(path, window, cx);
-                                        cx.stop_propagation();
-                                    }
-                                }
-                            }
-                        }
-                    }))
-                    .child(div().text_sm().font_bold().child("Go to File"))
-                    .child({
-                        let query = self.goto_input.read(cx).value().to_string();
-                        let text_width = if query.is_empty() {
-                            0.
-                        } else {
-                            let text = SharedString::from(query.clone());
-                            let run = TextRun {
-                                len: text.len(),
-                                font: gpui::font(cx.theme().mono_font_family.clone()),
-                                color: cx.theme().foreground,
-                                background_color: None,
-                                underline: None,
-                                strikethrough: None,
-                            };
-                            window
-                                .text_system()
-                                .shape_line(text, self.ui_px(14.), &[run], None)
-                                .width()
-                                .as_f32()
-                        };
-                        let ghost = if self.goto_input.read(cx).cursor() == query.len() {
-                            self.goto_matches(&query)
-                                .into_iter()
-                                .next()
-                                .and_then(|path| {
-                                    goto_ghost_suffix(&query, &path).map(str::to_string)
-                                })
-                        } else {
-                            None
-                        };
-                        div()
-                            .relative()
-                            .child(
-                                Input::new(&self.goto_input)
-                                    .font_family(cx.theme().mono_font_family.clone()),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top(px(8.))
-                                    .left(px(11. + text_width))
-                                    .text_sm()
-                                    .whitespace_nowrap()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .font_family(cx.theme().mono_font_family.clone())
-                                    .child(ghost.unwrap_or_default()),
-                            )
-                    })
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Tab or Right Arrow completes the first path match"),
-                    )
-                    .child(
-                        v_flex()
-                            .id("goto-results")
-                            .max_h(self.ui_px((GOTO_MAX_VISIBLE as f32) * 32.))
-                            .overflow_y_scroll()
-                            .children(
-                                self.goto_matches(&self.goto_input.read(cx).value().to_string())
-                                    .into_iter()
-                                    .map(|path| {
-                                        let open = cx.entity();
-                                        let is_dir = self.goto_path_is_dir(&path);
-                                        let label = display_path(&path);
-                                        let label = if is_dir {
-                                            format!("{label}/")
-                                        } else {
-                                            label
-                                        };
-                                        div()
-                                            .id(SharedString::from(format!("goto-{path}")))
-                                            .w_full()
-                                            .h(self.ui_px(32.))
-                                            .flex_shrink_0()
-                                            .flex()
-                                            .items_center()
-                                            .justify_start()
-                                            .px_2()
-                                            .cursor_pointer()
-                                            .hover(|style| style.bg(cx.theme().accent.opacity(0.15)))
-                                            .child(div().text_sm().text_ellipsis().child(label))
-                                            .on_click(move |_, window, cx| {
-                                                let path = path.clone();
-                                                open.update(cx, |this, cx| {
-                                                    if is_dir {
-                                                        this.complete_goto_path(path, window, cx);
-                                                    } else {
-                                                        this.goto_open = false;
-                                                        let path = this.resolve_goto_path(&path);
-                                                        this.open_path(path, false);
-                                                        cx.notify();
-                                                    }
-                                                });
-                                            })
-                                    }),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(Button::new("goto-cancel").ghost().label("Cancel").on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.goto_open = false;
-                                    cx.notify();
-                                }),
-                            ))
-                            .child(Button::new("goto-open").primary().label("Open").on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.confirm_goto(window, cx);
-                                }),
-                            )),
-                    ),
-            )
-    }
 
     fn render_copilot(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let submit = cx.entity();
@@ -7459,6 +7208,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_reset_ui_zoom))
             .on_action(cx.listener(Self::on_toggle_palette))
             .on_action(cx.listener(Self::on_goto_file))
+            .on_action(cx.listener(Self::on_goto_line))
+            .on_action(cx.listener(Self::on_switch_buffer))
             .on_action(cx.listener(Self::on_settings))
             .on_action(cx.listener(Self::on_default_settings))
             .on_action(cx.listener(Self::on_reconnect))

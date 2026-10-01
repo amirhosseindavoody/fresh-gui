@@ -77,6 +77,8 @@ actions!(
         SaveBuffer,
         ToggleSidebar,
         ToggleCommandPalette,
+        SwitchBuffer,
+        GoToLine,
         GoToFile,
         OpenSettings,
         OpenDefaultSettings,
@@ -138,75 +140,11 @@ pub fn apply_shortkeys(cx: &mut App, shortkeys: &[Shortkey]) {
             Some("Editor") => Some("Editor"),
             Some(other) => { tracing::warn!(when = other, "unsupported shortkey context"); return None; }
         };
-        let binding = match entry.action.as_str() {
-            "NewTerminal" => KeyBinding::new(key, NewTerminal, when),
-            "NewFile" => KeyBinding::new(key, NewFile, when),
-            "SplitTerminal" => KeyBinding::new(key, SplitTerminal, when),
-            "Complete" => KeyBinding::new(key, Complete, when),
-            "ShowHover" => KeyBinding::new(key, ShowHover, when),
-            "SignatureHelp" => KeyBinding::new(key, SignatureHelp, when),
-            "GoToDefinition" => KeyBinding::new(key, GoToDefinition, when),
-            "GoToDeclaration" => KeyBinding::new(key, GoToDeclaration, when),
-            "GoToTypeDefinition" => KeyBinding::new(key, GoToTypeDefinition, when),
-            "GoToImplementation" => KeyBinding::new(key, GoToImplementation, when),
-            "FindReferences" => KeyBinding::new(key, FindReferences, when),
-            "DocumentSymbols" => KeyBinding::new(key, DocumentSymbols, when),
-            "WorkspaceSymbols" => KeyBinding::new(key, WorkspaceSymbols, when),
-            "NavigateBack" => KeyBinding::new(key, NavigateBack, when),
-            "NavigateForward" => KeyBinding::new(key, NavigateForward, when),
-            "FormatDocument" => KeyBinding::new(key, FormatDocument, when),
-            "SearchProject" => KeyBinding::new(key, SearchProject, when),
-            "RenameSymbol" => KeyBinding::new(key, RenameSymbol, when),
-            "CodeActions" => KeyBinding::new(key, CodeActions, when),
-            "FindInBuffer" => KeyBinding::new(key, FindInBuffer, when),
-            "ReplaceInBuffer" => KeyBinding::new(key, ReplaceInBuffer, when),
-            "QueryReplace" => KeyBinding::new(key, QueryReplace, when),
-            "ClearSearchHighlights" => KeyBinding::new(key, ClearSearchHighlights, when),
-            "NextSearchMatch" => KeyBinding::new(key, NextSearchMatch, when),
-            "PreviousSearchMatch" => KeyBinding::new(key, PreviousSearchMatch, when),
-            "ToggleWordWrap" => KeyBinding::new(key, ToggleWordWrap, when),
-            "CloseTab" => KeyBinding::new(key, CloseTab, when),
-            "CloseAllEditors" => KeyBinding::new(key, CloseAllEditors, when),
-            "CloseAllTerminals" => KeyBinding::new(key, CloseAllTerminals, when),
-            "CloseAllOtherTerminals" => KeyBinding::new(key, CloseAllOtherTerminals, when),
-            "CloseAllOtherTabs" => KeyBinding::new(key, CloseAllOtherTabs, when),
-            "SaveBuffer" => KeyBinding::new(key, SaveBuffer, when),
-            "ToggleSidebar" => KeyBinding::new(key, ToggleSidebar, when),
-            "ToggleCommandPalette" => KeyBinding::new(key, ToggleCommandPalette, when),
-            "GoToFile" => KeyBinding::new(key, GoToFile, when),
-            "OpenSettings" => KeyBinding::new(key, OpenSettings, when),
-            "OpenDefaultSettings" => KeyBinding::new(key, OpenDefaultSettings, when),
-            "Reconnect" => KeyBinding::new(key, Reconnect, when),
-            "Disconnect" => KeyBinding::new(key, Disconnect, when),
-            "NextTab" => KeyBinding::new(key, NextTab, when),
-            "PrevTab" => KeyBinding::new(key, PrevTab, when),
-            "CopyExplorer" => KeyBinding::new(key, CopyExplorer, when),
-            "PasteExplorer" => KeyBinding::new(key, PasteExplorer, when),
-            "DeleteExplorer" => KeyBinding::new(key, DeleteExplorer, when),
-            "AskCopilot" => KeyBinding::new(key, AskCopilot, when),
-            "TerminalCopyOrInterrupt" => KeyBinding::new(key, TerminalCopyOrInterrupt, when),
-            "TogglePinTab" => KeyBinding::new(key, TogglePinTab, when),
-            "FilterExplorer" => KeyBinding::new(key, FilterExplorer, when),
-            "ClearExplorerInput" => KeyBinding::new(key, ClearExplorerInput, when),
-            "NewWorkspace" => KeyBinding::new(key, NewWorkspace, when),
-            "RenameWorkspace" => KeyBinding::new(key, RenameWorkspace, when),
-            "CloseWorkspace" => KeyBinding::new(key, CloseWorkspace, when),
-            "ZoomInContent" => KeyBinding::new(key, ZoomInContent, when),
-            "ZoomOutContent" => KeyBinding::new(key, ZoomOutContent, when),
-            "ResetContentZoom" => KeyBinding::new(key, ResetContentZoom, when),
-            "ZoomInUi" => KeyBinding::new(key, ZoomInUi, when),
-            "ZoomOutUi" => KeyBinding::new(key, ZoomOutUi, when),
-            "ResetUiZoom" => KeyBinding::new(key, ResetUiZoom, when),
-            "StopServer" => KeyBinding::new(key, StopServer, when),
-            "RestartServer" => KeyBinding::new(key, RestartServer, when),
-            "ReloadConfig" => KeyBinding::new(key, ReloadConfig, when),
-            "QuitClient" => KeyBinding::new(key, QuitClient, when),
-            unknown => {
-                tracing::warn!(action = unknown, "unknown shortkey action");
-                return None;
-            }
-        };
-        Some(binding)
+        let command = super::commands::command_descriptor(&entry.action);
+        match command {
+            Some(command) => Some(command.key_binding(key, when)),
+            None => { tracing::warn!(action = entry.action, "unknown shortkey action"); None }
+        }
     });
     let bindings: Vec<_> = bindings.collect();
     cx.clear_key_bindings();
@@ -215,78 +153,21 @@ pub fn apply_shortkeys(cx: &mut App, shortkeys: &[Shortkey]) {
     // The window Root binds Tab to focus-next, which lands on the File menu.
     // A Terminal-context binding is more specific and wins while the shell is focused.
     cx.bind_keys([
-        KeyBinding::new("tab", TerminalInputTab, Some("Terminal")),
-        KeyBinding::new("shift-tab", TerminalInputBacktab, Some("Terminal")),
-        KeyBinding::new("f2", RenameSymbol, Some("Editor")),
-        KeyBinding::new("ctrl-.", CodeActions, Some("Editor")),
-    ]);
+        ("tab", "TerminalInputTab", "Terminal"),
+        ("shift-tab", "TerminalInputBacktab", "Terminal"),
+        ("f2", "RenameSymbol", "Editor"),
+        ("ctrl-.", "CodeActions", "Editor"),
+    ].into_iter().filter_map(|(key, id, context)| {
+        super::commands::command_descriptor(id).map(|command| command.key_binding(key, Some(context)))
+    }));
 }
 
 /// Native actions understood by the shortkeys adapter.
 pub fn known_action(action: &str) -> bool {
-    matches!(
-        action,
-        "NewTerminal"
-            | "NewFile"
-            | "SplitTerminal"
-            | "FormatDocument"
-            | "RenameSymbol"
-            | "CodeActions"
-            | "Complete"
-            | "ShowHover"
-            | "SignatureHelp"
-            | "SearchProject"
-            | "FindInBuffer"
-            | "ReplaceInBuffer"
-            | "QueryReplace"
-            | "ClearSearchHighlights"
-            | "NextSearchMatch"
-            | "PreviousSearchMatch"
-            | "GoToDefinition"
-            | "GoToDeclaration"
-            | "GoToTypeDefinition"
-            | "GoToImplementation"
-            | "FindReferences"
-            | "DocumentSymbols"
-            | "WorkspaceSymbols"
-            | "NavigateBack"
-            | "NavigateForward"
-            | "ToggleWordWrap"
-            | "CloseTab"
-            | "CloseAllEditors"
-            | "CloseAllTerminals"
-            | "CloseAllOtherTerminals"
-            | "CloseAllOtherTabs"
-            | "SaveBuffer"
-            | "ToggleSidebar"
-            | "ToggleCommandPalette"
-            | "GoToFile"
-            | "OpenSettings"
-            | "OpenDefaultSettings"
-            | "Reconnect"
-            | "Disconnect"
-            | "NextTab"
-            | "PrevTab"
-            | "CopyExplorer"
-            | "PasteExplorer"
-            | "DeleteExplorer"
-            | "AskCopilot"
-            | "TerminalCopyOrInterrupt"
-            | "TogglePinTab"
-            | "FilterExplorer"
-            | "ClearExplorerInput"
-            | "NewWorkspace"
-            | "RenameWorkspace"
-            | "CloseWorkspace"
-            | "ZoomInContent"
-            | "ZoomOutContent"
-            | "ResetContentZoom"
-            | "ZoomInUi"
-            | "ZoomOutUi"
-            | "ResetUiZoom"
-            | "StopServer"
-            | "RestartServer"
-            | "ReloadConfig"
-            | "QuitClient"
-    )
+    super::commands::command_descriptor(action).is_some()
+}
+
+/// Command identifiers suitable for the keybinding editor's action picker.
+pub fn command_ids() -> Vec<(String, String)> {
+    super::commands::all_command_descriptors().into_iter().map(|command| (command.id, command.label)).collect()
 }

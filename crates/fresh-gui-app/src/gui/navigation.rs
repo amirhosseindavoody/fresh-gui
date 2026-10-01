@@ -26,6 +26,7 @@ pub(super) struct Navigation {
     accepted: Option<(fresh_gui_protocol::LspResult, String, usize)>,
     origin: Option<EditorLocation>,
     pending: HashMap<String, PendingLocation>,
+    opened: HashMap<String, PendingLocation>,
     histories: HashMap<String, NavigationHistory>,
     status: String,
 }
@@ -43,13 +44,91 @@ impl Navigation {
 }
 
 impl Workspace {
-    fn current_location(&self, cx: &App) -> Option<EditorLocation> {
+    pub(super) fn current_location(&self, cx: &App) -> Option<EditorLocation> {
         let Some(ActiveSurface::Editor(path)) = &self.active else {
             return None;
         };
         self.editors
             .get(path)
             .map(|panel| panel.read(cx).navigation_location(cx))
+    }
+
+    pub(super) fn record_location_jump(
+        &mut self,
+        origin: EditorLocation,
+        destination: EditorLocation,
+    ) {
+        self.navigation
+            .histories
+            .entry(self.workspace_id_or_empty())
+            .or_default()
+            .record_jump(origin, destination);
+    }
+
+    /// Finder and project matches share definition/history navigation without
+    /// translating byte columns into LSP UTF-16 coordinates.
+    pub(super) fn open_file_location(
+        &mut self,
+        path: String,
+        line: Option<u32>,
+        column: Option<u32>,
+        offset: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> String {
+        let request_id = next_id("nav-file");
+        self.navigation.pending.insert(
+            request_id.clone(),
+            PendingLocation {
+                origin: self.current_location(cx),
+                offset,
+                workspace: self.workspace_id_or_empty(),
+            },
+        );
+        self.pending_editors.insert(request_id.clone(), true);
+        self.ade.send(AdeCmd::OpenEditor {
+            request_id: request_id.clone(),
+            path,
+            preview: false,
+            line,
+            column,
+        });
+        request_id
+    }
+
+    pub(super) fn open_draft_location(
+        &mut self,
+        draft_id: String,
+        offset: usize,
+        cx: &mut Context<Self>,
+    ) -> String {
+        let request_id = next_id("nav-draft");
+        self.navigation.pending.insert(
+            request_id.clone(),
+            PendingLocation {
+                origin: self.current_location(cx),
+                offset: Some(offset),
+                workspace: self.workspace_id_or_empty(),
+            },
+        );
+        self.pending_editors.insert(request_id.clone(), true);
+        self.ade.send(AdeCmd::RestoreDraft {
+            request_id: request_id.clone(),
+            draft_id,
+        });
+        request_id
+    }
+
+    pub(super) fn record_opened_location(&mut self, panel: &Entity<EditorPanel>, cx: &App) {
+        let destination = panel.read(cx).navigation_location(cx);
+        if let Some(pending) = destination
+            .buffer_id
+            .as_ref()
+            .and_then(|id| self.navigation.opened.remove(id))
+            && pending.workspace == self.workspace_id_or_empty()
+            && let Some(origin) = pending.origin
+        {
+            self.record_location_jump(origin, destination);
+        }
     }
 
     pub(super) fn dismiss_navigation(&mut self, cx: &mut Context<Self>) {
@@ -82,6 +161,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_finder(window, cx);
         self.dismiss_navigation(cx);
         if !self
             .capabilities
@@ -305,19 +385,27 @@ impl Workspace {
         &mut self,
         request_id: &str,
         path: &str,
+        buffer_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(offset) = self
-            .navigation
-            .pending
-            .get(request_id)
-            .and_then(|pending| pending.offset)
-        {
-            if let Some(panel) = self.editors.get(path) {
-                panel.update(cx, |panel, cx| panel.reveal_byte(offset, window, cx));
+        if let Some(pending) = self.navigation.pending.remove(request_id) {
+            if pending.workspace != self.workspace_id_or_empty() {
+                return;
             }
-            self.navigation.pending.remove(request_id);
+            if let Some(panel) = self
+                .editor_by_buffer(buffer_id, cx)
+                .or_else(|| self.editors.get(path).cloned())
+            {
+                if let Some(offset) = pending.offset {
+                    panel.update(cx, |panel, cx| panel.reveal_byte(offset, window, cx));
+                }
+                if pending.origin.is_some()
+                    && let Some(buffer_id) = panel.read(cx).navigation_location(cx).buffer_id
+                {
+                    self.navigation.opened.insert(buffer_id, pending);
+                }
+            }
         }
     }
 
@@ -353,6 +441,16 @@ impl Workspace {
                 panel.reveal_byte(destination.offset, window, cx)
             });
         } else {
+            if is_untitled_editor_key(&destination.path)
+                && !self
+                    .capabilities
+                    .iter()
+                    .any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY)
+            {
+                self.status = "Reopening an untitled history location requires editor.draft-recovery; upgrade the daemon".into();
+                cx.notify();
+                return;
+            }
             let request_id = next_id("nav-history");
             self.navigation.pending.insert(
                 request_id.clone(),
@@ -363,20 +461,32 @@ impl Workspace {
                 },
             );
             self.pending_editors.insert(request_id.clone(), true);
-            self.ade.send(AdeCmd::OpenEditor {
-                request_id,
-                path: destination.path,
-                preview: false,
-                line: None,
-                column: None,
-            });
+            if let Some(draft_id) = destination
+                .path
+                .strip_prefix(super::super::explorer::UNTITLED_PREFIX)
+            {
+                self.ade.send(AdeCmd::RestoreDraft {
+                    request_id,
+                    draft_id: draft_id.to_string(),
+                });
+            } else {
+                self.ade.send(AdeCmd::OpenEditor {
+                    request_id,
+                    path: destination.path,
+                    preview: false,
+                    line: None,
+                    column: None,
+                });
+            }
         }
         cx.notify();
     }
 
     pub(super) fn clear_navigation_pending(&mut self, cx: &mut Context<Self>) {
         self.dismiss_navigation(cx);
+        self.reset_finder(cx);
         self.navigation.pending.clear();
+        self.navigation.opened.clear();
     }
 
     pub(super) fn navigation_open_error(&mut self, message: &str) {
