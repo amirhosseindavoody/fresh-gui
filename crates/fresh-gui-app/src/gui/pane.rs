@@ -2852,12 +2852,18 @@ impl EditorPanel {
     fn auto_save_is_safe(&self) -> bool {
         !self.unsaved && !self.path.is_empty() && self.transport_connected && !self.conflict
             && !self.auto_save_paused && self.external.is_none() && self.recovery_warning.is_none()
+            && !self.file_metadata.as_ref().is_some_and(|metadata| metadata.read_only)
             && self.edit_request_id.is_none() && self.sync_request_id.is_none()
             && self.save_request_id.is_none() && self.file_control_request.is_none()
             && !self.action_inflight && !self.format_inflight && self.is_dirty()
     }
 
     pub fn show_file_controls(&mut self, mode: FileControlMode, _window: &mut Window, cx: &mut Context<Self>) {
+        if mode == FileControlMode::SaveWithEncoding && self.unsaved {
+            self.lsp_status = Some("Use Save As to choose a file path before saving with an encoding".into());
+            cx.notify();
+            return;
+        }
         if !self.file_controls_supported {
             self.lsp_status = Some("This daemon does not support file encoding controls".into());
             cx.notify();
@@ -4442,6 +4448,16 @@ mod project_update_tests {
             assert!(panel.dirty);
             assert!(panel.conflict);
             assert!(!panel.auto_save_is_safe());
+
+            panel.conflict = false;
+            panel.file_control_request = Some("inspect-2".into());
+            panel.file_control_operation = Some(FileControlOperation::Inspect);
+            panel.apply_file_state("inspect-2", 6, BufferFileMetadata {
+                encoding: "UTF-8".into(), bom: false, line_ending: "LF".into(), read_only: false,
+                paged: false, auto_save_interval_secs: Some(5),
+            }, Some("stale inspection text".into()), false, window, cx);
+            assert_eq!(panel.current_text(cx), "new local edits");
+            assert!(panel.dirty, "metadata inspection must not clear a newer local draft");
         });
     }
 
