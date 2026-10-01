@@ -254,7 +254,7 @@ impl Workspace {
                 return;
             }
         }
-        if chosen.is_none() && self.goto_path_is_dir(&file) {
+        if chosen.is_none() && self.finder.selected == 0 && self.goto_path_is_dir(&file) {
             self.complete_goto_path(file, window, cx);
             return;
         }
@@ -264,7 +264,7 @@ impl Workspace {
             || file.starts_with(['.', '~'])
             || (self.finder.paths.is_empty() && file.contains(['/', '\\']));
         let target = chosen.unwrap_or_else(|| {
-            if explicit {
+            if explicit && self.finder.selected == 0 {
                 file.clone()
             } else {
                 let items = self.finder_items(cx);
