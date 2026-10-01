@@ -203,7 +203,9 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
     let beta_log = root.join("beta.log");
     let slow_log = root.join("slow.log");
     let config_path = root.join("config.json");
-    let target_path = root.join("target.py");
+    let target_name = if cfg!(windows) { "target name😀.py" } else { "target name😀.py:12" };
+    let target_path = root.join(target_name);
+    let target_uri = fresh::app::types::file_path_to_lsp_uri(&target_path).unwrap().to_string();
     let paged_path = root.join("paged.py");
     let config = serde_json::json!({
         "lsp": { "python": [
@@ -338,7 +340,7 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
         } else {
             assert_eq!(
                 result.navigation_targets[0].uri,
-                format!("file://{}", target_path.display())
+                target_uri.clone()
             );
             assert_eq!(result.navigation_targets[0].line, 0);
             assert_eq!(result.navigation_targets[0].character, 3);
@@ -348,7 +350,7 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
     client
         .send(Message::EditorOpenLocation {
             request_id: "lsp-location-open".into(),
-            uri: format!("file://{}", target_path.display()),
+            uri: target_uri.clone(),
             line: 0,
             character: 3,
         })
@@ -361,7 +363,7 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
                 match client.recv().await.expect("receive location open response") {
                     Message::EditorOpened { request_id, .. }
                         if request_id == "lsp-location-open" => {}
-                    Message::BufferSnapshot { text, path, .. } if path.ends_with("target.py") => {
+                    Message::BufferSnapshot { text, path, .. } if path.ends_with(target_name) => {
                         opened_text = Some(text)
                     }
                     Message::EditorLocationOpened {
@@ -393,7 +395,7 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
         })
         .await
         .expect("location open timed out");
-    assert!(opened_path.ends_with("target.py"));
+    assert!(opened_path.ends_with(target_name));
     assert_eq!(
         opened_offset, 5,
         "UTF-16 character 3 follows `a😀` (five UTF-8 bytes)"

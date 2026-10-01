@@ -227,11 +227,6 @@ pub(crate) fn navigation_targets(
             }
             return;
         }
-        if let Some(children) = value.get("children").and_then(Value::as_array) {
-            for child in children {
-                add(child, fallback_uri, output);
-            }
-        }
         let uri = value
             .get("targetUri")
             .or_else(|| value.get("uri"))
@@ -261,11 +256,17 @@ pub(crate) fn navigation_targets(
                 character: character.min(u32::MAX as u64) as u32,
             });
         } else if let Some(location) = value.get("location") {
+            let first_new_target = output.len();
             add(location, fallback_uri, output);
             if let Some(name) = value.get("name").and_then(Value::as_str)
-                && let Some(target) = output.last_mut()
+                && let Some(target) = output.get_mut(first_new_target)
             {
                 target.name = Some(name.to_owned());
+            }
+        }
+        if let Some(children) = value.get("children").and_then(Value::as_array) {
+            for child in children {
+                add(child, fallback_uri, output);
             }
         }
     }
@@ -400,6 +401,21 @@ mod tests {
         assert_eq!(targets[1].name.as_deref(), Some("Foo"));
         assert_eq!(targets[2].name.as_deref(), Some("Nested"));
         assert_eq!(targets[3].name.as_deref(), Some("Child"));
+    }
+
+    #[test]
+    fn unresolved_workspace_symbols_do_not_relabel_the_preceding_location() {
+        let responses = vec![one_response(
+            "server".into(),
+            json!([
+                {"name": "Located", "location": {"uri": "file:///a.rs", "range": {"start": {"line": 0, "character": 3}}}},
+                {"name": "NeedsResolve", "location": {"uri": "file:///b.rs"}}
+            ]),
+        )];
+        let targets = navigation_targets(&responses, None);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name.as_deref(), Some("Located"));
+        assert_eq!(targets[0].uri, "file:///a.rs");
     }
 
     #[test]

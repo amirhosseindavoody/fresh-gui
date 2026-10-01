@@ -84,6 +84,13 @@ async fn resolve_existing_file(fs_root: &FsRoot, raw: &str, cwd: Option<&str>) -
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("file not found: {raw}")))
 }
 
+/// LSP URIs already contain an exact absolute filename. Share the existing
+/// editor authorization/canonicalization path without parsing `:line:column`.
+pub(crate) async fn resolve_exact_file(fs_root: &FsRoot, path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() { bail!("LSP file path must be absolute"); }
+    allow_file(fs_root, path).await
+}
+
 async fn allow_file(fs_root: &FsRoot, candidate: &Path) -> Result<PathBuf> {
     if !candidate.is_file() {
         bail!("not a file: {}", candidate.display());

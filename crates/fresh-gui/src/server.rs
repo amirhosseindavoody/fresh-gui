@@ -1003,25 +1003,18 @@ async fn handle_client_msg(
                 code: "editor_open_failed".into(),
                 message: format!("{request_id}: {error}"),
             })?;
-            let resolved = resolve_editor_open(
-                state,
-                defaults_path,
-                &target_path.display().to_string(),
-                None,
-                None,
-                None,
-            )
+            let path = crate::path_open::resolve_exact_file(&state.fs_root, &target_path)
             .await
             .map_err(|error| Message::Error {
                 code: "editor_open_failed".into(),
                 message: format!("{request_id}: {error:#}"),
             })?;
-            if !*client_paged_reads && is_large_file(&resolved.path) {
+            if !*client_paged_reads && is_large_file(&path) {
                 return Err(paged_reads_unavailable(&request_id));
             }
             let workspace_id = current_workspace_id(state, session_id).await?;
             let (opened, offset) = editor
-                .open_location_in_workspace(resolved.path, workspace_id, line, character)
+                .open_location_in_workspace(path, workspace_id, line, character)
                 .await
                 .map_err(|error| Message::Error {
                     code: "editor_open_failed".into(),
@@ -2629,42 +2622,13 @@ async fn resolve_editor_open(
 }
 
 fn lsp_file_uri_to_path(uri: &str) -> anyhow::Result<PathBuf> {
-    anyhow::ensure!(uri.starts_with("file://"), "LSP target is not a file URI");
-    let encoded = &uri[7..];
-    anyhow::ensure!(
-        encoded.starts_with('/'),
-        "LSP file URI must use a local absolute path"
+    let wire = fresh::app::types::LspUri::from_wire(
+        serde_json::from_value(serde_json::Value::String(uri.to_owned()))
+            .context("invalid LSP URI")?,
     );
-    let mut bytes = Vec::with_capacity(encoded.len());
-    let raw = encoded.as_bytes();
-    let mut cursor = 0;
-    while cursor < raw.len() {
-        if raw[cursor] == b'%' {
-            anyhow::ensure!(
-                cursor + 2 < raw.len(),
-                "invalid percent escape in LSP file URI"
-            );
-            let hi = (raw[cursor + 1] as char)
-                .to_digit(16)
-                .context("invalid percent escape in LSP file URI")?;
-            let lo = (raw[cursor + 2] as char)
-                .to_digit(16)
-                .context("invalid percent escape in LSP file URI")?;
-            bytes.push(((hi << 4) | lo) as u8);
-            cursor += 3;
-        } else {
-            bytes.push(raw[cursor]);
-            cursor += 1;
-        }
-    }
-    let decoded = String::from_utf8(bytes).context("LSP file URI path is not UTF-8")?;
-    #[cfg(windows)]
-    let decoded = decoded
-        .strip_prefix('/')
-        .filter(|path| path.as_bytes().get(1) == Some(&b':'))
-        .unwrap_or(&decoded)
-        .to_owned();
-    let path = PathBuf::from(decoded);
+    // Fresh's LspManager runs under the daemon's local Authority. SSH transport
+    // translates the connection, while file URIs already name daemon paths.
+    let path = wire.to_host_path(None).context("LSP target is not a file URI")?;
     anyhow::ensure!(path.is_absolute(), "LSP file URI path is not absolute");
     Ok(path)
 }
