@@ -1684,6 +1684,7 @@ pub struct EditorPanel {
     page: Option<PageView>,
     page_request: Option<String>,
     pending_page: Option<usize>,
+    navigation_offset: Option<usize>,
     byte_offset_input: Entity<InputState>,
     draft_recovery: bool,
     transport_connected: bool,
@@ -1870,6 +1871,7 @@ impl EditorPanel {
             page: None,
             page_request: None,
             pending_page: None,
+            navigation_offset: None,
             byte_offset_input,
             draft_recovery: false,
             transport_connected: true,
@@ -2007,6 +2009,7 @@ impl EditorPanel {
             self.editor.update(cx, |state, cx| state.set_scroll_offset(point(px(0.), px(0.)), cx));
             self.dirty = dirty || self.conflict;
             self.lsp_status = Some("Paged file · line numbers and Find refer to this page".into());
+            self.apply_navigation_offset(window, cx);
             self.flush_pending(cx);
             cx.notify();
         } else if self.edit_request_id.as_deref() == Some(request_id) || self.sync_request_id.as_deref() == Some(request_id) {
@@ -2067,6 +2070,12 @@ impl EditorPanel {
 
     pub(crate) fn queue_lsp(&mut self, feature: LspRequestFeature, offset: usize,
         trigger_character: Option<String>, text: String, cx: &mut Context<Self>) -> async_channel::Receiver<LspResult> {
+        self.queue_lsp_payload(feature, offset, trigger_character, text, None, cx)
+    }
+
+    pub(crate) fn queue_lsp_payload(&mut self, feature: LspRequestFeature, offset: usize,
+        trigger_character: Option<String>, text: String, item: Option<serde_json::Value>,
+        cx: &mut Context<Self>) -> async_channel::Receiver<LspResult> {
         let (reply, receiver) = async_channel::bounded(1);
         if !self.lsp_requests || !self.transport_connected || self.closed || self.page.is_some()
             || self.conflict || self.sync_paused || self.markdown_preview || self.current_text(cx) != text {
@@ -2086,7 +2095,7 @@ impl EditorPanel {
         self.lsp_request_tracker.start(feature, request_id);
         self.pending_lsp.push(PendingLsp {
             request: LspRequest { request_id, buffer_id: self.buffer_id.clone(), view_id: self.view_id.clone(),
-                base_rev: self.rev, offset, feature, trigger_character, item: None, server: None },
+                base_rev: self.rev, offset, feature, trigger_character, item, server: None },
             text, sent: false, reply,
         });
         // Flush typing first; the request is sent only after its exact draft is acknowledged.
@@ -2215,6 +2224,70 @@ impl EditorPanel {
                 });
             }
         }).detach();
+    }
+
+    /// Absolute byte locations work for both normal buffers and paged views.
+    pub(crate) fn navigation_location(&self, cx: &App) -> fresh_gui_client::navigation::EditorLocation {
+        fresh_gui_client::navigation::EditorLocation {
+            path: self.path.clone(), buffer_id: Some(self.buffer_id.clone()), view_id: self.view_id.clone(),
+            offset: self.page.as_ref().map_or(0, |page| page.start) + self.byte_selection(cx).head,
+        }
+    }
+
+    pub(crate) fn navigation_snapshot(&self, cx: &App) -> (String, usize) {
+        (self.current_text(cx), self.byte_selection(cx).head)
+    }
+
+    pub(crate) fn cancel_navigation(&mut self) {
+        let mut retained = Vec::new();
+        for pending in self.pending_lsp.drain(..) {
+            if super::workspace::navigation_feature(pending.request.feature) {
+                self.lsp_request_tracker.cancel(pending.request.feature);
+                if pending.sent { self.ade.send(AdeCmd::LspCancel {
+                    request_id: pending.request.request_id, buffer_id: pending.request.buffer_id,
+                    view_id: pending.request.view_id }); }
+            } else { retained.push(pending); }
+        }
+        // Invalidate replies that have already arrived but await presentation.
+        for feature in [LspRequestFeature::Definition, LspRequestFeature::Declaration,
+            LspRequestFeature::TypeDefinition, LspRequestFeature::Implementation,
+            LspRequestFeature::References, LspRequestFeature::DocumentSymbols, LspRequestFeature::WorkspaceSymbols] {
+            self.lsp_request_tracker.cancel(feature);
+        }
+        self.pending_lsp = retained;
+    }
+
+    pub(crate) fn reveal_byte(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigation_offset = Some(offset);
+        self.pending = None;
+        self.markdown_preview = false;
+        if let Some(page) = &self.page {
+            let end = page.start + self.current_text(cx).len();
+            if self.page_request.is_some() { return; }
+            if offset < page.start || offset >= end {
+                self.navigate_page(offset.saturating_sub(PAGE_VIEW_BYTES / 4), cx);
+                return;
+            }
+        } else if self.edit_sync.is_none() && self.range_edits {
+            return; // Initial snapshot will reveal it.
+        }
+        self.apply_navigation_offset(window, cx);
+    }
+
+    fn apply_navigation_offset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(offset) = self.navigation_offset else { return; };
+        let start = self.page.as_ref().map_or(0, |page| page.start);
+        if self.page.is_some() && (offset < start || offset > start + self.current_text(cx).len()) {
+            self.navigate_page(offset.saturating_sub(PAGE_VIEW_BYTES / 4), cx);
+            return;
+        }
+        self.navigation_offset = None;
+        let offset = offset.saturating_sub(start).min(self.current_text(cx).len());
+        self.editor.update(cx, |editor, cx| {
+            editor.set_selected_range(offset..offset, cx);
+            editor.focus(window, cx);
+        });
+        cx.notify();
     }
 
     pub fn configure_range_edits(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -2864,6 +2937,7 @@ impl EditorPanel {
             self.editor
                 .update(cx, |state, cx| state.set_cursor_position(pos, window, cx));
         }
+        self.apply_navigation_offset(window, cx);
     }
 
     pub fn apply_edit_result(
@@ -3773,6 +3847,24 @@ impl Render for EditorPanel {
                     })
                     .child(
                         Editor::new(&self.editor)
+                            .context_menu(|menu, _, _| {
+                                use super::actions::*;
+                                use gpui_kit::component::input::{Cut, Copy, Paste, Undo, Redo};
+                                menu.menu("Go to Definition", Box::new(GoToDefinition))
+                                    .menu("Go to Declaration", Box::new(GoToDeclaration))
+                                    .menu("Go to Type Definition", Box::new(GoToTypeDefinition))
+                                    .menu("Go to Implementation", Box::new(GoToImplementation))
+                                    .menu("Find References", Box::new(FindReferences))
+                                    .menu("Document Symbols", Box::new(DocumentSymbols))
+                                    .menu("Workspace Symbols", Box::new(WorkspaceSymbols))
+                                    .separator()
+                                    .menu("Navigate Back", Box::new(NavigateBack))
+                                    .menu("Navigate Forward", Box::new(NavigateForward))
+                                    .separator()
+                                    .menu("Cut", Box::new(Cut)).menu("Copy", Box::new(Copy))
+                                    .menu("Paste", Box::new(Paste)).separator()
+                                    .menu("Undo", Box::new(Undo)).menu("Redo", Box::new(Redo))
+                            })
                             .disabled(self.search.review.is_some() || self.page_request.is_some() || (self.page.is_some() && self.sync_request_id.is_some()))
                             .bordered(false)
                             .p_0()

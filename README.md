@@ -74,6 +74,9 @@ Fresh GUI uses Fresh's configurable language server support. Set `lsp` in Settin
 
 Diagnostics appear in the editor's Problems list, with a click taking you to the reported line. In a normal editor buffer, the default shortcuts are **Ctrl+Space** for completion, **Ctrl+K Ctrl+I** for hover, and **Ctrl+Shift+Space** for signature help. These commands are also available in the command palette. Choose a completion with the arrow keys and **Enter**; **Esc** dismisses language help. Completion applies the server's text edits and auto-import edits together as one undoable Fresh transaction. Fresh expands snippet defaults and choices and places the cursor at `$0`; snippet tab-stop navigation is not available. Use **Format** above the editor to request LSP formatting, then save the result. A missing server command appears in the editor status and daemon log. These interactive requests are unavailable for paged files above 2 MiB so they do not materialize the full document.
 
+Symbol navigation is available from the command palette and editor context menu: **F12** opens definitions, **Ctrl+K F12** declarations, **Ctrl+K Ctrl+F12** type definitions, **Ctrl+F12** implementations, and **Shift+F12** references. **Ctrl+Shift+O** lists document symbols; **Ctrl+K Ctrl+T** searches workspace symbols through the current editor's language servers. Multiple destinations use a searchable picker with arrow keys and Enter; Cancel or Esc dismisses it. Missing servers, unsupported methods, empty results, and errors appear without blocking typing. **Alt+Left / Alt+Right** restore byte positions across files and panes. Destinations open on the daemon, including Linux files from a Windows SSH client and paged large files. Starting symbol requests from a paged buffer remains unavailable.
+
+
 For example, Tombi provides TOML diagnostics and formatting, while Ruff and TY can run together for Python:
 
 ```jsonc
