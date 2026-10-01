@@ -3,6 +3,7 @@
 pub mod edit_sync;
 pub mod lsp_sync;
 pub mod search;
+pub mod navigation;
 
 use std::time::Duration;
 
