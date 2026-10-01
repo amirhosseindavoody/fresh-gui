@@ -1947,6 +1947,26 @@ impl EditorPanel {
         &self.buffer_id
     }
 
+    pub(crate) fn revision(&self) -> u64 { self.rev }
+    pub(crate) fn navigation_selection(&self, cx: &App) -> ByteSelection { self.byte_selection(cx) }
+    pub(crate) fn cancel_workspace_lsp(&mut self) {
+        let features = [LspRequestFeature::PrepareRename, LspRequestFeature::Rename, LspRequestFeature::CodeActions, LspRequestFeature::CodeActionResolve, LspRequestFeature::ExecuteCommand];
+        for feature in features {
+            self.lsp_request_tracker.cancel(feature);
+            let mut retained = Vec::new();
+            for pending in self.pending_lsp.drain(..) {
+                if pending.request.feature == feature {
+                    if pending.sent { self.ade.send(AdeCmd::LspCancel { request_id: pending.request.request_id, buffer_id: pending.request.buffer_id, view_id: pending.request.view_id }); }
+                } else { retained.push(pending); }
+            }
+            self.pending_lsp = retained;
+        }
+    }
+    pub(crate) fn apply_workspace_edit_snapshot(&mut self, rev: u64, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        let diagnostics = self.diagnostics.clone();
+        self.set_lsp_state(rev, Some(text), diagnostics, None, window, cx);
+    }
+
     pub fn begin_paged(&mut self, rev: u64, total_bytes: usize, path: String, dirty: bool, cx: &mut Context<Self>) {
         self.cancel_lsp_requests();
         self.editor.update(cx, |editor, cx| editor.dismiss_lsp_overlays(cx));
@@ -2078,6 +2098,14 @@ impl EditorPanel {
     pub(crate) fn queue_lsp_payload(&mut self, feature: LspRequestFeature, offset: usize,
         trigger_character: Option<String>, text: String, item: Option<serde_json::Value>,
         cx: &mut Context<Self>) -> async_channel::Receiver<LspResult> {
+        self.queue_lsp_target(feature, offset, trigger_character, text, item, None, cx)
+    }
+
+    // Preserve the existing request bridge arguments while adding provider targeting.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn queue_lsp_target(&mut self, feature: LspRequestFeature, offset: usize,
+        trigger_character: Option<String>, text: String, item: Option<serde_json::Value>, server: Option<String>,
+        cx: &mut Context<Self>) -> async_channel::Receiver<LspResult> {
         let (reply, receiver) = async_channel::bounded(1);
         if !self.lsp_requests || !self.transport_connected || self.closed || self.page.is_some()
             || self.conflict || self.sync_paused || self.markdown_preview || self.current_text(cx) != text {
@@ -2097,7 +2125,7 @@ impl EditorPanel {
         self.lsp_request_tracker.start(feature, request_id);
         self.pending_lsp.push(PendingLsp {
             request: LspRequest { request_id, buffer_id: self.buffer_id.clone(), view_id: self.view_id.clone(),
-                base_rev: self.rev, offset, feature, trigger_character, item, server: None },
+                base_rev: self.rev, offset, feature, trigger_character, item, server },
             text, sent: false, reply,
         });
         // Flush typing first; the request is sent only after its exact draft is acknowledged.

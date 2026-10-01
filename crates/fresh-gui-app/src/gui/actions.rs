@@ -45,6 +45,8 @@ actions!(
         NewFile,
         SplitTerminal,
         FormatDocument,
+        RenameSymbol,
+        CodeActions,
         Complete,
         ShowHover,
         SignatureHelp,
@@ -154,6 +156,8 @@ pub fn apply_shortkeys(cx: &mut App, shortkeys: &[Shortkey]) {
             "NavigateForward" => KeyBinding::new(key, NavigateForward, when),
             "FormatDocument" => KeyBinding::new(key, FormatDocument, when),
             "SearchProject" => KeyBinding::new(key, SearchProject, when),
+            "RenameSymbol" => KeyBinding::new(key, RenameSymbol, when),
+            "CodeActions" => KeyBinding::new(key, CodeActions, when),
             "FindInBuffer" => KeyBinding::new(key, FindInBuffer, when),
             "ReplaceInBuffer" => KeyBinding::new(key, ReplaceInBuffer, when),
             "QueryReplace" => KeyBinding::new(key, QueryReplace, when),
@@ -213,6 +217,8 @@ pub fn apply_shortkeys(cx: &mut App, shortkeys: &[Shortkey]) {
     cx.bind_keys([
         KeyBinding::new("tab", TerminalInputTab, Some("Terminal")),
         KeyBinding::new("shift-tab", TerminalInputBacktab, Some("Terminal")),
+        KeyBinding::new("f2", RenameSymbol, Some("Editor")),
+        KeyBinding::new("ctrl-.", CodeActions, Some("Editor")),
     ]);
 }
 
@@ -224,6 +230,8 @@ pub fn known_action(action: &str) -> bool {
             | "NewFile"
             | "SplitTerminal"
             | "FormatDocument"
+            | "RenameSymbol"
+            | "CodeActions"
             | "Complete"
             | "ShowHover"
             | "SignatureHelp"

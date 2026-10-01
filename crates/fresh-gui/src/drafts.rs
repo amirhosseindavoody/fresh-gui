@@ -214,6 +214,28 @@ impl DraftStore {
         Ok(self.read(workspace_id)?.drafts)
     }
 
+    /// Paths held by recovery records in any workspace. Multi-file operations
+    /// must not bypass a dirty buffer simply because its workspace is detached.
+    pub(crate) fn protected_paths(&self) -> Result<Vec<PathBuf>> {
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error).context("inspect recovery records before workspace edit"),
+        };
+        let mut paths = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            if name.ends_with(".json.bak") {
+                if path.with_extension("").exists() { continue; }
+            } else if !name.ends_with(".json") { continue; }
+            let state: DraftFile = serde_json::from_slice(&std::fs::read(&path)?)
+                .with_context(|| format!("inspect recovery record {}", path.display()))?;
+            paths.extend(state.drafts.into_iter().filter_map(|draft| draft.path.map(PathBuf::from)));
+        }
+        Ok(paths)
+    }
+
     pub fn get(&self, workspace_id: &str, draft_id: &str) -> Result<Option<Draft>> {
         Ok(self
             .read(workspace_id)?
@@ -247,6 +269,21 @@ impl DraftStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protected_paths_include_detached_workspaces_and_backup_recovery() {
+        let root = std::env::temp_dir().join(format!("draft-protection-{}", uuid::Uuid::new_v4()));
+        let store = DraftStore::new(root.clone());
+        let path = root.join("source.txt");
+        store.checkpoint("detached", Draft { draft_id: "dirty".into(), path: Some(path.display().to_string()), text: "draft".into(), base_text: Some("base".into()), paged: None }).unwrap();
+        assert_eq!(store.protected_paths().unwrap(), vec![path.clone()]);
+        let record = store.path("detached");
+        std::fs::rename(&record, record.with_extension("json.bak")).unwrap();
+        assert_eq!(store.protected_paths().unwrap(), vec![path]);
+        std::fs::write(&record, b"broken").unwrap();
+        assert!(store.protected_paths().is_err(), "unreadable recovery records block destructive workspace edits");
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn drafts_are_atomic_persistent_and_workspace_scoped() {

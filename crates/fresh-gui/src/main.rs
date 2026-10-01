@@ -10,6 +10,7 @@ mod daemon;
 mod drafts;
 mod editor_fs;
 mod editor_worker;
+mod workspace_transaction;
 mod fs;
 mod fs_watch;
 mod git;
@@ -307,6 +308,8 @@ async fn run_server_foreground(args: ServeArgs, write_session_meta: bool) -> Res
             recovery_dir,
         )
     };
+
+    if let Some(editor) = &editor { editor.set_workspace_authority(fs_root.clone()); }
 
     let sessions = SessionStore::new();
     let workspaces = match workspaces_state_path(paths.as_ref()) {

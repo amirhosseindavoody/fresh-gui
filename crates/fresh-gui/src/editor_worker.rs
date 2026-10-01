@@ -23,6 +23,12 @@ use fresh_gui_protocol::{
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
+mod workspace_edits;
+#[cfg(test)]
+mod workspace_edit_tests;
+pub(crate) use workspace_edits::WorkspaceNotice;
+use workspace_edits::WorkspaceEdits;
+
 const MAX_PAGE_BYTES: usize = 64 * 1024;
 const MAX_PAGED_RECOVERY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROJECT_BUFFER_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
@@ -317,6 +323,17 @@ enum Cmd {
         resolution: ExternalResolution,
         reply: oneshot::Sender<Result<BufferTransactionResult>>,
     },
+    WorkspaceAuthority(crate::fs::FsRoot),
+    WorkspaceCancelOwner(String),
+    WorkspacePrepare {
+        buffer_id: String, base_rev: u64, owner: String, edit: serde_json::Value,
+        reply: oneshot::Sender<Result<fresh_gui_protocol::WorkspaceEditPreview>>,
+    },
+    WorkspaceApply {
+        buffer_id: String, owner: String, token: String,
+        reply: oneshot::Sender<Result<Vec<fresh_gui_protocol::WorkspaceBufferUpdate>>>,
+    },
+    WorkspaceCancel { buffer_id: String, owner: String, token: String },
     LspRequest {
         request: LspRequest,
     },
@@ -343,9 +360,33 @@ pub struct EditorHandle {
     tx: mpsc::UnboundedSender<Cmd>,
     external_tx: tokio::sync::broadcast::Sender<ExternalChange>,
     lsp_tx: tokio::sync::broadcast::Sender<LspResult>,
+    workspace_tx: tokio::sync::broadcast::Sender<WorkspaceNotice>,
 }
 
 impl EditorHandle {
+    pub(crate) fn set_workspace_authority(&self, authority: crate::fs::FsRoot) {
+        let _ = self.tx.send(Cmd::WorkspaceAuthority(authority));
+    }
+    pub(crate) fn cancel_workspace_owner(&self, owner: &str) {
+        let _ = self.tx.send(Cmd::WorkspaceCancelOwner(owner.to_owned()));
+    }
+
+    pub(crate) fn subscribe_workspace_edits(&self) -> tokio::sync::broadcast::Receiver<WorkspaceNotice> { self.workspace_tx.subscribe() }
+
+    pub(crate) async fn prepare_workspace_edit(&self, buffer_id: String, base_rev: u64, owner: String, edit: serde_json::Value) -> Result<fresh_gui_protocol::WorkspaceEditPreview> {
+        let (reply, receive) = oneshot::channel();
+        self.tx.send(Cmd::WorkspacePrepare { buffer_id, base_rev, owner, edit, reply }).map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        receive.await.context("editor worker stopped")?
+    }
+    pub(crate) async fn apply_workspace_edit(&self, buffer_id: String, owner: String, token: String) -> Result<Vec<fresh_gui_protocol::WorkspaceBufferUpdate>> {
+        let (reply, receive) = oneshot::channel();
+        self.tx.send(Cmd::WorkspaceApply { buffer_id, owner, token, reply }).map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        receive.await.context("editor worker stopped")?
+    }
+    pub(crate) fn cancel_workspace_edit(&self, buffer_id: String, owner: String, token: String) -> Result<()> {
+        self.tx.send(Cmd::WorkspaceCancel { buffer_id, owner, token }).map_err(|_| anyhow::anyhow!("editor worker stopped"))
+    }
+
     pub fn subscribe_lsp(&self) -> tokio::sync::broadcast::Receiver<LspResult> {
         self.lsp_tx.subscribe()
     }
@@ -419,6 +460,8 @@ impl EditorHandle {
         let (tx, rx) = mpsc::unbounded_channel::<Cmd>();
         let (external_tx, _) = tokio::sync::broadcast::channel(128);
         let (lsp_tx, _) = tokio::sync::broadcast::channel(256);
+        let (workspace_tx, _) = tokio::sync::broadcast::channel(128);
+        let worker_workspace = workspace_tx.clone();
         let worker_external = external_tx.clone();
         let worker_lsp = lsp_tx.clone();
         let dir_for_log = working_dir.clone();
@@ -434,6 +477,7 @@ impl EditorHandle {
                         DraftStore::new(recovery_dir),
                         worker_external,
                         worker_lsp,
+                        worker_workspace,
                     );
                 }
                 Err(err) => {
@@ -449,6 +493,7 @@ impl EditorHandle {
                     tx,
                     external_tx,
                     lsp_tx,
+                    workspace_tx,
                 })
             }
             Ok(Err(err)) => {
@@ -847,6 +892,7 @@ fn run_loop(
     drafts: DraftStore,
     external_tx: tokio::sync::broadcast::Sender<ExternalChange>,
     lsp_tx: tokio::sync::broadcast::Sender<LspResult>,
+    workspace_tx: tokio::sync::broadcast::Sender<WorkspaceNotice>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -874,6 +920,9 @@ fn run_loop(
         request_ids: HashMap::new(),
         aggregates: HashMap::new(),
         results: lsp_tx,
+        edits: WorkspaceEdits::with_authority(crate::fs::FsRoot::new(editor.working_dir().to_path_buf()).ok()),
+        drafts: drafts.clone(),
+        workspace_tx,
     };
 
     // Borrow editor/tracked into the future (no `async move`) so `Editor` is
@@ -1093,8 +1142,23 @@ fn run_loop(
                     };
                     let _ = reply.send(result);
                 }
+                Cmd::WorkspaceAuthority(authority) => { lsp_bridge.edits.authority = Some(authority); }
+                Cmd::WorkspaceCancelOwner(owner) => { lsp_bridge.edits.cancel_owner(&owner); }
+                Cmd::WorkspacePrepare { buffer_id, base_rev, owner, edit, reply } => {
+                    let result = lsp_bridge.edits.claim(&buffer_id, base_rev, &owner, &edit);
+                    let _ = reply.send(result);
+                }
+                Cmd::WorkspaceApply { buffer_id, owner, token, reply } => {
+                    let result = lsp_bridge.edits.apply(&mut editor, &mut tracked, &drafts, &buffer_id, &owner, &token)
+                        .map(|(workspace_id, updates)| {
+                            let _ = lsp_bridge.workspace_tx.send(WorkspaceNotice::Applied { workspace_id, updates: updates.clone() });
+                            updates
+                        });
+                    let _ = reply.send(result);
+                }
+                Cmd::WorkspaceCancel { buffer_id, owner, token } => { lsp_bridge.edits.cancel(&buffer_id, &owner, &token); }
                 Cmd::LspRequest { request } => {
-                    match sync_fresh_text(&editor, &mut tracked, &request.buffer_id) {
+                    match sync_all_fresh_text(&editor, &mut tracked) {
                         Ok(_) => begin_lsp_request(&mut editor, &tracked, request, &mut lsp_bridge),
                         Err(error) => send_lsp_status(&lsp_bridge.results, &request, &error.to_string(), true),
                     }
@@ -1427,6 +1491,7 @@ struct LspAggregate {
     signature_triggers: Vec<String>,
     deadline: tokio::time::Instant,
     status: Option<String>,
+    revisions: HashMap<String, u64>,
 }
 
 struct LspBridgeState {
@@ -1435,6 +1500,9 @@ struct LspBridgeState {
     request_ids: HashMap<u64, Vec<u64>>,
     aggregates: HashMap<u64, LspAggregate>,
     results: tokio::sync::broadcast::Sender<LspResult>,
+    edits: WorkspaceEdits,
+    drafts: DraftStore,
+    workspace_tx: tokio::sync::broadcast::Sender<WorkspaceNotice>,
 }
 
 fn begin_lsp_request(
@@ -1443,6 +1511,11 @@ fn begin_lsp_request(
     request: LspRequest,
     bridge: &mut LspBridgeState,
 ) {
+    let mut request = request;
+    if let Some(item) = request.item.as_mut().and_then(serde_json::Value::as_object_mut) {
+        if request.server.is_none() { request.server = item.remove("_fresh_gui_server").and_then(|v| v.as_str().map(str::to_owned)); }
+        else { item.remove("_fresh_gui_server"); }
+    }
     if request.view_id.is_empty() {
         send_lsp_status(&bridge.results, &request, "view_id cannot be empty", false);
         return;
@@ -1474,6 +1547,10 @@ fn begin_lsp_request(
             &request.view_id,
             bridge,
         );
+    }
+    if matches!(request.feature, LspRequestFeature::Rename | LspRequestFeature::CodeActions | LspRequestFeature::CodeActionResolve)
+        && let Some((owner, _)) = request.view_id.split_once(':') {
+        bridge.edits.cancel_source_owner(&request.buffer_id, owner);
     }
     let LspBridgeState {
         pending,
@@ -1561,26 +1638,17 @@ fn begin_lsp_request(
         return;
     }
 
-    let route_feature = match request.feature {
-        LspRequestFeature::Capabilities
-        | LspRequestFeature::Completion
-        | LspRequestFeature::CompletionResolve => LspFeature::Completion,
-        LspRequestFeature::Hover => LspFeature::Hover,
-        LspRequestFeature::SignatureHelp => LspFeature::SignatureHelp,
-        LspRequestFeature::Definition
-        | LspRequestFeature::Declaration
-        | LspRequestFeature::TypeDefinition => LspFeature::Definition,
-        LspRequestFeature::Implementation => LspFeature::Implementation,
-        LspRequestFeature::References => LspFeature::References,
-        LspRequestFeature::DocumentSymbols => LspFeature::DocumentSymbols,
-        LspRequestFeature::WorkspaceSymbols => LspFeature::WorkspaceSymbols,
-    };
+    let route_feature = lsp_route_feature(request.feature);
     let lsp = &editor.active_window().lsp;
     let mut eligible = lsp
         .handles_for_feature(language, route_feature)
         .into_iter()
         .filter(|server| {
             (uri.is_some() || request.feature == LspRequestFeature::WorkspaceSymbols)
+                && (!matches!(request.feature, LspRequestFeature::Rename | LspRequestFeature::CodeActionResolve | LspRequestFeature::ExecuteCommand)
+                    || request.server.as_deref() == Some(server.name.as_str()))
+                && (request.feature != LspRequestFeature::CodeActionResolve || server.capabilities.code_action_resolve)
+                && (request.feature != LspRequestFeature::PrepareRename || server.capabilities.rename)
                 && (request.feature != LspRequestFeature::CompletionResolve
                     || (server.name == request.server.as_deref().unwrap_or("")
                         && server.capabilities.completion_resolve))
@@ -1592,9 +1660,7 @@ fn begin_lsp_request(
             (server.name.clone(), triggers)
         })
         .collect::<Vec<_>>();
-    if request.feature == LspRequestFeature::SignatureHelp {
-        eligible.truncate(1);
-    }
+    if matches!(request.feature, LspRequestFeature::SignatureHelp | LspRequestFeature::PrepareRename | LspRequestFeature::Rename) { eligible.truncate(1); }
     if eligible.is_empty() {
         let response = if request.feature == LspRequestFeature::Completion {
             buffer_word_completions(&entry.text, request.offset)
@@ -1612,13 +1678,13 @@ fn begin_lsp_request(
             navigation_targets: Vec::new(),
             completion_triggers: all_completion_triggers,
             signature_triggers: all_signature_triggers,
-            status: if language.is_empty() && is_navigation_feature(request.feature) {
+            status: if language.is_empty() && request.feature != LspRequestFeature::Completion {
                 Some("buffer has no language mode".into())
             } else if language.is_empty() {
                 Some("buffer has no language mode; using buffer words".into())
             } else if uri.is_none() {
                 Some(
-                    if is_navigation_feature(request.feature) {
+                    if request.feature != LspRequestFeature::Completion {
                         "buffer has no file URI"
                     } else {
                         "buffer has no file URI; using buffer words"
@@ -1638,6 +1704,7 @@ fn begin_lsp_request(
         .map(|_| editor.active_window_mut().alloc_lsp_request_id())
         .collect::<Vec<_>>();
     let mut sent = Vec::new();
+    let diagnostics = uri.as_ref().and_then(|uri| editor.get_stored_diagnostics().get(uri)).cloned().unwrap_or_default();
     let manager = &mut editor.active_window_mut().lsp;
     for ((server_name, _), lsp_id) in eligible.into_iter().zip(request_ids_to_send) {
         let Some(server) = manager
@@ -1648,7 +1715,12 @@ fn begin_lsp_request(
             continue;
         };
         let method = crate::lsp_bridge::method(request.feature).to_owned();
-        let params = if request.feature == LspRequestFeature::CompletionResolve {
+        let params = if matches!(request.feature, LspRequestFeature::PrepareRename | LspRequestFeature::Rename | LspRequestFeature::CodeActions | LspRequestFeature::CodeActionResolve | LspRequestFeature::ExecuteCommand) {
+            match refactoring_params(&entry.text, uri.as_deref().unwrap_or(""), line, character, &request, &diagnostics) {
+                Ok(params) => Some(params),
+                Err(error) => { send_lsp_status(results, &request, &error.to_string(), false); continue; }
+            }
+        } else if request.feature == LspRequestFeature::CompletionResolve {
             request
                 .item
                 .clone()
@@ -1718,9 +1790,48 @@ fn begin_lsp_request(
                 signature_triggers,
                 deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(5),
                 status: None,
+                revisions: tracked.iter().map(|(id, entry)| (id.clone(), entry.rev)).collect(),
             },
         );
     }
+}
+
+fn refactoring_params(text: &str, uri: &str, line: u32, character: u32, request: &LspRequest, diagnostics: &[lsp_types::Diagnostic]) -> Result<serde_json::Value> {
+    use serde_json::json;
+    let mut params = json!({"textDocument":{"uri":uri},"position":{"line":line,"character":character}});
+    match request.feature {
+        LspRequestFeature::PrepareRename => {},
+        LspRequestFeature::Rename => {
+            let name = request.item.as_ref().and_then(|v| v.get("newName")).and_then(serde_json::Value::as_str).context("rename requires newName")?;
+            anyhow::ensure!(!name.is_empty() && name.len() <= 1024 && !name.contains(['\n', '\r']), "invalid rename name");
+            params["newName"] = json!(name);
+        }
+        LspRequestFeature::CodeActions => {
+            let start = request.item.as_ref().and_then(|v| v.get("startOffset")).and_then(serde_json::Value::as_u64).unwrap_or(request.offset as u64);
+            let end = request.item.as_ref().and_then(|v| v.get("endOffset")).and_then(serde_json::Value::as_u64).unwrap_or(request.offset as u64);
+            let (start, end) = (usize::try_from(start)?, usize::try_from(end)?);
+            anyhow::ensure!(start <= end && end <= text.len() && text.is_char_boundary(start) && text.is_char_boundary(end), "code action range is invalid");
+            let at = |offset| {
+                let prefix = &text[..offset];
+                json!({"line":prefix.bytes().filter(|b| *b == b'\n').count() as u32,
+                    "character":prefix.rsplit('\n').next().unwrap_or("").encode_utf16().count() as u32})
+            };
+            params = json!({"textDocument":{"uri":uri},"range":{"start":at(start),"end":at(end)},"context":{"diagnostics":diagnostics}});
+        }
+        LspRequestFeature::CodeActionResolve => {
+            params = request.item.clone().context("code action resolve requires an action")?;
+            let _: lsp_types::CodeAction = serde_json::from_value(params.clone()).context("invalid code action")?;
+        }
+        LspRequestFeature::ExecuteCommand => {
+            let item = request.item.as_ref().context("executeCommand requires a command")?;
+            let command = item.get("command").and_then(serde_json::Value::as_str).context("invalid command identifier")?;
+            let arguments = item.get("arguments").cloned().unwrap_or_else(|| json!([]));
+            anyhow::ensure!(arguments.is_array(), "command arguments must be an array");
+            params = json!({"command":command,"arguments":arguments});
+        }
+        _ => bail!("not a refactoring feature"),
+    }
+    Ok(params)
 }
 
 fn is_navigation_feature(feature: LspRequestFeature) -> bool {
@@ -1750,6 +1861,8 @@ fn lsp_route_feature(feature: LspRequestFeature) -> LspFeature {
         LspRequestFeature::References => LspFeature::References,
         LspRequestFeature::DocumentSymbols => LspFeature::DocumentSymbols,
         LspRequestFeature::WorkspaceSymbols => LspFeature::WorkspaceSymbols,
+        LspRequestFeature::PrepareRename | LspRequestFeature::Rename => LspFeature::Rename,
+        LspRequestFeature::CodeActions | LspRequestFeature::CodeActionResolve | LspRequestFeature::ExecuteCommand => LspFeature::CodeAction,
     }
 }
 
@@ -1938,9 +2051,34 @@ fn poll_lsp_bridge(
                         aggregate.remaining = 0;
                     } else {
                         match response {
-                            Ok(value) => aggregate
-                                .responses
-                                .push(crate::lsp_bridge::one_response(entry.server, value)),
+                            Ok(mut value) => {
+                                if entry.request.feature == LspRequestFeature::CodeActions {
+                                    for action in value.as_array_mut().into_iter().flatten() {
+                                        if action.get("disabled").is_some() { continue; }
+                                        let Some(edit) = action.get("edit").filter(|edit| edit.is_object()).cloned() else { continue; };
+                                        if let Err(error) = bridge_state.edits.offer(editor, tracked, &bridge_state.drafts,
+                                            &entry.request.buffer_id, entry.request.base_rev,
+                                            entry.request.view_id.split_once(':').map(|(owner, _)| owner.to_owned()), edit,
+                                            Some(&entry.server), &aggregate.revisions) {
+                                            action["disabled"] = serde_json::json!({"reason":format!("Workspace edit rejected: {error:#}")});
+                                        }
+                                    }
+                                }
+                                for edit in workspace_edits::response_edits(entry.request.feature, &value).into_iter().filter(|_| entry.request.feature != LspRequestFeature::CodeActions) {
+                                    if let Err(error) = bridge_state.edits.offer(editor, tracked, &bridge_state.drafts,
+                                        &entry.request.buffer_id, entry.request.base_rev,
+                                        entry.request.view_id.split_once(':').map(|(owner, _)| owner.to_owned()), edit,
+                                        Some(&entry.server), &aggregate.revisions) {
+                                        aggregate.status.get_or_insert(format!("workspace edit rejected: {error:#}"));
+                                    }
+                                }
+                                aggregate.responses.push(crate::lsp_bridge::one_response(entry.server, value));
+                            },
+                            Err(error) if entry.request.feature == LspRequestFeature::PrepareRename &&
+                                (error.to_ascii_lowercase().contains("method not found") || error.contains("-32601")) => {
+                                // prepareRename is optional even when renameProvider is true.
+                                aggregate.responses.push(crate::lsp_bridge::one_response(entry.server, serde_json::json!({"defaultBehavior":true})));
+                            }
                             Err(error) => {
                                 aggregate.status.get_or_insert(error);
                             }
@@ -1961,6 +2099,46 @@ fn poll_lsp_bridge(
                     request_ids,
                     results,
                 );
+            }
+            AsyncMessage::LspApplyEdit { edit, label: _ } => {
+                let commands = pending.values().filter(|p| p.request.feature == LspRequestFeature::ExecuteCommand).cloned().collect::<Vec<_>>();
+                let command = (commands.len() == 1).then(|| &commands[0]);
+                let touched = workspace_edits::touched_open_buffers(&edit, tracked);
+                let touched_workspaces = touched.as_ref().ok().into_iter().flatten().filter_map(|id| tracked.get(id)).map(|e| &e.workspace_id).collect::<std::collections::HashSet<_>>();
+                let all_workspaces = tracked.values().map(|e| &e.workspace_id).collect::<std::collections::HashSet<_>>();
+                let source = if touched.is_err() || touched_workspaces.len() > 1 {
+                    None
+                } else if let Some(command) = command {
+                    Some((command.request.buffer_id.clone(), command.request.base_rev))
+                } else if let Some(id) = touched.as_ref().ok().and_then(|ids| ids.first()) {
+                    tracked.get(id).map(|entry| (id.clone(), entry.rev))
+                } else if all_workspaces.len() == 1 {
+                    let active = editor.active_buffer().0.to_string();
+                    tracked.get_key_value(&active).or_else(|| tracked.iter().min_by_key(|(id, _)| *id)).map(|(id, e)| (id.clone(), e.rev))
+                } else { None };
+                if let Some((source, rev)) = source {
+                    if let Some(entry) = tracked.get(&source) {
+                        let workspace_id = entry.workspace_id.clone();
+                        let revisions = command.and_then(|c| aggregates.get(&c.request.request_id)).map(|a| a.revisions.clone())
+                            .unwrap_or_else(|| tracked.iter().map(|(id, e)| (id.clone(), e.rev)).collect());
+                        let result = serde_json::to_value(edit).context("encode server workspace edit").and_then(|edit|
+                            bridge_state.edits.offer(editor, tracked, &bridge_state.drafts, &source, rev, None, edit,
+                                command.map(|c| c.server.as_str()), &revisions));
+                        let notice = match result {
+                            Ok(preview) => WorkspaceNotice::Preview { workspace_id, preview },
+                            Err(error) => WorkspaceNotice::Rejected { workspace_id, message: format!("Server workspace edit rejected: {error:#}") },
+                        };
+                        let _ = bridge_state.workspace_tx.send(notice);
+                    }
+                } else {
+                    // Pinned Fresh doesn't attach a server identity to this callback.
+                    // Refuse ambiguous scope; never forward to its sequential applier.
+                    for workspace_id in all_workspaces {
+                        let _ = bridge_state.workspace_tx.send(WorkspaceNotice::Rejected {
+                            workspace_id: workspace_id.clone(), message: "Server workspace edit rejected: target is invalid or workspace ownership is ambiguous".into(),
+                        });
+                    }
+                }
             }
             message => {
                 if sender.send(message).is_err() {

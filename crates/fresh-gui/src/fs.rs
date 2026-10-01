@@ -115,6 +115,23 @@ impl FsRoot {
         Ok(canon)
     }
 
+    /// Synchronous authorization for the editor thread's staged workspace edits.
+    /// The path's parent was normalized by the proposal builder. Recheck it at
+    /// commit so a replaced directory cannot redirect an authorized operation.
+    pub(crate) fn validate_workspace_edit_path(&self, path: &Path) -> Result<()> {
+        anyhow::ensure!(path.is_absolute(), "workspace edit path must be absolute");
+        let parent = path.parent().context("workspace edit path has no parent")?;
+        let canonical_parent = parent.canonicalize()?;
+        anyhow::ensure!(canonical_parent == parent, "workspace edit parent changed: {}", path.display());
+        anyhow::ensure!(self.is_allowed(path), "workspace edit path escapes FS root: {}", path.display());
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => anyhow::ensure!(metadata.is_file() && !metadata.file_type().is_symlink(), "workspace edit target is not a regular file: {}", path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
     /// Kind of a symlink's target, only when it resolves inside the sandbox;
     /// a link out of the root must not look expandable.
     async fn symlink_target_kind(&self, link: &Path) -> Option<FsKind> {
@@ -559,6 +576,27 @@ async fn copy_path_recursive(from: &Path, to: &Path) -> Result<()> {
         .await
         .with_context(|| format!("copy {} → {}", from.display(), to.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod workspace_edit_authorization_tests {
+    use super::*;
+
+    #[test]
+    fn staged_edit_paths_require_authorized_regular_files_or_missing_leaves() {
+        let temp = std::env::temp_dir().join(format!("workspace-edit-authorization-{}", uuid::Uuid::new_v4()));
+        let inside = temp.join("inside"); let outside = temp.join("outside");
+        std::fs::create_dir_all(&inside).unwrap(); std::fs::create_dir_all(&outside).unwrap();
+        let root = FsRoot::new(inside.clone()).unwrap();
+        assert!(root.validate_workspace_edit_path(&inside.join("new.txt")).is_ok());
+        assert!(root.validate_workspace_edit_path(&outside.join("new.txt")).is_err());
+        assert!(root.validate_workspace_edit_path(&inside).is_err());
+        #[cfg(unix)] {
+            std::os::unix::fs::symlink(outside.join("new.txt"), inside.join("link")).unwrap();
+            assert!(root.validate_workspace_edit_path(&inside.join("link")).is_err());
+        }
+        let _ = std::fs::remove_dir_all(temp);
+    }
 }
 
 #[cfg(test)]

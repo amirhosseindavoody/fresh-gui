@@ -10,6 +10,8 @@
 
 #[path = "navigation.rs"]
 mod navigation;
+#[path = "workspace_edits.rs"]
+mod workspace_edits;
 pub(super) use navigation::navigation_feature;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -46,7 +48,7 @@ use super::actions::{SearchProject, FindInBuffer, ReplaceInBuffer, QueryReplace,
 use super::actions::{
     ClearExplorerInput, CloseAllEditors, CloseAllOtherTabs, CloseAllOtherTerminals,
     CloseAllTerminals, CloseTab, CloseWorkspace, CopyExplorer, DeleteExplorer, Disconnect, FilterExplorer,
-    GoToDefinition, GoToDeclaration, GoToTypeDefinition, GoToImplementation, FindReferences,
+    GoToDefinition, GoToDeclaration, GoToTypeDefinition, GoToImplementation, FindReferences, RenameSymbol, CodeActions,
     DocumentSymbols, WorkspaceSymbols, NavigateBack, NavigateForward,
     AskCopilot, Complete, ShowHover, SignatureHelp, FormatDocument, GoToFile, NewFile, NewTerminal, NewWorkspace, NextTab, OpenDefaultSettings, OpenSettings, PasteExplorer,
     PrevTab, QuitClient, Reconnect, RenameWorkspace, ResetContentZoom, ResetUiZoom, SaveBuffer,
@@ -976,6 +978,7 @@ pub struct Workspace {
     copilot_result: Option<String>,
     navigation: navigation::Navigation,
     navigation_state: Entity<CommandState>,
+    workspace_edits: workspace_edits::WorkspaceEdits,
     palette_open: bool,
     goto_open: bool,
     goto_input: Entity<InputState>,
@@ -1560,6 +1563,7 @@ impl Workspace {
             copilot_result: None,
             navigation: navigation::Navigation::default(),
             navigation_state,
+            workspace_edits: workspace_edits::WorkspaceEdits::default(),
             palette_open: false,
             goto_open: false,
             goto_input,
@@ -1619,6 +1623,7 @@ impl Workspace {
                 workspaces,
                 attached,
             } => {
+                workspace_edits::cancel(self, cx);
                 self.apply_hello(&hello, window, cx);
                 self.workspace_cap = hello.capabilities.iter().any(|cap| cap == CAP_WORKSPACE);
                 self.workspaces = workspaces;
@@ -1735,9 +1740,11 @@ impl Workspace {
                 }
             }
             AdeEvent::WorkspaceSwitched { attached } => {
+                workspace_edits::cancel(self, cx);
                 self.restore_workspace(*attached, window, cx);
             }
             AdeEvent::Disconnected { reason } => {
+                workspace_edits::cancel(self, cx);
                 self.clear_navigation_pending(cx);
                 self.project_search = None;
                 self.project_send_task = None;
@@ -1996,6 +2003,16 @@ impl Workspace {
                     panel.update(cx, |panel, cx| panel.apply_lsp_result(result, cx));
                 }
             }
+            AdeEvent::WorkspaceEditPreview { request_id, preview } => {
+                let mut edits = std::mem::take(&mut self.workspace_edits);
+                edits.preview(request_id, preview, self, cx);
+                self.workspace_edits = edits;
+            }
+            AdeEvent::WorkspaceEditApplied { request_id, updates } => {
+                let mut edits = std::mem::take(&mut self.workspace_edits);
+                edits.applied(request_id, updates, self, window, cx);
+                self.workspace_edits = edits;
+            }
             AdeEvent::BufferLspState { buffer_id, rev, text, diagnostics, status } => {
                 if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
                     panel.update(cx, |panel, cx| {
@@ -2011,6 +2028,7 @@ impl Workspace {
                 }
             }
             AdeEvent::Error { code, message } => {
+                let workspace_edit_error = workspace_edits::failed(self, &code, &message, cx);
                 self.navigation_open_error(&message);
                 if code.starts_with("settings_") {
                     if let Some((request_id, detail)) = split_request_message(&message) {
@@ -2061,6 +2079,8 @@ impl Workspace {
                 } else if code == "git_failed" {
                     self.git_busy = false;
                     self.status = format!("Git: {message}").into();
+                } else if workspace_edit_error {
+                    self.status = format!("Workspace edit failed: {message}").into();
                 } else {
                     // A folder saved as open may be gone now; its failed listing
                     // is not a reason to abandon reopening the workspace's tabs.
@@ -2495,6 +2515,7 @@ impl Workspace {
             if !self.terminals.contains_key(pty_id) {
                 return;
             }
+            self.cancel_workspace_edits_later(cx);
             self.active = Some(ActiveSurface::Terminal(pty_id.to_string()));
             let key = self.workspace_id_or_empty();
             let order = self.terminal_mru.entry(key).or_default();
@@ -2525,6 +2546,11 @@ impl Workspace {
 
     pub(crate) fn note_editor_active(&mut self, path: &str, active: bool, cx: &mut Context<Self>) {
         if active {
+            let next_buffer = self.editors.get(path).map(|panel| panel.read(cx).buffer_id().to_owned());
+            let source_buffer = self.workspace_edits.source.as_ref().map(|panel| panel.read(cx).buffer_id().to_owned());
+            if next_buffer.is_some() && source_buffer.is_some() && next_buffer != source_buffer {
+                self.cancel_workspace_edits_later(cx);
+            }
             self.active = Some(ActiveSurface::Editor(path.to_string()));
             if let Some(id) = self.active_panel_id() {
                 self.last_saved_panel = Some(id);
@@ -2536,6 +2562,15 @@ impl Workspace {
             self.active = None;
         }
         cx.notify();
+    }
+
+    fn cancel_workspace_edits_later(&mut self, cx: &mut Context<Self>) {
+        if self.workspace_edits.source.is_some() && !self.workspace_edits.server_initiated {
+            let workspace = cx.entity();
+            cx.defer(move |cx| {
+                workspace.update(cx, workspace_edits::cancel);
+            });
+        }
     }
 
     pub(crate) fn forget_terminal(&mut self, pty_id: &str, cx: &mut Context<Self>) {
@@ -4405,6 +4440,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
 
     pub(crate) fn note_diff_active(&mut self, rel: &str, active: bool, cx: &mut Context<Self>) {
         if active {
+            self.cancel_workspace_edits_later(cx);
             self.active = Some(ActiveSurface::Diff(rel.to_string()));
         } else if matches!(&self.active, Some(ActiveSurface::Diff(current)) if current == rel) {
             self.active = None;
@@ -4472,6 +4508,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
 
     pub(crate) fn note_binary_active(&mut self, path: &str, active: bool, cx: &mut Context<Self>) {
         if active {
+            self.cancel_workspace_edits_later(cx);
             self.active = Some(ActiveSurface::Binary(path.to_string()));
         } else if matches!(&self.active, Some(ActiveSurface::Binary(current)) if current == path) {
             self.active = None;
@@ -5488,6 +5525,13 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
 
     fn on_format_document(&mut self, _: &FormatDocument, window: &mut Window, cx: &mut Context<Self>) {
         self.format_active(window, cx);
+    }
+
+    fn on_rename_symbol(&mut self, _: &RenameSymbol, window: &mut Window, cx: &mut Context<Self>) {
+        workspace_edits::begin_rename(self, window, cx);
+    }
+    fn on_code_actions(&mut self, _: &CodeActions, window: &mut Window, cx: &mut Context<Self>) {
+        workspace_edits::begin_code_actions(self, window, cx);
     }
 
     fn on_toggle_pin_tab(&mut self, _: &TogglePinTab, _: &mut Window, cx: &mut Context<Self>) {
@@ -6902,6 +6946,8 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             ("Navigate Back", Box::new(NavigateBack)),
             ("Navigate Forward", Box::new(NavigateForward)),
             ("Format Document", Box::new(FormatDocument)),
+            ("Rename Symbol", Box::new(RenameSymbol)),
+            ("Code Actions", Box::new(CodeActions)),
             ("Find in Buffer", Box::new(FindInBuffer)),
             ("Replace in Buffer", Box::new(ReplaceInBuffer)),
             ("Query Replace", Box::new(QueryReplace)),
@@ -7444,6 +7490,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_signature_help))
             .on_action(cx.listener(Self::on_format_document))
             .on_action(cx.listener(Self::on_search_project))
+            .on_action(cx.listener(Self::on_rename_symbol))
+            .on_action(cx.listener(Self::on_code_actions))
             .on_action(cx.listener(Self::on_find_in_buffer))
             .on_action(cx.listener(Self::on_replace_in_buffer))
             .on_action(cx.listener(Self::on_query_replace))
@@ -7588,6 +7636,7 @@ impl Render for Workspace {
                 this.child(self.render_rename(cx))
             })
             .when(self.save_open, |this| this.child(self.render_save(cx)))
+            .when(self.workspace_edits.open, |this| this.child(self.workspace_edits.render(cx)))
             .children(dialog_layer)
             .children(notification_layer)
     }
