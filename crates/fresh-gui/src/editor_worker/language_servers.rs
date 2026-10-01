@@ -39,6 +39,21 @@ pub(super) fn language_servers(
             // Language-level shutdown marks this language disabled so a
             // subsequent edit or buffer activation cannot auto-respawn it.
             let _ = editor.active_window_mut().lsp.shutdown_server(language);
+            // Fresh's stop action also disables auto-start for this runtime
+            // configuration. This covers the case where no process handle was
+            // alive when Stop was requested, so shutdown_server had nothing to
+            // mark as explicitly disabled.
+            let stopped_configs = configs
+                .iter()
+                .cloned()
+                .map(|mut config| {
+                    config.auto_start = false;
+                    config
+                })
+                .collect();
+            editor
+                .active_window_mut()
+                .set_lsp_config(language.to_string(), stopped_configs);
         } else {
             let globally_enabled = editor.config().lsp_enabled;
             for config in &configs {
