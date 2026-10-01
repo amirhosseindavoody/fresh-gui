@@ -39,7 +39,7 @@ pub(super) fn language_servers(
                 LanguageServerAction::Status => unreachable!(),
                 LanguageServerAction::Start => {
                     if !manager_has_language_server(editor, language, &name) {
-                        let command = config.command.split_whitespace().next().unwrap_or("");
+                        let command = executable(&config.command);
                         if command.is_empty()
                             || !editor
                                 .active_window()
@@ -61,7 +61,7 @@ pub(super) fn language_servers(
                         .shutdown_server_by_name(language, &name);
                 }
                 LanguageServerAction::Restart => {
-                    let command = config.command.split_whitespace().next().unwrap_or("");
+                    let command = executable(&config.command);
                     if command.is_empty()
                         || !editor
                             .active_window()
@@ -93,7 +93,7 @@ pub(super) fn language_servers(
         } else if command.is_empty() {
             "missing command: configure an executable in language-server settings".to_string()
         } else {
-            let executable = command.split_whitespace().next().unwrap_or("");
+            let executable = executable(&command);
             if !executable.is_empty() && !manager.command_exists_via_authority(executable) {
                 format!("missing binary: install `{executable}` or update its configured command")
             } else {
@@ -134,16 +134,15 @@ fn client_status(state: LspClientState) -> String {
     .to_string()
 }
 
+fn executable(command: &str) -> &str {
+    command.split_whitespace().next().unwrap_or("")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn executable_name_is_taken_from_configured_command() {
-        assert_eq!(executable("rust-analyzer --stdio"), "rust-analyzer");
-        assert_eq!(executable(""), "");
-    }
-
     #[test]
     fn client_lifecycle_states_are_reported() {
         assert_eq!(client_status(LspClientState::Initializing), "initializing");
@@ -151,7 +150,8 @@ mod tests {
         assert_eq!(client_status(LspClientState::Error), "error");
     }
 
-    fn executable(command: &str) -> &str {
-        command.split_whitespace().next().unwrap_or("")
+    fn configured_executable_is_extracted_for_actionable_status() {
+        assert_eq!(executable("rust-analyzer --stdio"), "rust-analyzer");
+        assert_eq!(executable(""), "");
     }
 }
