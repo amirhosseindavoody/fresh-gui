@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use alacritty_terminal::vte::ansi::CursorShape;
 use fresh_gui_client::edit_sync::{EditSync, SnapshotReconciliation, contiguous_diff, external_reconciliation, ExternalSnapshotReconciliation};
-use fresh_gui_protocol::{BufferDiagnostic, ByteRange, ByteSelection, EditorAction, ExternalResolution, MAX_PAGE_BYTES};
+use fresh_gui_protocol::{BufferDiagnostic, BufferFileMetadata, ByteRange, ByteSelection, EditorAction, ExternalResolution, FileControlOperation, MAX_PAGE_BYTES};
 use fresh_gui_protocol::{LspRequest, LspRequestFeature, LspResult};
 
 use gpui_kit::base::ElementExt as _;
@@ -1658,6 +1658,16 @@ pub struct EditorPanel {
     search: editor_search::SearchUi,
     buffer_id: String,
     path: String,
+    file_metadata: Option<BufferFileMetadata>,
+    file_control_mode: Option<FileControlMode>,
+    file_control_request: Option<String>,
+    file_control_operation: Option<FileControlOperation>,
+    save_after_file_control: bool,
+    file_controls_supported: bool,
+    auto_save_epoch: u64,
+    auto_save_elapsed: u64,
+    auto_save_poll_elapsed: u8,
+    auto_save_paused: bool,
     /// Buffer has no file yet. `path` is a client key, not a disk path.
     unsaved: bool,
     /// Tab title while `unsaved` (`Untitled`, `Untitled 2`, …).
@@ -1733,6 +1743,9 @@ pub struct EditorPanel {
     _subscription: Subscription,
     _lsp_observer: Subscription,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileControlMode { Inspect, ReopenWithEncoding, SaveWithEncoding, ChangeLineEndings }
 
 fn reload_response_can_replace(sent_draft: &str, current_draft: &str) -> bool {
     sent_draft == current_draft
@@ -1849,6 +1862,16 @@ impl EditorPanel {
             search,
             buffer_id,
             path,
+            file_metadata: None,
+            file_control_mode: None,
+            file_control_request: None,
+            file_control_operation: None,
+            save_after_file_control: false,
+            file_controls_supported: false,
+            auto_save_epoch: 0,
+            auto_save_elapsed: 0,
+            auto_save_poll_elapsed: 0,
+            auto_save_paused: false,
             unsaved,
             unsaved_title,
             dirty: false,
@@ -2592,6 +2615,7 @@ impl EditorPanel {
             || self.save_request_id.is_some()
             || self.sync_request_id.is_some()
             || self.format_inflight
+            || (self.file_control_request.is_some() && self.file_control_operation != Some(FileControlOperation::Inspect))
         {
             return;
         }
@@ -2771,6 +2795,13 @@ impl EditorPanel {
     /// Compact file-scoped information for the workspace status bar.
     pub fn status_summary(&self) -> String {
         let mut parts = vec![format!("{} problems", self.diagnostics.len())];
+        if let Some(metadata) = &self.file_metadata {
+            parts.push(format!("{}{} · {}", metadata.encoding,
+                if metadata.bom && !metadata.encoding.to_ascii_uppercase().contains("BOM") { " BOM" } else { "" },
+                metadata.line_ending));
+            if metadata.read_only { parts.push("read-only".into()); }
+            if metadata.paged { parts.push("paged".into()); }
+        }
         if let Some(warning) = self.recovery_warning.as_ref() {
             parts.push(warning.clone());
         }
@@ -2780,10 +2811,149 @@ impl EditorPanel {
         parts.join(" · ")
     }
 
+    pub fn set_file_controls_supported(&mut self, supported: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.file_controls_supported = supported;
+        if supported {
+            if (self.rev > 0 || self.edit_sync.is_some()) && self.sync_request_id.is_none() {
+                self.request_file_control(FileControlOperation::Inspect, cx);
+            }
+            self.arm_file_control_poll(window, cx);
+        }
+    }
+
+    fn arm_file_control_poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.auto_save_epoch = self.auto_save_epoch.wrapping_add(1);
+        let epoch = self.auto_save_epoch;
+        cx.spawn_in(window, async move |this, cx| loop {
+            let timer = cx.background_executor().timer(std::time::Duration::from_secs(1));
+            timer.await;
+            let Ok(keep_running) = this.update_in(cx, |this, window, cx| {
+                if this.auto_save_epoch != epoch || this.closed || !this.file_controls_supported { return false; }
+                this.auto_save_elapsed = this.auto_save_elapsed.saturating_add(1);
+                this.auto_save_poll_elapsed = this.auto_save_poll_elapsed.saturating_add(1);
+                let interval = this.file_metadata.as_ref().and_then(|meta| meta.auto_save_interval_secs);
+                let ready = interval.is_some_and(|secs| secs > 0 && this.auto_save_elapsed >= secs)
+                    && this.auto_save_is_safe();
+                if ready {
+                    this.auto_save_elapsed = 0;
+                    this.request_save(String::new(), window, cx);
+                } else if this.auto_save_poll_elapsed >= 5 && this.file_control_request.is_none() && this.edit_request_id.is_none()
+                    && this.sync_request_id.is_none()
+                    && this.edit_sync.as_ref().map_or(true, |sync| sync.acknowledged().0 == this.current_text(cx)) {
+                    this.auto_save_poll_elapsed = 0;
+                    this.request_file_control(FileControlOperation::Inspect, cx);
+                }
+                true
+            }) else { break; };
+            if !keep_running { break; }
+        }).detach();
+    }
+
+    fn auto_save_is_safe(&self) -> bool {
+        !self.unsaved && !self.path.is_empty() && self.transport_connected && !self.conflict
+            && !self.auto_save_paused && self.external.is_none() && self.recovery_warning.is_none()
+            && self.edit_request_id.is_none() && self.sync_request_id.is_none()
+            && self.save_request_id.is_none() && self.file_control_request.is_none()
+            && !self.action_inflight && !self.format_inflight && self.is_dirty()
+    }
+
+    pub fn show_file_controls(&mut self, mode: FileControlMode, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.file_controls_supported {
+            self.lsp_status = Some("This daemon does not support file encoding controls".into());
+            cx.notify();
+            return;
+        }
+        self.auto_save_paused = false;
+        self.file_control_mode = Some(mode);
+        if mode == FileControlMode::Inspect || self.file_metadata.is_none() {
+            self.request_file_control(FileControlOperation::Inspect, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn request_file_control(&mut self, operation: FileControlOperation, cx: &mut Context<Self>) -> bool {
+        if !self.file_controls_supported || !self.transport_connected { return false; }
+        if self.unsaved || (matches!(operation, FileControlOperation::Inspect) && self.rev == 0) { return false; }
+        if self.file_control_request.is_some() || self.save_request_id.is_some() || self.format_inflight
+            || self.action_inflight || self.pending_format || !self.pending_actions.is_empty() || self.pending_save.is_some()
+        { return false; }
+        let snapshot = self.current_text(cx);
+        let synchronized = self.edit_request_id.is_none() && self.sync_request_id.is_none()
+            && self.edit_sync.as_ref().map_or(true, |sync| sync.acknowledged().0 == snapshot);
+        if !synchronized {
+            self.lsp_status = Some("Wait for pending edits to synchronize before changing file format".into());
+            cx.notify();
+            return false;
+        }
+        if matches!(operation, FileControlOperation::Reopen { .. }) && (self.is_dirty() || self.unsaved) {
+            self.lsp_status = Some("Save or discard this draft before reopening with another encoding".into());
+            cx.notify();
+            return false;
+        }
+        let request_id = self.next_edit_request("file-control");
+        self.file_control_request = Some(request_id.clone());
+        self.file_control_operation = Some(operation.clone());
+        self.ade.send(AdeCmd::FileControl { request_id, buffer_id: self.buffer_id.clone(), base_rev: self.rev, operation });
+        cx.notify();
+        true
+    }
+
+    pub fn apply_file_state(&mut self, request_id: &str, rev: u64, metadata: BufferFileMetadata,
+        text: Option<String>, dirty: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.file_control_request.as_deref() != Some(request_id) { return; }
+        let operation = self.file_control_operation.take();
+        self.file_control_request = None;
+        self.file_metadata = Some(metadata);
+        let local_dirty = self.is_dirty();
+        let mut preserve_local_state = false;
+        if operation != Some(FileControlOperation::Inspect) {
+            if let Some(text) = text {
+                let current = self.current_text(cx);
+                if current == text {
+                    self.rev = rev;
+                    self.edit_sync = Some(EditSync::new(text, rev));
+                } else if !local_dirty && self.edit_request_id.is_none() && self.sync_request_id.is_none()
+                    && self.save_request_id.is_none() && !self.format_inflight && !self.action_inflight {
+                    let (sync, reconciliation) = EditSync::from_initial_snapshot(text.clone(), rev, &current, false);
+                    if reconciliation == SnapshotReconciliation::Adopted {
+                        self.set_editor_text_and_selection(&text, None, window, cx);
+                        self.rev = rev;
+                        self.edit_sync = Some(sync);
+                    }
+                } else {
+                    self.lsp_status = Some("Reopen result arrived while local edits were pending; local draft retained".into());
+                    self.conflict = true;
+                    preserve_local_state = true;
+                }
+            }
+            self.dirty = dirty || local_dirty;
+        }
+        if !preserve_local_state { self.lsp_status = None; }
+        if self.save_after_file_control {
+            self.save_after_file_control = false;
+            self.request_save(String::new(), window, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn handle_file_control_error(&mut self, request_id: &str, message: &str, cx: &mut Context<Self>) {
+        if self.file_control_request.as_deref() != Some(request_id) { return; }
+        self.file_control_request = None;
+        self.file_control_operation = None;
+        self.save_after_file_control = false;
+        self.auto_save_paused = true;
+        self.lsp_status = Some(format!("File format operation failed: {message}"));
+        cx.notify();
+    }
+
     /// Drop the panel without sending `editor_close`. The Fresh buffer stays
     /// in the daemon worker so another workspace can reopen the same path.
     pub fn release(&mut self) {
         self.cancel_lsp_requests();
+        self.file_control_request = None;
+        self.file_control_operation = None;
+        self.save_after_file_control = false;
+        self.auto_save_epoch = self.auto_save_epoch.wrapping_add(1);
         self.closed = true;
     }
 
@@ -3214,6 +3384,10 @@ impl EditorPanel {
         self.external_pending = None;
         self.external_request = None;
         self.external_save_path = None;
+        self.file_control_request = None;
+        self.file_control_operation = None;
+        self.save_after_file_control = false;
+        self.auto_save_epoch = self.auto_save_epoch.wrapping_add(1);
         self.transport_connected = false;
         self.sync_paused = true;
         self.closed = true;
@@ -3233,6 +3407,10 @@ impl EditorPanel {
         self.external_request = None;
         self.external_pending = None;
         self.external_save_path = None;
+        self.file_control_request = None;
+        self.file_control_operation = None;
+        self.save_after_file_control = false;
+        self.auto_save_epoch = self.auto_save_epoch.wrapping_add(1);
         self.ade = ade;
         self.transport_connected = true;
         self.sync_paused = false;
@@ -3266,6 +3444,11 @@ impl EditorPanel {
     }
 
     pub fn request_save(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.file_control_request.is_some() && self.file_control_operation != Some(FileControlOperation::Inspect) {
+            self.lsp_status = Some("Wait for the file format operation to finish before saving".into());
+            cx.notify();
+            return;
+        }
         self.finish_search_review(window, cx);
         self.commit_markdown_inline_edit(window, cx);
         if self.external.is_some() {
@@ -3519,6 +3702,7 @@ impl EditorPanel {
         if self.save_request_id.as_deref() == Some(request_id) {
             self.save_request_id = None;
             self.save_sent_text = None;
+            self.auto_save_paused = true;
             self.lsp_status = Some(format!("Save failed: {message}"));
             self.flush_pending(cx);
             return true;
@@ -3637,6 +3821,7 @@ impl EditorPanel {
         }
         let previous = self.mark_saved(path, rev, cx);
         self.dirty |= outcome.dirty;
+        self.auto_save_paused = false;
         if let Some(status) = outcome.status { self.lsp_status = Some(status); }
         cx.notify();
         previous
@@ -3839,6 +4024,55 @@ impl Render for EditorPanel {
                     .on_click(cx.listener(|this, _, _, cx| { this.signature_help = None; this.signature_active = false; this.signature_snapshot = None; cx.notify(); }))));
         }
         if self.search.open { root = root.child(self.render_search(cx)); }
+        if let Some(mode) = self.file_control_mode {
+            let mode_label = match mode {
+                FileControlMode::Inspect => "File format",
+                FileControlMode::ReopenWithEncoding => "Reopen with encoding",
+                FileControlMode::SaveWithEncoding => "Save with encoding",
+                FileControlMode::ChangeLineEndings => "Change line endings",
+            };
+            let mut bar = h_flex().w_full().min_h_9().px_2().gap_1().items_center().flex_wrap()
+                .border_b_1().border_color(cx.theme().border)
+                .child(div().text_xs().child(mode_label));
+            if let Some(metadata) = self.file_metadata.as_ref() {
+                bar = bar.child(div().flex_1().min_w_0().text_xs().text_color(cx.theme().muted_foreground)
+                    .child(format!("{}{} · {}{}", metadata.encoding,
+                        if metadata.bom && !metadata.encoding.to_ascii_uppercase().contains("BOM") { " BOM" } else { "" },
+                        metadata.line_ending, if metadata.paged { " · paged: format changes unavailable" } else { "" })));
+            }
+            if matches!(mode, FileControlMode::ReopenWithEncoding | FileControlMode::SaveWithEncoding) {
+                for encoding in ["UTF-8", "UTF-8 BOM", "UTF-16 LE", "UTF-16 BE", "Windows-1252", "Windows-1251", "Shift-JIS"] {
+                    let panel = cx.entity();
+                    let operation = if mode == FileControlMode::ReopenWithEncoding {
+                        FileControlOperation::Reopen { encoding: encoding.to_string() }
+                    } else { FileControlOperation::SetEncoding { encoding: encoding.to_string() } };
+                    let disabled = self.file_control_request.is_some()
+                        || self.file_metadata.as_ref().is_some_and(|metadata| metadata.paged || metadata.read_only)
+                        || (mode == FileControlMode::ReopenWithEncoding && (self.is_dirty() || self.unsaved));
+                    bar = bar.child(Button::new(format!("file-encoding-{encoding}")).ghost().xsmall().label(encoding)
+                        .disabled(disabled).on_click(move |_, _, cx| {
+                            panel.update(cx, |this, cx| {
+                                let sent = this.request_file_control(operation.clone(), cx);
+                                if sent && mode == FileControlMode::SaveWithEncoding { this.save_after_file_control = true; }
+                            });
+                        }));
+                }
+            } else if mode == FileControlMode::ChangeLineEndings {
+                for (label, value) in [("LF", "lf"), ("CRLF", "crlf"), ("CR", "cr")] {
+                    let panel = cx.entity();
+                    let operation = FileControlOperation::SetLineEnding { line_ending: value.to_string() };
+                    bar = bar.child(Button::new(format!("file-eol-{value}")).ghost().xsmall().label(label)
+                        .disabled(self.file_control_request.is_some() || self.file_metadata.as_ref().is_some_and(|metadata| metadata.paged || metadata.read_only)).on_click(move |_, _, cx| {
+                            panel.update(cx, |this, cx| this.request_file_control(operation.clone(), cx));
+                        }));
+                }
+            }
+            bar = bar.child(Button::new("file-format-refresh").ghost().xsmall().label("Refresh")
+                .on_click(cx.listener(|this, _, window, cx| this.show_file_controls(FileControlMode::Inspect, window, cx))))
+                .child(Button::new("file-format-close").ghost().xsmall().label("Close")
+                    .on_click(cx.listener(|this, _, _, cx| { this.file_control_mode = None; cx.notify(); })));
+            root = root.child(bar);
+        }
         if let Some(page) = &self.page {
             let start = page.start;
             let end = start + self.editor.read(cx).value().len();
@@ -4175,6 +4409,40 @@ mod project_update_tests {
 
     fn test_workspace(window: &mut Window, cx: &mut Context<Workspace>) -> Workspace {
         Workspace::new_for_test(parse_connect_target("ws://", None), window, cx)
+    }
+
+    #[gpui::test]
+    fn file_controls_preserve_local_drafts_and_autosave_waits_for_sync(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (workspace, test_cx) = cx.add_window_view(test_workspace);
+        let (ade, commands) = AdeHandle::test_channel();
+        let panel = test_cx.update(|window, cx| cx.new(|cx| EditorPanel::new(
+            "buffer".into(), "test.txt".into(), None, None, None, false, None, ade,
+            workspace.downgrade(), TabStripMetrics::default(), window, cx,
+        )));
+        panel.update_in(test_cx, |panel, window, cx| {
+            panel.set_file_controls_supported(true, window, cx);
+            panel.rev = 4;
+            panel.edit_sync = Some(EditSync::new("local draft".into(), 4));
+            panel.dirty = true;
+            panel.sync_request_id = Some("pending-sync".into());
+            assert!(!panel.auto_save_is_safe());
+            assert!(!panel.request_file_control(FileControlOperation::Reopen { encoding: "UTF-8".into() }, cx));
+            assert!(commands.try_recv().is_err());
+
+            panel.sync_request_id = None;
+            panel.file_control_request = Some("reopen-1".into());
+            panel.file_control_operation = Some(FileControlOperation::Reopen { encoding: "UTF-8".into() });
+            panel.set_editor_text_and_selection("new local edits", None, window, cx);
+            panel.apply_file_state("reopen-1", 5, BufferFileMetadata {
+                encoding: "UTF-8".into(), bom: false, line_ending: "LF".into(), read_only: false,
+                paged: false, auto_save_interval_secs: Some(5),
+            }, Some("reopened text".into()), false, window, cx);
+            assert_eq!(panel.current_text(cx), "new local edits");
+            assert!(panel.dirty);
+            assert!(panel.conflict);
+            assert!(!panel.auto_save_is_safe());
+        });
     }
 
     #[gpui::test]
