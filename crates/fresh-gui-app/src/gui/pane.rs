@@ -2748,9 +2748,9 @@ impl EditorPanel {
         cx.notify();
     }
 
-    fn request_editor_action(&mut self, action: EditorAction, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn request_editor_action(&mut self, action: EditorAction, cx: &mut Context<Self>) -> bool {
         if self.page.is_some() {
-            self.lsp_status = Some("Undo/redo across pages is not available; edit this page or restore your draft".into());
+            self.lsp_status = Some("Fresh editing commands across pages are not available; edit this page or restore your draft".into());
             cx.notify();
             return true;
         }
@@ -3028,7 +3028,7 @@ impl EditorPanel {
         self.inline_markdown_subscription = None;
         self.editor.update(cx, |state, cx| {
             let scroll = state.scroll_offset();
-            state.set_value(text, window, cx);
+            if state.value().as_str() != text { state.set_value(text, window, cx); }
             if let Some(selection) = selection {
                 state.set_selected_range(selection.anchor..selection.head, cx);
                 state.set_scroll_offset(scroll, cx);
@@ -3131,10 +3131,10 @@ impl EditorPanel {
             .action_sent_selection
             .take()
             .is_some_and(|sent| self.byte_selection(cx) == sent);
-        let edit_selection_unchanged = self
-            .edit_sent_selection
-            .take()
-            .is_some_and(|sent| self.byte_selection(cx) == sent);
+        // The GUI already holds the selection produced by a native edit.
+        // Restoring the scalar protocol selection here would remove every
+        // secondary caret, including rectangular selections, on each ack.
+        self.edit_sent_selection = None;
         self.action_sent_selection = None;
         if let Some(sync) = self.edit_sync.as_mut() {
             if action_result {
@@ -3159,11 +3159,8 @@ impl EditorPanel {
                 self.byte_selection(cx)
             };
             self.set_editor_text_and_selection(&text, Some(selection), window, cx);
-        } else if !action_result && draft == text && edit_selection_unchanged {
-            self.editor.update(cx, |state, cx| {
-                state.set_selected_range(selection.anchor..selection.head, cx);
-            });
         }
+
         self.dirty = server_dirty || self.external.is_some() || self.current_text(cx) != text || self.conflict;
         if self.conflict {
             self.lsp_status = Some("Server and local edits conflict; local draft kept".into());

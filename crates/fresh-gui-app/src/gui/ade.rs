@@ -827,6 +827,11 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd, evt_tx: &async_channel::
                 client.supports_capability(CAP_EDITOR_RANGE_EDITS),
                 "daemon does not support editor actions"
             );
+            anyhow::ensure!(
+                matches!(action, EditorAction::Undo | EditorAction::Redo)
+                    || client.supports_capability(fresh_gui_protocol::CAP_EDITOR_SMART_EDITING),
+                "daemon does not support Fresh editing commands"
+            );
             client
                 .send(Message::BufferAction {
                     request_id,

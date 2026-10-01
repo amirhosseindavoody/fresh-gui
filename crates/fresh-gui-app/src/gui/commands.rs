@@ -161,7 +161,7 @@ pub fn builtin_commands() -> Vec<CommandDescriptor> {
             )
         };
     }
-    vec![
+    let mut commands = vec![
         command!("NewTerminal", "New Terminal", NewTerminal),
         command!("NewFile", "New File", NewFile),
         command!(
@@ -484,7 +484,9 @@ pub fn builtin_commands() -> Vec<CommandDescriptor> {
             Some(CommandContext::Editor),
             None
         ),
-    ]
+    ];
+    commands.extend(super::editing_commands::descriptors());
+    commands
 }
 
 /// Query the built-in registry for palette-visible commands. `context: None`
@@ -497,7 +499,7 @@ pub fn command_descriptors(
     COMMANDS.with(|commands| commands.borrow().available(context, capabilities))
 }
 
-fn descriptor(
+pub(super) fn descriptor(
     id: &str,
     label: &str,
     context: Option<CommandContext>,
