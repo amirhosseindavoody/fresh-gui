@@ -138,6 +138,7 @@ impl ProjectSearchPanel {
     fn invalidate_preview(&mut self, cx: &mut Context<Self>) {
         if let Some(request_id) = self.request_id.take() {
             cx.emit(ProjectSearchEvent::Cancel { request_id });
+            self.replace_request_id = None;
             self.results.clear();
             self.selected.clear();
             self.running = false;
@@ -582,6 +583,11 @@ mod tests {
             panel.selected.insert("file".into(), HashSet::from([0]));
             assert!(panel.can_apply());
             panel.cancel(cx);
+            assert!(!panel.can_apply());
+            panel.replace_request_id = Some("pending-apply".into());
+            panel.invalidate_preview(cx);
+            assert!(panel.replace_request_id.is_none());
+            assert!(panel.selected.is_empty());
             assert!(!panel.can_apply());
             panel.set_error("preflight failed", cx);
             assert!(!panel.running);
