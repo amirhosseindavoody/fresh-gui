@@ -115,6 +115,29 @@ pub fn preview(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor_worker::EditorHandle;
+    use fresh_gui_client::{edit_sync::contiguous_diff, search::SearchReview};
+    use fresh_gui_protocol::{ByteSelection, EditorAction};
+    use std::path::PathBuf;
+
+    fn test_editor(label: &str) -> (PathBuf, EditorHandle) {
+        let root = std::env::temp_dir().join(format!("fresh-search-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let editor = EditorHandle::spawn_with_recovery_dir(
+            root.clone(),
+            crate::config::Config::default(),
+            root.join("recovery"),
+        )
+        .expect("Fresh worker starts");
+        (root, editor)
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
 
     fn opts(use_regex: bool) -> SearchOptions {
         SearchOptions {
@@ -191,5 +214,157 @@ mod tests {
         assert!(preview("text", "[", "x", &opts(true), None).is_err());
         let text = "x".repeat(MAX_SEARCH_DRAFT_BYTES + 1);
         assert!(preview(&text, "x", "", &opts(false), None).is_err());
+    }
+
+    #[test]
+    fn reviewed_search_is_one_fresh_undo_group_and_rejects_stale_revision() {
+        let (root, editor) = test_editor("review");
+        let path = root.join("review.txt");
+        let initial = "café aa xx aa yy aa";
+        std::fs::write(&path, initial).unwrap();
+        runtime().block_on(async {
+            let opened = editor.open(path, false).await.unwrap();
+            assert_eq!(opened.text, initial);
+
+            // Scope to the selected suffix and use Fresh's regex capture/escape rules.
+            let scope_start = "café ".len();
+            let scope = ByteRange { start: scope_start, len: initial.len() - scope_start };
+            let options = SearchOptions { use_regex: true, ..SearchOptions::default() };
+            let (matches, capped) = preview(initial, "(aa)", r"$1\t", &options, Some(scope)).unwrap();
+            assert!(!capped);
+            assert_eq!(matches.len(), 3);
+            assert!(matches.iter().all(|matched| matched.replacement == "aa\t"));
+
+            let mut review = SearchReview::new(initial, matches);
+            review.accept();
+            review.skip();
+            review.accept_all();
+            // Cancel finalizes only explicit accepts: the skipped middle match stays unchanged.
+            let edited = review.cancel().unwrap();
+            assert_eq!(edited, "café aa\t xx aa yy aa\t");
+            let edits = contiguous_diff(initial, &edited);
+            assert_eq!(edits.len(), 1);
+            let applied = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "search-review-test".into(),
+                    opened.rev,
+                    edits,
+                    None,
+                    ByteSelection { anchor: edited.len(), head: edited.len() },
+                )
+                .await
+                .unwrap();
+            assert!(applied.accepted);
+            assert_eq!(applied.text, edited);
+
+            let stale = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "search-review-test".into(),
+                    opened.rev,
+                    vec![],
+                    None,
+                    applied.selection,
+                )
+                .await
+                .unwrap();
+            assert!(!stale.accepted);
+            assert_eq!(stale.text, edited);
+
+            let undone = editor
+                .action(
+                    opened.buffer_id.clone(),
+                    "search-review-test".into(),
+                    applied.rev,
+                    EditorAction::Undo,
+                    applied.selection,
+                )
+                .await
+                .unwrap();
+            assert!(undone.accepted);
+            assert_eq!(undone.text, initial, "all accepted matches undo as one group");
+            let redone = editor
+                .action(
+                    opened.buffer_id,
+                    "search-review-test".into(),
+                    undone.rev,
+                    EditorAction::Redo,
+                    undone.selection,
+                )
+                .await
+                .unwrap();
+            assert!(redone.accepted);
+            assert_eq!(redone.text, edited);
+        });
+        drop(editor);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn paged_search_edits_global_offsets_within_loaded_page_and_undoes() {
+        let (root, editor) = test_editor("paged");
+        let path = root.join("large.txt");
+        let marker = 2 * 1024 * 1024 + 100;
+        let mut contents = vec![b'a'; 3 * 1024 * 1024];
+        contents[marker..marker + b"target".len()].copy_from_slice(b"target");
+        std::fs::write(&path, contents).unwrap();
+        runtime().block_on(async {
+            let opened = editor.open(path, false).await.unwrap();
+            assert!(opened.text.is_empty());
+            let page_start = marker - 32;
+            let page = editor
+                .read_page(opened.buffer_id.clone(), page_start, 128)
+                .await
+                .unwrap();
+            let (matches, _) = preview(
+                &page.text,
+                "target",
+                "replacement",
+                &SearchOptions::default(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(matches.len(), 1);
+            let edited_page = fresh_gui_client::search::apply_matches(&page.text, &matches).unwrap();
+            let edits = contiguous_diff(&page.text, &edited_page)
+                .into_iter()
+                .map(|edit| fresh_gui_protocol::RangeEdit {
+                    start: page.start + edit.start,
+                    end: page.start + edit.end,
+                    text: edit.text,
+                })
+                .collect();
+            let selection = ByteSelection { anchor: page.start + page.text.len(), head: page.start + page.text.len() };
+            let applied = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "paged-search-test".into(),
+                    opened.rev,
+                    edits,
+                    Some(ByteRange { start: page.start, len: page.text.len() }),
+                    selection,
+                )
+                .await
+                .unwrap();
+            assert!(applied.accepted);
+            assert!(applied.page.as_ref().unwrap().text.contains("replacement"));
+
+            let undone = editor
+                .action(
+                    opened.buffer_id.clone(),
+                    "paged-search-test".into(),
+                    applied.rev,
+                    EditorAction::Undo,
+                    applied.selection,
+                )
+                .await
+                .unwrap();
+            assert!(undone.accepted);
+            let restored = editor.read_page(opened.buffer_id, page.start, page.text.len()).await.unwrap();
+            assert_eq!(restored.text, page.text);
+        });
+        drop(editor);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
