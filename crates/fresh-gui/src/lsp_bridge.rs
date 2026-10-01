@@ -74,15 +74,15 @@ pub(crate) fn normalize_completion_result(value: Value) -> Value {
             return;
         };
         if let Some(defaults) = defaults {
-            if obj.get("insertTextFormat").is_none() {
-                if let Some(format) = defaults.get("insertTextFormat") {
-                    obj.insert("insertTextFormat".into(), format.clone());
-                }
+            if obj.get("insertTextFormat").is_none()
+                && let Some(format) = defaults.get("insertTextFormat")
+            {
+                obj.insert("insertTextFormat".into(), format.clone());
             }
-            if obj.get("data").is_none() {
-                if let Some(data) = defaults.get("data") {
-                    obj.insert("data".into(), data.clone());
-                }
+            if obj.get("data").is_none()
+                && let Some(data) = defaults.get("data")
+            {
+                obj.insert("data".into(), data.clone());
             }
         }
         let mut original_item = Value::Object(obj.clone());
@@ -92,29 +92,29 @@ pub(crate) fn normalize_completion_result(value: Value) -> Value {
         let text_edit_text = obj
             .remove("textEditText")
             .and_then(|text| text.as_str().map(str::to_owned));
-        if obj.get("textEdit").is_none() {
-            if let Some(text) = text_edit_text.as_ref() {
-                if let Some(edit_range) = defaults.and_then(|defaults| defaults.get("editRange")) {
-                    let text_edit = if edit_range.get("insert").is_some()
-                        && edit_range.get("replace").is_some()
-                    {
-                        json!({"insert": edit_range["insert"], "replace": edit_range["replace"], "newText": text})
-                    } else {
-                        json!({"range": edit_range, "newText": text})
-                    };
-                    obj.insert("textEdit".into(), text_edit);
+        if obj.get("textEdit").is_none()
+            && let Some(text) = text_edit_text.as_ref()
+        {
+            if let Some(edit_range) = defaults.and_then(|defaults| defaults.get("editRange")) {
+                let text_edit = if edit_range.get("insert").is_some()
+                    && edit_range.get("replace").is_some()
+                {
+                    json!({"insert": edit_range["insert"], "replace": edit_range["replace"], "newText": text})
                 } else {
-                    obj.insert("insertText".into(), json!(text));
-                }
+                    json!({"range": edit_range, "newText": text})
+                };
+                obj.insert("textEdit".into(), text_edit);
+            } else {
+                obj.insert("insertText".into(), json!(text));
             }
         }
-        if let Some(original) = original_item.as_object_mut() {
-            if original.get("textEdit").is_none() {
-                if let Some(edit) = obj.get("textEdit") {
-                    original.insert("textEdit".into(), edit.clone());
-                } else if let Some(text) = text_edit_text.as_ref() {
-                    original.insert("insertText".into(), json!(text));
-                }
+        if let Some(original) = original_item.as_object_mut()
+            && original.get("textEdit").is_none()
+        {
+            if let Some(edit) = obj.get("textEdit") {
+                original.insert("textEdit".into(), edit.clone());
+            } else if let Some(text) = text_edit_text.as_ref() {
+                original.insert("insertText".into(), json!(text));
             }
         }
 
@@ -122,7 +122,7 @@ pub(crate) fn normalize_completion_result(value: Value) -> Value {
             .get("textEdit")
             .and_then(|edit| edit.get("newText"))
             .and_then(Value::as_str)
-            .or_else(|| text_edit_text.as_deref())
+            .or(text_edit_text.as_deref())
             .or_else(|| obj.get("insertText").and_then(Value::as_str))
             .or_else(|| obj.get("label").and_then(Value::as_str));
         let is_snippet = obj.get("insertTextFormat").and_then(Value::as_u64) == Some(2)
@@ -169,13 +169,11 @@ pub(crate) fn normalize_completion_result(value: Value) -> Value {
     }
     match &mut value {
         Value::Array(items) => items.iter_mut().for_each(|item| normalize_item(item, None)),
-        Value::Object(obj) => {
-            if obj.contains_key("items") {
-                let defaults = obj.get("itemDefaults").cloned();
-                if let Some(items) = obj.get_mut("items").and_then(Value::as_array_mut) {
-                    for item in items {
-                        normalize_item(item, defaults.as_ref());
-                    }
+        Value::Object(obj) if obj.contains_key("items") => {
+            let defaults = obj.get("itemDefaults").cloned();
+            if let Some(items) = obj.get_mut("items").and_then(Value::as_array_mut) {
+                for item in items {
+                    normalize_item(item, defaults.as_ref());
                 }
             }
         }
