@@ -15,6 +15,7 @@ use std::time::Instant;
 use alacritty_terminal::vte::ansi::CursorShape;
 use fresh_gui_client::edit_sync::{EditSync, SnapshotReconciliation, contiguous_diff, external_reconciliation, ExternalSnapshotReconciliation};
 use fresh_gui_protocol::{BufferDiagnostic, ByteRange, ByteSelection, EditorAction, ExternalResolution, MAX_PAGE_BYTES};
+use fresh_gui_protocol::{LspRequest, LspRequestFeature, LspResult};
 
 use gpui_kit::base::ElementExt as _;
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent, PanelId};
@@ -1641,6 +1642,14 @@ struct EditorPending {
 }
 
 static NEXT_EDITOR_VIEW: AtomicU64 = AtomicU64::new(1);
+static NEXT_LSP_REQUEST: AtomicU64 = AtomicU64::new(1);
+
+struct PendingLsp {
+    request: LspRequest,
+    text: String,
+    sent: bool,
+    reply: async_channel::Sender<LspResult>,
+}
 
 pub struct EditorPanel {
     buffer_id: String,
@@ -1652,6 +1661,12 @@ pub struct EditorPanel {
     dirty: bool,
     diagnostics: Vec<BufferDiagnostic>,
     lsp_status: Option<String>,
+    lsp_requests: bool,
+    lsp_provider: Option<Rc<super::lsp::RemoteLsp>>,
+    pending_lsp: Vec<PendingLsp>,
+    signature_triggers: Vec<String>,
+    completion_plans: Vec<super::lsp::CompletionPlan>,
+    signature_help: Option<String>,
     recovery_warning: Option<String>,
     format_pending_text: Option<String>,
     format_sent_selection: Option<ByteSelection>,
@@ -1706,6 +1721,7 @@ pub struct EditorPanel {
     inline_markdown_edit: Option<MarkdownInlineEdit>,
     inline_markdown_subscription: Option<Subscription>,
     _subscription: Subscription,
+    _lsp_observer: Subscription,
 }
 
 fn reload_response_can_replace(sent_draft: &str, current_draft: &str) -> bool {
@@ -1772,10 +1788,35 @@ impl EditorPanel {
         let hover_decoration = editor.update(cx, |state, cx| state.create_decorations_collection(Vec::new(), cx));
         let subscription = cx.subscribe(&editor, |this, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Change) {
+                let completion_accepted = this.on_lsp_text_change(cx);
                 this.dirty = true;
-                this.schedule_edit_flush(cx);
+                if completion_accepted { this.flush_pending(cx); }
+                else { this.schedule_edit_flush(cx); }
                 cx.notify();
+            } else if matches!(ev, InputEvent::Blur) {
+                this.cancel_lsp_requests();
+                this.signature_help = None;
             }
+        });
+        let lsp_observer = cx.observe(&editor, |this, editor, cx| {
+            let state = editor.read(cx);
+            let caret = state.cursor();
+            let draft = state.value().to_string();
+            let completion_caret_moved = this.completion_plans.iter().any(|plan|
+                plan.before == draft) && this.completion_plans.iter().any(|plan| plan.request_offset != caret);
+            if completion_caret_moved {
+                this.completion_plans.clear();
+                editor.update(cx, |editor, cx| editor.dismiss_completion_overlay(cx));
+            }
+            let mut retained = Vec::new();
+            for pending in this.pending_lsp.drain(..) {
+                if !matches!(pending.request.feature, LspRequestFeature::Hover | LspRequestFeature::Capabilities)
+                    && pending.request.offset != caret {
+                    if pending.sent { this.ade.send(AdeCmd::LspCancel { request_id: pending.request.request_id,
+                        buffer_id: pending.request.buffer_id, view_id: pending.request.view_id }); }
+                } else { retained.push(pending); }
+            }
+            this.pending_lsp = retained;
         });
         let view_id = format!("view-{}-{}-{}", std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -1789,6 +1830,12 @@ impl EditorPanel {
             dirty: false,
             diagnostics: Vec::new(),
             lsp_status: None,
+            lsp_requests: false,
+            lsp_provider: None,
+            pending_lsp: Vec::new(),
+            signature_triggers: Vec::new(),
+            completion_plans: Vec::new(),
+            signature_help: None,
             recovery_warning: None,
             format_pending_text: None,
             format_sent_selection: None,
@@ -1843,6 +1890,7 @@ impl EditorPanel {
             inline_markdown_edit: None,
             inline_markdown_subscription: None,
             _subscription: subscription,
+            _lsp_observer: lsp_observer,
         }
     }
 
@@ -1872,6 +1920,8 @@ impl EditorPanel {
     }
 
     pub fn begin_paged(&mut self, rev: u64, total_bytes: usize, path: String, dirty: bool, cx: &mut Context<Self>) {
+        self.cancel_lsp_requests();
+        self.editor.update(cx, |editor, cx| editor.dismiss_lsp_overlays(cx));
         self.path = path;
         self.rev = rev;
         self.dirty |= dirty;
@@ -1944,6 +1994,181 @@ impl EditorPanel {
             let selection = ByteSelection { anchor: selection.anchor.saturating_sub(start).min(text.len()), head: selection.head.saturating_sub(start).min(text.len()) };
             self.apply_edit_result(request_id, view_id, rev, text, selection, accepted, dirty, window, cx);
         }
+    }
+
+    pub fn configure_lsp_requests(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.lsp_requests = enabled && self.range_edits;
+        if !self.lsp_requests { self.cancel_lsp_requests(); }
+        let provider = super::lsp::RemoteLsp::new(cx.weak_entity());
+        self.lsp_provider = self.lsp_requests.then(|| provider.clone());
+        self.editor.update(cx, |editor, cx| {
+            editor.lsp_mut().completion_provider = self.lsp_requests.then(|| provider.clone() as Rc<dyn gpui_kit::component::input::CompletionProvider>);
+            editor.lsp_mut().hover_provider = self.lsp_requests.then(|| provider as Rc<dyn gpui_kit::component::input::HoverProvider>);
+            editor.refresh(cx);
+        });
+    }
+
+    pub(crate) fn lsp_snapshot_matches(&self, text: &str, offset: Option<usize>, cx: &App) -> bool {
+        self.lsp_requests && self.transport_connected && !self.closed && self.page.is_none()
+            && !self.conflict && !self.sync_paused && self.current_text(cx) == text
+            && offset.is_none_or(|offset| self.byte_selection(cx).head == offset)
+    }
+
+    pub(crate) fn set_completion_plans(&mut self, plans: Vec<super::lsp::CompletionPlan>, _cx: &mut Context<Self>) {
+        let draft = self.current_text(_cx);
+        if plans.iter().all(|plan| plan.before == draft) { self.completion_plans = plans; }
+    }
+
+    fn cancel_lsp_requests(&mut self) {
+        for pending in self.pending_lsp.drain(..) {
+            if pending.sent {
+                self.ade.send(AdeCmd::LspCancel { request_id: pending.request.request_id,
+                    buffer_id: pending.request.buffer_id, view_id: pending.request.view_id });
+            }
+            // Closing the channel also releases a provider waiting on a superseded request.
+        }
+        self.completion_plans.clear();
+    }
+
+    pub(crate) fn queue_lsp(&mut self, feature: LspRequestFeature, offset: usize,
+        trigger_character: Option<String>, text: String, cx: &mut Context<Self>) -> async_channel::Receiver<LspResult> {
+        let (reply, receiver) = async_channel::bounded(1);
+        if !self.lsp_requests || !self.transport_connected || self.closed || self.page.is_some()
+            || self.conflict || self.sync_paused || self.markdown_preview || self.current_text(cx) != text {
+            return receiver;
+        }
+        let mut retained = Vec::new();
+        for pending in self.pending_lsp.drain(..) {
+            if pending.request.feature == feature {
+                if pending.sent {
+                    self.ade.send(AdeCmd::LspCancel { request_id: pending.request.request_id,
+                        buffer_id: pending.request.buffer_id, view_id: pending.request.view_id });
+                }
+            } else { retained.push(pending); }
+        }
+        self.pending_lsp = retained;
+        let request_id = NEXT_LSP_REQUEST.fetch_add(1, Ordering::Relaxed);
+        self.pending_lsp.push(PendingLsp {
+            request: LspRequest { request_id, buffer_id: self.buffer_id.clone(), view_id: self.view_id.clone(),
+                base_rev: self.rev, offset, feature, trigger_character, item: None, server: None },
+            text, sent: false, reply,
+        });
+        // Flush typing first; the request is sent only after its exact draft is acknowledged.
+        self.flush_pending(cx);
+        let timer = cx.background_executor().timer(std::time::Duration::from_secs(7));
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = this.update(cx, |this, _| {
+                if let Some(index) = this.pending_lsp.iter().position(|pending| pending.request.request_id == request_id) {
+                    let pending = this.pending_lsp.remove(index);
+                    if pending.sent { this.ade.send(AdeCmd::LspCancel { request_id,
+                        buffer_id: pending.request.buffer_id, view_id: pending.request.view_id }); }
+                }
+            });
+        }).detach();
+        receiver
+    }
+
+    fn send_pending_lsp(&mut self, cx: &mut Context<Self>) {
+        if self.edit_request_id.is_some() || self.save_request_id.is_some() || self.format_inflight { return; }
+        let draft = self.current_text(cx);
+        let Some(sync) = self.edit_sync.as_ref() else { return; };
+        let (acknowledged, rev) = sync.acknowledged();
+        if acknowledged != draft { return; }
+        self.pending_lsp.retain(|pending| pending.text == draft && !pending.reply.is_closed());
+        for pending in &mut self.pending_lsp {
+            if !pending.sent {
+                pending.request.base_rev = rev;
+                pending.sent = true;
+                self.ade.send(AdeCmd::LspRequest { request: pending.request.clone() });
+            }
+        }
+    }
+
+    pub fn apply_lsp_result(&mut self, mut result: LspResult, cx: &mut Context<Self>) {
+        if result.view_id != self.view_id { return; }
+        let Some(index) = self.pending_lsp.iter().position(|pending| pending.request.request_id == result.request_id) else { return; };
+        let pending = self.pending_lsp.remove(index);
+        let draft = self.current_text(cx);
+        let caret_matches = matches!(result.feature, LspRequestFeature::Hover | LspRequestFeature::Capabilities)
+            || self.byte_selection(cx).head == result.offset;
+        result.stale |= result.rev != self.rev || pending.text != draft || !caret_matches
+            || pending.request.base_rev != result.rev || pending.request.feature != result.feature;
+        if !result.stale {
+            if let Some(provider) = &self.lsp_provider { provider.update_triggers(&result); }
+            self.signature_triggers = result.signature_triggers.clone();
+            if let Some(status) = &result.status { self.lsp_status = Some(status.clone()); }
+        }
+        let _ = pending.reply.try_send(result);
+    }
+
+    fn on_lsp_text_change(&mut self, cx: &mut Context<Self>) -> bool {
+        let draft = self.current_text(cx);
+        let accepted = self.completion_plans.iter().find(|plan| plan.after == draft);
+        let completion_accepted = accepted.is_some();
+        if let Some(plan) = accepted {
+            let cursor = plan.cursor;
+            self.editor.update(cx, |editor, cx| editor.set_selected_range(cursor..cursor, cx));
+        }
+        self.completion_plans.clear();
+        let mut retained = Vec::new();
+        for pending in self.pending_lsp.drain(..) {
+            if pending.text != draft {
+                if pending.sent { self.ade.send(AdeCmd::LspCancel { request_id: pending.request.request_id,
+                    buffer_id: pending.request.buffer_id, view_id: pending.request.view_id }); }
+            } else { retained.push(pending); }
+        }
+        self.pending_lsp = retained;
+        self.signature_help = None;
+        let offset = self.byte_selection(cx).head;
+        if self.lsp_requests && self.page.is_none() && self.signature_triggers.iter().any(|trigger|
+            !trigger.is_empty() && draft.get(..offset).is_some_and(|prefix| prefix.ends_with(trigger))) {
+            self.request_signature(cx);
+        }
+        completion_accepted
+    }
+
+    fn request_signature(&mut self, cx: &mut Context<Self>) {
+        let offset = self.byte_selection(cx).head;
+        let text = self.current_text(cx);
+        let trigger = self.signature_triggers.iter().find(|trigger| text.get(..offset).is_some_and(|prefix| prefix.ends_with(trigger.as_str()))).cloned();
+        let receiver = self.queue_lsp(LspRequestFeature::SignatureHelp, offset, trigger, text.clone(), cx);
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = receiver.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    if !result.stale && this.lsp_snapshot_matches(&text, Some(offset), cx) {
+                        this.signature_help = super::lsp::signature_text(&result); cx.notify();
+                    }
+                });
+            }
+        }).detach();
+    }
+
+    pub(crate) fn request_language_help(&mut self, feature: LspRequestFeature, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.lsp_requests || self.page.is_some() || !self.transport_connected {
+            self.lsp_status = Some(if self.page.is_some() { "Language help is unavailable for paged files" }
+                else { "Language help requires a daemon with lsp.requests and editor.range-edits" }.into());
+            cx.notify();
+            return;
+        }
+        if feature == LspRequestFeature::SignatureHelp { self.request_signature(cx); return; }
+        let offset = self.byte_selection(cx).head;
+        let text = self.current_text(cx);
+        let receiver = self.queue_lsp(feature, offset, None, text.clone(), cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(result) = receiver.recv().await {
+                let _ = this.update_in(cx, |this, _window, cx| {
+                    if result.stale || !this.lsp_snapshot_matches(&text, Some(offset), cx) { return; }
+                    if feature == LspRequestFeature::Completion {
+                        let (items, plans) = super::lsp::normalize_completions(&text, offset, &result);
+                        this.completion_plans = plans;
+                        this.editor.update(cx, |editor, cx| editor.present_completion_items(offset, "", items, cx));
+                    } else if let Some(hover) = super::lsp::merge_hover(&result) {
+                        this.editor.update(cx, |editor, cx| editor.present_hover(offset..offset, hover, cx));
+                    }
+                });
+            }
+        }).detach();
     }
 
     pub fn configure_range_edits(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -2341,6 +2566,7 @@ impl EditorPanel {
             self.format_inflight = true;
             self.lsp_status = Some("Formatting…".into());
         }
+        self.send_pending_lsp(cx);
         cx.notify();
     }
 
@@ -2379,6 +2605,7 @@ impl EditorPanel {
     /// Drop the panel without sending `editor_close`. The Fresh buffer stays
     /// in the daemon worker so another workspace can reopen the same path.
     pub fn release(&mut self) {
+        self.cancel_lsp_requests();
         self.closed = true;
     }
 
@@ -2733,6 +2960,8 @@ impl EditorPanel {
     }
 
     pub fn detach_transport(&mut self) {
+        self.cancel_lsp_requests();
+        self.signature_help = None;
         self.external_pending = None;
         self.external_request = None;
         self.external_save_path = None;
@@ -2750,6 +2979,7 @@ impl EditorPanel {
     }
 
     pub fn keep_detached_draft(&mut self, cx: &mut Context<Self>) {
+        self.cancel_lsp_requests();
         self.external_pending = None;
         self.external_request = None;
         self.external_save_path = None;
@@ -2768,6 +2998,7 @@ impl EditorPanel {
     }
 
     pub fn reconnect(&mut self, ade: AdeHandle, range_edits: bool, paged_reads: bool, cx: &mut Context<Self>) {
+        self.cancel_lsp_requests();
         self.external_request = None;
         self.external_pending = None;
         self.external_save_path = None;
@@ -2907,6 +3138,13 @@ impl EditorPanel {
             }
         }
         self.diagnostics = diagnostics;
+        if self.lsp_requests && self.page.is_none() && self.edit_sync.is_some()
+            && !self.pending_lsp.iter().any(|pending| pending.request.feature == LspRequestFeature::Capabilities) {
+            let text = self.current_text(cx);
+            let receiver = self.queue_lsp(LspRequestFeature::Capabilities, 0, None, text, cx);
+            // Keep the receiver alive until metadata is installed by apply_lsp_result.
+            cx.spawn(async move |_, _| { let _ = receiver.recv().await; }).detach();
+        }
         if status.is_some() {
             if !self.conflict {
                 self.lsp_status = status;
@@ -3174,6 +3412,7 @@ impl BasePanel for EditorPanel {
         if self.closed {
             return;
         }
+        self.cancel_lsp_requests();
         self.closed = true;
         self.ade.send(AdeCmd::CloseEditor {
             buffer_id: self.buffer_id.clone(),
@@ -3259,6 +3498,31 @@ impl Render for EditorPanel {
                         }
                     }))
             ;
+        root = root.capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            let key = event.keystroke.key.as_str();
+            let menu_open = this.editor.read(cx).completion_menu_state().open;
+            if key == "escape" {
+                this.cancel_lsp_requests();
+                this.signature_help = None;
+                this.editor.update(cx, |editor, cx| editor.dismiss_lsp_overlays(cx));
+                cx.notify();
+            } else if !menu_open || !matches!(key, "up" | "down" | "enter" | "tab" | "shift") {
+                // A positional edit prepared for the previous caret must never be accepted there.
+                this.completion_plans.clear();
+                this.editor.update(cx, |editor, cx| editor.dismiss_completion_overlay(cx));
+                if matches!(key, "left" | "right" | "home" | "end" | "pageup" | "pagedown") {
+                    this.cancel_lsp_requests();
+                    this.signature_help = None;
+                }
+            }
+        }));
+        if let Some(help) = &self.signature_help {
+            root = root.child(h_flex().w_full().px_2().py_1().gap_2().items_center()
+                .border_b_1().border_color(cx.theme().border)
+                .child(div().flex_1().text_sm().font_family(cx.theme().mono_font_family.clone()).child(help.clone()))
+                .child(Button::new("dismiss-signature").ghost().xsmall().label("Dismiss (Esc)")
+                    .on_click(cx.listener(|this, _, _, cx| { this.signature_help = None; cx.notify(); }))));
+        }
         if let Some(page) = &self.page {
             let start = page.start;
             let end = start + self.editor.read(cx).value().len();

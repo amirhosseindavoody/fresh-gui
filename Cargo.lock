@@ -2508,6 +2508,7 @@ dependencies = [
  "gpui-pre-platform",
  "image",
  "jsonc-parser",
+ "lsp-types",
  "raw-window-handle",
  "regex",
  "serde",
