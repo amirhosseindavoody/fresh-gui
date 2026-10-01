@@ -32,6 +32,7 @@ pub(super) fn language_servers(
 
     // Fresh owns process lifecycle. Its manager methods also preserve its
     // cooldown, restart, authority-routing, and per-server configuration rules.
+    let mut action_errors = std::collections::HashMap::new();
     if action != LanguageServerAction::Status {
         for config in &configs {
             let name = config.display_name();
@@ -40,18 +41,21 @@ pub(super) fn language_servers(
                 LanguageServerAction::Start => {
                     if !manager_has_language_server(editor, language, &name) {
                         let command = executable(&config.command);
-                        if command.is_empty()
-                            || !editor
-                                .active_window()
-                                .lsp
-                                .command_exists_via_authority(command)
-                        {
+                        if command.is_empty() {
+                            action_errors.insert(
+                                name.clone(),
+                                "configure a server command in language-server settings"
+                                    .to_string(),
+                            );
                             continue;
                         }
-                        let _ = editor
+                        let (started, message) = editor
                             .active_window_mut()
                             .lsp
                             .manual_restart_server(language, &name, path);
+                        if !started {
+                            action_errors.insert(name.clone(), message);
+                        }
                     }
                 }
                 LanguageServerAction::Stop => {
@@ -62,18 +66,20 @@ pub(super) fn language_servers(
                 }
                 LanguageServerAction::Restart => {
                     let command = executable(&config.command);
-                    if command.is_empty()
-                        || !editor
-                            .active_window()
-                            .lsp
-                            .command_exists_via_authority(command)
-                    {
+                    if command.is_empty() {
+                        action_errors.insert(
+                            name.clone(),
+                            "configure a server command in language-server settings".to_string(),
+                        );
                         continue;
                     }
-                    let _ = editor
+                    let (started, message) = editor
                         .active_window_mut()
                         .lsp
                         .manual_restart_server(language, &name, path);
+                    if !started {
+                        action_errors.insert(name.clone(), message);
+                    }
                 }
             }
         }
@@ -86,19 +92,16 @@ pub(super) fn language_servers(
         let name = config.display_name();
         let command = config.command.clone();
         let found = handles.iter().find(|handle| handle.name == name);
-        let status = if !config.enabled {
+        let status = if let Some(error) = action_errors.remove(&name) {
+            error
+        } else if !config.enabled {
             "disabled".to_string()
         } else if let Some(handle) = found {
             client_status(handle.handle.state())
         } else if command.is_empty() {
             "missing command: configure an executable in language-server settings".to_string()
         } else {
-            let executable = executable(&command);
-            if !executable.is_empty() && !manager.command_exists_via_authority(executable) {
-                format!("missing binary: install `{executable}` or update its configured command")
-            } else {
-                "stopped".to_string()
-            }
+            "stopped".to_string()
         };
         states.push(LanguageServerState {
             name,
