@@ -2267,16 +2267,8 @@ mod tests {
         let old_diagnostic = serde_json::json!({"start_line":0,"start_character":0,"end_line":0,"end_character":1,"severity":"error","message":"bad"});
         let d: BufferDiagnostic = serde_json::from_value(old_diagnostic).unwrap();
         assert!(d.related_information.is_empty());
-        assert!(
-            Hello::default_backend_caps()
-                .iter()
-                .any(|cap| cap == CAP_LSP_CONTROLS)
-        );
-        assert!(
-            Hello::default_client_caps()
-                .iter()
-                .any(|cap| cap == CAP_LSP_CONTROLS)
-        );
+        assert!(Hello::default_backend_caps().iter().any(|cap| cap == CAP_LSP_CONTROLS));
+        assert!(Hello::default_client_caps().iter().any(|cap| cap == CAP_LSP_CONTROLS));
     }
 
     #[test]
@@ -2472,16 +2464,8 @@ mod tests {
         };
         let saved = serde_json::to_value(&configured).unwrap();
         assert_eq!(saved["search_options"]["case_sensitive"], false);
-        assert_eq!(
-            serde_json::from_value::<WorkspaceLayoutExtra>(saved).unwrap(),
-            configured
-        );
-        assert!(
-            serde_json::to_value(&old)
-                .unwrap()
-                .get("search_options")
-                .is_none()
-        );
+        assert_eq!(serde_json::from_value::<WorkspaceLayoutExtra>(saved).unwrap(), configured);
+        assert!(serde_json::to_value(&old).unwrap().get("search_options").is_none());
     }
     #[test]
     fn buffer_search_roundtrips_and_search_cap_is_additive() {
@@ -2497,10 +2481,7 @@ mod tests {
             },
             scope: Some(ByteRange { start: 3, len: 3 }),
         };
-        assert_eq!(
-            Message::from_json(&request.to_json().unwrap()).unwrap(),
-            request
-        );
+        assert_eq!(Message::from_json(&request.to_json().unwrap()).unwrap(), request);
         let response = Message::BufferSearchResult {
             request_id: "search-1".into(),
             matches: vec![SearchMatch {
@@ -2511,10 +2492,7 @@ mod tests {
             error: None,
             capped: false,
         };
-        assert_eq!(
-            Message::from_json(&response.to_json().unwrap()).unwrap(),
-            response
-        );
+        assert_eq!(Message::from_json(&response.to_json().unwrap()).unwrap(), response);
 
         let old = Hello::client("old", Vec::new());
         assert!(!old.capabilities.contains(&CAP_EDITOR_SEARCH.to_owned()));
@@ -2528,12 +2506,7 @@ mod workspace_edit_protocol_tests {
 
     #[test]
     fn workspace_edit_capability_and_preview_tokens_roundtrip() {
-        assert!(
-            Hello::client("test", Hello::default_client_caps())
-                .capabilities
-                .iter()
-                .any(|cap| cap == CAP_LSP_WORKSPACE_EDITS)
-        );
+        assert!(Hello::client("test", Hello::default_client_caps()).capabilities.iter().any(|cap| cap == CAP_LSP_WORKSPACE_EDITS));
         let preview = WorkspaceEditPreview {
             token: "opaque-token".into(),
             buffer_id: "7".into(),
@@ -2570,10 +2543,7 @@ mod workspace_edit_protocol_tests {
             },
         ];
         for message in messages {
-            assert_eq!(
-                Message::from_json(&message.to_json().unwrap()).unwrap(),
-                message
-            );
+            assert_eq!(Message::from_json(&message.to_json().unwrap()).unwrap(), message);
         }
         for feature in [
             LspRequestFeature::PrepareRename,
@@ -2583,10 +2553,7 @@ mod workspace_edit_protocol_tests {
             LspRequestFeature::ExecuteCommand,
         ] {
             let encoded = serde_json::to_string(&feature).unwrap();
-            assert_eq!(
-                serde_json::from_str::<LspRequestFeature>(&encoded).unwrap(),
-                feature
-            );
+            assert_eq!(serde_json::from_str::<LspRequestFeature>(&encoded).unwrap(), feature);
         }
     }
 }

@@ -198,10 +198,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
     let mut external_rx = state.editor.as_ref().map(EditorHandle::subscribe_external);
     let mut lsp_rx = state.editor.as_ref().map(EditorHandle::subscribe_lsp);
-    let mut workspace_rx = state
-        .editor
-        .as_ref()
-        .map(EditorHandle::subscribe_workspace_edits);
+    let mut workspace_rx = state.editor.as_ref().map(EditorHandle::subscribe_workspace_edits);
 
     loop {
         tokio::select! {
@@ -359,9 +356,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    if let Some(editor) = state.editor.as_ref() {
-        editor.cancel_workspace_owner(&socket_id);
-    }
+    if let Some(editor) = state.editor.as_ref() { editor.cancel_workspace_owner(&socket_id); }
     if let Some(sid) = session_id {
         state.sessions.detach_subscriber(&sid).await;
     }
@@ -430,14 +425,8 @@ async fn handle_client_msg(
                 .capabilities
                 .iter()
                 .any(|cap| cap == CAP_SETTINGS_EDITOR);
-            *client_lsp_requests = client_hello
-                .capabilities
-                .iter()
-                .any(|cap| cap == CAP_LSP_REQUESTS);
-            *client_workspace_edits = client_hello
-                .capabilities
-                .iter()
-                .any(|cap| cap == CAP_LSP_WORKSPACE_EDITS);
+            *client_lsp_requests = client_hello.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS);
+            *client_workspace_edits = client_hello.capabilities.iter().any(|cap| cap == CAP_LSP_WORKSPACE_EDITS);
             *client_editor_search = client_hello
                 .capabilities
                 .iter()
@@ -446,18 +435,9 @@ async fn handle_client_msg(
                 .capabilities
                 .iter()
                 .any(|cap| cap == CAP_LSP_NAVIGATION);
-            *client_lsp_controls = client_hello
-                .capabilities
-                .iter()
-                .any(|cap| cap == CAP_LSP_CONTROLS);
-            *client_project_search = client_hello
-                .capabilities
-                .iter()
-                .any(|cap| cap == CAP_PROJECT_SEARCH);
-            *client_file_finder = client_hello
-                .capabilities
-                .iter()
-                .any(|cap| cap == CAP_FILE_FINDER);
+            *client_lsp_controls = client_hello.capabilities.iter().any(|cap| cap == CAP_LSP_CONTROLS);
+            *client_project_search = client_hello.capabilities.iter().any(|cap| cap == CAP_PROJECT_SEARCH);
+            *client_file_finder = client_hello.capabilities.iter().any(|cap| cap == CAP_FILE_FINDER);
             if client_hello.protocol_version != PROTOCOL_VERSION {
                 return Err(Message::Error {
                     code: "protocol_mismatch".into(),
@@ -1116,11 +1096,11 @@ async fn handle_client_msg(
                 message: format!("{request_id}: {error}"),
             })?;
             let path = crate::path_open::resolve_exact_file(&state.fs_root, &target_path)
-                .await
-                .map_err(|error| Message::Error {
-                    code: "editor_open_failed".into(),
-                    message: format!("{request_id}: {error:#}"),
-                })?;
+            .await
+            .map_err(|error| Message::Error {
+                code: "editor_open_failed".into(),
+                message: format!("{request_id}: {error:#}"),
+            })?;
             if !*client_paged_reads && is_large_file(&path) {
                 return Err(paged_reads_unavailable(&request_id));
             }
@@ -1954,10 +1934,7 @@ async fn handle_client_msg(
                         }
                     })?)
                 };
-            let saved = match editor
-                .save_with_actions(buffer_id.clone(), base_rev, dest, *client_lsp_controls)
-                .await
-            {
+            let saved = match editor.save_with_actions(buffer_id.clone(), base_rev, dest, *client_lsp_controls).await {
                 Ok(saved) => saved,
                 Err(err) => {
                     // A disk-generation conflict is returned as a save error to
@@ -2240,14 +2217,7 @@ async fn handle_client_msg(
                     message: format!("LSP navigation requires {CAP_LSP_NAVIGATION} capability"),
                 });
             }
-            if matches!(
-                request.feature,
-                fresh_gui_protocol::LspRequestFeature::PrepareRename
-                    | fresh_gui_protocol::LspRequestFeature::Rename
-                    | fresh_gui_protocol::LspRequestFeature::CodeActions
-                    | fresh_gui_protocol::LspRequestFeature::CodeActionResolve
-                    | fresh_gui_protocol::LspRequestFeature::ExecuteCommand
-            ) {
+            if matches!(request.feature, fresh_gui_protocol::LspRequestFeature::PrepareRename | fresh_gui_protocol::LspRequestFeature::Rename | fresh_gui_protocol::LspRequestFeature::CodeActions | fresh_gui_protocol::LspRequestFeature::CodeActionResolve | fresh_gui_protocol::LspRequestFeature::ExecuteCommand) {
                 require_workspace_edit_capability(*client_workspace_edits)?;
             }
             if lsp_request_map.len() >= 64 {
@@ -2896,26 +2866,14 @@ mod file_finder_capability_tests {
     #[test]
     fn file_finder_requires_client_negotiation_and_editor_daemon() {
         assert!(require_file_finder_cap(true, true, "finder-1").is_ok());
-        assert!(
-            matches!(require_file_finder_cap(false, true, "finder-1"), Err(Message::Error { code, .. }) if code == "capability_unavailable")
-        );
-        assert!(
-            matches!(require_file_finder_cap(true, false, "finder-1"), Err(Message::Error { code, .. }) if code == "capability_unavailable")
-        );
+        assert!(matches!(require_file_finder_cap(false, true, "finder-1"), Err(Message::Error { code, .. }) if code == "capability_unavailable"));
+        assert!(matches!(require_file_finder_cap(true, false, "finder-1"), Err(Message::Error { code, .. }) if code == "capability_unavailable"));
     }
 }
 
 async fn project_root(state: &AppState, workspace: &str) -> Result<PathBuf, Message> {
-    let root = state
-        .workspaces
-        .root_of(workspace)
-        .await
-        .unwrap_or_else(|| state.fs_root.root_display());
-    state
-        .fs_root
-        .resolve(&root)
-        .await
-        .map_err(|e| settings_error("project_search_failed", workspace, e))
+    let root = state.workspaces.root_of(workspace).await.unwrap_or_else(|| state.fs_root.root_display());
+    state.fs_root.resolve(&root).await.map_err(|e| settings_error("project_search_failed", workspace, e))
 }
 
 fn require_settings_cap(enabled: bool, request_id: &str) -> Result<(), Message> {
@@ -3171,9 +3129,7 @@ fn lsp_file_uri_to_path(uri: &str) -> anyhow::Result<PathBuf> {
     );
     // Fresh's LspManager runs under the daemon's local Authority. SSH transport
     // translates the connection, while file URIs already name daemon paths.
-    let path = wire
-        .to_host_path(None)
-        .context("LSP target is not a file URI")?;
+    let path = wire.to_host_path(None).context("LSP target is not a file URI")?;
     anyhow::ensure!(path.is_absolute(), "LSP file URI path is not absolute");
     Ok(path)
 }

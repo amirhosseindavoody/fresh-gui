@@ -377,16 +377,11 @@ enum Cmd {
     WorkspaceAuthority(crate::fs::FsRoot),
     WorkspaceCancelOwner(String),
     WorkspacePrepare {
-        buffer_id: String,
-        base_rev: u64,
-        owner: String,
-        edit: serde_json::Value,
+        buffer_id: String, base_rev: u64, owner: String, edit: serde_json::Value,
         reply: oneshot::Sender<Result<fresh_gui_protocol::WorkspaceEditPreview>>,
     },
     WorkspaceApply {
-        buffer_id: String,
-        owner: String,
-        token: String,
+        buffer_id: String, owner: String, token: String,
         reply: oneshot::Sender<Result<Vec<fresh_gui_protocol::WorkspaceBufferUpdate>>>,
     },
     WorkspaceCancel {
@@ -867,18 +862,12 @@ impl EditorHandle {
         base_rev: u64,
         path: Option<PathBuf>,
     ) -> Result<(String, u64)> {
-        let saved = self
-            .save_with_actions(buffer_id, base_rev, path, true)
-            .await?;
+        let saved = self.save_with_actions(buffer_id, base_rev, path, true).await?;
         Ok((saved.path, saved.rev))
     }
 
     pub async fn save_with_actions(
-        &self,
-        buffer_id: String,
-        base_rev: u64,
-        path: Option<PathBuf>,
-        on_save_actions: bool,
+        &self, buffer_id: String, base_rev: u64, path: Option<PathBuf>, on_save_actions: bool,
     ) -> Result<SavedBuffer> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -966,8 +955,7 @@ impl EditorHandle {
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
-        rx.await
-            .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+        rx.await.map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
     }
 
     pub async fn format(&self, buffer_id: String, base_rev: u64) -> Result<FormatState> {
@@ -1714,18 +1702,9 @@ fn begin_lsp_request(
     bridge: &mut LspBridgeState,
 ) {
     let mut request = request;
-    if let Some(item) = request
-        .item
-        .as_mut()
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        if request.server.is_none() {
-            request.server = item
-                .remove("_fresh_gui_server")
-                .and_then(|v| v.as_str().map(str::to_owned));
-        } else {
-            item.remove("_fresh_gui_server");
-        }
+    if let Some(item) = request.item.as_mut().and_then(serde_json::Value::as_object_mut) {
+        if request.server.is_none() { request.server = item.remove("_fresh_gui_server").and_then(|v| v.as_str().map(str::to_owned)); }
+        else { item.remove("_fresh_gui_server"); }
     }
     if request.view_id.is_empty() {
         send_lsp_status(&bridge.results, &request, "view_id cannot be empty", false);
@@ -1759,13 +1738,8 @@ fn begin_lsp_request(
             bridge,
         );
     }
-    if matches!(
-        request.feature,
-        LspRequestFeature::Rename
-            | LspRequestFeature::CodeActions
-            | LspRequestFeature::CodeActionResolve
-    ) && let Some((owner, _)) = request.view_id.split_once(':')
-    {
+    if matches!(request.feature, LspRequestFeature::Rename | LspRequestFeature::CodeActions | LspRequestFeature::CodeActionResolve)
+        && let Some((owner, _)) = request.view_id.split_once(':') {
         bridge.edits.cancel_source_owner(&request.buffer_id, owner);
     }
     let LspBridgeState {
@@ -1861,16 +1835,10 @@ fn begin_lsp_request(
         .into_iter()
         .filter(|server| {
             (uri.is_some() || request.feature == LspRequestFeature::WorkspaceSymbols)
-                && (!matches!(
-                    request.feature,
-                    LspRequestFeature::Rename
-                        | LspRequestFeature::CodeActionResolve
-                        | LspRequestFeature::ExecuteCommand
-                ) || request.server.as_deref() == Some(server.name.as_str()))
-                && (request.feature != LspRequestFeature::CodeActionResolve
-                    || server.capabilities.code_action_resolve)
-                && (request.feature != LspRequestFeature::PrepareRename
-                    || server.capabilities.rename)
+                && (!matches!(request.feature, LspRequestFeature::Rename | LspRequestFeature::CodeActionResolve | LspRequestFeature::ExecuteCommand)
+                    || request.server.as_deref() == Some(server.name.as_str()))
+                && (request.feature != LspRequestFeature::CodeActionResolve || server.capabilities.code_action_resolve)
+                && (request.feature != LspRequestFeature::PrepareRename || server.capabilities.rename)
                 && (request.feature != LspRequestFeature::CompletionResolve
                     || (server.name == request.server.as_deref().unwrap_or("")
                         && server.capabilities.completion_resolve))
@@ -1882,14 +1850,7 @@ fn begin_lsp_request(
             (server.name.clone(), triggers)
         })
         .collect::<Vec<_>>();
-    if matches!(
-        request.feature,
-        LspRequestFeature::SignatureHelp
-            | LspRequestFeature::PrepareRename
-            | LspRequestFeature::Rename
-    ) {
-        eligible.truncate(1);
-    }
+    if matches!(request.feature, LspRequestFeature::SignatureHelp | LspRequestFeature::PrepareRename | LspRequestFeature::Rename) { eligible.truncate(1); }
     if eligible.is_empty() {
         let response = if request.feature == LspRequestFeature::Completion {
             buffer_word_completions(&entry.text, request.offset)
@@ -1933,11 +1894,7 @@ fn begin_lsp_request(
         .map(|_| editor.active_window_mut().alloc_lsp_request_id())
         .collect::<Vec<_>>();
     let mut sent = Vec::new();
-    let diagnostics = uri
-        .as_ref()
-        .and_then(|uri| editor.get_stored_diagnostics().get(uri))
-        .cloned()
-        .unwrap_or_default();
+    let diagnostics = uri.as_ref().and_then(|uri| editor.get_stored_diagnostics().get(uri)).cloned().unwrap_or_default();
     let manager = &mut editor.active_window_mut().lsp;
     for ((server_name, _), lsp_id) in eligible.into_iter().zip(request_ids_to_send) {
         let Some(server) = manager
@@ -1965,10 +1922,7 @@ fn begin_lsp_request(
                 &diagnostics,
             ) {
                 Ok(params) => Some(params),
-                Err(error) => {
-                    send_lsp_status(results, &request, &error.to_string(), false);
-                    continue;
-                }
+                Err(error) => { send_lsp_status(results, &request, &error.to_string(), false); continue; }
             }
         } else if request.feature == LspRequestFeature::CompletionResolve {
             request
@@ -2040,10 +1994,7 @@ fn begin_lsp_request(
                 signature_triggers,
                 deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(5),
                 status: None,
-                revisions: tracked
-                    .iter()
-                    .map(|(id, entry)| (id.clone(), entry.rev))
-                    .collect(),
+                revisions: tracked.iter().map(|(id, entry)| (id.clone(), entry.rev)).collect(),
             },
         );
     }
@@ -2058,44 +2009,19 @@ fn refactoring_params(
     diagnostics: &[lsp_types::Diagnostic],
 ) -> Result<serde_json::Value> {
     use serde_json::json;
-    let mut params =
-        json!({"textDocument":{"uri":uri},"position":{"line":line,"character":character}});
+    let mut params = json!({"textDocument":{"uri":uri},"position":{"line":line,"character":character}});
     match request.feature {
         LspRequestFeature::PrepareRename => {}
         LspRequestFeature::Rename => {
-            let name = request
-                .item
-                .as_ref()
-                .and_then(|v| v.get("newName"))
-                .and_then(serde_json::Value::as_str)
-                .context("rename requires newName")?;
-            anyhow::ensure!(
-                !name.is_empty() && name.len() <= 1024 && !name.contains(['\n', '\r']),
-                "invalid rename name"
-            );
+            let name = request.item.as_ref().and_then(|v| v.get("newName")).and_then(serde_json::Value::as_str).context("rename requires newName")?;
+            anyhow::ensure!(!name.is_empty() && name.len() <= 1024 && !name.contains(['\n', '\r']), "invalid rename name");
             params["newName"] = json!(name);
         }
         LspRequestFeature::CodeActions => {
-            let start = request
-                .item
-                .as_ref()
-                .and_then(|v| v.get("startOffset"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(request.offset as u64);
-            let end = request
-                .item
-                .as_ref()
-                .and_then(|v| v.get("endOffset"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(request.offset as u64);
+            let start = request.item.as_ref().and_then(|v| v.get("startOffset")).and_then(serde_json::Value::as_u64).unwrap_or(request.offset as u64);
+            let end = request.item.as_ref().and_then(|v| v.get("endOffset")).and_then(serde_json::Value::as_u64).unwrap_or(request.offset as u64);
             let (start, end) = (usize::try_from(start)?, usize::try_from(end)?);
-            anyhow::ensure!(
-                start <= end
-                    && end <= text.len()
-                    && text.is_char_boundary(start)
-                    && text.is_char_boundary(end),
-                "code action range is invalid"
-            );
+            anyhow::ensure!(start <= end && end <= text.len() && text.is_char_boundary(start) && text.is_char_boundary(end), "code action range is invalid");
             let at = |offset| {
                 let prefix = &text[..offset];
                 json!({"line":prefix.bytes().filter(|b| *b == b'\n').count() as u32,
@@ -2104,22 +2030,12 @@ fn refactoring_params(
             params = json!({"textDocument":{"uri":uri},"range":{"start":at(start),"end":at(end)},"context":{"diagnostics":diagnostics}});
         }
         LspRequestFeature::CodeActionResolve => {
-            params = request
-                .item
-                .clone()
-                .context("code action resolve requires an action")?;
-            let _: lsp_types::CodeAction =
-                serde_json::from_value(params.clone()).context("invalid code action")?;
+            params = request.item.clone().context("code action resolve requires an action")?;
+            let _: lsp_types::CodeAction = serde_json::from_value(params.clone()).context("invalid code action")?;
         }
         LspRequestFeature::ExecuteCommand => {
-            let item = request
-                .item
-                .as_ref()
-                .context("executeCommand requires a command")?;
-            let command = item
-                .get("command")
-                .and_then(serde_json::Value::as_str)
-                .context("invalid command identifier")?;
+            let item = request.item.as_ref().context("executeCommand requires a command")?;
+            let command = item.get("command").and_then(serde_json::Value::as_str).context("invalid command identifier")?;
             let arguments = item.get("arguments").cloned().unwrap_or_else(|| json!([]));
             anyhow::ensure!(arguments.is_array(), "command arguments must be an array");
             params = json!({"command":command,"arguments":arguments});
@@ -2157,9 +2073,7 @@ fn lsp_route_feature(feature: LspRequestFeature) -> LspFeature {
         LspRequestFeature::DocumentSymbols => LspFeature::DocumentSymbols,
         LspRequestFeature::WorkspaceSymbols => LspFeature::WorkspaceSymbols,
         LspRequestFeature::PrepareRename | LspRequestFeature::Rename => LspFeature::Rename,
-        LspRequestFeature::CodeActions
-        | LspRequestFeature::CodeActionResolve
-        | LspRequestFeature::ExecuteCommand => LspFeature::CodeAction,
+        LspRequestFeature::CodeActions | LspRequestFeature::CodeActionResolve | LspRequestFeature::ExecuteCommand => LspFeature::CodeAction,
     }
 }
 
@@ -2310,36 +2224,23 @@ fn poll_lsp_bridge(
         match message {
             message @ AsyncMessage::LspFormatting { .. } => {
                 let (request_id, uri) = match &message {
-                    AsyncMessage::LspFormatting {
-                        request_id, uri, ..
-                    } => (*request_id, uri),
+                    AsyncMessage::LspFormatting { request_id, uri, .. } => (*request_id, uri),
                     _ => unreachable!(),
                 };
                 // Fresh's dispatcher applies formatting without a revision guard.
                 // Only the currently awaited ADE request can mutate the buffer;
                 // timed-out or superseded responses must never reach it.
                 let valid = bridge_state.formatting.as_ref().is_some_and(|request| {
-                    request.request_id == request_id
-                        && request.uri == *uri
-                        && tracked
-                            .get(&request.buffer_id)
-                            .is_some_and(|buffer| buffer.rev == request.rev)
-                        && request
-                            .buffer_id
-                            .parse::<usize>()
-                            .ok()
-                            .and_then(|id| editor.active_window().buffers.get(&BufferId(id)))
-                            .and_then(|state| state.buffer.to_string())
-                            .as_deref()
-                            == Some(request.text.as_str())
+                    request.request_id == request_id && request.uri == *uri
+                        && tracked.get(&request.buffer_id).is_some_and(|buffer| buffer.rev == request.rev)
+                        && request.buffer_id.parse::<usize>().ok().and_then(|id| editor.active_window().buffers.get(&BufferId(id))).and_then(|state| state.buffer.to_string()).as_deref() == Some(request.text.as_str())
                 });
                 if valid {
                     bridge_state.formatting = None;
                     let _ = sender.send(message);
                 }
             }
-            message @ (AsyncMessage::LspLogMessage { .. }
-            | AsyncMessage::LspWindowMessage { .. }) => {
+            message @ (AsyncMessage::LspLogMessage { .. } | AsyncMessage::LspWindowMessage { .. }) => {
                 let (language, message_type, body) = match &message {
                     AsyncMessage::LspLogMessage {
                         language,
@@ -2353,23 +2254,13 @@ fn poll_lsp_bridge(
                     } => (language, message_type, message),
                     _ => unreachable!(),
                 };
-                let workspaces = tracked
-                    .values()
-                    .map(|entry| &entry.workspace_id)
-                    .collect::<std::collections::HashSet<_>>();
+                let workspaces = tracked.values().map(|entry| &entry.workspace_id).collect::<std::collections::HashSet<_>>();
                 if workspaces.len() == 1 {
                     let workspace = (*workspaces.iter().next().expect("one workspace")).clone();
-                    let ring = bridge_state
-                        .language_logs
-                        .entry((workspace, language.clone()))
-                        .or_default();
+                    let ring = bridge_state.language_logs.entry((workspace, language.clone())).or_default();
                     let body = body.chars().take(2048).collect::<String>();
-                    ring.push_back(format!(
-                        "Language log (server identity unavailable) {message_type:?}: {body}"
-                    ));
-                    while ring.len() > 100 {
-                        ring.pop_front();
-                    }
+                    ring.push_back(format!("Language log (server identity unavailable) {message_type:?}: {body}"));
+                    while ring.len() > 100 { ring.pop_front(); }
                 }
                 let _ = sender.send(message);
             }
@@ -2511,25 +2402,11 @@ fn poll_lsp_bridge(
                 );
             }
             AsyncMessage::LspApplyEdit { edit, label: _ } => {
-                let commands = pending
-                    .values()
-                    .filter(|p| p.request.feature == LspRequestFeature::ExecuteCommand)
-                    .cloned()
-                    .collect::<Vec<_>>();
+                let commands = pending.values().filter(|p| p.request.feature == LspRequestFeature::ExecuteCommand).cloned().collect::<Vec<_>>();
                 let command = (commands.len() == 1).then(|| &commands[0]);
                 let touched = workspace_edits::touched_open_buffers(&edit, tracked);
-                let touched_workspaces = touched
-                    .as_ref()
-                    .ok()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|id| tracked.get(id))
-                    .map(|e| &e.workspace_id)
-                    .collect::<std::collections::HashSet<_>>();
-                let all_workspaces = tracked
-                    .values()
-                    .map(|e| &e.workspace_id)
-                    .collect::<std::collections::HashSet<_>>();
+                let touched_workspaces = touched.as_ref().ok().into_iter().flatten().filter_map(|id| tracked.get(id)).map(|e| &e.workspace_id).collect::<std::collections::HashSet<_>>();
+                let all_workspaces = tracked.values().map(|e| &e.workspace_id).collect::<std::collections::HashSet<_>>();
                 let source = if touched.is_err() || touched_workspaces.len() > 1 {
                     None
                 } else if let Some(command) = command {
@@ -2538,13 +2415,8 @@ fn poll_lsp_bridge(
                     tracked.get(id).map(|entry| (id.clone(), entry.rev))
                 } else if all_workspaces.len() == 1 {
                     let active = editor.active_buffer().0.to_string();
-                    tracked
-                        .get_key_value(&active)
-                        .or_else(|| tracked.iter().min_by_key(|(id, _)| *id))
-                        .map(|(id, e)| (id.clone(), e.rev))
-                } else {
-                    None
-                };
+                    tracked.get_key_value(&active).or_else(|| tracked.iter().min_by_key(|(id, _)| *id)).map(|(id, e)| (id.clone(), e.rev))
+                } else { None };
                 if let Some((source, rev)) = source {
                     if let Some(entry) = tracked.get(&source) {
                         let workspace_id = entry.workspace_id.clone();
@@ -4424,21 +4296,12 @@ fn lsp_state(
                 Some(lsp_types::DiagnosticSeverity::WARNING) => "warning",
                 Some(lsp_types::DiagnosticSeverity::HINT) => "hint",
                 _ => "info",
-            }
-            .into(),
+            }.into(),
             message: d.message,
             source: d.source,
-            related_information: d
-                .related_information
-                .unwrap_or_default()
-                .into_iter()
-                .map(|info| fresh_gui_protocol::DiagnosticRelatedInformation {
-                    uri: info.location.uri.to_string(),
-                    line: info.location.range.start.line,
-                    character: info.location.range.start.character,
-                    message: info.message,
-                })
-                .collect(),
+            related_information: d.related_information.unwrap_or_default().into_iter().map(|info| fresh_gui_protocol::DiagnosticRelatedInformation {
+                uri: info.location.uri.to_string(), line: info.location.range.start.line, character: info.location.range.start.character, message: info.message,
+            }).collect(),
         })
         .collect();
     let rev = tracked[buffer_id].rev;
@@ -4491,11 +4354,7 @@ async fn format_buffer(
     }
     activate_tracked(editor, tracked, buffer_id)?;
     let language = tracked[buffer_id].language.as_deref().unwrap_or("");
-    let has_external = editor
-        .config()
-        .languages
-        .get(language)
-        .is_some_and(|language| language.formatter.is_some());
+    let has_external = editor.config().languages.get(language).is_some_and(|language| language.formatter.is_some());
     if !has_external {
         let formatter = editor
             .config()
@@ -4507,16 +4366,8 @@ async fn format_buffer(
                 })
             })
             .context("no formatting server or external formatter configured for this file")?;
-        if !editor.config().lsp_enabled {
-            bail!("Language servers are disabled in settings");
-        }
-        if !fresh::services::lsp::command_exists(&formatter.command) {
-            bail!(
-                "LSP {}: command '{}' not found on daemon host; install it or change lsp settings",
-                formatter.display_name(),
-                formatter.command
-            );
-        }
+        if !editor.config().lsp_enabled { bail!("Language servers are disabled in settings"); }
+        if !fresh::services::lsp::command_exists(&formatter.command) { bail!("LSP {}: command '{}' not found on daemon host; install it or change lsp settings", formatter.display_name(), formatter.command); }
     }
     let before = editor
         .active_state()
@@ -4526,10 +4377,7 @@ async fn format_buffer(
     let prior_status = editor.get_status_message().cloned();
     let prior_selection = current_selection(editor);
     if let Some(range) = range {
-        let end = range
-            .start
-            .checked_add(range.len)
-            .context("format range overflow")?;
+        let end = range.start.checked_add(range.len).context("format range overflow")?;
         if end > before.len()
             || !before.is_char_boundary(range.start)
             || !before.is_char_boundary(end)
@@ -5164,12 +5012,7 @@ fn save_buffer(
     // Acknowledge the actual generation even if a later on-save action failed.
     entry.rev += 1;
     Ok(SavedBuffer {
-        path: entry
-            .path
-            .as_ref()
-            .expect("saved buffer has a path")
-            .display()
-            .to_string(),
+        path: entry.path.as_ref().expect("saved buffer has a path").display().to_string(),
         rev: entry.rev,
         outcome: fresh_gui_protocol::SaveOutcome {
             text: (!paged && on_save_actions).then(|| entry.text.clone()),

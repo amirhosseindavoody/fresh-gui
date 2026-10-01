@@ -233,17 +233,10 @@ impl DraftStore {
         let mut paths = Vec::new();
         for entry in entries {
             let path = entry?.path();
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("");
+            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
             if name.ends_with(".json.bak") {
-                if path.with_extension("").exists() {
-                    continue;
-                }
-            } else if !name.ends_with(".json") {
-                continue;
-            }
+                if path.with_extension("").exists() { continue; }
+            } else if !name.ends_with(".json") { continue; }
             let state: DraftFile = serde_json::from_slice(&std::fs::read(&path)?)
                 .with_context(|| format!("inspect recovery record {}", path.display()))?;
             paths.extend(
@@ -324,10 +317,7 @@ mod tests {
         std::fs::rename(&record, record.with_extension("json.bak")).unwrap();
         assert_eq!(store.protected_paths().unwrap(), vec![path]);
         std::fs::write(&record, b"broken").unwrap();
-        assert!(
-            store.protected_paths().is_err(),
-            "unreadable recovery records block destructive workspace edits"
-        );
+        assert!(store.protected_paths().is_err(), "unreadable recovery records block destructive workspace edits");
         let _ = std::fs::remove_dir_all(root);
     }
 
