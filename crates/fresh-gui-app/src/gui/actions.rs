@@ -45,6 +45,14 @@ actions!(
         NewFile,
         SplitTerminal,
         FormatDocument,
+        FormatSelection,
+        ShowProblems,
+        NextError,
+        PreviousError,
+        ShowLanguageServers,
+        StartLanguageServers,
+        StopLanguageServers,
+        RestartLanguageServers,
         RenameSymbol,
         CodeActions,
         Complete,
@@ -156,6 +164,8 @@ pub fn apply_shortkeys(cx: &mut App, shortkeys: &[Shortkey]) {
         ("tab", "TerminalInputTab", "Terminal"),
         ("shift-tab", "TerminalInputBacktab", "Terminal"),
         ("f2", "RenameSymbol", "Editor"),
+        ("f8", "NextError", "Editor"),
+        ("shift-f8", "PreviousError", "Editor"),
         ("ctrl-.", "CodeActions", "Editor"),
     ].into_iter().filter_map(|(key, id, context)| {
         super::commands::command_descriptor(id).map(|command| command.key_binding(key, Some(context)))

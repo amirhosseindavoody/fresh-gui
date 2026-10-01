@@ -41,6 +41,8 @@ pub const CAP_FILE_FINDER: &str = "project.file-finder";
 pub const MAX_SEARCH_DRAFT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_SEARCH_MATCHES: usize = 10_000;
 pub const CAP_LSP: &str = "lsp";
+/// Selection formatting and configured language-server lifecycle controls.
+pub const CAP_LSP_CONTROLS: &str = "lsp.controls";
 /// Revision-aware completion, hover and signature-help requests.
 pub const CAP_LSP_REQUESTS: &str = "lsp.requests";
 /// Definition, references, implementation, and symbol navigation requests.
@@ -281,6 +283,29 @@ pub struct BufferDiagnostic {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related_information: Vec<DiagnosticRelatedInformation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticRelatedInformation {
+    pub uri: String,
+    pub line: u32,
+    pub character: u32,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LanguageServerAction { Status, Start, Stop, Restart }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LanguageServerState {
+    pub name: String,
+    pub language: String,
+    pub status: String,
+    pub command: String,
+    pub logs: Vec<String>,
 }
 
 /// An LSP request made against a revisioned editor buffer.
@@ -1078,6 +1103,9 @@ pub enum Message {
         buffer_id: String,
         path: String,
         rev: u64,
+        /// Authoritative text after on-save formatting (omitted for paged files).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
     },
     /// Client → backend: inspect current disk state for an open buffer.
     /// Requires `editor.external-changes`; used after reconnect and explorer refresh.
@@ -1183,10 +1211,14 @@ pub enum Message {
         view_id: String,
     },
     /// Client → backend: format the buffer with Fresh's formatter.
+    LanguageServers { request_id: String, buffer_id: String, action: LanguageServerAction },
+    LanguageServersState { request_id: String, buffer_id: String, servers: Vec<LanguageServerState> },
     BufferFormat {
         request_id: String,
         buffer_id: String,
         base_rev: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        range: Option<ByteRange>,
     },
     /// Backend → client: formatted text. `rev` is unchanged when the formatter
     /// left the buffer alone.
@@ -1401,6 +1433,7 @@ impl Hello {
             CAP_PROJECT_SEARCH.to_owned(),
             CAP_FILE_FINDER.to_owned(),
             CAP_LSP.to_owned(),
+            CAP_LSP_CONTROLS.to_owned(),
             CAP_LSP_REQUESTS.to_owned(),
             CAP_LSP_NAVIGATION.to_owned(),
             CAP_LSP_WORKSPACE_EDITS.to_owned(),
@@ -1426,6 +1459,7 @@ impl Hello {
             CAP_PROJECT_SEARCH.to_owned(),
             CAP_FILE_FINDER.to_owned(),
             CAP_LSP.to_owned(),
+            CAP_LSP_CONTROLS.to_owned(),
             CAP_LSP_REQUESTS.to_owned(),
             CAP_LSP_NAVIGATION.to_owned(),
             CAP_LSP_WORKSPACE_EDITS.to_owned(),
@@ -1689,6 +1723,7 @@ mod tests {
             buffer_id: "1".into(),
             path: "/tmp/a.rs".into(),
             rev: 1,
+            text: None,
         };
         assert_eq!(
             Message::from_json(&saved.to_json().unwrap()).unwrap(),
@@ -1989,6 +2024,7 @@ mod tests {
                 severity: "error".into(),
                 message: "bad value".into(),
                 source: Some("Ruff".into()),
+                related_information: Vec::new(),
             }],
             status: None,
             text: None,
@@ -2008,6 +2044,21 @@ mod tests {
             Message::from_json(&formatted.to_json().unwrap()).unwrap(),
             formatted
         );
+    }
+
+    #[test]
+    fn diagnostics_controls_are_additive_and_roundtrip() {
+        let legacy = r#"{"type":"buffer_format","request_id":"format","buffer_id":"1","base_rev":2}"#;
+        assert!(matches!(Message::from_json(legacy).unwrap(), Message::BufferFormat { range: None, .. }));
+        let selection = Message::BufferFormat { request_id: "range".into(), buffer_id: "1".into(), base_rev: 2, range: Some(ByteRange { start: 3, len: 4 }) };
+        assert_eq!(Message::from_json(&selection.to_json().unwrap()).unwrap(), selection);
+        let status = Message::LanguageServersState { request_id: "servers".into(), buffer_id: "1".into(), servers: vec![LanguageServerState { name: "Ruff".into(), language: "python".into(), status: "running".into(), command: "ruff".into(), logs: vec!["ready".into()] }] };
+        assert_eq!(Message::from_json(&status.to_json().unwrap()).unwrap(), status);
+        let old_diagnostic = serde_json::json!({"start_line":0,"start_character":0,"end_line":0,"end_character":1,"severity":"error","message":"bad"});
+        let d: BufferDiagnostic = serde_json::from_value(old_diagnostic).unwrap();
+        assert!(d.related_information.is_empty());
+        assert!(Hello::default_backend_caps().iter().any(|cap| cap == CAP_LSP_CONTROLS));
+        assert!(Hello::default_client_caps().iter().any(|cap| cap == CAP_LSP_CONTROLS));
     }
 
     #[test]

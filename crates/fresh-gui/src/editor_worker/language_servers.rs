@@ -11,6 +11,7 @@ pub(super) fn language_servers(
     action: LanguageServerAction,
     logs: &[String],
 ) -> Result<Vec<LanguageServerState>> {
+    super::activate_tracked(editor, tracked, buffer_id)?;
     let buffer = tracked
         .get(buffer_id)
         .with_context(|| format!("unknown or inactive buffer {buffer_id}"))?;
@@ -95,10 +96,12 @@ pub(super) fn language_servers(
     let globally_enabled = editor.config().lsp_enabled;
     let manager = &editor.active_window().lsp;
     let handles = manager.get_handles(language);
+    let workspace_count = tracked.values().map(|buffer| &buffer.workspace_id).collect::<std::collections::HashSet<_>>().len();
     let progress = editor
         .active_window()
         .get_lsp_progress()
         .into_iter()
+        .filter(|_| workspace_count == 1)
         .take(8)
         .map(|(_, title, message)| {
             let progress = message
@@ -133,7 +136,7 @@ pub(super) fn language_servers(
             "stopped".to_string()
         };
         if !progress.is_empty() {
-            status.push_str(" · progress: ");
+            status.push_str(" · window progress: ");
             status.push_str(&progress.join("; "));
         }
         states.push(LanguageServerState {

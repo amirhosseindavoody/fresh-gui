@@ -24,8 +24,12 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 mod workspace_edits;
+mod language_servers;
 #[cfg(test)]
 mod workspace_edit_tests;
+#[cfg(test)]
+#[path = "editor_worker/formatting_tests.rs"]
+mod formatting_tests;
 pub(crate) use workspace_edits::WorkspaceNotice;
 use workspace_edits::WorkspaceEdits;
 
@@ -285,9 +289,15 @@ enum Cmd {
         known_rev: u64,
         reply: oneshot::Sender<Result<LspState>>,
     },
+    LanguageServers {
+        buffer_id: String,
+        action: fresh_gui_protocol::LanguageServerAction,
+        reply: oneshot::Sender<Result<Vec<fresh_gui_protocol::LanguageServerState>>>,
+    },
     Format {
         buffer_id: String,
         base_rev: u64,
+        range: Option<ByteRange>,
         reply: oneshot::Sender<Result<FormatState>>,
     },
     Reconfigure {
@@ -821,12 +831,34 @@ impl EditorHandle {
             .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
     }
 
+    pub async fn language_servers(
+        &self,
+        buffer_id: String,
+        action: fresh_gui_protocol::LanguageServerAction,
+    ) -> Result<Vec<fresh_gui_protocol::LanguageServerState>> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::LanguageServers { buffer_id, action, reply })
+            .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        rx.await.map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+    }
+
     pub async fn format(&self, buffer_id: String, base_rev: u64) -> Result<FormatState> {
+        self.format_range(buffer_id, base_rev, None).await
+    }
+
+    pub async fn format_range(
+        &self,
+        buffer_id: String,
+        base_rev: u64,
+        range: Option<ByteRange>,
+    ) -> Result<FormatState> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Cmd::Format {
                 buffer_id,
                 base_rev,
+                range,
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
@@ -863,15 +895,6 @@ fn build_editor(working_dir: &Path, gui_config: &crate::config::Config) -> Resul
     cfg.editor.animations = false;
     // Config layers cannot change the negotiated ADE lazy/snapshot boundary.
     cfg.editor.large_file_threshold_bytes = MAX_SNAPSHOT_BYTES as u64 + 1;
-    cfg.lsp = gui_config.lsp.clone();
-    cfg.lsp_enabled = !cfg.lsp.is_empty();
-    for language in cfg.lsp.keys() {
-        if let Some(config) = cfg.languages.get_mut(language) {
-            // The GUI's Format action should use the configured LSP server,
-            // not Fresh's unrelated built-in external formatter command.
-            config.formatter = None;
-        }
-    }
     let fs: Arc<dyn FileSystem + Send + Sync> = Arc::new(crate::editor_fs::EditorFileSystem::new());
     Editor::with_working_dir(
         cfg,
@@ -923,6 +946,7 @@ fn run_loop(
         edits: WorkspaceEdits::with_authority(crate::fs::FsRoot::new(editor.working_dir().to_path_buf()).ok()),
         drafts: drafts.clone(),
         workspace_tx,
+        language_logs: HashMap::new(),
     };
 
     // Borrow editor/tracked into the future (no `async move`) so `Editor` is
@@ -1178,13 +1202,19 @@ fn run_loop(
                         });
                     let _ = reply.send(result);
                 }
+                Cmd::LanguageServers { buffer_id, action, reply } => {
+                    let logs: Vec<String> = tracked.get(&buffer_id).and_then(|entry| lsp_bridge.language_logs.get(&(entry.workspace_id.clone(), entry.language.clone().unwrap_or_default()))).map(|lines| lines.iter().cloned().collect()).unwrap_or_default();
+                    let result = language_servers::language_servers(&mut editor, &tracked, &buffer_id, action, &logs);
+                    let _ = reply.send(result);
+                }
                 Cmd::Format {
                     buffer_id,
                     base_rev,
+                    range,
                     reply,
                 } => {
                     cancel_all_lsp_requests(&mut editor, &mut lsp_bridge);
-                    let result = format_buffer(&mut editor, &mut tracked, &buffer_id, base_rev, &mut lsp_bridge)
+                    let result = format_buffer(&mut editor, &mut tracked, &buffer_id, base_rev, range, &mut lsp_bridge)
                         .await
                         .and_then(|result| {
                             if result.text.is_some() {
@@ -1206,11 +1236,6 @@ fn run_loop(
                     // Editor preferences are applied at construction; existing buffers
                     // retain their settings until server restart.
                     config.apply_fresh_services(&mut fresh_config);
-                    for language in fresh_config.lsp.keys() {
-                        if let Some(config) = fresh_config.languages.get_mut(language) {
-                            config.formatter = None;
-                        }
-                    }
                     editor.set_config(fresh_config);
                     let lsp_enabled = editor.config().lsp_enabled;
                     editor
@@ -1503,6 +1528,7 @@ struct LspBridgeState {
     edits: WorkspaceEdits,
     drafts: DraftStore,
     workspace_tx: tokio::sync::broadcast::Sender<WorkspaceNotice>,
+    language_logs: HashMap<(String, String), std::collections::VecDeque<String>>,
 }
 
 fn begin_lsp_request(
@@ -2011,6 +2037,21 @@ fn poll_lsp_bridge(
     let sender = bridge.sender();
     for message in bridge_state.inbox.try_recv_all() {
         match message {
+            message @ (AsyncMessage::LspLogMessage { .. } | AsyncMessage::LspWindowMessage { .. }) => {
+                let (language, message_type, body) = match &message {
+                    AsyncMessage::LspLogMessage { language, message_type, message } | AsyncMessage::LspWindowMessage { language, message_type, message } => (language, message_type, message),
+                    _ => unreachable!(),
+                };
+                let workspaces = tracked.values().map(|entry| &entry.workspace_id).collect::<std::collections::HashSet<_>>();
+                if workspaces.len() == 1 {
+                    let workspace = (*workspaces.iter().next().expect("one workspace")).clone();
+                    let ring = bridge_state.language_logs.entry((workspace, language.clone())).or_default();
+                    let body = body.chars().take(2048).collect::<String>();
+                    ring.push_back(format!("Language log (server identity unavailable) {message_type:?}: {body}"));
+                    while ring.len() > 100 { ring.pop_front(); }
+                }
+                let _ = sender.send(message);
+            }
             AsyncMessage::PluginLspResponse {
                 request_id,
                 result,
@@ -3722,6 +3763,9 @@ fn lsp_state(
                 .unwrap_or_else(|| "info".into()),
             message: d.message,
             source: d.source,
+            related_information: d.related_information.unwrap_or_default().into_iter().map(|info| fresh_gui_protocol::DiagnosticRelatedInformation {
+                uri: info.location.uri.to_string(), line: info.location.range.start.line, character: info.location.range.start.character, message: info.message,
+            }).collect(),
         })
         .collect();
     let rev = tracked[buffer_id].rev;
@@ -3755,6 +3799,7 @@ async fn format_buffer(
     tracked: &mut HashMap<String, TrackedBuffer>,
     buffer_id: &str,
     base_rev: u64,
+    range: Option<ByteRange>,
     bridge: &mut LspBridgeState,
 ) -> Result<FormatState> {
     if tracked
@@ -3771,32 +3816,36 @@ async fn format_buffer(
     if current != base_rev {
         bail!("revision conflict: base_rev={base_rev} current={current}");
     }
-    let language = tracked[buffer_id].language.as_deref().unwrap_or("");
-    let servers = editor
-        .config()
-        .lsp
-        .get(language)
-        .context("no language server configured for this file")?;
-    let formatter = servers
-        .as_slice()
-        .iter()
-        .find(|server| server.enabled && server.feature_filter().allows(LspFeature::Format))
-        .context("no formatting language server configured for this file")?;
-    if !fresh::services::lsp::command_exists(&formatter.command) {
-        bail!(
-            "LSP {}: command '{}' not found on daemon host",
-            formatter.display_name(),
-            formatter.command
-        );
-    }
     activate_tracked(editor, tracked, buffer_id)?;
+    let language = tracked[buffer_id].language.as_deref().unwrap_or("");
+    let has_external = editor.config().languages.get(language).is_some_and(|language| language.formatter.is_some());
+    if !has_external {
+        let formatter = editor.config().lsp.get(language).and_then(|servers| servers.as_slice().iter().find(|server| server.enabled && server.feature_filter().allows(LspFeature::Format)))
+            .context("no formatting server or external formatter configured for this file")?;
+        if !editor.config().lsp_enabled { bail!("Language servers are disabled in settings"); }
+        if !fresh::services::lsp::command_exists(&formatter.command) { bail!("LSP {}: command '{}' not found on daemon host; install it or change lsp settings", formatter.display_name(), formatter.command); }
+    }
     let before = editor
         .active_state()
         .buffer
         .to_string()
         .context("buffer has unloaded regions")?;
     let prior_status = editor.get_status_message().cloned();
-    editor.format_buffer().map_err(anyhow::Error::msg)?;
+    let prior_selection = current_selection(editor);
+    if let Some(range) = range {
+        let end = range.start.checked_add(range.len).context("format range overflow")?;
+        if end > before.len()
+            || !before.is_char_boundary(range.start)
+            || !before.is_char_boundary(end)
+        {
+            bail!("format range is outside the buffer or not on UTF-8 boundaries");
+        }
+        set_selection(editor, ByteSelection { anchor: range.start, head: end });
+    }
+    if range.is_none() { set_selection(editor, ByteSelection { anchor: prior_selection.head, head: prior_selection.head }); }
+    let format_result = editor.format_buffer();
+    set_selection(editor, prior_selection);
+    format_result.map_err(anyhow::Error::msg)?;
     if let Some(status) = editor.get_status_message()
         && prior_status.as_ref() != Some(status)
         && (status.contains("Formatting not supported") || status.contains("LSP not available"))
@@ -4243,6 +4292,12 @@ fn save_buffer(
         }
     } else {
         bail!("unsaved buffer needs a path");
+    }
+    // Reuse Fresh's configured format-on-save and on-save actions after its
+    // normal save has passed ADE's external-change checks. Fresh persists any
+    // formatter output itself and refreshes its watched-file metadata.
+    if tracked.get(buffer_id).is_some_and(|entry| entry.total_bytes.is_none()) {
+        editor.run_on_save_actions().map_err(anyhow::Error::msg).context("Fresh on-save actions")?;
     }
     let total_bytes = editor.active_state().buffer.total_bytes();
     let was_paged = tracked
@@ -5834,7 +5889,7 @@ mod tests {
 
     // A stdio LSP exercised through Fresh and the ADE worker, including
     // two Python servers and a TOML server. No developer-installed binary is needed.
-    const FAKE_LSP: &str = r#"#!/usr/bin/env python3
+    pub(super) const FAKE_LSP: &str = r#"#!/usr/bin/env python3
 import json, sys
 source = sys.argv[1]
 log_path = sys.argv[0] + '.' + source + '.log'
@@ -6097,18 +6152,19 @@ while True:
         let script = script.display().to_string();
         let missing = root.join("missing-lsp").display().to_string();
         let cfg = crate::config::Config::parse(&serde_json::json!({
+            "languages": {"fixture_python": {"extensions":["fixturepy"], "grammar":"python"}, "fixture_rust":{"extensions":["fixturers"], "grammar":"rust"}},
             "lsp": {
-                "python": [
+                "fixture_python": [
                     {"name":"Ruff","command":"python3","args":[script,"Ruff"],"only_features":["diagnostics","format"]},
                     {"name":"TY","command":"python3","args":[script,"TY"],"only_features":["diagnostics"]}
                 ],
                 "toml": {"name":"Tombi","command":"python3","args":[script,"Tombi"]},
-                "rust": {"name":"Missing","command":missing,"args":[]}
+                "fixture_rust": {"name":"Missing","command":missing,"args":[]}
             }
         }).to_string()).unwrap();
-        let python = root.join("sample.py");
+        let python = root.join("sample.fixturepy");
         let toml = root.join("sample.toml");
-        let rust = root.join("sample.rs");
+        let rust = root.join("sample.fixturers");
         std::fs::write(&python, "bad = 1\n").unwrap();
         std::fs::write(&toml, "bad = 1\n").unwrap();
         std::fs::write(&rust, "fn main() {}\n").unwrap();
@@ -6189,13 +6245,14 @@ while True:
             for source in ["Ruff", "TY"] {
                 let log = root.join(format!("fake_lsp.py.{source}.log"));
                 let mut closed = false;
-                for _ in 0..40 {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                while tokio::time::Instant::now() < deadline {
                     let events = std::fs::read_to_string(&log).unwrap_or_default();
                     closed = events.contains("textDocument/didClose");
                     if closed {
                         break;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
                 assert!(closed, "{source} received didClose");
             }
@@ -6268,7 +6325,7 @@ while True:
             editor.close(opened.buffer_id).await.unwrap();
 
             let changed_config = crate::config::Config::parse(
-                &serde_json::json!({"lsp": {"rust": {
+                &serde_json::json!({"lsp": {"fixture_rust": {
                     "name": "Fresh", "command": "python3", "args": [script, "Fresh"]
                 }}})
                 .to_string(),
@@ -6299,4 +6356,6 @@ while True:
         drop(editor);
         let _ = std::fs::remove_dir_all(root);
     }
+
+
 }

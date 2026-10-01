@@ -351,6 +351,13 @@ impl Workspace {
         self.dismiss_navigation(cx);
     }
 
+    pub(super) fn open_problem_location(&mut self, uri: String, line: u32, character: u32, cx: &mut Context<Self>) {
+        let request_id = next_id("problem-location");
+        self.navigation.pending.insert(request_id.clone(), PendingLocation { origin: self.current_location(cx), offset: None, workspace: self.workspace_id_or_empty() });
+        self.pending_editors.insert(request_id.clone(), true);
+        self.ade.send(AdeCmd::OpenLocation { request_id, uri, line, character });
+    }
+
     pub(super) fn location_opened(
         &mut self,
         request_id: &str,

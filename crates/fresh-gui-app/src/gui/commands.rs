@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use super::actions::*;
 use fresh_gui_protocol::{
-    CAP_EDITOR_SEARCH, CAP_LSP_NAVIGATION, CAP_LSP_REQUESTS, CAP_LSP_WORKSPACE_EDITS,
+    CAP_LSP, CAP_LSP_CONTROLS, CAP_EDITOR_SEARCH, CAP_LSP_NAVIGATION, CAP_LSP_REQUESTS, CAP_LSP_WORKSPACE_EDITS,
     CAP_PROJECT_SEARCH,
 };
 
@@ -176,8 +176,16 @@ pub fn builtin_commands() -> Vec<CommandDescriptor> {
             "Format Document",
             FormatDocument,
             Some(CommandContext::Editor),
-            Some(CAP_LSP_REQUESTS)
+            Some(CAP_LSP)
         ),
+        command!("FormatSelection", "Format Selection", FormatSelection, Some(CommandContext::Editor), Some(CAP_LSP_CONTROLS)),
+        command!("ShowProblems", "Problems", ShowProblems, None, Some(CAP_LSP)),
+        command!("NextError", "Next Error", NextError, None, Some(CAP_LSP)),
+        command!("PreviousError", "Previous Error", PreviousError, None, Some(CAP_LSP)),
+        command!("ShowLanguageServers", "Language Servers", ShowLanguageServers, Some(CommandContext::Editor), Some(CAP_LSP_CONTROLS)),
+        command!("StartLanguageServers", "Start Language Servers", StartLanguageServers, Some(CommandContext::Editor), Some(CAP_LSP_CONTROLS)),
+        command!("StopLanguageServers", "Stop Language Servers", StopLanguageServers, Some(CommandContext::Editor), Some(CAP_LSP_CONTROLS)),
+        command!("RestartLanguageServers", "Restart Language Servers", RestartLanguageServers, Some(CommandContext::Editor), Some(CAP_LSP_CONTROLS)),
         command!(
             "RenameSymbol",
             "Rename Symbol",
