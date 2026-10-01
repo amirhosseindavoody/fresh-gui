@@ -177,6 +177,18 @@ pub fn catalog() -> Vec<SettingDefinition> {
         fresh(&["editor", "use_tabs"], Boolean),
         bounded(fresh(&["editor", "tab_size"], Integer), 1, 32),
         fresh(&["editor", "auto_indent"], Boolean),
+        SettingDefinition {
+            scope: SettingScope::Global,
+            effect: SettingEffect::Restart,
+            ..daemon(&["lsp_enabled"], Boolean, None)
+        },
+        // Structured Fresh-compatible JSON lets the editor expose the full
+        // multi-server configuration while workspace layers can disable an
+        // already configured language server.
+        fresh(&["lsp"], Object),
+        // Formatter and format_on_save live on language definitions in Fresh;
+        // exposing this as an object preserves Fresh's config shape.
+        fresh(&["languages"], Object),
     ]
 }
 
@@ -447,6 +459,30 @@ mod tests {
                 .unwrap()
                 .owner,
             SettingOwner::Daemon
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|e| e.path == ["lsp_enabled"])
+                .unwrap()
+                .scope,
+            SettingScope::Global
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|e| e.path == ["lsp"])
+                .unwrap()
+                .scope,
+            SettingScope::Workspace
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|e| e.path == ["languages"])
+                .unwrap()
+                .value_type,
+            SettingValueType::Object
         );
     }
 
