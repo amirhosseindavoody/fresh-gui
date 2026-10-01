@@ -934,5 +934,9 @@ pub mod finder;
 
 // Pure, self-contained source reuse keeps ranking identical to the pinned
 // daemon Fresh matcher without linking the terminal editor into the client.
+// Upstream doctests import their owning `fresh` crate. Keep those examples in
+// Fresh; this source's unit tests and our ranked-label tests still run here.
+#[cfg(not(doctest))]
+#[doc(hidden)]
 #[path = "../../../vendor/fresh/crates/fresh-editor/src/input/fuzzy/mod.rs"]
 pub mod fuzzy;

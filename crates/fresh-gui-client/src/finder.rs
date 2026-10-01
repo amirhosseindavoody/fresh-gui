@@ -31,6 +31,7 @@ pub fn line_position(text: &str, query: &str) -> Option<usize> {
 }
 
 /// Rank in-memory labels using the same matcher as daemon file discovery.
+#[cfg(not(doctest))]
 pub fn ranked<T>(
     query: &str,
     items: impl IntoIterator<Item = T>,

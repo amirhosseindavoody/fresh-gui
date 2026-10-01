@@ -441,6 +441,16 @@ impl Workspace {
                 panel.reveal_byte(destination.offset, window, cx)
             });
         } else {
+            if is_untitled_editor_key(&destination.path)
+                && !self
+                    .capabilities
+                    .iter()
+                    .any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY)
+            {
+                self.status = "Reopening an untitled history location requires editor.draft-recovery; upgrade the daemon".into();
+                cx.notify();
+                return;
+            }
             let request_id = next_id("nav-history");
             self.navigation.pending.insert(
                 request_id.clone(),
