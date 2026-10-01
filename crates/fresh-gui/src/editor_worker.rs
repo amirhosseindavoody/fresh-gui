@@ -1292,36 +1292,49 @@ fn begin_lsp_request(
 }
 
 fn buffer_word_completions(text: &str, offset: usize) -> Vec<LspServerResponse> {
-    let prefix_start = text[..offset]
+    use fresh::services::completion::{
+        buffer_words::BufferWordProvider,
+        provider::{CompletionContext, CompletionProvider, ProviderResult},
+    };
+    let word_start = text[..offset]
         .char_indices()
         .rev()
         .take_while(|(_, ch)| ch.is_alphanumeric() || *ch == '_')
         .last()
         .map_or(offset, |(index, _)| index);
-    let prefix = &text[prefix_start..offset];
-    if prefix.is_empty() {
+    let prefix = &text[word_start..offset];
+    // The GUI uses standard identifier boundaries. Fresh supplies smart-case
+    // matching, frequency/proximity ranking, and a bounded scan window.
+    let mut scan_range = CompletionContext::compute_scan_range(offset, text.len(), false);
+    while !text.is_char_boundary(scan_range.start) { scan_range.start += 1; }
+    while !text.is_char_boundary(scan_range.end) { scan_range.end -= 1; }
+    let context = CompletionContext {
+        prefix: prefix.into(),
+        cursor_byte: offset,
+        word_start_byte: word_start,
+        buffer_len: text.len(),
+        is_large_file: false,
+        scan_range: scan_range.clone(),
+        viewport_top_byte: offset,
+        viewport_bottom_byte: offset,
+        language_id: None,
+        word_chars_extra: String::new(),
+        prefix_has_uppercase: prefix.chars().any(char::is_uppercase),
+        other_buffers: Vec::new(),
+    };
+    let provider = BufferWordProvider::new();
+    if !provider.is_enabled(&context) { return Vec::new(); }
+    let ProviderResult::Ready(candidates) = provider.provide(&context, &text.as_bytes()[scan_range]) else {
         return Vec::new();
-    }
-    let mut words = std::collections::BTreeSet::new();
-    let mut current = String::new();
-    for ch in text.chars().chain(std::iter::once(' ')) {
-        if ch.is_alphanumeric() || ch == '_' {
-            current.push(ch);
-        } else {
-            if current.starts_with(prefix) && current != prefix {
-                words.insert(current.clone());
-            }
-            current.clear();
-        }
-    }
-    let items = words
-        .into_iter()
-        .take(100)
-        .map(|word| serde_json::json!({ "label": word, "insertText": word }))
-        .collect::<Vec<_>>();
-    if items.is_empty() {
-        Vec::new()
-    } else {
+    };
+    let items = candidates.into_iter().enumerate().map(|(rank, candidate)| {
+        serde_json::json!({
+            "label": candidate.label,
+            "insertText": candidate.insert_text,
+            "sortText": format!("{rank:03}"),
+        })
+    }).collect::<Vec<_>>();
+    if items.is_empty() { Vec::new() } else {
         vec![crate::lsp_bridge::one_response("buffer_words".into(), serde_json::json!(items))]
     }
 }
