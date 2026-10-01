@@ -1900,6 +1900,20 @@ mod tests {
         ));
     }
 
+
+    #[test]
+    fn search_workspace_overrides_are_optional_and_retain_explicit_false() {
+        let old: WorkspaceLayoutExtra = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.search_options, None);
+        let configured = WorkspaceLayoutExtra {
+            search_options: Some(SearchOptions { case_sensitive: false, whole_word: true, use_regex: false }),
+            ..Default::default()
+        };
+        let saved = serde_json::to_value(&configured).unwrap();
+        assert_eq!(saved["search_options"]["case_sensitive"], false);
+        assert_eq!(serde_json::from_value::<WorkspaceLayoutExtra>(saved).unwrap(), configured);
+        assert!(serde_json::to_value(&old).unwrap().get("search_options").is_none());
+    }
     #[test]
     fn buffer_search_roundtrips_and_search_cap_is_additive() {
         let request = Message::BufferSearch {

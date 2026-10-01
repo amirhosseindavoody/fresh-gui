@@ -152,11 +152,7 @@ mod tests {
     #[test]
     fn review_accept_skip_all_cancel_and_finish_keep_expected_matches() {
         let text = "one two three";
-        let matches = vec![
-            matched(0, 3, "1"),
-            matched(4, 7, "2"),
-            matched(8, 13, "3"),
-        ];
+        let matches = vec![matched(0, 3, "1"), matched(4, 7, "2"), matched(8, 13, "3")];
         let mut review = SearchReview::new(text, matches.clone());
         review.accept();
         review.skip();

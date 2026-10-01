@@ -1,7 +1,7 @@
 //! Bounded Fresh-compatible in-buffer search preview.
 
 use fresh_gui_protocol::{
-    ByteRange, SearchMatch, SearchOptions, MAX_SEARCH_DRAFT_BYTES, MAX_SEARCH_MATCHES,
+    ByteRange, MAX_SEARCH_DRAFT_BYTES, MAX_SEARCH_MATCHES, SearchMatch, SearchOptions,
 };
 
 #[allow(dead_code)] // The pinned Fresh module exposes more helpers than ADE needs.
@@ -19,10 +19,14 @@ mod fresh_regex_replace {
         let references = normalized.bytes().filter(|byte| *byte == b'$').count();
         let mut output_bytes = 0usize;
         let mut result = Vec::new();
-        for captures in regex.captures_iter(haystack.as_bytes()).filter(|captures| {
+        for captures in regex
+            .captures_iter(haystack.as_bytes())
+            .filter(|captures| {
                 let matched = captures.get(0).expect("capture set has whole match");
-                haystack.is_char_boundary(matched.start()) && haystack.is_char_boundary(matched.end())
-            }).take(limit)
+                haystack.is_char_boundary(matched.start())
+                    && haystack.is_char_boundary(matched.end())
+            })
+            .take(limit)
         {
             let matched = captures.get(0).expect("capture set has whole match");
             // Bound expansion before allocating it. Each `$` could expand to
@@ -96,12 +100,8 @@ pub fn preview(
             options.case_sensitive,
         )
         .ok_or_else(|| "invalid regular expression".to_owned())?;
-        for matched in fresh_regex_replace::collect_bounded(
-            &replace,
-            haystack,
-            replacement,
-            limit,
-        )? {
+        for matched in fresh_regex_replace::collect_bounded(&replace, haystack, replacement, limit)?
+        {
             matches.push(SearchMatch {
                 start: base + matched.offset,
                 end: base + matched.offset + matched.len,
@@ -136,7 +136,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_editor(label: &str) -> (PathBuf, EditorHandle) {
-        let root = std::env::temp_dir().join(format!("fresh-search-{label}-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("fresh-search-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let editor = EditorHandle::spawn_with_recovery_dir(
             root.clone(),
@@ -189,16 +190,38 @@ mod tests {
     #[test]
     fn zero_width_unicode_matches_never_report_interior_byte_offsets() {
         let (found, _) = preview("éx", "()", "x", &opts(true), None).unwrap();
-        assert_eq!(found.iter().map(|item| item.start).collect::<Vec<_>>(), [0, 2, 3]);
+        assert_eq!(
+            found.iter().map(|item| item.start).collect::<Vec<_>>(),
+            [0, 2, 3]
+        );
     }
 
     #[test]
     fn unicode_offsets_selection_scope_and_anchors_are_respected() {
-        let options = SearchOptions { whole_word: false, ..opts(true) };
+        let options = SearchOptions {
+            whole_word: false,
+            ..opts(true)
+        };
         let text = "é\nfoo\nfoo";
-        let (found, _) = preview(text, "^foo$", "x", &options, Some(ByteRange { start: 3, len: 4 })).unwrap();
+        let (found, _) = preview(
+            text,
+            "^foo$",
+            "x",
+            &options,
+            Some(ByteRange { start: 3, len: 4 }),
+        )
+        .unwrap();
         assert_eq!((found[0].start, found[0].end), (3, 6));
-        assert!(preview(text, "foo", "x", &options, Some(ByteRange { start: 1, len: 2 })).is_err());
+        assert!(
+            preview(
+                text,
+                "foo",
+                "x",
+                &options,
+                Some(ByteRange { start: 1, len: 2 })
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -219,7 +242,14 @@ mod tests {
         let (found, _) = preview("éx", r"^|$", "!", &opts(true), None).unwrap();
         assert_eq!(found.len(), 2);
         assert_eq!(found[1].start, 3);
-        let (found, capped) = preview(&"x".repeat(MAX_SEARCH_MATCHES + 1), "x", "", &opts(false), None).unwrap();
+        let (found, capped) = preview(
+            &"x".repeat(MAX_SEARCH_MATCHES + 1),
+            "x",
+            "",
+            &opts(false),
+            None,
+        )
+        .unwrap();
         assert_eq!(found.len(), MAX_SEARCH_MATCHES);
         assert!(capped);
     }
@@ -251,9 +281,16 @@ mod tests {
 
             // Scope to the selected suffix and use Fresh's regex capture/escape rules.
             let scope_start = "café ".len();
-            let scope = ByteRange { start: scope_start, len: initial.len() - scope_start };
-            let options = SearchOptions { use_regex: true, ..SearchOptions::default() };
-            let (matches, capped) = preview(initial, "(aa)", r"$1\t", &options, Some(scope)).unwrap();
+            let scope = ByteRange {
+                start: scope_start,
+                len: initial.len() - scope_start,
+            };
+            let options = SearchOptions {
+                use_regex: true,
+                ..SearchOptions::default()
+            };
+            let (matches, capped) =
+                preview(initial, "(aa)", r"$1\t", &options, Some(scope)).unwrap();
             assert!(!capped);
             assert_eq!(matches.len(), 3);
             assert!(matches.iter().all(|matched| matched.replacement == "aa\t"));
@@ -274,7 +311,10 @@ mod tests {
                     opened.rev,
                     edits,
                     None,
-                    ByteSelection { anchor: edited.len(), head: edited.len() },
+                    ByteSelection {
+                        anchor: edited.len(),
+                        head: edited.len(),
+                    },
                 )
                 .await
                 .unwrap();
@@ -306,7 +346,10 @@ mod tests {
                 .await
                 .unwrap();
             assert!(undone.accepted);
-            assert_eq!(undone.text, initial, "all accepted matches undo as one group");
+            assert_eq!(
+                undone.text, initial,
+                "all accepted matches undo as one group"
+            );
             let redone = editor
                 .action(
                     opened.buffer_id,
@@ -332,7 +375,10 @@ mod tests {
         let mut contents = vec![b'a'; 3 * 1024 * 1024];
         contents[marker..marker + b"target".len()].copy_from_slice(b"target");
         let mut expected_contents = contents.clone();
-        expected_contents.splice(marker..marker + b"target".len(), b"replacement".iter().copied());
+        expected_contents.splice(
+            marker..marker + b"target".len(),
+            b"replacement".iter().copied(),
+        );
         std::fs::write(&path, contents).unwrap();
         runtime().block_on(async {
             let opened = editor.open(path, false).await.unwrap();
@@ -351,7 +397,8 @@ mod tests {
             )
             .unwrap();
             assert_eq!(matches.len(), 1);
-            let edited_page = fresh_gui_client::search::apply_matches(&page.text, &matches).unwrap();
+            let edited_page =
+                fresh_gui_client::search::apply_matches(&page.text, &matches).unwrap();
             let edits = contiguous_diff(&page.text, &edited_page)
                 .into_iter()
                 .map(|edit| fresh_gui_protocol::RangeEdit {
@@ -360,14 +407,20 @@ mod tests {
                     text: edit.text,
                 })
                 .collect();
-            let selection = ByteSelection { anchor: page.start + page.text.len(), head: page.start + page.text.len() };
+            let selection = ByteSelection {
+                anchor: page.start + page.text.len(),
+                head: page.start + page.text.len(),
+            };
             let applied = editor
                 .range_edit(
                     opened.buffer_id.clone(),
                     "paged-search-test".into(),
                     opened.rev,
                     edits,
-                    Some(ByteRange { start: page.start, len: page.text.len() }),
+                    Some(ByteRange {
+                        start: page.start,
+                        len: page.text.len(),
+                    }),
                     selection,
                 )
                 .await
@@ -384,8 +437,14 @@ mod tests {
                     applied.selection,
                 )
                 .await;
-            assert!(undo.is_err(), "paged undo is not implemented by Fresh's ADE path");
-            let unchanged = editor.read_page(opened.buffer_id.clone(), page.start, 128).await.unwrap();
+            assert!(
+                undo.is_err(),
+                "paged undo is not implemented by Fresh's ADE path"
+            );
+            let unchanged = editor
+                .read_page(opened.buffer_id.clone(), page.start, 128)
+                .await
+                .unwrap();
             assert_eq!(unchanged.text, edited_page);
 
             // Saving proves the replacement touched only its global byte range;
