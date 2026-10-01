@@ -2,7 +2,7 @@
 use super::*;
 
 impl Workspace {
-    pub(super) fn set_search_options(
+    pub(in crate::gui) fn set_search_options(
         &mut self,
         options: Option<fresh_gui_protocol::SearchOptions>,
         cx: &mut Context<Self>,
@@ -14,14 +14,19 @@ impl Workspace {
         self.publish_layout(cx);
     }
 
-    fn on_find_in_buffer(&mut self, _: &FindInBuffer, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn on_find_in_buffer(
+        &mut self,
+        _: &FindInBuffer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(ActiveSurface::Editor(path)) = &self.active
             && let Some(panel) = self.editors.get(path)
         {
             panel.update(cx, |panel, cx| panel.open_search(false, window, cx));
         }
     }
-    fn on_replace_in_buffer(
+    pub(super) fn on_replace_in_buffer(
         &mut self,
         _: &ReplaceInBuffer,
         window: &mut Window,
@@ -33,14 +38,19 @@ impl Workspace {
             panel.update(cx, |panel, cx| panel.open_search(true, window, cx));
         }
     }
-    fn on_query_replace(&mut self, _: &QueryReplace, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn on_query_replace(
+        &mut self,
+        _: &QueryReplace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(ActiveSurface::Editor(path)) = &self.active
             && let Some(panel) = self.editors.get(path)
         {
             panel.update(cx, |panel, cx| panel.open_search(true, window, cx));
         }
     }
-    fn on_clear_search(
+    pub(super) fn on_clear_search(
         &mut self,
         _: &ClearSearchHighlights,
         window: &mut Window,
@@ -52,14 +62,19 @@ impl Workspace {
             panel.update(cx, |panel, cx| panel.clear_search(window, cx));
         }
     }
-    fn on_next_search(&mut self, _: &NextSearchMatch, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn on_next_search(
+        &mut self,
+        _: &NextSearchMatch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(ActiveSurface::Editor(path)) = &self.active
             && let Some(panel) = self.editors.get(path)
         {
             panel.update(cx, |panel, cx| panel.navigate_search(false, window, cx));
         }
     }
-    fn on_previous_search(
+    pub(super) fn on_previous_search(
         &mut self,
         _: &PreviousSearchMatch,
         window: &mut Window,

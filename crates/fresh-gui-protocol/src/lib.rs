@@ -26,6 +26,8 @@ pub const CAP_EDITOR_RANGE_EDITS: &str = "editor.range-edits";
 pub const CAP_EDITOR_PAGED_READS: &str = "editor.paged-reads";
 /// Maximum requested or returned editor page size.
 pub const MAX_PAGE_BYTES: usize = 64 * 1024;
+/// Existing full-buffer range-edit and snapshot limit. Larger files use pages.
+pub const MAX_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 /// Durable daemon-owned dirty-buffer recovery.
 pub const CAP_EDITOR_DRAFT_RECOVERY: &str = "editor.draft-recovery";
 /// Revisioned external file change checks and resolution.

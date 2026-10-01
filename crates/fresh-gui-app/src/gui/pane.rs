@@ -3549,14 +3549,14 @@ impl Render for EditorPanel {
             .on_action(cx.listener(Self::on_previous_match))
             .capture_key_down(cx.listener(Self::search_key_down))
                     .capture_action::<gpui_kit::component::input::Undo>(cx.listener(|this, _, window, cx| {
-                        if !this.editor.read(cx).focus_handle(cx).is_focused(window) { return; }
+                        if this.search_input_focused(window, cx) { return; }
                         if this.search.review.is_some() { cx.stop_propagation(); return; }
                         if this.request_editor_action(EditorAction::Undo, cx) {
                             cx.stop_propagation();
                         }
                     }))
                     .capture_action::<gpui_kit::component::input::Redo>(cx.listener(|this, _, window, cx| {
-                        if !this.editor.read(cx).focus_handle(cx).is_focused(window) { return; }
+                        if this.search_input_focused(window, cx) { return; }
                         if this.search.review.is_some() { cx.stop_propagation(); return; }
                         if this.request_editor_action(EditorAction::Redo, cx) {
                             cx.stop_propagation();

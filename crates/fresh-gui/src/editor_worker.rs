@@ -18,12 +18,11 @@ use fresh::types::LspFeature;
 use fresh::view::color_support::ColorCapability;
 use fresh_gui_protocol::{
     BufferDiagnostic, ByteRange, ByteSelection, EditorAction, LspRequest, LspRequestFeature,
-    LspResult, LspServerResponse, RangeEdit, SceneBuffer,
+    LspResult, LspServerResponse, RangeEdit, SceneBuffer, MAX_SNAPSHOT_BYTES,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
-const MAX_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PAGE_BYTES: usize = 64 * 1024;
 const MAX_PAGED_RECOVERY_BYTES: usize = 4 * 1024 * 1024;
 

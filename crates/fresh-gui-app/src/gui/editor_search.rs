@@ -301,6 +301,18 @@ impl EditorPanel {
         if text == self.current_text(cx) {
             return;
         }
+        let limit = if self.page.is_some() {
+            fresh_gui_protocol::MAX_PAGE_BYTES
+        } else {
+            fresh_gui_protocol::MAX_SNAPSHOT_BYTES
+        };
+        if text.len() > limit {
+            self.search.error = Some(format!(
+                "Replacement exceeds the {limit}-byte edit limit; draft unchanged"
+            ));
+            cx.notify();
+            return;
+        }
         let selection =
             map_selection_through_edits(&self.current_text(cx), &text, self.byte_selection(cx));
         self.set_editor_text_and_selection(&text, Some(selection), window, cx);
@@ -433,6 +445,20 @@ impl EditorPanel {
     ) {
         self.navigate_search(true, window, cx);
         cx.stop_propagation();
+    }
+
+    pub(super) fn search_input_focused(&self, window: &Window, cx: &App) -> bool {
+        self.search
+            .query
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+            || self
+                .search
+                .replacement
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
     }
 
     pub(super) fn search_key_down(
@@ -969,6 +995,110 @@ mod tests {
             panel.clear_search(window, cx);
             assert!(!panel.search.open);
             assert!(panel.search.query.read(cx).value().is_empty());
+        });
+    }
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use crate::gui::actions;
+    use crate::gui::actions::{FindInBuffer, ReplaceInBuffer};
+    use core::prelude::v1::test;
+    use gpui::AppContext as _;
+    use gpui::{
+        App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, TestAppContext, Window,
+    };
+    use gpui::{InteractiveElement as _, ParentElement as _, Styled as _, div};
+    use gpui_kit::component::input::{Editor, EditorState};
+
+    struct KeyHarness {
+        editor: Option<Entity<EditorState>>,
+        focus: FocusHandle,
+        find: usize,
+        replace: usize,
+        terminal_bytes: Vec<u8>,
+    }
+    impl Focusable for KeyHarness {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.focus.clone()
+        }
+    }
+    impl Render for KeyHarness {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let editor = self.editor.clone();
+            div()
+                .key_context(if editor.is_some() {
+                    "Editor"
+                } else {
+                    "Terminal"
+                })
+                .track_focus(&self.focus)
+                .size_full()
+                .capture_action::<gpui_kit::component::input::Search>(cx.listener(
+                    |this, _, _, cx| {
+                        this.find += 1;
+                        cx.stop_propagation();
+                    },
+                ))
+                .capture_action::<gpui_kit::component::input::Replace>(cx.listener(
+                    |this, _, _, cx| {
+                        this.replace += 1;
+                        cx.stop_propagation();
+                    },
+                ))
+                .on_action(cx.listener(|this, _: &FindInBuffer, _, _| this.find += 1))
+                .on_action(cx.listener(|this, _: &ReplaceInBuffer, _, _| this.replace += 1))
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, _| {
+                    if this.editor.is_none() {
+                        let key = &event.keystroke;
+                        if let Some(bytes) = crate::gui::terminal::keystroke_to_bytes(
+                            &key.key,
+                            key.key_char.as_deref(),
+                            key.modifiers.control,
+                            key.modifiers.alt,
+                            key.modifiers.shift,
+                            false,
+                        ) {
+                            this.terminal_bytes.extend(bytes);
+                        }
+                    }
+                }))
+                .children(editor.map(|editor| Editor::new(&editor)))
+        }
+    }
+    #[gpui::test]
+    fn configured_search_keys_follow_editor_and_terminal_focus(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(actions::init);
+        let (harness, test_cx) = cx.add_window_view(|window, cx| {
+            let editor = cx.new(|cx| EditorState::new(window, cx));
+            KeyHarness {
+                editor: Some(editor),
+                focus: cx.focus_handle(),
+                find: 0,
+                replace: 0,
+                terminal_bytes: Vec::new(),
+            }
+        });
+        harness.update_in(test_cx, |harness, window, cx| {
+            harness
+                .editor
+                .as_ref()
+                .unwrap()
+                .update(cx, |editor, cx| editor.focus(window, cx))
+        });
+        test_cx.simulate_keystrokes("ctrl-f ctrl-r");
+        harness.update_in(test_cx, |harness, window, cx| {
+            assert_eq!(harness.find, 1);
+            assert_eq!(harness.replace, 1);
+            harness.editor = None;
+            window.focus(&harness.focus, cx);
+            cx.notify();
+        });
+        test_cx.simulate_keystrokes("ctrl-f");
+        harness.update_in(test_cx, |harness, _, _| {
+            assert_eq!(harness.find, 1);
+            assert_eq!(harness.terminal_bytes, b"\x06");
         });
     }
 }

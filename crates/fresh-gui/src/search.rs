@@ -6,6 +6,7 @@ use fresh_gui_protocol::{
 
 #[allow(dead_code)] // The pinned Fresh module exposes more helpers than ADE needs.
 mod fresh_regex_replace {
+    use super::MAX_SEARCH_DRAFT_BYTES;
     include!("../../../vendor/fresh/crates/fresh-editor/src/app/regex_replace.rs");
 
     pub fn collect_bounded(
@@ -276,7 +277,7 @@ mod tests {
         let initial = "café aa xx aa yy aa";
         std::fs::write(&path, initial).unwrap();
         runtime().block_on(async {
-            let opened = editor.open(path, false).await.unwrap();
+            let opened = editor.open(path.clone(), false).await.unwrap();
             assert_eq!(opened.text, initial);
 
             // Scope to the selected suffix and use Fresh's regex capture/escape rules.
@@ -368,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn paged_search_edits_global_offsets_within_loaded_page_and_undoes() {
+    fn paged_search_edits_only_loaded_page_and_reports_undo_limitation() {
         let (root, editor) = test_editor("paged");
         let path = root.join("large.txt");
         let marker = 2 * 1024 * 1024 + 100;
@@ -381,7 +382,7 @@ mod tests {
         );
         std::fs::write(&path, contents).unwrap();
         runtime().block_on(async {
-            let opened = editor.open(path, false).await.unwrap();
+            let opened = editor.open(path.clone(), false).await.unwrap();
             assert!(opened.text.is_empty());
             let page_start = marker - 32;
             let page = editor
