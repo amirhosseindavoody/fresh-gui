@@ -106,10 +106,10 @@ impl Workspace {
                 "Format Selection requires lsp.controls; upgrade and restart the daemon".into();
             return;
         }
-        if let Some(ActiveSurface::Editor(path)) = &self.active {
-            if let Some(panel) = self.editors.get(path) {
-                panel.update(cx, |panel, cx| panel.request_format_selection(window, cx));
-            }
+        if let Some(ActiveSurface::Editor(path)) = &self.active
+            && let Some(panel) = self.editors.get(path)
+        {
+            panel.update(cx, |panel, cx| panel.request_format_selection(window, cx));
         }
     }
     fn step_error(&mut self, previous: bool, window: &mut Window, cx: &mut Context<Self>) {

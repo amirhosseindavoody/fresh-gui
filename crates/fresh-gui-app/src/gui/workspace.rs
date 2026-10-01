@@ -1998,7 +1998,7 @@ impl Workspace {
                     self.status = save_status.into();
                     self.resume_pending_save_close(window, cx);
                     cx.notify();
-                } else { self.on_buffer_saved(&request_id, &buffer_id, path, rev, outcome, window, cx); }
+                } else { self.on_buffer_saved(&request_id, &buffer_id, (path, rev, outcome), window, cx); }
             }
             AdeEvent::LanguageServersState { request_id, buffer_id, servers } => {
                 self.receive_language_servers(request_id, buffer_id, servers, cx);
@@ -2416,7 +2416,8 @@ impl Workspace {
         }
     }
 
-    fn on_buffer_saved(&mut self, request_id: &str, buffer_id: &str, path: String, rev: u64, outcome: fresh_gui_protocol::SaveOutcome, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_buffer_saved(&mut self, request_id: &str, buffer_id: &str, saved: (String, u64, fresh_gui_protocol::SaveOutcome), window: &mut Window, cx: &mut Context<Self>) {
+        let (path, rev, outcome) = saved;
         let Some(panel) = self.editor_by_buffer(buffer_id, cx) else {
             return;
         };

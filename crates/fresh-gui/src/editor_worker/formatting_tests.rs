@@ -44,15 +44,17 @@ fn external_formatter_without_lsp_and_format_on_save_refreshes_snapshot() {
     )
     .unwrap();
     let path = root.join("sample.py");
-    std::fs::write(&path, "bad = 1\n").unwrap();
+    std::fs::write(&path, "bad = 'bad'\n").unwrap();
     let editor = EditorHandle::spawn(root.clone(), cfg).unwrap();
     runtime().block_on(async {
         let opened = editor.open(path.clone(), false).await.unwrap();
         let formatted = editor
-            .format(opened.buffer_id.clone(), opened.rev)
+            // No LSP range provider: Fresh falls back to the external
+            // formatter for the whole document, including outside the range.
+            .format_range(opened.buffer_id.clone(), opened.rev, Some(ByteRange { start: 0, len: 3 }))
             .await
             .unwrap();
-        assert_eq!(formatted.text.as_deref(), Some("good = 1\n"));
+        assert_eq!(formatted.text.as_deref(), Some("good = 'good'\n"));
 
         let dirty_rev = editor
             .edit(opened.buffer_id.clone(), formatted.rev, "bad = 2\n".into())
