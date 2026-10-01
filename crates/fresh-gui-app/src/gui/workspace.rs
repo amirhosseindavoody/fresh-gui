@@ -1225,6 +1225,27 @@ impl Workspace {
 
     pub fn new(target: ConnectTarget, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (ade, evt_rx) = super::ade::spawn(target.clone());
+        Self::new_with_ade(target, ade, evt_rx, window, cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        target: ConnectTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (ade, _commands) = AdeHandle::test_channel();
+        let (_events, evt_rx) = async_channel::unbounded();
+        Self::new_with_ade(target, ade, evt_rx, window, cx)
+    }
+
+    fn new_with_ade(
+        target: ConnectTarget,
+        ade: AdeHandle,
+        evt_rx: async_channel::Receiver<AdeEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let (dock, _) = install_workspace_dock(window, cx);
         let explorer = cx.new(|cx| TreeState::new(cx));
         let command_state = cx.new(|cx| CommandState::new(window, cx));

@@ -4091,7 +4091,7 @@ mod project_update_tests {
     use gpui::TestAppContext;
 
     fn test_workspace(window: &mut Window, cx: &mut Context<Workspace>) -> Workspace {
-        Workspace::new(parse_connect_target("ws://", None), window, cx)
+        Workspace::new_for_test(parse_connect_target("ws://", None), window, cx)
     }
 
     #[gpui::test]
