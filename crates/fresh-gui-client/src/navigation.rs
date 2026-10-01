@@ -17,7 +17,12 @@ pub struct EditorLocation {
 
 impl EditorLocation {
     pub fn new(path: impl Into<String>, view_id: impl Into<String>, offset: usize) -> Self {
-        Self { path: path.into(), buffer_id: None, view_id: view_id.into(), offset }
+        Self {
+            path: path.into(),
+            buffer_id: None,
+            view_id: view_id.into(),
+            offset,
+        }
     }
 
     pub fn with_buffer_id(mut self, buffer_id: impl Into<String>) -> Self {
@@ -35,22 +40,37 @@ pub struct NavigationHistory {
 }
 
 impl Default for NavigationHistory {
-    fn default() -> Self { Self::with_capacity(100) }
+    fn default() -> Self {
+        Self::with_capacity(100)
+    }
 }
 
 impl NavigationHistory {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { entries: Vec::new(), index: None, capacity: capacity.max(1) }
+        Self {
+            entries: Vec::new(),
+            index: None,
+            capacity: capacity.max(1),
+        }
     }
 
-    pub fn can_go_back(&self) -> bool { self.index.is_some_and(|index| index > 0) }
-    pub fn can_go_forward(&self) -> bool {
-        self.index.is_some_and(|index| index + 1 < self.entries.len())
+    pub fn can_go_back(&self) -> bool {
+        self.index.is_some_and(|index| index > 0)
     }
-    pub fn len(&self) -> usize { self.entries.len() }
-    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+    pub fn can_go_forward(&self) -> bool {
+        self.index
+            .is_some_and(|index| index + 1 < self.entries.len())
+    }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 
     /// Record a semantic jump, retaining both its origin and destination.
     /// Jumps made after going back discard the old forward branch.
@@ -72,7 +92,9 @@ impl NavigationHistory {
     /// Move backward, saving the caller's current cursor before leaving it.
     pub fn back(&mut self, current: EditorLocation) -> Option<EditorLocation> {
         let index = self.index?;
-        if index == 0 { return None; }
+        if index == 0 {
+            return None;
+        }
         self.entries[index] = current;
         self.index = Some(index - 1);
         self.entries.get(index - 1).cloned()
@@ -81,7 +103,9 @@ impl NavigationHistory {
     /// Move forward, saving the caller's current cursor before leaving it.
     pub fn forward(&mut self, current: EditorLocation) -> Option<EditorLocation> {
         let index = self.index?;
-        if index + 1 >= self.entries.len() { return None; }
+        if index + 1 >= self.entries.len() {
+            return None;
+        }
         self.entries[index] = current;
         self.index = Some(index + 1);
         self.entries.get(index + 1).cloned()
@@ -108,8 +132,14 @@ mod tests {
     fn jump_and_back_forward_preserve_departure_cursor() {
         let mut history = NavigationHistory::new();
         history.record_jump(location("a.rs", 5), location("b.rs", 10));
-        assert_eq!(history.back(location("b.rs", 20)), Some(location("a.rs", 5)));
-        assert_eq!(history.forward(location("a.rs", 8)), Some(location("b.rs", 20)));
+        assert_eq!(
+            history.back(location("b.rs", 20)),
+            Some(location("a.rs", 5))
+        );
+        assert_eq!(
+            history.forward(location("a.rs", 8)),
+            Some(location("b.rs", 20))
+        );
     }
 
     #[test]
@@ -125,8 +155,10 @@ mod tests {
 
     #[test]
     fn history_restores_the_original_view_and_daemon_path() {
-        let origin = EditorLocation::new("/remote/project/a.rs", "pane-left", 9).with_buffer_id("a");
-        let target = EditorLocation::new("/remote/project/b.rs", "pane-right", 3_000_004).with_buffer_id("b");
+        let origin =
+            EditorLocation::new("/remote/project/a.rs", "pane-left", 9).with_buffer_id("a");
+        let target = EditorLocation::new("/remote/project/b.rs", "pane-right", 3_000_004)
+            .with_buffer_id("b");
         let mut history = NavigationHistory::new();
         history.record_jump(origin.clone(), target.clone());
         assert_eq!(history.back(target.clone()), Some(origin.clone()));
