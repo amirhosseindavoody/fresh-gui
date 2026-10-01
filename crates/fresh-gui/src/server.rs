@@ -15,7 +15,7 @@ use axum::routing::get;
 use base64::Engine;
 use fresh_gui_protocol::{
     ByteSelection, CAP_EDITOR, CAP_EDITOR_DRAFT_RECOVERY, CAP_EDITOR_EXTERNAL_CHANGES,
-    CAP_EDITOR_PAGED_READS, CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_SEARCH, CAP_PROJECT_SEARCH, CAP_LSP, CAP_LSP_NAVIGATION, CAP_LSP_REQUESTS, CAP_LSP_WORKSPACE_EDITS,
+    CAP_EDITOR_PAGED_READS, CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_SEARCH, CAP_PROJECT_SEARCH, CAP_FILE_FINDER, CAP_LSP, CAP_LSP_NAVIGATION, CAP_LSP_REQUESTS, CAP_LSP_WORKSPACE_EDITS,
     CAP_SCENE, CAP_SETTINGS_EDITOR, EditorDraftInfo, ExternalResolution, Hello, HelloUi,
     MAX_PAGE_BYTES, Message, PROTOCOL_VERSION,
 };
@@ -138,6 +138,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 && c != CAP_EDITOR_EXTERNAL_CHANGES
                 && c != CAP_EDITOR_SEARCH
                 && c != CAP_PROJECT_SEARCH
+                && c != CAP_FILE_FINDER
                 && c != CAP_LSP
                 && c != CAP_LSP_REQUESTS
                 && c != CAP_LSP_NAVIGATION
@@ -177,9 +178,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut client_editor_search = false;
     let mut client_lsp_navigation = false;
     let mut client_project_search = false;
+    let mut client_file_finder = false;
     let project = crate::project_session::ProjectSession::default();
     let (project_tx, mut project_rx) = mpsc::channel::<crate::project_session::SearchOutput>(8);
     let mut client_workspace_edits = false;
+    let finder = crate::file_finder::FileFinderSession::default();
+    let (finder_tx, mut finder_rx) = mpsc::channel::<crate::file_finder::FinderOutput>(4);
     let mut session_id: Option<String> = None;
     let socket_id = uuid::Uuid::new_v4().to_string();
     let mut lsp_request_map: HashMap<u64, (u64, String, String)> = HashMap::new();
@@ -190,6 +194,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     loop {
         tokio::select! {
+            finder_output = finder_rx.recv() => {
+                if let Some(output) = finder_output {
+                    if !output.generation.load(Ordering::Relaxed) {
+                        let id = match &output.message { Message::FileFinderResults { request_id, .. } => request_id, _ => continue };
+                        if finder.is_current(id) && send_msg(&mut sink, &output.message).await.is_err() { break; }
+                    }
+                }
+            }
             project_message = project_rx.recv() => {
                 if let Some(output) = project_message {
                     if output.generation.load(Ordering::Relaxed) { continue; }
@@ -311,8 +323,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     &socket_id,
                     &mut client_editor_search,
                     &mut client_project_search,
+                    &mut client_file_finder,
                     &project,
                     project_tx.clone(),
+                    &finder,
+                    finder_tx.clone(),
                     &mut session_id,
                     out_tx.clone(),
                     &mut sink,
@@ -324,6 +339,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 if previous_session != session_id {
                     project.clear();
                     if let Some(editor) = state.editor.as_ref() { editor.cancel_workspace_owner(&socket_id); }
+                    finder.clear();
                     cancel_socket_lsp(state.editor.as_ref(), &socket_id, &mut lsp_request_map);
                 }
             }
@@ -335,6 +351,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         state.sessions.detach_subscriber(&sid).await;
     }
     cancel_socket_lsp(state.editor.as_ref(), &socket_id, &mut lsp_request_map);
+    finder.clear();
     let _ = std::fs::remove_file(&defaults_path);
     info!("websocket client disconnected");
 }
@@ -356,8 +373,11 @@ async fn handle_client_msg(
     socket_id: &str,
     client_editor_search: &mut bool,
     client_project_search: &mut bool,
+    client_file_finder: &mut bool,
     project: &crate::project_session::ProjectSession,
     project_tx: mpsc::Sender<crate::project_session::SearchOutput>,
+    finder: &crate::file_finder::FileFinderSession,
+    finder_tx: mpsc::Sender<crate::file_finder::FinderOutput>,
     session_id: &mut Option<String>,
     out_tx: mpsc::UnboundedSender<Message>,
     sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
@@ -395,6 +415,7 @@ async fn handle_client_msg(
                 .iter()
                 .any(|cap| cap == CAP_LSP_NAVIGATION);
             *client_project_search = client_hello.capabilities.iter().any(|cap| cap == CAP_PROJECT_SEARCH);
+            *client_file_finder = client_hello.capabilities.iter().any(|cap| cap == CAP_FILE_FINDER);
             if client_hello.protocol_version != PROTOCOL_VERSION {
                 return Err(Message::Error {
                     code: "protocol_mismatch".into(),
@@ -1342,6 +1363,21 @@ async fn handle_client_msg(
                 state.editor.as_ref().expect("checked").clone(),
                 project_tx,
             );
+            Ok(())
+        }
+        Message::FileFinder { request_id, query } => {
+            require_file_finder_cap(*client_file_finder, state.editor.is_some(), &request_id)?;
+            require_auth(*authed)?;
+            let workspace = current_workspace_id(state, session_id).await?;
+            let root = project_root(state, &workspace).await?;
+            finder.start(request_id, root, query, finder_tx);
+            Ok(())
+        }
+        Message::FileFinderCancel { request_id } => {
+            require_file_finder_cap(*client_file_finder, state.editor.is_some(), &request_id)?;
+            require_auth(*authed)?;
+            finder.cancel(&request_id);
+            send_msg(sink, &Message::FileFinderResults { request_id, paths: Vec::new(), truncated: false, cancelled: true, error: None }).await.map_err(|_| settings_error("send_failed", "file finder", "socket closed"))?;
             Ok(())
         }
         Message::ProjectSearchCancel { request_id } => {
@@ -2549,6 +2585,10 @@ async fn handle_client_msg(
 
 fn require_project_cap(client: bool, editor: bool, request_id: &str) -> Result<(), Message> {
     if client && editor { Ok(()) } else { Err(settings_error("capability_unavailable", request_id, "project.search.v1 capability not negotiated")) }
+}
+
+fn require_file_finder_cap(client: bool, editor: bool, request_id: &str) -> Result<(), Message> {
+    if client && editor { Ok(()) } else { Err(settings_error("capability_unavailable", request_id, "project.file-finder capability not negotiated")) }
 }
 
 async fn project_root(state: &AppState, workspace: &str) -> Result<PathBuf, Message> {

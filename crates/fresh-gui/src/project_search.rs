@@ -383,7 +383,7 @@ fn cache_and_emit(
     true
 }
 
-fn workspace_walker(root: &Path, include_ignored: bool) -> WalkBuilder {
+pub(crate) fn workspace_walker(root: &Path, include_ignored: bool) -> WalkBuilder {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(!include_ignored)

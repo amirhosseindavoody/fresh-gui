@@ -1,0 +1,108 @@
+//! Daemon-side, gitignore-aware fuzzy workspace file enumeration.
+use std::{path::PathBuf, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}};
+use tokio::sync::mpsc;
+use fresh_gui_protocol::Message;
+
+use fresh::input::fuzzy::FuzzyMatcher;
+
+const MAX_RESULTS: usize = 200;
+const MAX_QUERY_BYTES: usize = 4096;
+
+pub struct FinderResult {
+    pub paths: Vec<String>,
+    pub truncated: bool,
+    pub cancelled: bool,
+}
+
+pub fn scan(root: PathBuf, query: &str, cancel: Arc<AtomicBool>) -> Result<FinderResult, String> {
+    if query.len() > MAX_QUERY_BYTES { return Err("file finder query is limited to 4 KiB".into()); }
+    let root = std::fs::canonicalize(&root).map_err(|e| format!("cannot resolve workspace root: {e}"))?;
+    if !root.is_dir() { return Err("workspace root is not a directory".into()); }
+    let mut matcher = FuzzyMatcher::new(query);
+    let mut ranked = Vec::<(i32, String)>::new();
+    let mut total = 0usize;
+    for entry in crate::project_search::workspace_walker(&root, false).build() {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(FinderResult { paths: Vec::new(), truncated: false, cancelled: true });
+        }
+        let entry = match entry { Ok(entry) => entry, Err(_) => continue };
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) { continue; }
+        let Ok(relative) = entry.path().strip_prefix(&root) else { continue };
+        let path = relative.to_string_lossy().replace('\\', "/");
+        let matched = matcher.match_target(&path);
+        if !matched.matched { continue; }
+        total += 1;
+        ranked.push((matched.score, path));
+        ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        ranked.truncate(MAX_RESULTS);
+    }
+    Ok(FinderResult { paths: ranked.into_iter().map(|(_, path)| path).collect(), truncated: total > MAX_RESULTS, cancelled: false })
+}
+
+#[derive(Clone)]
+pub struct FinderOutput { pub generation: Arc<AtomicBool>, pub message: Message }
+#[derive(Default)]
+pub struct FileFinderSession { current: Arc<Mutex<Option<(String, Arc<AtomicBool>)>>> }
+impl FileFinderSession {
+    pub fn clear(&self) {
+        if let Some((_, cancel)) = self.current.lock().expect("file finder session").take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+    pub fn cancel(&self, id: &str) {
+        let mut current = self.current.lock().expect("file finder session");
+        if current.as_ref().is_some_and(|(current_id, _)| current_id == id)
+            && let Some((_, cancel)) = current.take() { cancel.store(true, Ordering::Relaxed); }
+    }
+    pub fn is_current(&self, id: &str) -> bool {
+        self.current.lock().expect("file finder session").as_ref().is_some_and(|(current_id, _)| current_id == id)
+    }
+    pub fn start(&self, id: String, root: PathBuf, query: String, tx: mpsc::Sender<FinderOutput>) {
+        self.clear();
+        let cancel = Arc::new(AtomicBool::new(false));
+        *self.current.lock().expect("file finder session") = Some((id.clone(), cancel.clone()));
+        let generation = cancel.clone();
+        tokio::spawn(async move {
+            let worker_cancel = cancel.clone();
+            let result = tokio::task::spawn_blocking(move || scan(root, &query, worker_cancel)).await;
+            let message = match result {
+                Ok(Ok(result)) => Message::FileFinderResults { request_id: id, paths: result.paths, truncated: result.truncated, cancelled: result.cancelled, error: None },
+                Ok(Err(error)) => Message::FileFinderResults { request_id: id, paths: Vec::new(), truncated: false, cancelled: false, error: Some(error) },
+                Err(error) => Message::FileFinderResults { request_id: id, paths: Vec::new(), truncated: false, cancelled: false, error: Some(error.to_string()) },
+            };
+            let _ = tx.send(FinderOutput { generation, message }).await;
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn finder_uses_fresh_ranking_and_gitignore_walker() {
+        let root = std::env::temp_dir().join(format!("fresh-file-finder-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("nested/deep")).unwrap();
+        fs::create_dir_all(root.join("ignored")).unwrap();
+        fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        fs::write(root.join("nested/deep/foo_bar.rs"), "").unwrap();
+        fs::write(root.join("ignored/foo_bar.rs"), "").unwrap();
+        fs::write(root.join("foobar.rs"), "").unwrap();
+        let result = scan(root.clone(), "fbr", Arc::new(AtomicBool::new(false))).unwrap();
+        let mut expected = vec!["foobar.rs".to_owned(), "nested/deep/foo_bar.rs".to_owned()];
+        let mut matcher = FuzzyMatcher::new("fbr");
+        expected.sort_by(|a, b| matcher.match_target(b).score.cmp(&matcher.match_target(a).score).then_with(|| a.cmp(b)));
+        assert_eq!(result.paths, expected);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finder_honors_cancellation() {
+        let root = std::env::temp_dir().join(format!("fresh-file-finder-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let cancel = Arc::new(AtomicBool::new(true));
+        assert!(scan(root.clone(), "file", cancel).unwrap().cancelled);
+        fs::remove_dir_all(root).unwrap();
+    }
+}

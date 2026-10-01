@@ -36,6 +36,8 @@ pub const CAP_EDITOR_EXTERNAL_CHANGES: &str = "editor.external-changes";
 pub const CAP_EDITOR_SEARCH: &str = "editor.search";
 /// Daemon workspace search and reviewed replacement.
 pub const CAP_PROJECT_SEARCH: &str = "project.search.v1";
+/// Daemon-owned fuzzy workspace file enumeration.
+pub const CAP_FILE_FINDER: &str = "project.file-finder";
 pub const MAX_SEARCH_DRAFT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_SEARCH_MATCHES: usize = 10_000;
 pub const CAP_LSP: &str = "lsp";
@@ -957,6 +959,9 @@ pub enum Message {
         request_id: String,
         search: ProjectSearchRequest,
     },
+    FileFinder { request_id: String, query: String },
+    FileFinderCancel { request_id: String },
+    FileFinderResults { request_id: String, paths: Vec<String>, truncated: bool, cancelled: bool, error: Option<String> },
     ProjectSearchCancel {
         request_id: String,
     },
@@ -1394,6 +1399,7 @@ impl Hello {
             CAP_EDITOR_EXTERNAL_CHANGES.to_owned(),
             CAP_EDITOR_SEARCH.to_owned(),
             CAP_PROJECT_SEARCH.to_owned(),
+            CAP_FILE_FINDER.to_owned(),
             CAP_LSP.to_owned(),
             CAP_LSP_REQUESTS.to_owned(),
             CAP_LSP_NAVIGATION.to_owned(),
@@ -1418,6 +1424,7 @@ impl Hello {
             CAP_EDITOR_EXTERNAL_CHANGES.to_owned(),
             CAP_EDITOR_SEARCH.to_owned(),
             CAP_PROJECT_SEARCH.to_owned(),
+            CAP_FILE_FINDER.to_owned(),
             CAP_LSP.to_owned(),
             CAP_LSP_REQUESTS.to_owned(),
             CAP_LSP_NAVIGATION.to_owned(),
