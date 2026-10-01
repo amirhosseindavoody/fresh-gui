@@ -10,6 +10,13 @@ use std::sync::{
 };
 use tokio::sync::mpsc;
 
+/// A private generation guard travels with queued frames. Reusing a wire
+/// request ID cannot make a cancelled generation visible again.
+pub struct SearchOutput {
+    pub generation: Arc<AtomicBool>,
+    pub message: Message,
+}
+
 struct SearchState {
     id: String,
     workspace: String,
@@ -50,7 +57,7 @@ impl ProjectSession {
         root: PathBuf,
         request: ProjectSearchRequest,
         editor: EditorHandle,
-        tx: mpsc::Sender<Message>,
+        tx: mpsc::Sender<SearchOutput>,
     ) {
         self.clear();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -67,12 +74,15 @@ impl ProjectSession {
                 Ok(buffers) => buffers,
                 Err(error) => {
                     let _ = tx
-                        .send(Message::ProjectSearchDone {
-                            request_id: id,
-                            truncated: false,
-                            cancelled: false,
-                            warnings: vec![],
-                            error: Some(error.to_string()),
+                        .send(SearchOutput {
+                            generation: cancel.clone(),
+                            message: Message::ProjectSearchDone {
+                                request_id: id,
+                                truncated: false,
+                                cancelled: false,
+                                warnings: vec![],
+                                error: Some(error.to_string()),
+                            },
                         })
                         .await;
                     return;
@@ -81,12 +91,16 @@ impl ProjectSession {
             let stream = tx.clone();
             let stream_id = id.clone();
             let scan_cancel = cancel.clone();
+            let stream_generation = cancel.clone();
             let scan = tokio::task::spawn_blocking(move || {
                 crate::project_search::scan(root, &request, buffers, scan_cancel, |file| {
                     stream
-                        .blocking_send(Message::ProjectSearchFile {
-                            request_id: stream_id.clone(),
-                            file,
+                        .blocking_send(SearchOutput {
+                            generation: stream_generation.clone(),
+                            message: Message::ProjectSearchFile {
+                                request_id: stream_id.clone(),
+                                file,
+                            },
                         })
                         .is_ok()
                 })
@@ -112,12 +126,15 @@ impl ProjectSession {
                 Err(error) => (false, false, vec![], Some(error.to_string())),
             };
             let _ = tx
-                .send(Message::ProjectSearchDone {
-                    request_id: id,
-                    truncated,
-                    cancelled,
-                    warnings,
-                    error,
+                .send(SearchOutput {
+                    generation: cancel.clone(),
+                    message: Message::ProjectSearchDone {
+                        request_id: id,
+                        truncated,
+                        cancelled,
+                        warnings,
+                        error,
+                    },
                 })
                 .await;
         });
@@ -149,6 +166,7 @@ impl ProjectSession {
             }
             guard.take().expect("checked")
         };
+        state.cancel.store(true, Ordering::Relaxed);
         let result = state.result.expect("checked");
         let mut output = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -197,6 +215,7 @@ impl ProjectSession {
                 editor
                     .project_replace(
                         workspace.to_owned(),
+                        root.to_path_buf(),
                         snapshot.result.path.clone(),
                         snapshot.result.buffer_id.clone(),
                         snapshot.result.rev,

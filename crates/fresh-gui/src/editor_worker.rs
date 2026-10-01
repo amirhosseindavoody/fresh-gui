@@ -18,7 +18,7 @@ use fresh::types::LspFeature;
 use fresh::view::color_support::ColorCapability;
 use fresh_gui_protocol::{
     BufferDiagnostic, ByteRange, ByteSelection, EditorAction, LspRequest, LspRequestFeature,
-    LspResult, LspServerResponse, RangeEdit, SceneBuffer, MAX_SNAPSHOT_BYTES,
+    LspResult, LspServerResponse, MAX_SNAPSHOT_BYTES, RangeEdit, SceneBuffer,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
@@ -250,6 +250,7 @@ enum Cmd {
     },
     ProjectReplace {
         workspace_id: String,
+        root: PathBuf,
         path: Option<String>,
         expected_buffer_id: Option<String>,
         expected_rev: Option<u64>,
@@ -615,9 +616,11 @@ impl EditorHandle {
     /// For open buffers, identity and revision are checked and the buffer stays
     /// dirty/recoverable. For unopened files, disk text is checked before opening
     /// and Fresh's normal save conflict checks protect the write.
+    #[allow(clippy::too_many_arguments)] // One revisioned, scoped worker transaction.
     pub async fn project_replace(
         &self,
         workspace_id: String,
+        root: PathBuf,
         path: Option<String>,
         expected_buffer_id: Option<String>,
         expected_rev: Option<u64>,
@@ -628,6 +631,7 @@ impl EditorHandle {
         self.tx
             .send(Cmd::ProjectReplace {
                 workspace_id,
+                root,
                 path,
                 expected_buffer_id,
                 expected_rev,
@@ -1028,6 +1032,7 @@ fn run_loop(
                 }
                 Cmd::ProjectReplace {
                     workspace_id,
+                    root,
                     path,
                     expected_buffer_id,
                     expected_rev,
@@ -1041,6 +1046,7 @@ fn run_loop(
                         &mut tracked,
                         &drafts,
                         &workspace_id,
+                        &root,
                         path.as_deref().map(Path::new),
                         expected_buffer_id.as_deref(),
                         expected_rev,
@@ -3274,6 +3280,7 @@ fn project_replace(
     tracked: &mut HashMap<String, TrackedBuffer>,
     drafts: &DraftStore,
     workspace_id: &str,
+    root: &Path,
     path: Option<&Path>,
     expected_buffer_id: Option<&str>,
     expected_rev: Option<u64>,
@@ -3284,6 +3291,13 @@ fn project_replace(
     if expected_text.len() > MAX_SNAPSHOT_BYTES {
         bail!("project replacement source exceeds snapshot limit");
     }
+    let check_scope = || -> Result<()> {
+        if path.is_some_and(|path| crate::project_search::confined_path(root, path).is_none()) {
+            bail!("project replacement path moved outside workspace");
+        }
+        Ok(())
+    };
+    check_scope()?;
     let open = tracked
         .iter()
         .find(|(buffer_id, entry)| match (entry.path.as_deref(), path) {
@@ -3322,6 +3336,7 @@ fn project_replace(
             if generation.text.as_deref() != Some(expected_text) {
                 bail!("file changed on disk since project search");
             }
+            check_scope()?;
             let opened = open_buffer(editor, tracked, path, false, workspace_id)?;
             let entry = tracked
                 .get(&opened.buffer_id)
@@ -3355,6 +3370,7 @@ fn project_replace(
         bail!("project replacement path or workspace changed");
     }
     let base_rev = entry.rev;
+    check_scope()?;
     let mut outcome = range_edit_buffer(
         editor,
         tracked,
@@ -3372,6 +3388,7 @@ fn project_replace(
         checkpoint(drafts, tracked, &buffer_id)?;
     }
     if save_unopened {
+        check_scope()?;
         save_buffer(editor, tracked, &buffer_id, outcome.rev, None)?;
         let entry = tracked
             .get(&buffer_id)
@@ -5007,6 +5024,7 @@ mod tests {
             let applied = editor
                 .project_replace(
                     "project-test".into(),
+                    root.clone(),
                     None,
                     Some(draft.buffer_id.clone()),
                     Some(rev),
@@ -5026,6 +5044,7 @@ mod tests {
                 editor
                     .project_replace(
                         "project-test".into(),
+                        root.clone(),
                         None,
                         Some(draft.buffer_id.clone()),
                         Some(rev),
@@ -5040,9 +5059,31 @@ mod tests {
                     .is_err()
             );
 
+            // Recheck the explicit scope inside the serialized worker transaction.
+            assert!(
+                editor
+                    .project_replace(
+                        "project-test".into(),
+                        recovery.clone(),
+                        Some(source.display().to_string()),
+                        None,
+                        None,
+                        "from disk".into(),
+                        vec![RangeEdit {
+                            start: 0,
+                            end: 4,
+                            text: "lost".into()
+                        }],
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(std::fs::read_to_string(&source).unwrap(), "from disk");
+
             let disk_replaced = editor
                 .project_replace(
                     "project-test".into(),
+                    root.clone(),
                     Some(source.display().to_string()),
                     None,
                     None,
@@ -5087,6 +5128,7 @@ mod tests {
                 editor
                     .project_replace(
                         "project-test".into(),
+                        root.clone(),
                         Some(externally_changed.display().to_string()),
                         None,
                         None,
@@ -5111,6 +5153,7 @@ mod tests {
                 editor
                     .project_replace(
                         "project-test".into(),
+                        root.clone(),
                         Some(newly_opened.display().to_string()),
                         None,
                         None,

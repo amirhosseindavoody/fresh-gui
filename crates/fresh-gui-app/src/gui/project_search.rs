@@ -261,7 +261,7 @@ impl ProjectSearchPanel {
         cx.notify();
     }
 
-    fn cancel(&mut self, cx: &mut Context<Self>) {
+    pub fn cancel(&mut self, cx: &mut Context<Self>) {
         if let Some(request_id) = self.request_id.clone() {
             cx.emit(ProjectSearchEvent::Cancel { request_id });
             self.running = false;
@@ -353,9 +353,7 @@ impl Render for ProjectSearchPanel {
                     )
                     .child(Button::new("project-search-close").label("Close").on_click(
                         cx.listener(|this, _, _, cx| {
-                            if this.running {
-                                this.cancel(cx);
-                            }
+                            this.cancel(cx);
                             cx.emit(ProjectSearchEvent::Close);
                         }),
                     )),
@@ -509,7 +507,8 @@ impl Render for ProjectSearchPanel {
                                         .ghost()
                                         .xsmall()
                                         .label(format!("{}:{}", line, column))
-                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.cancel(cx);
                                             cx.emit(ProjectSearchEvent::OpenMatch {
                                                 path: open_path.clone(),
                                                 buffer_id: buffer_id.clone(),

@@ -177,7 +177,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut client_lsp_navigation = false;
     let mut client_project_search = false;
     let project = crate::project_session::ProjectSession::default();
-    let (project_tx, mut project_rx) = mpsc::channel::<Message>(8);
+    let (project_tx, mut project_rx) = mpsc::channel::<crate::project_session::SearchOutput>(8);
     let mut session_id: Option<String> = None;
     let socket_id = uuid::Uuid::new_v4().to_string();
     let mut lsp_request_map: HashMap<u64, (u64, String, String)> = HashMap::new();
@@ -188,7 +188,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     loop {
         tokio::select! {
             project_message = project_rx.recv() => {
-                if let Some(message) = project_message {
+                if let Some(output) = project_message {
+                    if output.generation.load(Ordering::Relaxed) { continue; }
+                    let message = output.message;
                     let id = match &message { Message::ProjectSearchFile { request_id, .. } | Message::ProjectSearchDone { request_id, .. } => request_id, _ => continue };
                     if !project.is_current(id) { continue; }
                     if send_msg(&mut sink, &message).await.is_err() { break; }
@@ -328,7 +330,7 @@ async fn handle_client_msg(
     client_editor_search: &mut bool,
     client_project_search: &mut bool,
     project: &crate::project_session::ProjectSession,
-    project_tx: mpsc::Sender<Message>,
+    project_tx: mpsc::Sender<crate::project_session::SearchOutput>,
     session_id: &mut Option<String>,
     out_tx: mpsc::UnboundedSender<Message>,
     sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,

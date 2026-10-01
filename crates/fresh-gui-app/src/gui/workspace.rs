@@ -1580,10 +1580,9 @@ impl Workspace {
                     for update in files.iter().filter_map(|file| file.buffer.as_ref()) {
                         if let Some(panel) = self.editor_by_buffer(&update.buffer_id, cx) {
                             panel.update(cx, |panel, cx| panel.apply_project_update(update, window, cx));
-                        } else if let Some(panel) = self.diffs.values().find(|panel| panel.read(cx).buffer_id() == Some(update.buffer_id.as_str())).cloned() {
-                            if !panel.update(cx, |panel, cx| panel.apply_project_update(update, window, cx)) {
-                                self.status = "Project edit changed the daemon buffer; newer diff draft kept. Reopen in an editor to review.".into();
-                            }
+                        } else if let Some(panel) = self.diffs.values().find(|panel| panel.read(cx).buffer_id() == Some(update.buffer_id.as_str())).cloned()
+                            && !panel.update(cx, |panel, cx| panel.apply_project_update(update, window, cx)) {
+                            self.status = "Project edit changed the daemon buffer; newer diff draft kept. Reopen in an editor to review.".into();
                         }
                     }
                 }
@@ -3790,6 +3789,10 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(panel) = &self.project_search {
+            panel.update(cx, |panel, cx| panel.cancel(cx));
+        }
+        self.project_send_task = None;
         let root = self
             .workspace_root()
             .unwrap_or_else(|| self.session_root.clone());

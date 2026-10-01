@@ -358,9 +358,32 @@ async fn cancelled_search_and_new_query_keep_streams_correlated() {
         })
         .await
         .unwrap();
+    // Drain through the cancellation acknowledgement, then deliberately reuse
+    // the wire ID. Queued frames must retain their private generation identity.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match client.recv().await.unwrap() {
+                Message::ProjectSearchDone {
+                    request_id,
+                    cancelled: true,
+                    ..
+                } if request_id == "cancel-me" => break,
+                Message::ProjectSearchFile { request_id, .. }
+                | Message::ProjectSearchDone { request_id, .. }
+                    if request_id == "cancel-me" => {}
+                Message::PtyData { .. }
+                | Message::FsChanged { .. }
+                | Message::Pong { .. }
+                | Message::Ping { .. } => {}
+                other => panic!("unexpected cancellation response: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("cancellation acknowledgement timed out");
     client
         .send(Message::ProjectSearch {
-            request_id: "next-query".into(),
+            request_id: "cancel-me".into(),
             search: request("needle", "two"),
         })
         .await
@@ -370,10 +393,12 @@ async fn cancelled_search_and_new_query_keep_streams_correlated() {
         let mut next_files = 0usize;
         loop {
             match client.recv().await.unwrap() {
-                Message::ProjectSearchFile { request_id, .. } if request_id == "cancel-me" => {}
-                // The daemon drops completion from a cancelled stale session.
-                Message::ProjectSearchDone { request_id, .. } if request_id == "cancel-me" => {}
-                Message::ProjectSearchFile { request_id, .. } if request_id == "next-query" => {
+                Message::ProjectSearchFile { request_id, file } if request_id == "cancel-me" => {
+                    assert!(
+                        file.matches
+                            .iter()
+                            .all(|matched| matched.replacement == "two")
+                    );
                     next_files += 1;
                 }
                 Message::ProjectSearchDone {
@@ -381,7 +406,7 @@ async fn cancelled_search_and_new_query_keep_streams_correlated() {
                     error,
                     cancelled,
                     ..
-                } if request_id == "next-query" => {
+                } if request_id == "cancel-me" => {
                     assert!(!cancelled);
                     assert!(error.is_none());
                     break;
