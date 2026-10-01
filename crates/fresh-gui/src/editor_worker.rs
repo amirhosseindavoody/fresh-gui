@@ -1548,8 +1548,9 @@ fn begin_lsp_request(
             bridge,
         );
     }
-    if matches!(request.feature, LspRequestFeature::Rename | LspRequestFeature::CodeActions | LspRequestFeature::CodeActionResolve) {
-        if let Some((owner, _)) = request.view_id.split_once(':') { bridge.edits.cancel_source_owner(&request.buffer_id, owner); }
+    if matches!(request.feature, LspRequestFeature::Rename | LspRequestFeature::CodeActions | LspRequestFeature::CodeActionResolve)
+        && let Some((owner, _)) = request.view_id.split_once(':') {
+        bridge.edits.cancel_source_owner(&request.buffer_id, owner);
     }
     let LspBridgeState {
         pending,

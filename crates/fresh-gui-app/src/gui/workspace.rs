@@ -2568,7 +2568,7 @@ impl Workspace {
         if self.workspace_edits.source.is_some() && !self.workspace_edits.server_initiated {
             let workspace = cx.entity();
             cx.defer(move |cx| {
-                let _ = workspace.update(cx, |workspace, cx| workspace_edits::cancel(workspace, cx));
+                workspace.update(cx, workspace_edits::cancel);
             });
         }
     }

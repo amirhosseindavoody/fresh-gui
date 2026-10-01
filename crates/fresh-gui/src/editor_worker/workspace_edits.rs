@@ -71,10 +71,10 @@ fn uri_path(uri: &lsp_types::Uri) -> Result<PathBuf> {
                 path.display()
             );
         }
-    } else if let Err(error) = metadata {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            return Err(error.into());
-        }
+    } else if let Err(error) = metadata
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error.into());
     }
     // Normalize parents on the authority, making aliases and '..' share one key.
     let parent = path
@@ -809,10 +809,10 @@ impl WorkspaceEdits {
                         failures.push(format!("buffer {id}: {e}"));
                     }
                 }
-                if let Some(mut transaction) = file_transaction {
-                    if let Err(e) = transaction.rollback() {
-                        failures.push(e.to_string());
-                    }
+                if let Some(mut transaction) = file_transaction
+                    && let Err(e) = transaction.rollback()
+                {
+                    failures.push(e.to_string());
                 }
                 for (workspace, id, old) in saved_drafts {
                     let restored = match old {

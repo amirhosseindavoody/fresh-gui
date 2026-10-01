@@ -2101,6 +2101,8 @@ impl EditorPanel {
         self.queue_lsp_target(feature, offset, trigger_character, text, item, None, cx)
     }
 
+    // Preserve the existing request bridge arguments while adding provider targeting.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn queue_lsp_target(&mut self, feature: LspRequestFeature, offset: usize,
         trigger_character: Option<String>, text: String, item: Option<serde_json::Value>, server: Option<String>,
         cx: &mut Context<Self>) -> async_channel::Receiver<LspResult> {

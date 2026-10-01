@@ -31,7 +31,8 @@ while True:
     elif method == 'textDocument/prepareRename':
         send({'jsonrpc':'2.0','id':msg['id'],'result':{'range':{'start':{'line':0,'character':0},'end':{'line':0,'character':3}},'placeholder':'old'}})
     elif method == 'textDocument/rename':
-        changes = {uri:[{'range':{'start':{'line':0,'character':0},'end':{'line':0,'character':3}},'newText':'new'}] for uri in paths}
+        new_name = msg['params']['newName']
+        changes = {uri:[{'range':{'start':{'line':0,'character':0},'end':{'line':0,'character':3}},'newText':new_name}] for uri in paths}
         send({'jsonrpc':'2.0','id':msg['id'],'result':{'changes':changes}})
     elif method == 'shutdown':
         send({'jsonrpc':'2.0','id':msg['id'],'result':None})
@@ -105,7 +106,7 @@ while True:
     if method == 'initialize':
         send({'jsonrpc':'2.0','id':msg['id'],'result':{'capabilities':{
             'textDocumentSync':2,'codeActionProvider':{'resolveProvider':True},
-            'executeCommandProvider':{'commands':['fresh.test']}}})
+            'executeCommandProvider':{'commands':['fresh.test']}}}})
     elif method == 'textDocument/codeAction':
         action = {'title':'Fix '+name,'kind':'quickfix','data':{'provider':name}}
         send({'jsonrpc':'2.0','id':msg['id'],'result':[action]})
@@ -181,10 +182,6 @@ fn fake_rename_config(script: &Path, paths: &[&Path]) -> crate::config::Config {
     .unwrap()
 }
 
-fn rename_request(buffer_id: String, base_rev: u64) -> LspRequest {
-    rename_request_named(buffer_id, base_rev, 147, "new")
-}
-
 fn rename_request_named(
     buffer_id: String,
     base_rev: u64,
@@ -225,10 +222,19 @@ async fn lsp_rename_preview(
     editor: &EditorHandle,
     source: &OpenedBuffer,
 ) -> (LspResult, fresh_gui_protocol::WorkspaceEditPreview) {
+    lsp_rename_preview_named(editor, source, 147, "new").await
+}
+
+async fn lsp_rename_preview_named(
+    editor: &EditorHandle,
+    source: &OpenedBuffer,
+    request_id: u64,
+    new_name: &str,
+) -> (LspResult, fresh_gui_protocol::WorkspaceEditPreview) {
     let prepared = lsp_response(
         editor,
         LspRequest {
-            request_id: 146,
+            request_id: request_id - 1,
             buffer_id: source.buffer_id.clone(),
             view_id: "test-owner:view".into(),
             base_rev: source.rev,
@@ -245,7 +251,7 @@ async fn lsp_rename_preview(
     lsp_edit_preview(
         editor,
         source,
-        rename_request(source.buffer_id.clone(), source.rev),
+        rename_request_named(source.buffer_id.clone(), source.rev, request_id, new_name),
     )
     .await
 }
@@ -256,6 +262,11 @@ async fn lsp_edit_preview(
     request: LspRequest,
 ) -> (LspResult, fresh_gui_protocol::WorkspaceEditPreview) {
     let result = lsp_response(editor, request).await;
+    assert!(
+        result.status.is_none(),
+        "LSP edit failed: {:?}",
+        result.status
+    );
     assert!(
         !result.stale,
         "LSP response should match its source revision"
@@ -280,7 +291,7 @@ async fn lsp_edit_preview(
 
 async fn lsp_response(editor: &EditorHandle, request: LspRequest) -> LspResult {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-    for attempt in 0..32_u64 {
+    for attempt in 0..80_u64 {
         let mut results = editor.subscribe_lsp();
         let request_id = request.request_id + attempt;
         let mut next = request.clone();
@@ -423,7 +434,8 @@ fn lsp_rename_previews_open_and_closed_files_and_applies_as_buffer_undo_groups()
             text: current.text.clone(),
             ..opened_source.clone()
         };
-        let (_, cancelled) = lsp_rename_preview(&editor, &refreshed_source).await;
+        let (_, cancelled) =
+            lsp_rename_preview_named(&editor, &refreshed_source, 148, "next").await;
         editor
             .cancel_workspace_edit(
                 opened_source.buffer_id.clone(),

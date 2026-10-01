@@ -43,10 +43,9 @@ impl FileTransaction {
         for entry in &self.entries {
             if entry.backed_up
                 && let Some(backup) = &entry.backup
+                && let Err(error) = fs::remove_file(backup)
             {
-                if let Err(error) = fs::remove_file(backup) {
-                    tracing::warn!(path = %backup.display(), %error, "workspace edit committed but backup cleanup failed");
-                }
+                tracing::warn!(path = %backup.display(), %error, "workspace edit committed but backup cleanup failed");
             }
         }
         self.finished = true;
@@ -177,10 +176,10 @@ impl FileTransaction {
 
 impl Drop for FileTransaction {
     fn drop(&mut self) {
-        if !self.finished {
-            if let Err(error) = self.rollback() {
-                tracing::error!(%error, "workspace file transaction rollback failed");
-            }
+        if !self.finished
+            && let Err(error) = self.rollback()
+        {
+            tracing::error!(%error, "workspace file transaction rollback failed");
         }
         // Any remaining backup may be the only copy of original contents.
     }
