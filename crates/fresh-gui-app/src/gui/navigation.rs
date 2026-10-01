@@ -468,6 +468,13 @@ impl Workspace {
         let query_view = view.clone();
         let cancel = view.clone();
         div()
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key.eq_ignore_ascii_case("escape") {
+                    this.cancel_navigation_picker(window, cx);
+                    cx.stop_propagation();
+                    cx.prevent_default();
+                }
+            }))
             .absolute()
             .inset_0()
             .flex()
