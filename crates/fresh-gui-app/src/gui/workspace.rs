@@ -56,6 +56,7 @@ use super::actions::{
     DocumentSymbols, WorkspaceSymbols, NavigateBack, NavigateForward,
     FormatSelection, ShowProblems, NextError, PreviousError, ShowLanguageServers, StartLanguageServers, StopLanguageServers, RestartLanguageServers,
     AskCopilot, Complete, ShowHover, SignatureHelp, FormatDocument, GoToFile, GoToLine, SwitchBuffer, NewFile, NewTerminal, NewWorkspace, NextTab, OpenDefaultSettings, OpenSettings, PasteExplorer,
+    SaveAs, SaveAll, InspectFileFormat, ReopenWithEncoding, SaveWithEncoding, ChangeLineEndings,
     PrevTab, QuitClient, Reconnect, RenameWorkspace, ResetContentZoom, ResetUiZoom, SaveBuffer,
     SplitTerminal, StopServer, RestartServer, ReloadConfig, TerminalCopyOrInterrupt, TogglePinTab, ToggleCommandPalette, ToggleSidebar, ToggleWordWrap, ZoomInContent, ZoomInUi, ZoomOutContent,
     ZoomOutUi,
@@ -1175,6 +1176,7 @@ impl Workspace {
         let waiting_for_diff_saves = pending.waiting_for_diff_saves.len();
         if editor_saves_complete && diff_saves_complete && waiting_for_diff_saves == 0 {
             self.pending_save_close = None;
+            if ids.is_empty() { self.status = "Saved all buffers".into(); cx.notify(); }
             if closes_window {
                 self.shutdown_client(cx);
                 crate::note_window_shutdown();
@@ -1978,6 +1980,11 @@ impl Workspace {
                     });
                 }
             }
+            AdeEvent::FileState { request_id, buffer_id, rev, metadata, text, dirty } => {
+                if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
+                    panel.update(cx, |panel, cx| panel.apply_file_state(&request_id, rev, metadata, text, dirty, window, cx));
+                }
+            }
             AdeEvent::BufferSaved {
                 request_id,
                 buffer_id,
@@ -2179,7 +2186,8 @@ impl Workspace {
         for panel in self.editors.values() {
             panel.update(cx, |panel, cx| {
                 panel.configure_range_edits(range_edits, cx);
-                panel.configure_lsp_requests(self.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS), cx);
+                panel.set_file_controls_supported(self.capabilities.iter().any(|cap| cap == fresh_gui_protocol::CAP_EDITOR_FILE_CONTROLS));
+            panel.configure_lsp_requests(self.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS), cx);
                 panel.configure_search(self.search_options.clone(), cx);
                 panel.configure_draft_recovery(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
                 panel.configure_external_changes(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES));
@@ -2325,12 +2333,14 @@ impl Workspace {
         let lookup_key = if path.is_empty() { untitled_editor_key(draft_id.as_deref().unwrap_or(&buffer_id)) } else { path.clone() };
         if let Some(panel) = self.editors.get(&lookup_key).cloned() {
             panel.update(cx, |panel, cx| {
-                panel.configure_lsp_requests(self.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS), cx);
+                panel.set_file_controls_supported(self.capabilities.iter().any(|cap| cap == fresh_gui_protocol::CAP_EDITOR_FILE_CONTROLS));
+            panel.configure_lsp_requests(self.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS), cx);
                 panel.configure_draft_recovery(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
                 panel.configure_external_changes(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES));
                 panel.note_reopen(buffer_id, line, column, cx);
                 panel.reconnect(self.ade.clone(), self.capabilities.iter().any(|cap| cap == CAP_EDITOR_RANGE_EDITS), self.capabilities.iter().any(|cap| cap == CAP_EDITOR_PAGED_READS), cx);
-                panel.configure_lsp_requests(self.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS), cx);
+                panel.set_file_controls_supported(self.capabilities.iter().any(|cap| cap == fresh_gui_protocol::CAP_EDITOR_FILE_CONTROLS));
+            panel.configure_lsp_requests(self.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS), cx);
             });
             if activate {
                 self.select_entity(&panel, window, cx);
@@ -2365,6 +2375,7 @@ impl Workspace {
         panel.update(cx, |panel, cx| {
             panel.configure_search(self.search_options.clone(), cx);
             panel.configure_range_edits(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_RANGE_EDITS), cx);
+            panel.set_file_controls_supported(self.capabilities.iter().any(|cap| cap == fresh_gui_protocol::CAP_EDITOR_FILE_CONTROLS));
             panel.configure_lsp_requests(self.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS), cx);
                 panel.configure_draft_recovery(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
                 panel.configure_external_changes(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES));
@@ -4977,6 +4988,32 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.save_active(window, cx);
     }
 
+    fn on_save_as(&mut self, _: &SaveAs, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.active, Some(ActiveSurface::Editor(_))) { self.open_save_dialog(window, cx); }
+    }
+
+    fn on_save_all(&mut self, _: &SaveAll, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_save_close.is_some() || self.save_open { return; }
+        let dirty: Vec<_> = self.editors.values().filter(|panel| panel.read(cx).is_dirty())
+            .map(|panel| PanelId::from(panel.entity_id()))
+            .chain(self.diffs.values().filter(|panel| panel.read(cx).is_dirty()).map(|panel| PanelId::from(panel.entity_id())))
+            .collect();
+        // Empty close IDs reuse the guarded bulk-save workflow, including its
+        // sequential untitled destination prompts, without closing any panels.
+        self.save_before_close(&[], &dirty, false, window, cx);
+    }
+
+    fn file_controls(&mut self, mode: super::pane::FileControlMode, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ActiveSurface::Editor(key)) = &self.active
+            && let Some(panel) = self.editors.get(key).cloned() {
+            panel.update(cx, |panel, cx| panel.show_file_controls(mode, window, cx));
+        }
+    }
+    fn on_file_format(&mut self, _: &InspectFileFormat, window: &mut Window, cx: &mut Context<Self>) { self.file_controls(super::pane::FileControlMode::Inspect, window, cx); }
+    fn on_reopen_encoding(&mut self, _: &ReopenWithEncoding, window: &mut Window, cx: &mut Context<Self>) { self.file_controls(super::pane::FileControlMode::ReopenWithEncoding, window, cx); }
+    fn on_save_encoding(&mut self, _: &SaveWithEncoding, window: &mut Window, cx: &mut Context<Self>) { self.file_controls(super::pane::FileControlMode::SaveWithEncoding, window, cx); }
+    fn on_line_endings(&mut self, _: &ChangeLineEndings, window: &mut Window, cx: &mut Context<Self>) { self.file_controls(super::pane::FileControlMode::ChangeLineEndings, window, cx); }
+
     fn on_toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
         self.publish_layout(cx);
@@ -7249,6 +7286,12 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_close_all_other_terminals))
             .on_action(cx.listener(Self::on_close_all_other_tabs))
             .on_action(cx.listener(Self::on_save))
+            .on_action(cx.listener(Self::on_save_as))
+            .on_action(cx.listener(Self::on_save_all))
+            .on_action(cx.listener(Self::on_file_format))
+            .on_action(cx.listener(Self::on_reopen_encoding))
+            .on_action(cx.listener(Self::on_save_encoding))
+            .on_action(cx.listener(Self::on_line_endings))
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_zoom_in_content))
             .on_action(cx.listener(Self::on_zoom_out_content))

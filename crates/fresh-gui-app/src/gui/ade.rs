@@ -18,6 +18,7 @@ use super::paths::{daemon_uses_unix_paths, workspace_root_for_daemon};
 
 #[derive(Debug, Clone)]
 pub enum AdeCmd {
+    FileControl { request_id: String, buffer_id: String, base_rev: u64, operation: fresh_gui_protocol::FileControlOperation },
     Project(Message),
     OpenPty {
         cols: u16,
@@ -266,6 +267,7 @@ pub struct AttachedWorkspace {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum AdeEvent {
+    FileState { request_id: String, buffer_id: String, rev: u64, metadata: fresh_gui_protocol::BufferFileMetadata, text: Option<String>, dirty: bool },
     Project(Message),
     Connecting,
     // Boxed: every PTY chunk crosses this channel as an `AdeEvent`, so the
@@ -897,6 +899,13 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd, evt_tx: &async_channel::
                 })
                 .await?;
         }
+        AdeCmd::FileControl { request_id, buffer_id, base_rev, operation } => {
+            if client.supports_capability(fresh_gui_protocol::CAP_EDITOR_FILE_CONTROLS) {
+                client.send(Message::BufferFileControl { request_id, buffer_id, base_rev, operation }).await?;
+            } else {
+                let _ = evt_tx.send(AdeEvent::Error { code: "buffer_file_control_failed".into(), message: format!("{request_id}: Upgrade and restart daemon for encoding and line-ending controls") }).await;
+            }
+        }
         AdeCmd::SaveBuffer {
             request_id,
             buffer_id,
@@ -1516,6 +1525,7 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
         message @ (Message::FileFinderResults { .. } | Message::ProjectSearchFile { .. } | Message::ProjectSearchDone { .. } | Message::ProjectReplaceResult { .. }) => Some(AdeEvent::Project(message)),
         Message::BufferSearchResult { request_id, matches, error, capped } => Some(AdeEvent::SearchResult { request_id, matches, error, capped }),
         Message::ConfigUpdated { shortkeys, ui } => Some(AdeEvent::ConfigUpdated { shortkeys, ui }),
+        Message::BufferFileState { request_id, buffer_id, rev, metadata, text, dirty } => Some(AdeEvent::FileState { request_id, buffer_id, rev, metadata, text, dirty }),
         Message::BufferSaved {
             request_id,
             buffer_id,
