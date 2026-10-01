@@ -185,6 +185,8 @@ pub fn catalog() -> Vec<SettingDefinition> {
             1,
             u32::MAX as u64,
         ),
+        fresh(&["editor", "trim_trailing_whitespace_on_save"], Boolean),
+        fresh(&["editor", "ensure_final_newline_on_save"], Boolean),
         SettingDefinition {
             effect: SettingEffect::BackendOnly,
             ..fresh(&["editor", "hot_exit"], Boolean)
@@ -510,6 +512,8 @@ mod tests {
         for path in [
             ["editor", "auto_save_enabled"],
             ["editor", "auto_save_interval_secs"],
+            ["editor", "trim_trailing_whitespace_on_save"],
+            ["editor", "ensure_final_newline_on_save"],
             ["editor", "hot_exit"],
             ["editor", "confirm_quit"],
         ] {
@@ -529,6 +533,16 @@ mod tests {
         assert!(validate_value(interval, &Value::from(0)).is_err());
         assert!(validate_value(interval, &Value::from(u64::from(u32::MAX) + 1)).is_err());
         assert_eq!(interval.effect, SettingEffect::Restart);
+        for path in [
+            ["editor", "trim_trailing_whitespace_on_save"],
+            ["editor", "ensure_final_newline_on_save"],
+        ] {
+            let setting = entries.iter().find(|entry| entry.path == path).unwrap();
+            assert_eq!(setting.value_type, SettingValueType::Boolean);
+            assert_eq!(setting.default, None);
+            assert_eq!(setting.effect, SettingEffect::Restart);
+            assert!(validate_value(setting, &Value::Bool(true)).is_ok());
+        }
         for path in [["editor", "hot_exit"], ["editor", "confirm_quit"]] {
             let setting = entries.iter().find(|entry| entry.path == path).unwrap();
             assert_eq!(setting.effect, SettingEffect::BackendOnly);
