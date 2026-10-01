@@ -59,6 +59,7 @@ actions!(
         NavigateForward,
         ToggleWordWrap,
         FindInBuffer,
+        SearchProject,
         ReplaceInBuffer,
         QueryReplace,
         ClearSearchHighlights,
@@ -152,6 +153,7 @@ pub fn apply_shortkeys(cx: &mut App, shortkeys: &[Shortkey]) {
             "NavigateBack" => KeyBinding::new(key, NavigateBack, when),
             "NavigateForward" => KeyBinding::new(key, NavigateForward, when),
             "FormatDocument" => KeyBinding::new(key, FormatDocument, when),
+            "SearchProject" => KeyBinding::new(key, SearchProject, when),
             "FindInBuffer" => KeyBinding::new(key, FindInBuffer, when),
             "ReplaceInBuffer" => KeyBinding::new(key, ReplaceInBuffer, when),
             "QueryReplace" => KeyBinding::new(key, QueryReplace, when),
@@ -225,6 +227,7 @@ pub fn known_action(action: &str) -> bool {
             | "Complete"
             | "ShowHover"
             | "SignatureHelp"
+            | "SearchProject"
             | "FindInBuffer"
             | "ReplaceInBuffer"
             | "QueryReplace"

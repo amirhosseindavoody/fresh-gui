@@ -42,7 +42,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::actions::{FindInBuffer, ReplaceInBuffer, QueryReplace, ClearSearchHighlights, NextSearchMatch, PreviousSearchMatch};
+use super::actions::{SearchProject, FindInBuffer, ReplaceInBuffer, QueryReplace, ClearSearchHighlights, NextSearchMatch, PreviousSearchMatch};
 use super::actions::{
     ClearExplorerInput, CloseAllEditors, CloseAllOtherTabs, CloseAllOtherTerminals,
     CloseAllTerminals, CloseTab, CloseWorkspace, CopyExplorer, DeleteExplorer, Disconnect, FilterExplorer,
@@ -831,6 +831,9 @@ impl Render for ExplorerDragPreview {
 
 #[path = "workspace_search.rs"]
 mod workspace_search;
+#[path = "project_search.rs"]
+mod project_search;
+use project_search::{ProjectSearchPanel, ProjectSearchEvent};
 
 pub struct Workspace {
     target: ConnectTarget,
@@ -984,6 +987,10 @@ pub struct Workspace {
     rename_input: Entity<InputState>,
     settings: Entity<SettingsEditor>,
     settings_open: bool,
+    project_search: Option<Entity<ProjectSearchPanel>>,
+    project_subscription: Option<Subscription>,
+    project_send_task: Option<Task<()>>,
+    project_locations: HashMap<String, (usize, usize)>,
     _subscriptions: Vec<Subscription>,
     _recv_task: Task<()>,
 }
@@ -1218,6 +1225,27 @@ impl Workspace {
 
     pub fn new(target: ConnectTarget, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (ade, evt_rx) = super::ade::spawn(target.clone());
+        Self::new_with_ade(target, ade, evt_rx, window, cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        target: ConnectTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (ade, _commands) = AdeHandle::test_channel();
+        let (_events, evt_rx) = async_channel::unbounded();
+        Self::new_with_ade(target, ade, evt_rx, window, cx)
+    }
+
+    fn new_with_ade(
+        target: ConnectTarget,
+        ade: AdeHandle,
+        evt_rx: async_channel::Receiver<AdeEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let (dock, _) = install_workspace_dock(window, cx);
         let explorer = cx.new(|cx| TreeState::new(cx));
         let command_state = cx.new(|cx| CommandState::new(window, cx));
@@ -1543,6 +1571,10 @@ impl Workspace {
             rename_input,
             settings,
             settings_open: false,
+            project_search: None,
+            project_subscription: None,
+            project_send_task: None,
+            project_locations: HashMap::new(),
             _subscriptions: vec![
                 settings_sub,
                 tree_sub,
@@ -1564,6 +1596,19 @@ impl Workspace {
 
     fn handle_event(&mut self, ev: AdeEvent, window: &mut Window, cx: &mut Context<Self>) {
         match ev {
+            AdeEvent::Project(message) => {
+                if let fresh_gui_protocol::Message::ProjectReplaceResult { files, .. } = &message {
+                    for update in files.iter().filter_map(|file| file.buffer.as_ref()) {
+                        if let Some(panel) = self.editor_by_buffer(&update.buffer_id, cx) {
+                            panel.update(cx, |panel, cx| panel.apply_project_update(update, window, cx));
+                        } else if let Some(panel) = self.diffs.values().find(|panel| panel.read(cx).buffer_id() == Some(update.buffer_id.as_str())).cloned()
+                            && !panel.update(cx, |panel, cx| panel.apply_project_update(update, window, cx)) {
+                            self.status = "Project edit changed the daemon buffer; newer diff draft kept. Reopen in an editor to review.".into();
+                        }
+                    }
+                }
+                if let Some(panel) = &self.project_search { panel.update(cx, |panel, cx| panel.handle_message(&message, cx)); }
+            }
             AdeEvent::Connecting => {
                 self.connection = ConnectionState::Connecting;
                 self.status = "Connecting…".into();
@@ -1637,6 +1682,8 @@ impl Workspace {
                 self.upsert_workspace(workspace);
             }
             AdeEvent::WorkspaceRootSet { workspace } => {
+                self.project_search = None;
+                self.project_send_task = None;
                 let active = self.active_workspace_id.as_deref() == Some(workspace.id.as_str());
                 self.status = format!(
                     "Workspace location changed to {}",
@@ -1692,6 +1739,8 @@ impl Workspace {
             }
             AdeEvent::Disconnected { reason } => {
                 self.clear_navigation_pending(cx);
+                self.project_search = None;
+                self.project_send_task = None;
                 self.close_settings(cx);
                 for panel in self.editors.values() {
                     panel.update(cx, |panel, _| panel.detach_transport());
@@ -1839,10 +1888,16 @@ impl Workspace {
                     return;
                 }
                 if let Some(activate) = self.pending_editors.remove(&request_id) {
+                    let project_location = self.project_locations.remove(&request_id);
+                    let opened_id = buffer_id.clone();
                     self.begin_editor_tab(
                         buffer_id, draft_id, path.clone(), language, line, column, activate, window, cx,
                     );
                     self.history_editor_opened(&request_id, &path, window, cx);
+                    if let Some((start, end)) = project_location
+                        && let Some(panel) = self.editor_by_buffer(&opened_id, cx) {
+                        panel.update(cx, |panel, cx| panel.reveal_project_match(start, end, cx));
+                    }
                     self.finish_restore_if_idle(window, cx);
                 }
             }
@@ -3015,6 +3070,9 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.project_search = None;
+        self.project_send_task = None;
+        self.project_locations.clear();
         self.close_settings(cx);
         self.clear_navigation_pending(cx);
         let AttachedWorkspace {
@@ -3744,6 +3802,137 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
 
     fn open_path(&mut self, path: String, preview: bool) {
         self.open_editor(path, preview, true);
+    }
+
+    fn on_search_project(
+        &mut self,
+        _: &SearchProject,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(panel) = &self.project_search {
+            panel.update(cx, |panel, cx| panel.cancel(cx));
+        }
+        self.project_send_task = None;
+        let root = self
+            .workspace_root()
+            .unwrap_or_else(|| self.session_root.clone());
+        let supported = self
+            .capabilities
+            .iter()
+            .any(|cap| cap == fresh_gui_protocol::CAP_PROJECT_SEARCH);
+        let panel = cx.new(|cx| ProjectSearchPanel::new(root, supported, window, cx));
+        self.project_subscription = Some(cx.subscribe_in(
+            &panel,
+            window,
+            |this, _, event: &ProjectSearchEvent, window, cx| {
+                use fresh_gui_protocol::Message;
+                match event {
+                    ProjectSearchEvent::Search { request_id, search } => this
+                        .send_project_after_flush(
+                            Message::ProjectSearch {
+                                request_id: request_id.clone(),
+                                search: search.clone(),
+                            },
+                            cx,
+                        ),
+                    ProjectSearchEvent::Apply {
+                        request_id,
+                        search_id,
+                        selections,
+                    } => this.send_project_after_flush(
+                        Message::ProjectReplace {
+                            request_id: request_id.clone(),
+                            search_id: search_id.clone(),
+                            selections: selections.clone(),
+                        },
+                        cx,
+                    ),
+                    ProjectSearchEvent::Cancel { request_id } => {
+                        this.project_send_task = None;
+                        this.ade.send(AdeCmd::Project(Message::ProjectSearchCancel {
+                            request_id: request_id.clone(),
+                        }));
+                    }
+                    ProjectSearchEvent::Close => {
+                        this.project_send_task = None;
+                        this.project_search = None;
+                    }
+                    ProjectSearchEvent::OpenMatch {
+                        path,
+                        buffer_id,
+                        draft_id,
+                        line,
+                        column,
+                        start,
+                        end,
+                    } => {
+                        if let Some(path) = path {
+                            let request_id = next_id("project-open");
+                            this.pending_editors.insert(request_id.clone(), true);
+                            this.project_locations
+                                .insert(request_id.clone(), (*start, *end));
+                            this.ade.send(AdeCmd::OpenEditor {
+                                request_id,
+                                path: path.clone(),
+                                preview: false,
+                                line: Some(*line),
+                                column: Some(*column),
+                            });
+                        } else if let Some(buffer_id) = buffer_id {
+                            if let Some(editor) = this.editor_by_buffer(buffer_id, cx) {
+                                editor.update(cx, |editor, cx| {
+                                    editor.reveal_project_match(*start, *end, cx)
+                                });
+                                this.select_entity(&editor, window, cx);
+                            } else if let Some(draft_id) = draft_id {
+                                let request_id = next_id("project-draft-open");
+                                this.pending_editors.insert(request_id.clone(), true);
+                                this.project_locations
+                                    .insert(request_id.clone(), (*start, *end));
+                                this.ade.send(AdeCmd::RestoreDraft {
+                                    request_id,
+                                    draft_id: draft_id.clone(),
+                                });
+                            }
+                        }
+                        this.project_search = None;
+                    }
+                }
+                cx.notify();
+            },
+        ));
+        self.project_search = Some(panel);
+        cx.notify();
+    }
+
+    fn send_project_after_flush(
+        &mut self,
+        message: fresh_gui_protocol::Message,
+        cx: &mut Context<Self>,
+    ) {
+        if self.diffs.values().any(|panel| panel.read(cx).is_dirty()) {
+            if let Some(panel) = &self.project_search { panel.update(cx, |panel, cx| panel.set_error("Save or close dirty Source Control diff drafts before project search", cx)); }
+            return;
+        }
+        let workspace = self.active_workspace_id.clone();
+        self.project_send_task = Some(cx.spawn(async move |this, cx| {
+            for _ in 0..50 {
+                let ready = this.update(cx, |this, cx| {
+                    if this.active_workspace_id != workspace || this.project_search.is_none() { return None; }
+                    for editor in this.editors.values() { editor.update(cx, |editor, cx| editor.flush_for_recovery(cx)); }
+                    Some(this.editors.values().all(|editor| editor.read(cx).recovery_guaranteed(cx)))
+                }).ok().flatten();
+                match ready {
+                    Some(true) => { let _ = this.update(cx, |this, _| this.ade.send(AdeCmd::Project(message.clone()))); return; }
+                    None => return,
+                    Some(false) => cx.background_executor().timer(Duration::from_millis(100)).await,
+                }
+            }
+            let _ = this.update(cx, |this, cx| {
+                if let Some(panel) = &this.project_search { panel.update(cx, |panel, cx| panel.set_error("Open buffers have pending edits or conflicts; resolve them before project search", cx)); }
+            });
+        }));
     }
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
@@ -6730,6 +6919,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             ("Close All Other Terminals", Box::new(CloseAllOtherTerminals)),
             ("Close All Other Tabs", Box::new(CloseAllOtherTabs)),
             ("Save", Box::new(SaveBuffer)),
+            ("Search in Workspace", Box::new(SearchProject)),
             ("Toggle Sidebar", Box::new(ToggleSidebar)),
             ("Go to File…", Box::new(GoToFile)),
             ("Open Settings", Box::new(OpenSettings)),
@@ -7253,6 +7443,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_show_hover))
             .on_action(cx.listener(Self::on_signature_help))
             .on_action(cx.listener(Self::on_format_document))
+            .on_action(cx.listener(Self::on_search_project))
             .on_action(cx.listener(Self::on_find_in_buffer))
             .on_action(cx.listener(Self::on_replace_in_buffer))
             .on_action(cx.listener(Self::on_query_replace))
@@ -7380,6 +7571,11 @@ impl Render for Workspace {
                                 .child(self.render_palette(cx)),
                         ),
                 )
+            })
+            .when_some(self.project_search.clone(), |view, panel| {
+                view.child(div().absolute().inset_0().flex().justify_center().items_center()
+                    .bg(cx.theme().background.opacity(0.6))
+                    .child(div().w(px(880.)).h(px(620.)).max_w_full().max_h_full().child(panel)))
             })
             .when(self.settings_open, |view| view.child(self.settings.clone()))
             .when(self.goto_open, |this| this.child(self.render_goto(window, cx)))

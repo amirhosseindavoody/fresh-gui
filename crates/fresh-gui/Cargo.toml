@@ -21,6 +21,8 @@ clap = { workspace = true }
 fresh = { path = "../../vendor/fresh/crates/fresh-editor", package = "fresh-editor", default-features = false, features = ["runtime"] }
 fresh-gui-protocol = { workspace = true }
 futures-util = { workspace = true }
+globset = "0.4"
+ignore = "0.4"
 notify = { workspace = true }
 regex = "1"
 portable-pty = { workspace = true }

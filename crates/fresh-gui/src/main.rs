@@ -20,6 +20,8 @@ mod path_open;
 mod pty;
 mod server;
 mod search;
+mod project_search;
+mod project_session;
 mod settings;
 mod session;
 mod shell_resolve;

@@ -15,7 +15,7 @@ use axum::routing::get;
 use base64::Engine;
 use fresh_gui_protocol::{
     ByteSelection, CAP_EDITOR, CAP_EDITOR_DRAFT_RECOVERY, CAP_EDITOR_EXTERNAL_CHANGES,
-    CAP_EDITOR_PAGED_READS, CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_SEARCH, CAP_LSP, CAP_LSP_NAVIGATION, CAP_LSP_REQUESTS,
+    CAP_EDITOR_PAGED_READS, CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_SEARCH, CAP_PROJECT_SEARCH, CAP_LSP, CAP_LSP_NAVIGATION, CAP_LSP_REQUESTS,
     CAP_SCENE, CAP_SETTINGS_EDITOR, EditorDraftInfo, ExternalResolution, Hello, HelloUi,
     MAX_PAGE_BYTES, Message, PROTOCOL_VERSION,
 };
@@ -137,6 +137,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 && c != CAP_EDITOR_DRAFT_RECOVERY
                 && c != CAP_EDITOR_EXTERNAL_CHANGES
                 && c != CAP_EDITOR_SEARCH
+                && c != CAP_PROJECT_SEARCH
                 && c != CAP_LSP
                 && c != CAP_LSP_REQUESTS
                 && c != CAP_LSP_NAVIGATION
@@ -174,6 +175,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut client_lsp_requests = false;
     let mut client_editor_search = false;
     let mut client_lsp_navigation = false;
+    let mut client_project_search = false;
+    let project = crate::project_session::ProjectSession::default();
+    let (project_tx, mut project_rx) = mpsc::channel::<crate::project_session::SearchOutput>(8);
     let mut session_id: Option<String> = None;
     let socket_id = uuid::Uuid::new_v4().to_string();
     let mut lsp_request_map: HashMap<u64, (u64, String, String)> = HashMap::new();
@@ -183,6 +187,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     loop {
         tokio::select! {
+            project_message = project_rx.recv() => {
+                if let Some(output) = project_message {
+                    if output.generation.load(Ordering::Relaxed) { continue; }
+                    let message = output.message;
+                    let id = match &message { Message::ProjectSearchFile { request_id, .. } | Message::ProjectSearchDone { request_id, .. } => request_id, _ => continue };
+                    if !project.is_current(id) { continue; }
+                    if send_msg(&mut sink, &message).await.is_err() { break; }
+                }
+            }
             lsp = async { match lsp_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } }, if authed && client_lsp_requests => {
                 match lsp {
                     Ok(result) => if let Some((client_id, buffer_id, view_id)) = lsp_request_map.remove(&result.request_id) {
@@ -273,6 +286,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     &mut lsp_request_map,
                     &socket_id,
                     &mut client_editor_search,
+                    &mut client_project_search,
+                    &project,
+                    project_tx.clone(),
                     &mut session_id,
                     out_tx.clone(),
                     &mut sink,
@@ -282,6 +298,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     let _ = send_msg(&mut sink, &resp).await;
                 }
                 if previous_session != session_id {
+                    project.clear();
                     cancel_socket_lsp(state.editor.as_ref(), &socket_id, &mut lsp_request_map);
                 }
             }
@@ -311,6 +328,9 @@ async fn handle_client_msg(
     lsp_request_map: &mut HashMap<u64, (u64, String, String)>,
     socket_id: &str,
     client_editor_search: &mut bool,
+    client_project_search: &mut bool,
+    project: &crate::project_session::ProjectSession,
+    project_tx: mpsc::Sender<crate::project_session::SearchOutput>,
     session_id: &mut Option<String>,
     out_tx: mpsc::UnboundedSender<Message>,
     sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
@@ -346,6 +366,7 @@ async fn handle_client_msg(
                 .capabilities
                 .iter()
                 .any(|cap| cap == CAP_LSP_NAVIGATION);
+            *client_project_search = client_hello.capabilities.iter().any(|cap| cap == CAP_PROJECT_SEARCH);
             if client_hello.protocol_version != PROTOCOL_VERSION {
                 return Err(Message::Error {
                     code: "protocol_mismatch".into(),
@@ -1280,6 +1301,81 @@ async fn handle_client_msg(
                 })?;
             Ok(())
         }
+        Message::ProjectSearch { request_id, search } => {
+            require_auth(*authed)?;
+            require_project_cap(*client_project_search, state.editor.is_some(), &request_id)?;
+            let workspace = current_workspace_id(state, session_id).await?;
+            let root = project_root(state, &workspace).await?;
+            project.start(
+                request_id,
+                workspace,
+                root,
+                search,
+                state.editor.as_ref().expect("checked").clone(),
+                project_tx,
+            );
+            Ok(())
+        }
+        Message::ProjectSearchCancel { request_id } => {
+            require_auth(*authed)?;
+            require_project_cap(*client_project_search, state.editor.is_some(), &request_id)?;
+            project.cancel(&request_id);
+            send_msg(sink, &Message::ProjectSearchDone { request_id: request_id.clone(), truncated: false, cancelled: true, warnings: Vec::new(), error: None }).await.map_err(|_| settings_error("send_failed", &request_id, "socket closed"))?;
+            Ok(())
+        }
+        Message::ProjectReplace {
+            request_id,
+            search_id,
+            selections,
+        } => {
+            require_auth(*authed)?;
+            require_project_cap(*client_project_search, state.editor.is_some(), &request_id)?;
+            let workspace = current_workspace_id(state, session_id).await?;
+            let root = project_root(state, &workspace).await?;
+            let replaced = project
+                .replace(
+                    &search_id,
+                    &workspace,
+                    &root,
+                    selections,
+                    state.editor.as_ref().expect("checked"),
+                )
+                .await;
+            let mut files = Vec::new();
+            match replaced {
+                Ok(results) => {
+                    for (mut file, applied) in results {
+                        if let Some(applied) = applied.filter(|result| !result.saved) {
+                            file.buffer = Some(fresh_gui_protocol::ProjectBufferUpdate {
+                                buffer_id: applied.buffer_id,
+                                base_rev: applied.base_rev,
+                                rev: applied.rev,
+                                text: applied.text,
+                                path: applied.path,
+                                dirty: applied.dirty,
+                            });
+                        }
+                        files.push(file);
+                    }
+                }
+                Err(error) => files.push(fresh_gui_protocol::ProjectReplaceFileResult {
+                    file_id: search_id,
+                    error: Some(error),
+                    buffer: None,
+                }),
+            }
+            send_msg(
+                sink,
+                &Message::ProjectReplaceResult {
+                    request_id: request_id.clone(),
+                    files,
+                },
+            )
+            .await
+            .map_err(|_| settings_error("send_failed", &request_id, "socket closed"))?;
+            Ok(())
+        }
+
         Message::BufferSearch {
             request_id,
             text,
@@ -2228,6 +2324,7 @@ async fn handle_client_msg(
         }
         Message::WorkspaceSetRoot { workspace_id, root } => {
             require_auth(*authed)?;
+            project.clear();
             if root.trim().is_empty() {
                 return Err(Message::Error {
                     code: "workspace_set_root_failed".into(),
@@ -2386,6 +2483,15 @@ async fn handle_client_msg(
             Ok(())
         }
     }
+}
+
+fn require_project_cap(client: bool, editor: bool, request_id: &str) -> Result<(), Message> {
+    if client && editor { Ok(()) } else { Err(settings_error("capability_unavailable", request_id, "project.search.v1 capability not negotiated")) }
+}
+
+async fn project_root(state: &AppState, workspace: &str) -> Result<PathBuf, Message> {
+    let root = state.workspaces.root_of(workspace).await.unwrap_or_else(|| state.fs_root.root_display());
+    state.fs_root.resolve(&root).await.map_err(|e| settings_error("project_search_failed", workspace, e))
 }
 
 fn require_settings_cap(enabled: bool, request_id: &str) -> Result<(), Message> {

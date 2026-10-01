@@ -1713,6 +1713,7 @@ pub struct EditorPanel {
     save_request_id: Option<String>,
     save_sent_text: Option<String>,
     pending: Option<EditorPending>,
+    project_reveal: Option<std::ops::Range<usize>>,
     editor: Entity<EditorState>,
     ade: AdeHandle,
     workspace: WeakEntity<Workspace>,
@@ -1900,6 +1901,7 @@ impl EditorPanel {
             save_request_id: None,
             save_sent_text: None,
             pending: Some(EditorPending { line, column }),
+            project_reveal: None,
             editor,
             ade,
             workspace,
@@ -2847,6 +2849,56 @@ impl EditorPanel {
         cx.notify();
     }
 
+    pub fn apply_project_update(
+        &mut self,
+        update: &fresh_gui_protocol::ProjectBufferUpdate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let unchanged = self.edit_request_id.is_none()
+            && self.sync_request_id.is_none()
+            && self.edit_sync.as_ref().is_some_and(|sync| {
+                sync.acknowledged().1 == update.base_rev
+                    && sync.acknowledged().0 == self.current_text(cx)
+            });
+        if unchanged {
+            // The user approved this transaction over the acknowledged draft.
+            // The ordinary snapshot protection still applies to any newer draft.
+            self.dirty = false;
+        }
+        self.apply_snapshot(
+            update.rev,
+            update.text.clone(),
+            update.path.clone(),
+            window,
+            cx,
+        );
+        self.dirty |= update.dirty;
+    }
+
+    /// Project results carry global UTF-8 byte ranges, independent of displayed
+    /// character columns. Defer revealing until the opening snapshot is ready.
+    pub fn reveal_project_match(&mut self, start: usize, end: usize, cx: &mut Context<Self>) {
+        self.pending = None;
+        self.project_reveal = Some(start..end);
+        self.apply_project_reveal(cx);
+    }
+
+    fn apply_project_reveal(&mut self, cx: &mut Context<Self>) {
+        let Some(range) = self.project_reveal.clone() else {
+            return;
+        };
+        let text = self.current_text(cx);
+        if self.edit_sync.is_none() || range.end > text.len() {
+            return;
+        }
+        if text.is_char_boundary(range.start) && text.is_char_boundary(range.end) {
+            self.editor
+                .update(cx, |state, cx| state.set_selected_range(range, cx));
+        }
+        self.project_reveal = None;
+    }
+
     pub fn apply_snapshot(
         &mut self,
         rev: u64,
@@ -2942,6 +2994,7 @@ impl EditorPanel {
                 .update(cx, |state, cx| state.set_cursor_position(pos, window, cx));
         }
         self.apply_navigation_offset(window, cx);
+        self.apply_project_reveal(cx);
     }
 
     pub fn apply_edit_result(
@@ -4024,6 +4077,156 @@ mod lsp_position_tests {
             map_selection_through_edits(old, new, ByteSelection { anchor: 6, head: 1 }),
             ByteSelection { anchor: 7, head: 1 },
         );
+    }
+}
+
+#[cfg(test)]
+mod project_update_tests {
+    use super::*;
+    use crate::gui::{
+        connect::parse_connect_target,
+        workspace::Workspace,
+    };
+    use core::prelude::v1::test;
+    use gpui::TestAppContext;
+
+    fn test_workspace(window: &mut Window, cx: &mut Context<Workspace>) -> Workspace {
+        Workspace::new_for_test(parse_connect_target("ws://", None), window, cx)
+    }
+
+    #[gpui::test]
+    fn accepted_project_update_adopts_matching_acknowledged_dirty_draft(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (workspace, test_cx) = cx.add_window_view(test_workspace);
+        let (ade, _) = AdeHandle::test_channel();
+        let panel = test_cx.update(|window, cx| {
+            cx.new(|cx| {
+                EditorPanel::new(
+                    "buffer".into(),
+                    "test.txt".into(),
+                    None,
+                    None,
+                    None,
+                    true,
+                    None,
+                    ade,
+                    workspace.downgrade(),
+                    TabStripMetrics::default(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        panel.update_in(test_cx, |panel, window, cx| {
+            let original = "猫 needle";
+            panel.set_editor_text_and_selection(original, None, window, cx);
+            panel.edit_sync = Some(EditSync::new(original.into(), 4));
+            panel.rev = 4;
+            panel.dirty = true;
+
+            panel.apply_project_update(
+                &fresh_gui_protocol::ProjectBufferUpdate {
+                    buffer_id: "buffer".into(),
+                    base_rev: 4,
+                    rev: 5,
+                    text: "猫 replacement".into(),
+                    path: "test.txt".into(),
+                    dirty: true,
+                },
+                window,
+                cx,
+            );
+
+            assert_eq!(panel.current_text(cx), "猫 replacement");
+            assert_eq!(panel.rev, 5);
+            assert!(panel.is_dirty());
+            assert!(!panel.conflict);
+        });
+    }
+
+    #[gpui::test]
+    fn project_update_keeps_newer_visible_edits_and_marks_conflict(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (workspace, test_cx) = cx.add_window_view(test_workspace);
+        let (ade, _) = AdeHandle::test_channel();
+        let panel = test_cx.update(|window, cx| {
+            cx.new(|cx| {
+                EditorPanel::new(
+                    "buffer".into(),
+                    "test.txt".into(),
+                    None,
+                    None,
+                    None,
+                    true,
+                    None,
+                    ade,
+                    workspace.downgrade(),
+                    TabStripMetrics::default(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        panel.update_in(test_cx, |panel, window, cx| {
+            panel.set_editor_text_and_selection("猫 newer local", None, window, cx);
+            panel.edit_sync = Some(EditSync::new("猫 original".into(), 9));
+            panel.rev = 9;
+            panel.dirty = true;
+
+            panel.apply_project_update(
+                &fresh_gui_protocol::ProjectBufferUpdate {
+                    buffer_id: "buffer".into(),
+                    base_rev: 9,
+                    rev: 10,
+                    text: "猫 accepted replacement".into(),
+                    path: "test.txt".into(),
+                    dirty: true,
+                },
+                window,
+                cx,
+            );
+
+            assert_eq!(panel.current_text(cx), "猫 newer local");
+            assert!(panel.conflict);
+            assert!(panel.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    fn project_match_reveal_uses_utf8_byte_offsets(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (workspace, test_cx) = cx.add_window_view(test_workspace);
+        let (ade, _) = AdeHandle::test_channel();
+        let panel = test_cx.update(|window, cx| {
+            cx.new(|cx| {
+                EditorPanel::new(
+                    "buffer".into(),
+                    "test.txt".into(),
+                    None,
+                    None,
+                    None,
+                    true,
+                    None,
+                    ade,
+                    workspace.downgrade(),
+                    TabStripMetrics::default(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        panel.update_in(test_cx, |panel, window, cx| {
+            let text = "猫 needle";
+            let start = text.find("needle").unwrap();
+            let end = start + "needle".len();
+            panel.set_editor_text_and_selection(text, None, window, cx);
+            panel.edit_sync = Some(EditSync::new(text.into(), 1));
+            panel.reveal_project_match(start, end, cx);
+            assert_eq!(panel.editor.read(cx).selected_range(), start..end);
+            assert_eq!(&text[start..end], "needle");
+        });
     }
 }
 

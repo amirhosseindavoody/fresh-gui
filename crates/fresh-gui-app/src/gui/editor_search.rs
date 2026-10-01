@@ -839,7 +839,7 @@ mod tests {
     fn stale_search_responses_and_changed_drafts_cannot_replace(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let (workspace, test_cx) = cx.add_window_view(|window, cx| {
-            Workspace::new(
+            Workspace::new_for_test(
                 crate::gui::connect::parse_connect_target("ws://", None),
                 window,
                 cx,
@@ -903,7 +903,7 @@ mod tests {
     fn query_review_commits_accepted_deletions_in_one_range_transaction(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let (workspace, test_cx) = cx.add_window_view(|window, cx| {
-            Workspace::new(
+            Workspace::new_for_test(
                 crate::gui::connect::parse_connect_target("ws://", None),
                 window,
                 cx,
@@ -978,7 +978,7 @@ mod tests {
     ) {
         cx.update(gpui_kit::init);
         let (workspace, test_cx) = cx.add_window_view(|window, cx| {
-            Workspace::new(
+            Workspace::new_for_test(
                 crate::gui::connect::parse_connect_target("ws://", None),
                 window,
                 cx,
