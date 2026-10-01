@@ -2368,7 +2368,7 @@ impl EditorPanel {
     /// Retention is established by a durable daemon acknowledgement for exactly
     /// the visible text. Capability negotiation alone never authorizes closing.
     pub fn recovery_guaranteed(&self, cx: &App) -> bool {
-        self.draft_recovery && self.transport_connected && !self.conflict
+        !self.search_has_accepted() && self.draft_recovery && self.transport_connected && !self.conflict
             && self.external_request.is_none() && self.external_pending.is_none()
             && !self.sync_paused && self.edit_request_id.is_none()
             && self.sync_request_id.is_none() && !self.action_inflight
@@ -2377,6 +2377,7 @@ impl EditorPanel {
     }
 
     pub fn flush_for_recovery(&mut self, cx: &mut Context<Self>) {
+        self.checkpoint_search_review(cx);
         self.flush_pending(cx);
     }
 
@@ -2658,7 +2659,7 @@ impl EditorPanel {
     pub fn is_dirty(&self) -> bool {
         // The legacy opening snapshot omits Fresh's modified state. Treat a
         // pending authoritative sync as potentially dirty until it replies.
-        self.dirty || self.sync_request_id.is_some()
+        self.dirty || self.search_has_accepted() || self.sync_request_id.is_some()
     }
 
     pub fn is_unsaved(&self) -> bool {
@@ -3085,6 +3086,7 @@ impl EditorPanel {
     }
 
     pub fn request_save(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_search_review(window, cx);
         self.commit_markdown_inline_edit(window, cx);
         if self.external.is_some() {
             self.external_save_path = Some(path);

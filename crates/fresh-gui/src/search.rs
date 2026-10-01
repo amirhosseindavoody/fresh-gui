@@ -7,7 +7,6 @@ use fresh_gui_protocol::{
 #[allow(dead_code)] // The pinned Fresh module exposes more helpers than ADE needs.
 mod fresh_regex_replace {
     use super::MAX_SEARCH_DRAFT_BYTES;
-    include!("../../../vendor/fresh/crates/fresh-editor/src/app/regex_replace.rs");
 
     pub fn collect_bounded(
         regex: &regex::bytes::Regex,
@@ -50,6 +49,8 @@ mod fresh_regex_replace {
         }
         Ok(result)
     }
+
+    include!("../../../vendor/fresh/crates/fresh-editor/src/app/regex_replace.rs");
 }
 
 pub fn preview(

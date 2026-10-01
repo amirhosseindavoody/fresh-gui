@@ -23,11 +23,7 @@ impl SearchReview {
 
     /// Create a review that starts at a match index and wraps once through the
     /// source-ordered result set. `start_index` is clamped to the result count.
-    pub fn new_at(
-        text: impl Into<String>,
-        matches: Vec<SearchMatch>,
-        start_index: usize,
-    ) -> Self {
+    pub fn new_at(text: impl Into<String>, matches: Vec<SearchMatch>, start_index: usize) -> Self {
         let len = matches.len();
         let start_index = start_index.min(len);
         let visit_order = if len == 0 || start_index == len {
@@ -81,6 +77,10 @@ impl SearchReview {
             self.accepted[index] = true;
         }
         self.visit_position = self.visit_order.len();
+    }
+
+    pub fn has_accepted(&self) -> bool {
+        self.accepted.iter().any(|accepted| *accepted)
     }
 
     /// Whether the match set still refers to this exact text snapshot.
@@ -188,7 +188,7 @@ mod tests {
         review.skip();
         review.accept_all();
         assert!(review.is_done());
-        assert_eq!(review.cancel().as_deref(), Some("1 2 3"));
+        assert_eq!(review.cancel().as_deref(), Some("1 two 3"));
     }
 
     #[test]

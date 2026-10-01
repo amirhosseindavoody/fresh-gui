@@ -988,6 +988,7 @@ impl Workspace {
         let mut prompt_needed = false;
         for panel in self.editors.values() {
             let unretained = panel.update(cx, |panel, cx| {
+                panel.finish_search_review(window, cx);
                 if !close_requires_prompt(panel.is_dirty(), panel.recovery_guaranteed(cx)) { return false; }
                 panel.flush_for_recovery(cx);
                 close_requires_prompt(panel.is_dirty(), panel.recovery_guaranteed(cx))
@@ -3506,6 +3507,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         let mut prompt_needed = false;
         for panel in self.editors.values().filter(|panel| ids.contains(&PanelId::from(panel.entity_id()))) {
             let unretained = panel.update(cx, |panel, cx| {
+                panel.finish_search_review(window, cx);
                 if !close_requires_prompt(panel.is_dirty(), panel.recovery_guaranteed(cx)) { return false; }
                 panel.flush_for_recovery(cx);
                 close_requires_prompt(panel.is_dirty(), panel.recovery_guaranteed(cx))

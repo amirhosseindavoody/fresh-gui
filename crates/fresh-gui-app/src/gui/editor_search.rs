@@ -23,6 +23,7 @@ pub(super) struct SearchUi {
     error: Option<String>,
     capped: bool,
     pub review: Option<SearchReview>,
+    window: AnyWindowHandle,
     decorations: TextDecorationCollection,
     refresh_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -66,6 +67,7 @@ impl SearchUi {
             error: None,
             capped: false,
             review: None,
+            window: window.window_handle(),
             decorations,
             refresh_task: None,
             _subscriptions: subscriptions,
@@ -355,6 +357,32 @@ impl EditorPanel {
         cx.notify();
     }
 
+    pub fn finish_search_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.review_decision('q', window, cx);
+    }
+
+    pub(super) fn search_has_accepted(&self) -> bool {
+        self.search
+            .review
+            .as_ref()
+            .is_some_and(SearchReview::has_accepted)
+    }
+
+    /// Recovery callers may hold the workspace borrow and have no Window.
+    /// Finish review after releasing that borrow, then use the normal edit flush.
+    pub(super) fn checkpoint_search_review(&mut self, cx: &mut Context<Self>) {
+        if self.search.review.is_none() {
+            return;
+        }
+        let panel = cx.weak_entity();
+        let window = self.search.window;
+        cx.defer(move |cx| {
+            let _ = window.update(cx, |_, window, cx| {
+                let _ = panel.update(cx, |panel, cx| panel.finish_search_review(window, cx));
+            });
+        });
+    }
+
     fn review_decision(&mut self, decision: char, window: &mut Window, cx: &mut Context<Self>) {
         let Some(review) = self.search.review.as_mut() else {
             return;
@@ -535,6 +563,7 @@ impl EditorPanel {
             .border_color(cx.theme().border)
             .child(
                 h_flex()
+                    .flex_wrap()
                     .gap_1()
                     .items_center()
                     .child(
@@ -632,6 +661,7 @@ impl EditorPanel {
             )
             .child(
                 h_flex()
+                    .flex_wrap()
                     .gap_2()
                     .items_center()
                     .child(div().text_xs().child(count))
@@ -679,10 +709,11 @@ impl EditorPanel {
         if self.search.replace {
             bar = bar.child(
                 h_flex()
+                    .flex_wrap()
                     .gap_1()
                     .items_center()
                     .child(
-                        div().flex_1().child(
+                        div().min_w(px(160.)).flex_1().child(
                             Input::new(&self.search.replacement)
                                 .small()
                                 .disabled(reviewing),
@@ -723,6 +754,7 @@ impl EditorPanel {
         if reviewing {
             bar = bar.child(
                 h_flex()
+                    .flex_wrap()
                     .gap_1()
                     .child(
                         div()
@@ -914,7 +946,14 @@ mod tests {
             panel.review_decision('n', window, cx);
             assert_eq!(panel.current_text(cx), "cat é cat cat");
             assert!(commands.try_recv().is_err());
-            panel.review_decision('q', window, cx);
+            assert!(
+                panel.is_dirty(),
+                "accepted review decisions must enter close guards"
+            );
+            assert!(!panel.recovery_guaranteed(cx));
+            panel.flush_for_recovery(cx);
+        });
+        panel.update_in(test_cx, |panel, _, cx| {
             assert_eq!(panel.current_text(cx), " é cat cat");
             assert!(panel.search.review.is_none());
             let AdeCmd::RangeEdit {
