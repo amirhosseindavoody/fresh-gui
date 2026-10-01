@@ -127,6 +127,42 @@ while True:
         send({'jsonrpc':'2.0','id':msg['id'],'result':None})
 "##;
 
+const PREPARE_FALLBACK_LSP: &str = r##"#!/usr/bin/env python3
+import json, pathlib, sys
+source = pathlib.Path(sys.argv[1]).resolve().as_uri()
+name, log_path = sys.argv[2], sys.argv[3]
+def send(obj):
+    body = json.dumps(obj).encode()
+    sys.stdout.buffer.write(b'Content-Length: %d\r\n\r\n' % len(body) + body)
+    sys.stdout.buffer.flush()
+def read():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line: return None
+        if line == b'\r\n': break
+        key, value = line.decode().split(':', 1)
+        headers[key.lower()] = value.strip()
+    return json.loads(sys.stdin.buffer.read(int(headers['content-length'])))
+while True:
+    msg = read()
+    if msg is None: break
+    method = msg.get('method')
+    if method:
+        with open(log_path, 'a') as log: log.write(method + '\n')
+    if method == 'initialize':
+        send({'jsonrpc':'2.0','id':msg['id'],'result':{'capabilities':{'textDocumentSync':2,'renameProvider':True}}})
+    elif method == 'textDocument/prepareRename':
+        send({'jsonrpc':'2.0','id':msg['id'],'error':{'code':-32601,'message':'Method not found'}})
+    elif method == 'textDocument/rename':
+        changes = {source:[{'range':{'start':{'line':0,'character':0},'end':{'line':0,'character':3}},'newText':name.lower()}]}
+        send({'jsonrpc':'2.0','id':msg['id'],'result':{'changes':changes}})
+    elif method == 'shutdown':
+        send({'jsonrpc':'2.0','id':msg['id'],'result':None})
+    elif 'id' in msg:
+        send({'jsonrpc':'2.0','id':msg['id'],'result':None})
+"##;
+
 fn temp_root(label: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "fresh-gui-workspace-edit-{label}-{}",
@@ -455,6 +491,128 @@ fn lsp_rename_previews_open_and_closed_files_and_applies_as_buffer_undo_groups()
         );
         editor.close(opened_source.buffer_id).await.unwrap();
         editor.close(opened_other.buffer_id).await.unwrap();
+    });
+    drop(editor);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn prepare_rename_method_not_found_uses_default_behavior_and_keeps_server_route() {
+    if !fresh::services::lsp::command_exists("python3") {
+        return;
+    }
+    let root = temp_root("prepare-fallback");
+    let script = root.join("fake_lsp.py");
+    std::fs::write(&script, PREPARE_FALLBACK_LSP).unwrap();
+    let source = root.join("sample.py");
+    let legacy_log = root.join("legacy.log");
+    let other_log = root.join("other.log");
+    std::fs::write(&source, "old = 1\n").unwrap();
+    let server = |name: &str, log: &Path| {
+        json!({
+            "name":name,
+            "command":"python3",
+            "args":[script.display().to_string(),source.display().to_string(),name,log.display().to_string()],
+            "only_features":["rename"]
+        })
+    };
+    let config = crate::config::Config::parse(
+        &json!({"lsp":{"python":[server("LegacyRename", &legacy_log), server("OtherRename", &other_log)]}}).to_string(),
+    ).unwrap();
+    let editor =
+        EditorHandle::spawn_with_recovery_dir(root.clone(), config, root.join("recovery")).unwrap();
+    editor.set_workspace_authority(crate::fs::FsRoot::new(root.clone()).unwrap());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let opened = editor.open(source.clone(), false).await.unwrap();
+        let prepared = lsp_response(
+            &editor,
+            LspRequest {
+                request_id: 601,
+                buffer_id: opened.buffer_id.clone(),
+                view_id: "test-owner:view".into(),
+                base_rev: opened.rev,
+                offset: 0,
+                feature: LspRequestFeature::PrepareRename,
+                trigger_character: None,
+                item: None,
+                server: None,
+            },
+        )
+        .await;
+        assert_eq!(prepared.responses.len(), 1, "prepareRename is exclusive");
+        let selected_server = prepared.responses[0].server.clone();
+        assert!(matches!(
+            selected_server.as_str(),
+            "LegacyRename" | "OtherRename"
+        ));
+        assert_eq!(
+            prepared.responses[0].result,
+            json!({"defaultBehavior":true})
+        );
+
+        let renamed = lsp_response(
+            &editor,
+            LspRequest {
+                request_id: 602,
+                buffer_id: opened.buffer_id.clone(),
+                view_id: "test-owner:view".into(),
+                base_rev: opened.rev,
+                offset: 0,
+                feature: LspRequestFeature::Rename,
+                trigger_character: None,
+                item: Some(json!({"newName":"next"})),
+                server: Some(selected_server.clone()),
+            },
+        )
+        .await;
+        assert_eq!(renamed.responses.len(), 1);
+        assert_eq!(renamed.responses[0].server, selected_server);
+        let edit = renamed.responses[0].result.clone();
+        let preview = editor
+            .prepare_workspace_edit(
+                opened.buffer_id.clone(),
+                opened.rev,
+                "test-owner".into(),
+                edit,
+            )
+            .await
+            .unwrap();
+        let applied = editor
+            .apply_workspace_edit(opened.buffer_id.clone(), "test-owner".into(), preview.token)
+            .await
+            .unwrap();
+        assert_eq!(
+            applied[0].text,
+            format!("{} = 1\n", selected_server.to_lowercase())
+        );
+
+        let legacy_calls = std::fs::read_to_string(legacy_log).unwrap_or_default();
+        let other_calls = std::fs::read_to_string(other_log).unwrap_or_default();
+        let (selected_calls, other_calls) = if selected_server == "LegacyRename" {
+            (legacy_calls.as_str(), other_calls.as_str())
+        } else {
+            (other_calls.as_str(), legacy_calls.as_str())
+        };
+        assert!(
+            selected_calls
+                .lines()
+                .any(|line| line == "textDocument/prepareRename")
+        );
+        assert!(
+            selected_calls
+                .lines()
+                .any(|line| line == "textDocument/rename")
+        );
+        assert!(
+            !other_calls
+                .lines()
+                .any(|line| line == "textDocument/rename")
+        );
+        editor.close(opened.buffer_id).await.unwrap();
     });
     drop(editor);
     let _ = std::fs::remove_dir_all(root);

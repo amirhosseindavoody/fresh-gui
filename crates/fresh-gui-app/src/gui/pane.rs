@@ -1948,7 +1948,6 @@ impl EditorPanel {
     }
 
     pub(crate) fn revision(&self) -> u64 { self.rev }
-    pub(crate) fn view_id(&self) -> &str { &self.view_id }
     pub(crate) fn navigation_selection(&self, cx: &App) -> ByteSelection { self.byte_selection(cx) }
     pub(crate) fn cancel_workspace_lsp(&mut self) {
         let features = [LspRequestFeature::PrepareRename, LspRequestFeature::Rename, LspRequestFeature::CodeActions, LspRequestFeature::CodeActionResolve, LspRequestFeature::ExecuteCommand];

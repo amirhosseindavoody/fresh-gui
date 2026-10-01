@@ -130,6 +130,10 @@ impl FileTransaction {
                     } else if let Err(error) = fs::hard_link(backup, &entry.path) {
                         failures.push(format!("{}: restore backup: {error}", entry.path.display()));
                     } else {
+                        // The original is restored even when removing its extra
+                        // backup link fails. A retry must recognize that state.
+                        entry.published_state = false;
+                        entry.published = None;
                         if let Err(error) = fs::remove_file(backup) {
                             failures.push(format!(
                                 "{}: remove restored backup: {error}",

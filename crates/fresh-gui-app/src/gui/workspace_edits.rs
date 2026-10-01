@@ -188,6 +188,7 @@ impl WorkspaceEdits {
                 if matches!(event, InputEvent::PressEnter { .. })
                     && ws.workspace_edits.mode == Mode::Rename
                     && !ws.workspace_edits.loading
+                    && ws.workspace_edits.server.is_some()
                 {
                     let name = input.read(cx).value().to_string();
                     let mut state = std::mem::take(&mut ws.workspace_edits);
@@ -228,6 +229,7 @@ impl WorkspaceEdits {
                 && offset == self.offset
         });
         if result.stale || !current {
+            self.loading = false;
             self.status = "LSP edit discarded because the editor changed".into();
             self.open = true;
             cx.notify();
@@ -236,18 +238,8 @@ impl WorkspaceEdits {
         self.rev = result.rev;
         if let Some(status) = result.status.as_deref() {
             self.loading = false;
-            if result.feature == Feature::PrepareRename
-                && (status.to_ascii_lowercase().contains("method not found")
-                    || status.contains("-32601"))
-            {
-                self.server = None;
-                self.open = true;
-                self.mode = Mode::Rename;
-                self.status = "Enter the new symbol name".into();
-            } else {
-                self.status = status.to_owned();
-                self.open = true;
-            }
+            self.status = status.to_owned();
+            self.open = true;
             cx.notify();
             return true;
         }
@@ -296,6 +288,7 @@ impl WorkspaceEdits {
                             server: response.server.clone(),
                             item: response.result.clone(),
                         },
+                        false,
                         cx,
                     );
                 }
@@ -542,12 +535,14 @@ impl WorkspaceEdits {
         &mut self,
         ws: &mut Workspace,
         action: ServerAction,
+        allow_resolve: bool,
         cx: &mut Context<Workspace>,
     ) {
         if has_lsp_value(&action.item, "disabled") {
             return;
         }
-        if has_lsp_value(&action.item, "data")
+        if allow_resolve
+            && has_lsp_value(&action.item, "data")
             && !has_lsp_value(&action.item, "edit")
             && !has_lsp_value(&action.item, "command")
         {
@@ -673,6 +668,10 @@ impl WorkspaceEdits {
         self.mode = Mode::Closed;
         self.applying = false;
         self.actions.clear();
+        self.preview_request_id = None;
+        self.apply_request_id = None;
+        self.loading = false;
+        self.server_initiated = false;
         self.deferred_command = None;
         cx.notify();
     }
@@ -742,7 +741,7 @@ impl WorkspaceEdits {
                     Button::new("rename-symbol-apply")
                         .primary()
                         .label("Rename")
-                        .disabled(self.loading)
+                        .disabled(self.loading || self.server.is_none())
                         .on_click(move |_, _, cx| {
                             let _ = weak.update(cx, |ws, cx| {
                                 let name = ws
@@ -956,6 +955,9 @@ impl WorkspaceEdits {
     }
 
     fn send_rename(&mut self, _ws: &mut Workspace, name: String, cx: &mut Context<Workspace>) {
+        if self.loading || self.server.is_none() {
+            return;
+        }
         if name.trim().is_empty() {
             self.status = "Enter a new symbol name".into();
             self.open = true;
@@ -985,7 +987,7 @@ impl WorkspaceEdits {
         let Some(action) = self.actions.get(idx).cloned() else {
             return;
         };
-        self.consume_action(ws, action, cx);
+        self.consume_action(ws, action, true, cx);
     }
 }
 
