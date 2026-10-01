@@ -137,9 +137,7 @@ impl ProjectSearchPanel {
 
     fn invalidate_preview(&mut self, cx: &mut Context<Self>) {
         if let Some(request_id) = self.request_id.take() {
-            if self.running {
-                cx.emit(ProjectSearchEvent::Cancel { request_id });
-            }
+            cx.emit(ProjectSearchEvent::Cancel { request_id });
             self.results.clear();
             self.selected.clear();
             self.running = false;
