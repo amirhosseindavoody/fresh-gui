@@ -154,6 +154,9 @@ pub(crate) fn normalize_completions(
     if result.stale || result.feature != LspFeature::Completion || result.offset != offset {
         return (Vec::new(), Vec::new());
     }
+    let Some(prefix) = completion_prefix(text, offset) else {
+        return (Vec::new(), Vec::new());
+    };
 
     let mut normalized = Vec::new();
     for response in &result.responses {
@@ -164,6 +167,10 @@ pub(crate) fn normalize_completions(
             else {
                 continue;
             };
+            if !completion_matches_prefix(&item, &prefix) {
+                continue;
+            }
+            let item = sanitize_completion_highlight(item, &prefix);
             normalized.push((item, plan, key));
         }
     }
@@ -189,6 +196,41 @@ pub(crate) fn normalize_completions(
         }
     }
     (items, plans)
+}
+
+fn completion_prefix(text: &str, offset: usize) -> Option<String> {
+    let prefix = text.get(..offset)?;
+    Some(
+        prefix
+            .char_indices()
+            .rev()
+            .take_while(|(_, ch)| is_completion_word_char(*ch))
+            .last()
+            .map_or_else(String::new, |(byte, _)| prefix[byte..].to_owned()),
+    )
+}
+
+fn completion_matches_prefix(item: &CompletionItem, prefix: &str) -> bool {
+    let prefix = prefix.to_lowercase();
+    prefix.is_empty()
+        || item.label.to_lowercase().starts_with(&prefix)
+        || item
+            .filter_text
+            .as_ref()
+            .is_some_and(|filter| filter.to_lowercase().starts_with(&prefix))
+}
+
+/// The stock menu uses `filter_text.len()` as a byte range into the visible
+/// label. Preserve matching against the server's filter text above, then set a
+/// safe visible-label prefix so Unicode labels cannot produce invalid ranges.
+fn sanitize_completion_highlight(mut item: CompletionItem, prefix: &str) -> CompletionItem {
+    let len = item
+        .label
+        .get(..prefix.len())
+        .filter(|candidate| candidate.to_lowercase().starts_with(&prefix.to_lowercase()))
+        .map_or(0, str::len);
+    item.filter_text = Some(item.label[..len].to_owned());
+    item
 }
 
 fn completion_items(value: &JsonValue) -> (Vec<CompletionItem>, Option<JsonValue>) {
@@ -616,6 +658,7 @@ mod tests {
         let end = byte_to_utf16_position(text, cursor).unwrap();
         let value = json!([{
             "label":"call",
+            "filterText":"pri",
             "textEdit":{"range":{"start":start,"end":end},"newText":"call(arg)"},
             "data":{"_fresh_cursor_offset":5}
         }]);
@@ -718,6 +761,45 @@ mod tests {
         };
         assert!(markup.value.contains("### rust-analyzer\n\nfirst"));
         assert!(markup.value.contains("### other-server\n\nsecond"));
+    }
+
+    #[test]
+    fn completion_filter_text_matches_and_native_highlights_are_utf8_safe() {
+        let text = "pri";
+        let value = json!([{
+            "label":"displayName",
+            "filterText":"printable",
+            "textEdit":{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},"newText":"displayName"}
+        }]);
+        let (items, _) = normalize_completions(text, 3, &result(LspFeature::Completion, 3, value));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].filter_text.as_deref(), Some(""));
+        assert_eq!(
+            items[0].data.as_ref().unwrap()["_fresh_original"]["filterText"],
+            "printable"
+        );
+
+        let unicode_text = "ñ";
+        let value = json!([{
+            "label":"🛠tool",
+            "filterText":"ñ",
+            "textEdit":{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"newText":"🛠tool"}
+        }]);
+        let (items, _) = normalize_completions(
+            unicode_text,
+            unicode_text.len(),
+            &result(LspFeature::Completion, unicode_text.len(), value),
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].filter_text.as_deref(), Some(""));
+        let value = json!([{
+            "label":"🛠tool",
+            "filterText":"printable",
+            "textEdit":{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},"newText":"🛠tool"}
+        }]);
+        let (items, _) = normalize_completions(text, 3, &result(LspFeature::Completion, 3, value));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].filter_text.as_deref(), Some(""));
     }
 
     #[test]
