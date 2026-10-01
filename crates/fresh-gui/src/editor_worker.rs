@@ -25,18 +25,18 @@ use fresh_gui_protocol::{
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
+mod workspace_edits;
+mod language_servers;
+#[cfg(test)]
+mod workspace_edit_tests;
 #[cfg(test)]
 #[path = "editor_worker/formatting_tests.rs"]
 mod formatting_tests;
 #[cfg(test)]
 #[path = "editor_worker/file_format_tests.rs"]
 mod file_format_tests;
-mod language_servers;
-#[cfg(test)]
-mod workspace_edit_tests;
-mod workspace_edits;
-use workspace_edits::WorkspaceEdits;
 pub(crate) use workspace_edits::WorkspaceNotice;
+use workspace_edits::WorkspaceEdits;
 
 const MAX_PAGE_BYTES: usize = 64 * 1024;
 const MAX_PAGED_RECOVERY_BYTES: usize = 4 * 1024 * 1024;
@@ -384,11 +384,7 @@ enum Cmd {
         buffer_id: String, owner: String, token: String,
         reply: oneshot::Sender<Result<Vec<fresh_gui_protocol::WorkspaceBufferUpdate>>>,
     },
-    WorkspaceCancel {
-        buffer_id: String,
-        owner: String,
-        token: String,
-    },
+    WorkspaceCancel { buffer_id: String, owner: String, token: String },
     LspRequest {
         request: LspRequest,
     },
@@ -426,61 +422,20 @@ impl EditorHandle {
         let _ = self.tx.send(Cmd::WorkspaceCancelOwner(owner.to_owned()));
     }
 
-    pub(crate) fn subscribe_workspace_edits(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<WorkspaceNotice> {
-        self.workspace_tx.subscribe()
-    }
+    pub(crate) fn subscribe_workspace_edits(&self) -> tokio::sync::broadcast::Receiver<WorkspaceNotice> { self.workspace_tx.subscribe() }
 
-    pub(crate) async fn prepare_workspace_edit(
-        &self,
-        buffer_id: String,
-        base_rev: u64,
-        owner: String,
-        edit: serde_json::Value,
-    ) -> Result<fresh_gui_protocol::WorkspaceEditPreview> {
+    pub(crate) async fn prepare_workspace_edit(&self, buffer_id: String, base_rev: u64, owner: String, edit: serde_json::Value) -> Result<fresh_gui_protocol::WorkspaceEditPreview> {
         let (reply, receive) = oneshot::channel();
-        self.tx
-            .send(Cmd::WorkspacePrepare {
-                buffer_id,
-                base_rev,
-                owner,
-                edit,
-                reply,
-            })
-            .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        self.tx.send(Cmd::WorkspacePrepare { buffer_id, base_rev, owner, edit, reply }).map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
         receive.await.context("editor worker stopped")?
     }
-    pub(crate) async fn apply_workspace_edit(
-        &self,
-        buffer_id: String,
-        owner: String,
-        token: String,
-    ) -> Result<Vec<fresh_gui_protocol::WorkspaceBufferUpdate>> {
+    pub(crate) async fn apply_workspace_edit(&self, buffer_id: String, owner: String, token: String) -> Result<Vec<fresh_gui_protocol::WorkspaceBufferUpdate>> {
         let (reply, receive) = oneshot::channel();
-        self.tx
-            .send(Cmd::WorkspaceApply {
-                buffer_id,
-                owner,
-                token,
-                reply,
-            })
-            .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        self.tx.send(Cmd::WorkspaceApply { buffer_id, owner, token, reply }).map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
         receive.await.context("editor worker stopped")?
     }
-    pub(crate) fn cancel_workspace_edit(
-        &self,
-        buffer_id: String,
-        owner: String,
-        token: String,
-    ) -> Result<()> {
-        self.tx
-            .send(Cmd::WorkspaceCancel {
-                buffer_id,
-                owner,
-                token,
-            })
-            .map_err(|_| anyhow::anyhow!("editor worker stopped"))
+    pub(crate) fn cancel_workspace_edit(&self, buffer_id: String, owner: String, token: String) -> Result<()> {
+        self.tx.send(Cmd::WorkspaceCancel { buffer_id, owner, token }).map_err(|_| anyhow::anyhow!("editor worker stopped"))
     }
 
     pub fn subscribe_lsp(&self) -> tokio::sync::broadcast::Receiver<LspResult> {
@@ -949,11 +904,7 @@ impl EditorHandle {
     ) -> Result<Vec<fresh_gui_protocol::LanguageServerState>> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Cmd::LanguageServers {
-                buffer_id,
-                action,
-                reply,
-            })
+            .send(Cmd::LanguageServers { buffer_id, action, reply })
             .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
         rx.await.map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
     }
@@ -1058,9 +1009,7 @@ fn run_loop(
         request_ids: HashMap::new(),
         aggregates: HashMap::new(),
         results: lsp_tx,
-        edits: WorkspaceEdits::with_authority(
-            crate::fs::FsRoot::new(editor.working_dir().to_path_buf()).ok(),
-        ),
+        edits: WorkspaceEdits::with_authority(crate::fs::FsRoot::new(editor.working_dir().to_path_buf()).ok()),
         drafts: drafts.clone(),
         workspace_tx,
         language_logs: HashMap::new(),
@@ -1905,22 +1854,8 @@ fn begin_lsp_request(
             continue;
         };
         let method = crate::lsp_bridge::method(request.feature).to_owned();
-        let params = if matches!(
-            request.feature,
-            LspRequestFeature::PrepareRename
-                | LspRequestFeature::Rename
-                | LspRequestFeature::CodeActions
-                | LspRequestFeature::CodeActionResolve
-                | LspRequestFeature::ExecuteCommand
-        ) {
-            match refactoring_params(
-                &entry.text,
-                uri.as_deref().unwrap_or(""),
-                line,
-                character,
-                &request,
-                &diagnostics,
-            ) {
+        let params = if matches!(request.feature, LspRequestFeature::PrepareRename | LspRequestFeature::Rename | LspRequestFeature::CodeActions | LspRequestFeature::CodeActionResolve | LspRequestFeature::ExecuteCommand) {
+            match refactoring_params(&entry.text, uri.as_deref().unwrap_or(""), line, character, &request, &diagnostics) {
                 Ok(params) => Some(params),
                 Err(error) => { send_lsp_status(results, &request, &error.to_string(), false); continue; }
             }
@@ -2000,14 +1935,7 @@ fn begin_lsp_request(
     }
 }
 
-fn refactoring_params(
-    text: &str,
-    uri: &str,
-    line: u32,
-    character: u32,
-    request: &LspRequest,
-    diagnostics: &[lsp_types::Diagnostic],
-) -> Result<serde_json::Value> {
+fn refactoring_params(text: &str, uri: &str, line: u32, character: u32, request: &LspRequest, diagnostics: &[lsp_types::Diagnostic]) -> Result<serde_json::Value> {
     use serde_json::json;
     let mut params = json!({"textDocument":{"uri":uri},"position":{"line":line,"character":character}});
     match request.feature {
@@ -2242,16 +2170,7 @@ fn poll_lsp_bridge(
             }
             message @ (AsyncMessage::LspLogMessage { .. } | AsyncMessage::LspWindowMessage { .. }) => {
                 let (language, message_type, body) = match &message {
-                    AsyncMessage::LspLogMessage {
-                        language,
-                        message_type,
-                        message,
-                    }
-                    | AsyncMessage::LspWindowMessage {
-                        language,
-                        message_type,
-                        message,
-                    } => (language, message_type, message),
+                    AsyncMessage::LspLogMessage { language, message_type, message } | AsyncMessage::LspWindowMessage { language, message_type, message } => (language, message_type, message),
                     _ => unreachable!(),
                 };
                 let workspaces = tracked.values().map(|entry| &entry.workspace_id).collect::<std::collections::HashSet<_>>();
@@ -2307,31 +2226,12 @@ fn poll_lsp_bridge(
                             Ok(mut value) => {
                                 if entry.request.feature == LspRequestFeature::CodeActions {
                                     for action in value.as_array_mut().into_iter().flatten() {
-                                        if action.get("disabled").is_some() {
-                                            continue;
-                                        }
-                                        let Some(edit) = action
-                                            .get("edit")
-                                            .filter(|edit| edit.is_object())
-                                            .cloned()
-                                        else {
-                                            continue;
-                                        };
-                                        if let Err(error) = bridge_state.edits.offer(
-                                            editor,
-                                            tracked,
-                                            &bridge_state.drafts,
-                                            &entry.request.buffer_id,
-                                            entry.request.base_rev,
-                                            entry
-                                                .request
-                                                .view_id
-                                                .split_once(':')
-                                                .map(|(owner, _)| owner.to_owned()),
-                                            edit,
-                                            Some(&entry.server),
-                                            &aggregate.revisions,
-                                        ) {
+                                        if action.get("disabled").is_some() { continue; }
+                                        let Some(edit) = action.get("edit").filter(|edit| edit.is_object()).cloned() else { continue; };
+                                        if let Err(error) = bridge_state.edits.offer(editor, tracked, &bridge_state.drafts,
+                                            &entry.request.buffer_id, entry.request.base_rev,
+                                            entry.request.view_id.split_once(':').map(|(owner, _)| owner.to_owned()), edit,
+                                            Some(&entry.server), &aggregate.revisions) {
                                             action["disabled"] = serde_json::json!({"reason":format!("Workspace edit rejected: {error:#}")});
                                         }
                                     }
@@ -2375,10 +2275,7 @@ fn poll_lsp_bridge(
                                         || error.contains("-32601")) =>
                             {
                                 // prepareRename is optional even when renameProvider is true.
-                                aggregate.responses.push(crate::lsp_bridge::one_response(
-                                    entry.server,
-                                    serde_json::json!({"defaultBehavior":true}),
-                                ));
+                                aggregate.responses.push(crate::lsp_bridge::one_response(entry.server, serde_json::json!({"defaultBehavior":true})));
                             }
                             Err(error) => {
                                 aggregate.status.get_or_insert(error);
@@ -2442,14 +2339,8 @@ fn poll_lsp_bridge(
                                 )
                             });
                         let notice = match result {
-                            Ok(preview) => WorkspaceNotice::Preview {
-                                workspace_id,
-                                preview,
-                            },
-                            Err(error) => WorkspaceNotice::Rejected {
-                                workspace_id,
-                                message: format!("Server workspace edit rejected: {error:#}"),
-                            },
+                            Ok(preview) => WorkspaceNotice::Preview { workspace_id, preview },
+                            Err(error) => WorkspaceNotice::Rejected { workspace_id, message: format!("Server workspace edit rejected: {error:#}") },
                         };
                         let _ = bridge_state.workspace_tx.send(notice);
                     }
@@ -4384,23 +4275,9 @@ async fn format_buffer(
         {
             bail!("format range is outside the buffer or not on UTF-8 boundaries");
         }
-        set_selection(
-            editor,
-            ByteSelection {
-                anchor: range.start,
-                head: end,
-            },
-        );
+        set_selection(editor, ByteSelection { anchor: range.start, head: end });
     }
-    if range.is_none() {
-        set_selection(
-            editor,
-            ByteSelection {
-                anchor: prior_selection.head,
-                head: prior_selection.head,
-            },
-        );
-    }
+    if range.is_none() { set_selection(editor, ByteSelection { anchor: prior_selection.head, head: prior_selection.head }); }
     let before_request = editor.active_window().next_lsp_request_id;
     let format_result = editor.format_buffer();
     set_selection(editor, prior_selection);
@@ -4409,17 +4286,8 @@ async fn format_buffer(
     if requested_lsp {
         bridge.formatting = Some(PendingFormatting {
             request_id: editor.active_window().next_lsp_request_id,
-            uri: fresh::services::lsp::manager::path_to_uri(
-                tracked[buffer_id]
-                    .path
-                    .as_deref()
-                    .context("formatting needs a saved path")?,
-            )
-            .context("invalid formatting file URI")?
-            .to_string(),
-            buffer_id: buffer_id.to_owned(),
-            rev: current,
-            text: before.clone(),
+            uri: fresh::services::lsp::manager::path_to_uri(tracked[buffer_id].path.as_deref().context("formatting needs a saved path")?).context("invalid formatting file URI")?.to_string(),
+            buffer_id: buffer_id.to_owned(), rev: current, text: before.clone(),
         });
     }
     if let Some(status) = editor.get_status_message()
@@ -4450,11 +4318,7 @@ async fn format_buffer(
             });
         }
         if !requested_lsp || bridge.formatting.is_none() {
-            return Ok(FormatState {
-                rev: current,
-                text: None,
-                status: Some("No formatting changes".into()),
-            });
+            return Ok(FormatState { rev: current, text: None, status: Some("No formatting changes".into()) });
         }
         if tokio::time::Instant::now() >= deadline {
             bridge.formatting = None;
@@ -7834,4 +7698,6 @@ while True:
         drop(editor);
         let _ = std::fs::remove_dir_all(root);
     }
+
+
 }

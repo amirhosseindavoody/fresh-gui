@@ -226,9 +226,7 @@ impl DraftStore {
         let entries = match std::fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => {
-                return Err(error).context("inspect recovery records before workspace edit");
-            }
+            Err(error) => return Err(error).context("inspect recovery records before workspace edit"),
         };
         let mut paths = Vec::new();
         for entry in entries {
@@ -239,12 +237,7 @@ impl DraftStore {
             } else if !name.ends_with(".json") { continue; }
             let state: DraftFile = serde_json::from_slice(&std::fs::read(&path)?)
                 .with_context(|| format!("inspect recovery record {}", path.display()))?;
-            paths.extend(
-                state
-                    .drafts
-                    .into_iter()
-                    .filter_map(|draft| draft.path.map(PathBuf::from)),
-            );
+            paths.extend(state.drafts.into_iter().filter_map(|draft| draft.path.map(PathBuf::from)));
         }
         Ok(paths)
     }
