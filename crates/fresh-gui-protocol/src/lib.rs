@@ -22,6 +22,8 @@ pub const CAP_WORKSPACE_SET_ROOT: &str = "workspace_set_root";
 pub const CAP_EDITOR: &str = "editor";
 /// Revisioned Fresh-backed editor transactions and actions.
 pub const CAP_EDITOR_RANGE_EDITS: &str = "editor.range-edits";
+/// Fresh-backed smart editing actions operating on the primary selection.
+pub const CAP_EDITOR_SMART_EDITING: &str = "editor.smart-editing";
 /// Bounded reads and viewport refreshes for large editor buffers.
 pub const CAP_EDITOR_PAGED_READS: &str = "editor.paged-reads";
 /// Maximum requested or returned editor page size.
@@ -531,6 +533,32 @@ pub struct ProjectBufferUpdate {
 pub enum EditorAction {
     Undo,
     Redo,
+    ExpandSelection,
+    SelectWord,
+    SelectLine,
+    SmartHome,
+    /// Fresh's DeleteBackward action includes smart indentation and paired-delimiter deletion.
+    SmartBackspace,
+    InsertNewline,
+    InsertTab,
+    DedentSelection,
+    DuplicateLine,
+    DeleteLine,
+    MoveLineUp,
+    MoveLineDown,
+    ToggleComment,
+    SortLines,
+    UniqueLines,
+    ToUpperCase,
+    ToLowerCase,
+    ToggleCase,
+    GoToMatchingBracket,
+    SurroundParentheses,
+    SurroundBrackets,
+    SurroundBraces,
+    SurroundDoubleQuotes,
+    SurroundSingleQuotes,
+    SurroundBackticks,
 }
 
 /// One changed path from `git status --porcelain`.
@@ -1060,8 +1088,8 @@ pub enum Message {
         /// Selection after the edits, in UTF-8 byte offsets.
         selection: ByteSelection,
     },
-    /// Client → backend: run a Fresh editor action. The selection is captured
-    /// before the action, in UTF-8 byte offsets.
+    /// Client → backend: run Undo/Redo or, with `editor.smart-editing`, an
+    /// allowlisted Fresh smart-editing action. Selection uses UTF-8 byte offsets.
     BufferAction {
         request_id: String,
         buffer_id: String,
@@ -1436,6 +1464,7 @@ impl Hello {
             CAP_WORKSPACE_SET_ROOT.to_owned(),
             CAP_EDITOR.to_owned(),
             CAP_EDITOR_RANGE_EDITS.to_owned(),
+            CAP_EDITOR_SMART_EDITING.to_owned(),
             CAP_EDITOR_PAGED_READS.to_owned(),
             CAP_EDITOR_DRAFT_RECOVERY.to_owned(),
             CAP_EDITOR_EXTERNAL_CHANGES.to_owned(),
@@ -1462,6 +1491,7 @@ impl Hello {
             CAP_WORKSPACE.to_owned(),
             CAP_EDITOR.to_owned(),
             CAP_EDITOR_RANGE_EDITS.to_owned(),
+            CAP_EDITOR_SMART_EDITING.to_owned(),
             CAP_EDITOR_PAGED_READS.to_owned(),
             CAP_EDITOR_DRAFT_RECOVERY.to_owned(),
             CAP_EDITOR_EXTERNAL_CHANGES.to_owned(),
@@ -1597,6 +1627,14 @@ mod tests {
                 action: EditorAction::Undo,
                 selection,
             },
+            Message::BufferAction {
+                request_id: "r2-smart".into(),
+                buffer_id: "b1".into(),
+                view_id: "v1".into(),
+                base_rev: 8,
+                action: EditorAction::SurroundBraces,
+                selection,
+            },
             Message::BufferSync {
                 request_id: "r3".into(),
                 buffer_id: "b1".into(),
@@ -1629,6 +1667,14 @@ mod tests {
                 .iter()
                 .any(|c| c == CAP_EDITOR_RANGE_EDITS)
         );
+    }
+
+    #[test]
+    fn smart_editing_capability_is_explicit_and_backward_compatible() {
+        assert!(Hello::default_backend_caps().contains(&CAP_EDITOR_SMART_EDITING.to_owned()));
+        assert!(Hello::default_client_caps().contains(&CAP_EDITOR_SMART_EDITING.to_owned()));
+        let old = Hello::backend("old-daemon", vec![CAP_PING.to_owned()]);
+        assert!(!old.capabilities.contains(&CAP_EDITOR_SMART_EDITING.to_owned()));
     }
 
     #[test]

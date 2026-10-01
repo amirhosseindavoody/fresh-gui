@@ -14,6 +14,7 @@ use fresh::config::Config;
 use fresh::config_io::DirectoryContext;
 use fresh::model::event::{BufferId, Event};
 use fresh::model::filesystem::{FileSystem, StdFileSystem};
+use fresh::input::keybindings::Action as FreshAction;
 use fresh::types::LspFeature;
 use fresh::view::color_support::ColorCapability;
 use fresh_gui_protocol::{
@@ -3417,13 +3418,223 @@ fn action_buffer(
     {
         bail!("selection is outside the buffer or not on a UTF-8 boundary");
     }
+    if !matches!(action, EditorAction::Undo | EditorAction::Redo) {
+        clear_secondary_cursors(editor);
+    }
     set_selection(editor, selection);
+    if action == EditorAction::UniqueLines {
+        let (edits, next_selection) = unique_selected_lines(&text, selection)?;
+        if !edits.is_empty() {
+            return range_edit_buffer(
+                editor,
+                tracked,
+                buffer_id,
+                view_id,
+                base_rev,
+                edits,
+                None,
+                next_selection,
+            );
+        }
+        return transaction_result(tracked, editor, buffer_id, true);
+    }
+    if action == EditorAction::ToggleComment {
+        let affected_lines = text.lines().count().max(1);
+        let language = &editor.active_state().language;
+        let prefix_len = editor
+            .config()
+            .languages
+            .get(language)
+            .and_then(|language| language.comment_prefix.as_ref())
+            .map(|prefix| prefix.len() + usize::from(!prefix.ends_with(' ')))
+            .unwrap_or(0);
+        if text
+            .len()
+            .saturating_add(affected_lines.saturating_mul(prefix_len))
+            > MAX_SNAPSHOT_BYTES
+        {
+            bail!("smart edit exceeds the full-buffer editing limit");
+        }
+    }
     match action {
         EditorAction::Undo => editor.handle_undo(),
         EditorAction::Redo => editor.handle_redo(),
+        action => apply_smart_edit_action(editor, action)?,
     }
     let _ = sync_fresh_text(editor, tracked, buffer_id)?;
     transaction_result(tracked, editor, buffer_id, true)
+}
+
+/// Run an allowlisted Fresh editing action through Fresh's own action/event
+/// pipeline. `dispatch_action_for_tests` is the only public complete dispatcher
+/// at this Fresh pin; actions with public event conversion use that narrower
+/// path and are recorded as one Fresh undo event.
+fn apply_smart_edit_action(editor: &mut Editor, action: EditorAction) -> Result<()> {
+    let fresh_action = match action {
+        EditorAction::ExpandSelection => FreshAction::ExpandSelection,
+        EditorAction::SelectWord => FreshAction::SelectWord,
+        EditorAction::SelectLine => FreshAction::SelectLine,
+        EditorAction::SmartHome => FreshAction::SmartHome,
+        // Fresh's DeleteBackward already implements smart indentation and
+        // paired-delimiter deletion from the current buffer settings.
+        EditorAction::SmartBackspace => FreshAction::DeleteBackward,
+        EditorAction::InsertNewline => FreshAction::InsertNewline,
+        EditorAction::InsertTab => FreshAction::InsertTab,
+        EditorAction::DedentSelection => FreshAction::DedentSelection,
+        EditorAction::DuplicateLine => FreshAction::DuplicateLine,
+        EditorAction::DeleteLine => FreshAction::DeleteLine,
+        EditorAction::MoveLineUp => FreshAction::MoveLineUp,
+        EditorAction::MoveLineDown => FreshAction::MoveLineDown,
+        EditorAction::UniqueLines => {
+            unreachable!("custom text transforms are handled by action_buffer")
+        }
+        EditorAction::ToggleComment => FreshAction::ToggleComment,
+        EditorAction::SortLines => FreshAction::SortLines,
+        EditorAction::ToUpperCase => FreshAction::ToUpperCase,
+        EditorAction::ToLowerCase => FreshAction::ToLowerCase,
+        EditorAction::ToggleCase => FreshAction::ToggleCase,
+        EditorAction::GoToMatchingBracket => FreshAction::GoToMatchingBracket,
+        EditorAction::SurroundParentheses => FreshAction::InsertChar('('),
+        EditorAction::SurroundBrackets => FreshAction::InsertChar('['),
+        EditorAction::SurroundBraces => FreshAction::InsertChar('{'),
+        EditorAction::SurroundDoubleQuotes => FreshAction::InsertChar('"'),
+        EditorAction::SurroundSingleQuotes => FreshAction::InsertChar('\''),
+        EditorAction::SurroundBackticks => FreshAction::InsertChar('`'),
+        EditorAction::Undo | EditorAction::Redo => unreachable!("handled by caller"),
+    };
+
+    match action {
+        EditorAction::SmartHome
+        | EditorAction::ToggleComment
+        | EditorAction::GoToMatchingBracket => {
+            // The pinned Fresh release keeps these cross-cutting handlers
+            // behind its internal action dispatcher; this public adapter is
+            // the only route that preserves their Fresh-native behavior.
+            editor.dispatch_action_for_tests(fresh_action);
+        }
+        _ => {
+            if let Some(events) = editor
+                .active_window_mut()
+                .action_to_events(fresh_action)
+            {
+                let added_bytes = events.iter().fold(0usize, |total, event| {
+                    total.saturating_add(match event {
+                        Event::Insert { text, .. } => text.len(),
+                        _ => 0,
+                    })
+                });
+                let removed_bytes = events.iter().fold(0usize, |total, event| {
+                    total.saturating_add(match event {
+                        Event::Delete { range, .. } => range.len(),
+                        _ => 0,
+                    })
+                });
+                let resulting_len = editor
+                    .active_state()
+                    .buffer
+                    .len()
+                    .saturating_sub(removed_bytes)
+                    .saturating_add(added_bytes);
+                if resulting_len
+                    > MAX_SNAPSHOT_BYTES
+                {
+                    bail!("smart edit exceeds the full-buffer editing limit");
+                }
+                if let Some(event) = editor.apply_events_as_bulk_edit(
+                    events,
+                    format!("Fresh action: {action:?}"),
+                ) {
+                    editor.active_event_log_mut().append(event);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn clear_secondary_cursors(editor: &mut Editor) {
+    // ADE currently carries a single selection. Drop any cursors left behind
+    // by another Fresh action without logging a standalone undo transaction.
+    editor.active_cursors_mut().remove_secondary();
+}
+
+fn unique_selected_lines(
+    text: &str,
+    selection: ByteSelection,
+) -> Result<(Vec<RangeEdit>, ByteSelection)> {
+    if text.is_empty() {
+        return Ok((Vec::new(), selection));
+    }
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut starts = Vec::with_capacity(lines.len());
+    let mut offset = 0usize;
+    for line in &lines {
+        starts.push(offset);
+        offset += line.len();
+    }
+    let line_at = |offset: usize| -> usize {
+        starts
+            .iter()
+            .rposition(|start| *start <= offset.min(text.len().saturating_sub(1)))
+            .unwrap_or(0)
+    };
+    let low = selection.anchor.min(selection.head);
+    let high = selection.anchor.max(selection.head);
+    let first = line_at(low);
+    let last = if high > low {
+        line_at(high - 1)
+    } else {
+        first
+    };
+    use std::collections::HashSet;
+    let mut seen = HashSet::<&str>::new();
+    let mut keep = Vec::new();
+    for index in first..=last {
+        let mut key = lines[index];
+        if let Some(stripped) = key.strip_suffix('\n') {
+            key = stripped.strip_suffix('\r').unwrap_or(stripped);
+        }
+        if seen.insert(key) {
+            keep.push(index);
+        }
+    }
+    if keep.len() == last - first + 1 {
+        return Ok((Vec::new(), selection));
+    }
+    let selected_start = starts[first];
+    let selected_end = starts[last] + lines[last].len();
+    let mut transformed = String::new();
+    for index in &keep {
+        transformed.push_str(lines[*index]);
+    }
+    if !text.ends_with('\n') && last + 1 == lines.len() {
+        if let Some(without_lf) = transformed.strip_suffix('\n') {
+            transformed.truncate(without_lf.len());
+            if transformed.ends_with('\r') {
+                transformed.pop();
+            }
+        }
+    }
+    let transformed_end = selected_start + transformed.len();
+    let next_selection = if selection.anchor <= selection.head {
+        ByteSelection {
+            anchor: selected_start,
+            head: transformed_end,
+        }
+    } else {
+        ByteSelection {
+            anchor: transformed_end,
+            head: selected_start,
+        }
+    };
+    Ok((
+        vec![RangeEdit {
+            start: selected_start,
+            end: selected_end,
+            text: transformed,
+        }],
+        next_selection,
+    ))
 }
 
 fn sync_buffer(
@@ -5958,6 +6169,326 @@ mod tests {
             assert_eq!(after_invalid.rev, 5);
         });
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn smart_edit_actions_use_fresh_semantics_and_one_undo_transaction() {
+        let root = std::env::temp_dir().join(format!(
+            "fresh-gui-smart-edit-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let markdown = root.join("notes.md");
+        std::fs::write(&markdown, "hello λ🙂\n").unwrap();
+        let rust = root.join("indent.rs");
+        std::fs::write(&rust, "    λ🙂\n").unwrap();
+        let editor = EditorHandle::spawn(root.clone(), crate::config::Config::default())
+            .expect("Fresh worker starts");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let opened = editor.open(markdown.clone(), false).await.unwrap();
+            // UTF-8 byte offsets select the Greek letter and emoji together.
+            let selected = editor
+                .range_edit(
+                    opened.buffer_id.clone(),
+                    "view-smart".into(),
+                    opened.rev,
+                    Vec::new(),
+                    None,
+                    ByteSelection { anchor: 6, head: 12 },
+                )
+                .await
+                .unwrap();
+            assert!(selected.accepted);
+            let surrounded = editor
+                .action(
+                    opened.buffer_id.clone(),
+                    "view-smart".into(),
+                    selected.rev,
+                    EditorAction::SurroundDoubleQuotes,
+                    selected.selection,
+                )
+                .await
+                .unwrap();
+            assert_eq!(surrounded.text, "hello \"λ🙂\"\n");
+            let saved = editor
+                .save(opened.buffer_id.clone(), surrounded.rev, None)
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read_to_string(&markdown).unwrap(), surrounded.text);
+
+            let undo = editor
+                .action(
+                    opened.buffer_id.clone(),
+                    "view-smart".into(),
+                    saved.1,
+                    EditorAction::Undo,
+                    surrounded.selection,
+                )
+                .await
+                .unwrap();
+            assert_eq!(undo.text, "hello λ🙂\n");
+            assert!(undo.dirty, "undoing a post-save edit diverges from disk");
+
+            let indented = editor.open(rust.clone(), false).await.unwrap();
+            let backspaced = editor
+                .action(
+                    indented.buffer_id.clone(),
+                    "view-smart".into(),
+                    indented.rev,
+                    EditorAction::SmartBackspace,
+                    ByteSelection { anchor: 4, head: 4 },
+                )
+                .await
+                .unwrap();
+            assert_eq!(backspaced.text, "λ🙂\n");
+            let restored = editor
+                .action(
+                    indented.buffer_id,
+                    "view-smart".into(),
+                    backspaced.rev,
+                    EditorAction::Undo,
+                    backspaced.selection,
+                )
+                .await
+                .unwrap();
+            assert_eq!(restored.text, "    λ🙂\n");
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_smart_action_rejects_without_mutating_the_buffer() {
+        let root = std::env::temp_dir().join(format!("fresh-gui-smart-limit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("limit.txt");
+        let text = "x".repeat(MAX_SNAPSHOT_BYTES - 1) + "\n";
+        std::fs::write(&path, &text).unwrap();
+        let editor = EditorHandle::spawn(root.clone(), crate::config::Config::default()).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let opened = editor.open(path, false).await.unwrap();
+            let result = editor.action(opened.buffer_id.clone(), "view-limit".into(), opened.rev,
+                EditorAction::DuplicateLine, ByteSelection { anchor: 0, head: 0 }).await;
+            assert!(result.is_err());
+            let retained = editor.sync(opened.buffer_id).await.unwrap();
+            assert_eq!(retained.text, text);
+            assert_eq!(retained.rev, opened.rev);
+            assert!(!retained.dirty);
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn editor_action_bridge_matches_direct_fresh_dispatch_for_shared_fixtures() {
+        let root = std::env::temp_dir().join(format!(
+            "fresh-gui-action-parity-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let fixtures = vec![
+            (
+                "newline.rs",
+                "if ready {\n    value\n}\n",
+                ByteSelection { anchor: 14, head: 14 },
+                EditorAction::InsertNewline,
+                FreshAction::InsertNewline,
+            ),
+            (
+                "tab.txt",
+                "\tvalue\n",
+                ByteSelection { anchor: 1, head: 1 },
+                EditorAction::InsertTab,
+                FreshAction::InsertTab,
+            ),
+            (
+                "word.txt",
+                "hello λ🙂\n",
+                ByteSelection { anchor: 1, head: 1 },
+                EditorAction::SelectWord,
+                FreshAction::SelectWord,
+            ),
+            (
+                "comment.rs",
+                "let value = 1;\n",
+                ByteSelection { anchor: 0, head: 14 },
+                EditorAction::ToggleComment,
+                FreshAction::ToggleComment,
+            ),
+            (
+                "sort.txt",
+                "z\na\n",
+                ByteSelection { anchor: 0, head: 4 },
+                EditorAction::SortLines,
+                FreshAction::SortLines,
+            ),
+            (
+                "case.txt",
+                "straße\n",
+                ByteSelection { anchor: 0, head: 7 },
+                EditorAction::ToUpperCase,
+                FreshAction::ToUpperCase,
+            ),
+            (
+                "bracket.rs",
+                "fn f() {}\n",
+                ByteSelection { anchor: 4, head: 4 },
+                EditorAction::GoToMatchingBracket,
+                FreshAction::GoToMatchingBracket,
+            ),
+            (
+                "surround.md",
+                "λ🙂\n",
+                ByteSelection { anchor: 0, head: 6 },
+                EditorAction::SurroundBackticks,
+                FreshAction::InsertChar('`'),
+            ),
+            (
+                "home.txt",
+                "\t    λ\n",
+                ByteSelection { anchor: 7, head: 7 },
+                EditorAction::SmartHome,
+                FreshAction::SmartHome,
+            ),
+            (
+                "expand.txt",
+                "first second third\n",
+                ByteSelection { anchor: 0, head: 5 },
+                EditorAction::ExpandSelection,
+                FreshAction::ExpandSelection,
+            ),
+            (
+                "move.txt",
+                "first\nsecond\n",
+                ByteSelection { anchor: 6, head: 6 },
+                EditorAction::MoveLineUp,
+                FreshAction::MoveLineUp,
+            ),
+        ];
+        let config = crate::config::Config::default();
+        let mut expected = Vec::new();
+        {
+            let mut fresh = build_editor(&root, &config).unwrap();
+            for (name, initial, selection, _, action) in &fixtures {
+                let path = root.join(name);
+                std::fs::write(&path, initial).unwrap();
+                fresh.open_file(&path).unwrap();
+                set_selection(&mut fresh, *selection);
+                fresh.dispatch_action_for_tests(action.clone());
+                expected.push((
+                    fresh.active_state().buffer.to_string().unwrap(),
+                    current_selection(&fresh),
+                ));
+            }
+        }
+        let editor = EditorHandle::spawn(root.clone(), config).expect("Fresh worker starts");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for ((name, _, selection, action, _), (expected_text, expected_selection)) in
+                fixtures.into_iter().zip(expected)
+            {
+                let opened = editor.open(root.join(name), false).await.unwrap();
+                let result = editor
+                    .action(
+                        opened.buffer_id,
+                        "view-parity".into(),
+                        opened.rev,
+                        action,
+                        selection,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result.text, expected_text, "action fixture {name}");
+                assert_eq!(
+                    result.selection, expected_selection,
+                    "selection fixture {name}"
+                );
+            }
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn daemon_line_move_is_single_fresh_undoable_edit() {
+        let root = std::env::temp_dir().join(format!(
+            "fresh-gui-line-move-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("lines.txt");
+        std::fs::write(&source, "one\ntwo\nthree\n").unwrap();
+        let editor = EditorHandle::spawn(root.clone(), crate::config::Config::default())
+            .expect("Fresh worker starts");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let opened = editor.open(source, false).await.unwrap();
+            let moved = editor
+                .action(
+                    opened.buffer_id.clone(),
+                    "view-lines".into(),
+                    opened.rev,
+                    EditorAction::MoveLineDown,
+                    ByteSelection { anchor: 0, head: 3 },
+                )
+                .await
+                .unwrap();
+            assert_eq!(moved.text, "two\none\nthree\n");
+            let undone = editor
+                .action(
+                    opened.buffer_id,
+                    "view-lines".into(),
+                    moved.rev,
+                    EditorAction::Undo,
+                    moved.selection,
+                )
+                .await
+                .unwrap();
+            assert_eq!(undone.text, "one\ntwo\nthree\n");
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unique_lines_preserves_terminators_and_selection_direction() {
+        fn apply(text: &str, selection: ByteSelection) -> (String, ByteSelection) {
+            let (edits, selection) = unique_selected_lines(text, selection).unwrap();
+            let Some(edit) = edits.first() else {
+                return (text.to_owned(), selection);
+            };
+            let mut result = text.to_owned();
+            result.replace_range(edit.start..edit.end, &edit.text);
+            (result, selection)
+        }
+
+        let (unique, unique_selection) = apply(
+            "α\nβ\nα",
+            ByteSelection { anchor: 0, head: 5 },
+        );
+        assert_eq!(unique, "α\nβ");
+        assert_eq!(unique_selection, ByteSelection { anchor: 0, head: 3 });
+
+        let (reverse, reverse_selection) = apply(
+            "α\nβ\nα",
+            ByteSelection { anchor: 5, head: 0 },
+        );
+        assert_eq!(reverse, "α\nβ");
+        assert_eq!(reverse_selection, ByteSelection { anchor: 3, head: 0 });
+
+        let (crlf, crlf_selection) = apply(
+            "keep\r\nx\r\ny\r\nx\r\nend",
+            ByteSelection { anchor: 6, head: 15 },
+        );
+        assert_eq!(crlf, "keep\r\nx\r\ny\r\nend");
+        assert_eq!(crlf_selection, ByteSelection { anchor: 6, head: 12 });
     }
 
     // A stdio LSP exercised through Fresh and the ADE worker, including

@@ -15,7 +15,7 @@ use axum::routing::get;
 use base64::Engine;
 use fresh_gui_protocol::{
     ByteSelection, CAP_EDITOR, CAP_EDITOR_DRAFT_RECOVERY, CAP_EDITOR_EXTERNAL_CHANGES,
-    CAP_EDITOR_PAGED_READS, CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_SEARCH, CAP_PROJECT_SEARCH, CAP_FILE_FINDER, CAP_LSP_CONTROLS, CAP_LSP, CAP_LSP_NAVIGATION, CAP_LSP_REQUESTS, CAP_LSP_WORKSPACE_EDITS,
+    CAP_EDITOR_PAGED_READS, CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_SMART_EDITING, CAP_EDITOR_SEARCH, CAP_PROJECT_SEARCH, CAP_FILE_FINDER, CAP_LSP_CONTROLS, CAP_LSP, CAP_LSP_NAVIGATION, CAP_LSP_REQUESTS, CAP_LSP_WORKSPACE_EDITS,
     CAP_SCENE, CAP_SETTINGS_EDITOR, EditorDraftInfo, ExternalResolution, Hello, HelloUi,
     MAX_PAGE_BYTES, Message, PROTOCOL_VERSION,
 };
@@ -133,6 +133,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         caps.retain(|c| {
             c != CAP_EDITOR
                 && c != CAP_EDITOR_RANGE_EDITS
+                && c != CAP_EDITOR_SMART_EDITING
                 && c != CAP_EDITOR_PAGED_READS
                 && c != CAP_EDITOR_DRAFT_RECOVERY
                 && c != CAP_EDITOR_EXTERNAL_CHANGES
@@ -171,6 +172,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     let mut authed = !state.require_auth;
     let mut client_range_edits = false;
+    let mut client_smart_editing = false;
     let mut client_paged_reads = false;
     let mut client_draft_recovery = false;
     let mut client_external_changes = false;
@@ -313,6 +315,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     &defaults_path,
                     &mut authed,
                     &mut client_range_edits,
+                    &mut client_smart_editing,
                     &mut client_paged_reads,
                     &mut client_draft_recovery,
                     &mut client_external_changes,
@@ -364,6 +367,7 @@ async fn handle_client_msg(
     defaults_path: &Path,
     authed: &mut bool,
     client_range_edits: &mut bool,
+    client_smart_editing: &mut bool,
     client_paged_reads: &mut bool,
     client_draft_recovery: &mut bool,
     client_external_changes: &mut bool,
@@ -391,6 +395,10 @@ async fn handle_client_msg(
                 .capabilities
                 .iter()
                 .any(|cap| cap == CAP_EDITOR_RANGE_EDITS);
+            *client_smart_editing = client_hello
+                .capabilities
+                .iter()
+                .any(|cap| cap == CAP_EDITOR_SMART_EDITING);
             *client_paged_reads = client_hello
                 .capabilities
                 .iter()
@@ -1677,6 +1685,7 @@ async fn handle_client_msg(
                     ),
                 });
             }
+            require_smart_editing_negotiated(action, *client_smart_editing, &request_id)?;
             let Some(editor) = state.editor.as_ref() else {
                 return Err(Message::Error {
                     code: "editor_unavailable".into(),
@@ -2607,6 +2616,45 @@ fn require_project_cap(client: bool, editor: bool, request_id: &str) -> Result<(
 
 fn require_file_finder_cap(client: bool, editor: bool, request_id: &str) -> Result<(), Message> {
     if client && editor { Ok(()) } else { Err(settings_error("capability_unavailable", request_id, "project.file-finder capability not negotiated")) }
+}
+
+fn require_smart_editing_negotiated(
+    action: fresh_gui_protocol::EditorAction,
+    client: bool,
+    request_id: &str,
+) -> Result<(), Message> {
+    if client
+        || matches!(
+            action,
+            fresh_gui_protocol::EditorAction::Undo | fresh_gui_protocol::EditorAction::Redo
+        )
+    {
+        Ok(())
+    } else {
+        Err(settings_error(
+            "capability_unavailable",
+            request_id,
+            format!("client did not negotiate {CAP_EDITOR_SMART_EDITING}"),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod smart_editing_capability_tests {
+    use super::require_smart_editing_negotiated;
+    use fresh_gui_protocol::{EditorAction, Message};
+
+    #[test]
+    fn only_undo_redo_are_allowed_without_smart_editing_negotiation() {
+        assert!(require_smart_editing_negotiated(EditorAction::Undo, false, "a").is_ok());
+        assert!(require_smart_editing_negotiated(EditorAction::Redo, false, "b").is_ok());
+        assert!(require_smart_editing_negotiated(EditorAction::SmartHome, true, "c").is_ok());
+        assert!(matches!(
+            require_smart_editing_negotiated(EditorAction::UniqueLines, false, "d"),
+            Err(Message::Error { code, message })
+                if code == "capability_unavailable" && message.contains("d:")
+        ));
+    }
 }
 
 #[cfg(test)]
