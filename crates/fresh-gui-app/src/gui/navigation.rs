@@ -74,7 +74,7 @@ impl Workspace {
         column: Option<u32>,
         offset: Option<usize>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> String {
         let request_id = next_id("nav-file");
         self.navigation.pending.insert(
             request_id.clone(),
@@ -86,12 +86,13 @@ impl Workspace {
         );
         self.pending_editors.insert(request_id.clone(), true);
         self.ade.send(AdeCmd::OpenEditor {
-            request_id,
+            request_id: request_id.clone(),
             path,
             preview: false,
             line,
             column,
         });
+        request_id
     }
 
     pub(super) fn open_draft_location(
@@ -99,7 +100,7 @@ impl Workspace {
         draft_id: String,
         offset: usize,
         cx: &mut Context<Self>,
-    ) {
+    ) -> String {
         let request_id = next_id("nav-draft");
         self.navigation.pending.insert(
             request_id.clone(),
@@ -111,9 +112,10 @@ impl Workspace {
         );
         self.pending_editors.insert(request_id.clone(), true);
         self.ade.send(AdeCmd::RestoreDraft {
-            request_id,
+            request_id: request_id.clone(),
             draft_id,
         });
+        request_id
     }
 
     pub(super) fn record_opened_location(&mut self, panel: &Entity<EditorPanel>, cx: &App) {

@@ -3902,7 +3902,8 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                         end,
                     } => {
                         if let Some(path) = path {
-                            this.open_file_location(path.clone(), Some(*line), Some(*column), Some(*start), cx);
+                            let request_id = this.open_file_location(path.clone(), Some(*line), Some(*column), Some(*start), cx);
+                            this.project_locations.insert(request_id, (*start, *end));
                         } else if let Some(buffer_id) = buffer_id {
                             if let Some(editor) = this.editor_by_buffer(buffer_id, cx) {
                                 let origin = this.current_location(cx);
@@ -3910,7 +3911,8 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                                 this.select_entity(&editor, window, cx);
                                 if let Some(origin) = origin { this.record_location_jump(origin, editor.read(cx).navigation_location(cx)); }
                             } else if let Some(draft_id) = draft_id {
-                                this.open_draft_location(draft_id.clone(), *start, cx);
+                                let request_id = this.open_draft_location(draft_id.clone(), *start, cx);
+                                this.project_locations.insert(request_id, (*start, *end));
                             }
                         }
                         this.project_search = None;
