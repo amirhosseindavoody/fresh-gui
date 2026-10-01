@@ -90,7 +90,7 @@ impl CompletionProvider for RemoteLsp {
             let (items, plans) = normalize_completions(&text, offset, &response);
             let current = panel
                 .update(cx, |panel, cx| {
-                    panel.lsp_snapshot_matches(&text, Some(offset), cx)
+                    panel.lsp_result_matches(&response, &text, Some(offset), cx)
                 })
                 .unwrap_or(false);
             if !current {
@@ -108,7 +108,7 @@ impl CompletionProvider for RemoteLsp {
                 .completion_triggers
                 .borrow()
                 .iter()
-                .any(|trigger| new_text.ends_with(trigger))
+                .any(|trigger| !trigger.is_empty() && new_text.ends_with(trigger))
     }
 }
 
@@ -136,7 +136,7 @@ impl HoverProvider for RemoteLsp {
                 .map_err(|_| anyhow!("LSP hover request timed out"))?
                 .map_err(|_| anyhow!("LSP hover response channel closed"))?;
             let current = panel
-                .update(_cx, |panel, cx| panel.lsp_snapshot_matches(&text, None, cx))
+                .update(_cx, |panel, cx| panel.lsp_result_matches(&response, &text, None, cx))
                 .unwrap_or(false);
             Ok(current.then(|| merge_hover(&response)).flatten())
         })
@@ -858,9 +858,10 @@ mod tests {
         let (revision, edits) = sync.begin_edit(&plan.after).expect("one committed draft");
         assert_eq!(revision, 9);
         assert_eq!(edits.len(), 1);
-        assert_eq!(
-            edits[0].text,
-            "🎉use std::fmt;\nuse std::io;\n\nfn main() { println!() }"
-        );
+        let mut reconstructed = text.to_owned();
+        for edit in edits {
+            reconstructed.replace_range(edit.start..edit.end, &edit.text);
+        }
+        assert_eq!(reconstructed, plan.after);
     }
 }

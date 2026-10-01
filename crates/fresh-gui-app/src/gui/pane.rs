@@ -1664,9 +1664,12 @@ pub struct EditorPanel {
     lsp_requests: bool,
     lsp_provider: Option<Rc<super::lsp::RemoteLsp>>,
     pending_lsp: Vec<PendingLsp>,
+    lsp_request_tracker: fresh_gui_client::lsp_sync::LspRequestTracker,
     signature_triggers: Vec<String>,
     completion_plans: Vec<super::lsp::CompletionPlan>,
     signature_help: Option<String>,
+    signature_active: bool,
+    signature_snapshot: Option<(String, usize)>,
     recovery_warning: Option<String>,
     format_pending_text: Option<String>,
     format_sent_selection: Option<ByteSelection>,
@@ -1796,6 +1799,8 @@ impl EditorPanel {
             } else if matches!(ev, InputEvent::Blur) {
                 this.cancel_lsp_requests();
                 this.signature_help = None;
+                this.signature_active = false;
+                this.signature_snapshot = None;
             }
         });
         let lsp_observer = cx.observe(&editor, |this, editor, cx| {
@@ -1805,6 +1810,7 @@ impl EditorPanel {
             let completion_caret_moved = this.completion_plans.iter().any(|plan|
                 plan.before == draft) && this.completion_plans.iter().any(|plan| plan.request_offset != caret);
             if completion_caret_moved {
+                this.lsp_request_tracker.cancel(LspRequestFeature::Completion);
                 this.completion_plans.clear();
                 editor.update(cx, |editor, cx| editor.dismiss_completion_overlay(cx));
             }
@@ -1812,11 +1818,19 @@ impl EditorPanel {
             for pending in this.pending_lsp.drain(..) {
                 if !matches!(pending.request.feature, LspRequestFeature::Hover | LspRequestFeature::Capabilities)
                     && pending.request.offset != caret {
+                    this.lsp_request_tracker.cancel(pending.request.feature);
                     if pending.sent { this.ade.send(AdeCmd::LspCancel { request_id: pending.request.request_id,
                         buffer_id: pending.request.buffer_id, view_id: pending.request.view_id }); }
                 } else { retained.push(pending); }
             }
             this.pending_lsp = retained;
+            if this.signature_snapshot.as_ref().is_some_and(|(text, offset)| text == &draft && *offset != caret) {
+                this.signature_help = None;
+                this.signature_active = false;
+                this.signature_snapshot = None;
+                this.lsp_request_tracker.cancel(LspRequestFeature::SignatureHelp);
+                cx.notify();
+            }
         });
         let view_id = format!("view-{}-{}-{}", std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -1833,9 +1847,12 @@ impl EditorPanel {
             lsp_requests: false,
             lsp_provider: None,
             pending_lsp: Vec::new(),
+            lsp_request_tracker: Default::default(),
             signature_triggers: Vec::new(),
             completion_plans: Vec::new(),
             signature_help: None,
+            signature_active: false,
+            signature_snapshot: None,
             recovery_warning: None,
             format_pending_text: None,
             format_sent_selection: None,
@@ -2014,12 +2031,19 @@ impl EditorPanel {
             && offset.is_none_or(|offset| self.byte_selection(cx).head == offset)
     }
 
-    pub(crate) fn set_completion_plans(&mut self, plans: Vec<super::lsp::CompletionPlan>, _cx: &mut Context<Self>) {
-        let draft = self.current_text(_cx);
+    pub(crate) fn lsp_result_matches(&self, result: &LspResult, text: &str, offset: Option<usize>, cx: &App) -> bool {
+        !result.stale && result.rev == self.rev
+            && self.lsp_request_tracker.is_current(result.feature, result.request_id)
+            && self.lsp_snapshot_matches(text, offset, cx)
+    }
+
+    pub(crate) fn set_completion_plans(&mut self, plans: Vec<super::lsp::CompletionPlan>, cx: &mut Context<Self>) {
+        let draft = self.current_text(cx);
         if plans.iter().all(|plan| plan.before == draft) { self.completion_plans = plans; }
     }
 
     fn cancel_lsp_requests(&mut self) {
+        self.lsp_request_tracker.clear();
         for pending in self.pending_lsp.drain(..) {
             if pending.sent {
                 self.ade.send(AdeCmd::LspCancel { request_id: pending.request.request_id,
@@ -2048,6 +2072,7 @@ impl EditorPanel {
         }
         self.pending_lsp = retained;
         let request_id = NEXT_LSP_REQUEST.fetch_add(1, Ordering::Relaxed);
+        self.lsp_request_tracker.start(feature, request_id);
         self.pending_lsp.push(PendingLsp {
             request: LspRequest { request_id, buffer_id: self.buffer_id.clone(), view_id: self.view_id.clone(),
                 base_rev: self.rev, offset, feature, trigger_character, item: None, server: None },
@@ -2104,6 +2129,11 @@ impl EditorPanel {
 
     fn on_lsp_text_change(&mut self, cx: &mut Context<Self>) -> bool {
         let draft = self.current_text(cx);
+        // Invalidate callbacks that received their reply before this change.
+        self.lsp_request_tracker.clear();
+        for pending in &self.pending_lsp {
+            if pending.text == draft { self.lsp_request_tracker.start(pending.request.feature, pending.request.request_id); }
+        }
         let accepted = self.completion_plans.iter().find(|plan| plan.after == draft);
         let completion_accepted = accepted.is_some();
         if let Some(plan) = accepted {
@@ -2120,15 +2150,17 @@ impl EditorPanel {
         }
         self.pending_lsp = retained;
         self.signature_help = None;
+        self.signature_snapshot = None;
         let offset = self.byte_selection(cx).head;
-        if self.lsp_requests && self.page.is_none() && self.signature_triggers.iter().any(|trigger|
-            !trigger.is_empty() && draft.get(..offset).is_some_and(|prefix| prefix.ends_with(trigger))) {
+        if self.lsp_requests && self.page.is_none() && (self.signature_active || self.signature_triggers.iter().any(|trigger|
+            !trigger.is_empty() && draft.get(..offset).is_some_and(|prefix| prefix.ends_with(trigger)))) {
             self.request_signature(cx);
         }
         completion_accepted
     }
 
     fn request_signature(&mut self, cx: &mut Context<Self>) {
+        self.signature_active = true;
         let offset = self.byte_selection(cx).head;
         let text = self.current_text(cx);
         let trigger = self.signature_triggers.iter().find(|trigger| text.get(..offset).is_some_and(|prefix| prefix.ends_with(trigger.as_str()))).cloned();
@@ -2136,8 +2168,11 @@ impl EditorPanel {
         cx.spawn(async move |this, cx| {
             if let Ok(result) = receiver.recv().await {
                 let _ = this.update(cx, |this, cx| {
-                    if !result.stale && this.lsp_snapshot_matches(&text, Some(offset), cx) {
-                        this.signature_help = super::lsp::signature_text(&result); cx.notify();
+                    if this.signature_active && this.lsp_result_matches(&result, &text, Some(offset), cx) {
+                        this.signature_help = super::lsp::signature_text(&result);
+                        this.signature_active = this.signature_help.is_some();
+                        this.signature_snapshot = this.signature_help.as_ref().map(|_| (text.clone(), offset));
+                        cx.notify();
                     }
                 });
             }
@@ -2158,7 +2193,7 @@ impl EditorPanel {
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(result) = receiver.recv().await {
                 let _ = this.update_in(cx, |this, _window, cx| {
-                    if result.stale || !this.lsp_snapshot_matches(&text, Some(offset), cx) { return; }
+                    if !this.lsp_result_matches(&result, &text, Some(offset), cx) { return; }
                     if feature == LspRequestFeature::Completion {
                         let (items, plans) = super::lsp::normalize_completions(&text, offset, &result);
                         this.completion_plans = plans;
@@ -2962,6 +2997,8 @@ impl EditorPanel {
     pub fn detach_transport(&mut self) {
         self.cancel_lsp_requests();
         self.signature_help = None;
+        self.signature_active = false;
+        self.signature_snapshot = None;
         self.external_pending = None;
         self.external_request = None;
         self.external_save_path = None;
@@ -3504,15 +3541,20 @@ impl Render for EditorPanel {
             if key == "escape" {
                 this.cancel_lsp_requests();
                 this.signature_help = None;
+                this.signature_active = false;
+                this.signature_snapshot = None;
                 this.editor.update(cx, |editor, cx| editor.dismiss_lsp_overlays(cx));
                 cx.notify();
-            } else if !menu_open || !matches!(key, "up" | "down" | "enter" | "tab" | "shift") {
+            } else if !menu_open || !matches!(key, "up" | "down" | "enter" | "shift") {
                 // A positional edit prepared for the previous caret must never be accepted there.
                 this.completion_plans.clear();
+                this.lsp_request_tracker.cancel(LspRequestFeature::Completion);
                 this.editor.update(cx, |editor, cx| editor.dismiss_completion_overlay(cx));
                 if matches!(key, "left" | "right" | "home" | "end" | "pageup" | "pagedown") {
                     this.cancel_lsp_requests();
                     this.signature_help = None;
+                    this.signature_active = false;
+                    this.signature_snapshot = None;
                 }
             }
         }));
@@ -3521,7 +3563,7 @@ impl Render for EditorPanel {
                 .border_b_1().border_color(cx.theme().border)
                 .child(div().flex_1().text_sm().font_family(cx.theme().mono_font_family.clone()).child(help.clone()))
                 .child(Button::new("dismiss-signature").ghost().xsmall().label("Dismiss (Esc)")
-                    .on_click(cx.listener(|this, _, _, cx| { this.signature_help = None; cx.notify(); }))));
+                    .on_click(cx.listener(|this, _, _, cx| { this.signature_help = None; this.signature_active = false; this.signature_snapshot = None; cx.notify(); }))));
         }
         if let Some(page) = &self.page {
             let start = page.start;
