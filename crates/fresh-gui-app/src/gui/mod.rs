@@ -6,6 +6,7 @@
 
 mod actions;
 mod commands;
+mod editing_commands;
 mod ade;
 mod assets;
 mod chrome;

@@ -189,6 +189,8 @@ pub fn catalog() -> Vec<SettingDefinition> {
         // Formatter and format_on_save live on language definitions in Fresh;
         // exposing this as an object preserves Fresh's config shape.
         fresh(&["languages"], Object),
+        fresh(&["editor", "auto_close"], Boolean),
+        fresh(&["editor", "auto_surround"], Boolean),
     ]
 }
 

@@ -5509,6 +5509,43 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.language_help(LspRequestFeature::SignatureHelp, window, cx);
     }
 
+    fn on_editing_command(
+        &mut self,
+        command: &super::editing_commands::EditingCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use super::editing_commands::Operation;
+        let Some(ActiveSurface::Editor(path)) = &self.active else {
+            if matches!(self.active, Some(ActiveSurface::Diff(_))) {
+                self.status = "Open a normal editor tab to use editing commands".into();
+                cx.notify();
+            }
+            return;
+        };
+        let Some(panel) = self.editors.get(path).cloned() else { return; };
+        self.palette_open = false;
+        panel.update(cx, |panel, cx| match command.operation {
+            Operation::Fresh(action) => {
+                if !self.capabilities.iter().any(|cap| cap == fresh_gui_protocol::CAP_EDITOR_SMART_EDITING) {
+                    self.status = "This daemon does not support Fresh editing commands".into();
+                    return;
+                }
+                panel.request_editor_action(action, cx);
+                panel.focus_handle(cx).focus(window, cx);
+            }
+            Operation::AddCursorAbove => {
+                panel.focus_handle(cx).focus(window, cx);
+                panel.focus_handle(cx).dispatch_action(&gpui_kit::base::input::AddCursorAbove, window, cx);
+            }
+            Operation::AddCursorBelow => {
+                panel.focus_handle(cx).focus(window, cx);
+                panel.focus_handle(cx).dispatch_action(&gpui_kit::base::input::AddCursorBelow, window, cx);
+            }
+        });
+        cx.notify();
+    }
+
     fn on_format_document(&mut self, _: &FormatDocument, window: &mut Window, cx: &mut Context<Self>) {
         self.format_active(window, cx);
     }
@@ -7261,6 +7298,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_start_language_servers))
             .on_action(cx.listener(Self::on_stop_language_servers))
             .on_action(cx.listener(Self::on_restart_language_servers))
+            .on_action(cx.listener(Self::on_editing_command))
             .on_action(cx.listener(Self::on_search_project))
             .on_action(cx.listener(Self::on_rename_symbol))
             .on_action(cx.listener(Self::on_code_actions))

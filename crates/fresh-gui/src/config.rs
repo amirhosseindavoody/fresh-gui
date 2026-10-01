@@ -784,7 +784,7 @@ mod tests {
         assert_eq!(cfg.ui.palette, "primer");
         assert_eq!(cfg.ui.font_weight, 400);
         assert_eq!(cfg.resolve_shell().0, DEFAULT_SHELL_COMMAND);
-        assert_eq!(cfg.shortkeys.len(), 45);
+        assert_eq!(cfg.shortkeys.len(), 51);
 
         // Second call is a no-op.
         assert!(!Config::ensure_file(&path).unwrap());
@@ -834,7 +834,7 @@ mod tests {
         assert!(!cfg.ui.show_git_dirs);
         assert!(!cfg.ui.editor_minimap);
         assert!(cfg.ui.editor_line_wrap);
-        assert_eq!(cfg.shortkeys.len(), 45);
+        assert_eq!(cfg.shortkeys.len(), 51);
         assert_eq!(cfg.shortkeys[0].action, "NewTerminal");
         assert_eq!(cfg.shortkeys[0].shortkey, "ctrl-t");
         assert_eq!(cfg.shortkeys[0].when, None);
