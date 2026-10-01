@@ -216,8 +216,8 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn finder_session_cancels_superseded_and_cleared_generations() {
+    #[tokio::test]
+    async fn finder_session_cancels_superseded_and_cleared_generations() {
         let session = FileFinderSession::default();
         let (tx, _rx) = mpsc::channel(1);
         session.start(
