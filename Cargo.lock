@@ -2479,6 +2479,8 @@ dependencies = [
  "fresh-gui-client",
  "fresh-gui-protocol",
  "futures-util",
+ "globset",
+ "ignore",
  "jsonc-parser",
  "libc",
  "notify 7.0.0",

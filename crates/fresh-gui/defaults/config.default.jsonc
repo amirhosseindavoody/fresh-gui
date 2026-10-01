@@ -60,6 +60,7 @@
     { "action": "Complete", "shortkey": "ctrl-space", "when": "Editor" },
     { "action": "ShowHover", "shortkey": "ctrl-k ctrl-i", "when": "Editor" },
     { "action": "SignatureHelp", "shortkey": "ctrl-shift-space", "when": "Editor" },
+    { "action": "SearchProject", "shortkey": "ctrl-shift-f" },
     { "action": "FindInBuffer", "shortkey": "ctrl-f", "when": "Editor" },
     { "action": "ReplaceInBuffer", "shortkey": "ctrl-r", "when": "Editor" },
     { "action": "NextSearchMatch", "shortkey": "f3", "when": "Editor" },

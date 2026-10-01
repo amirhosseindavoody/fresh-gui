@@ -34,6 +34,8 @@ pub const CAP_EDITOR_DRAFT_RECOVERY: &str = "editor.draft-recovery";
 pub const CAP_EDITOR_EXTERNAL_CHANGES: &str = "editor.external-changes";
 /// Fresh-compatible in-buffer find and replacement preview.
 pub const CAP_EDITOR_SEARCH: &str = "editor.search";
+/// Daemon workspace search and reviewed replacement.
+pub const CAP_PROJECT_SEARCH: &str = "project.search.v1";
 pub const MAX_SEARCH_DRAFT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_SEARCH_MATCHES: usize = 10_000;
 pub const CAP_LSP: &str = "lsp";
@@ -396,6 +398,62 @@ pub struct SearchMatch {
     pub start: usize,
     pub end: usize,
     pub replacement: String,
+}
+
+/// Search scope is always the attached workspace root, resolved by the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectSearchRequest {
+    pub query: String,
+    pub replacement: String,
+    pub options: SearchOptions,
+    pub globs: Vec<String>,
+    pub include_ignored: bool,
+    pub max_matches: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectSearchMatch {
+    pub start: usize,
+    pub end: usize,
+    pub replacement: String,
+    /// One-based line and UTF-8 byte column, matching Fresh path navigation.
+    pub line: u32,
+    pub column: u32,
+    pub preview: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectSearchFile {
+    pub id: String,
+    pub path: Option<String>,
+    pub buffer_id: Option<String>,
+    pub draft_id: Option<String>,
+    pub rev: Option<u64>,
+    pub matches: Vec<ProjectSearchMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectSearchSelection {
+    pub file_id: String,
+    pub match_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectReplaceFileResult {
+    pub file_id: String,
+    pub error: Option<String>,
+    pub buffer: Option<ProjectBufferUpdate>,
+}
+
+/// An explicitly accepted project edit, reconciled against the client's source revision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectBufferUpdate {
+    pub buffer_id: String,
+    pub base_rev: u64,
+    pub rev: u64,
+    pub text: String,
+    pub path: String,
+    pub dirty: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -863,6 +921,33 @@ pub enum Message {
         text: String,
         path: String,
     },
+    ProjectSearch {
+        request_id: String,
+        search: ProjectSearchRequest,
+    },
+    ProjectSearchCancel {
+        request_id: String,
+    },
+    ProjectSearchFile {
+        request_id: String,
+        file: ProjectSearchFile,
+    },
+    ProjectSearchDone {
+        request_id: String,
+        truncated: bool,
+        cancelled: bool,
+        warnings: Vec<String>,
+        error: Option<String>,
+    },
+    ProjectReplace {
+        request_id: String,
+        search_id: String,
+        selections: Vec<ProjectSearchSelection>,
+    },
+    ProjectReplaceResult {
+        request_id: String,
+        files: Vec<ProjectReplaceFileResult>,
+    },
     /// Client → backend: find and preview replacements in the supplied UTF-8 draft.
     /// Requires `editor.search`; this request never mutates the buffer.
     BufferSearch {
@@ -1253,6 +1338,7 @@ impl Hello {
             CAP_EDITOR_DRAFT_RECOVERY.to_owned(),
             CAP_EDITOR_EXTERNAL_CHANGES.to_owned(),
             CAP_EDITOR_SEARCH.to_owned(),
+            CAP_PROJECT_SEARCH.to_owned(),
             CAP_LSP.to_owned(),
             CAP_LSP_REQUESTS.to_owned(),
             CAP_LSP_NAVIGATION.to_owned(),
@@ -1275,6 +1361,7 @@ impl Hello {
             CAP_EDITOR_DRAFT_RECOVERY.to_owned(),
             CAP_EDITOR_EXTERNAL_CHANGES.to_owned(),
             CAP_EDITOR_SEARCH.to_owned(),
+            CAP_PROJECT_SEARCH.to_owned(),
             CAP_LSP.to_owned(),
             CAP_LSP_REQUESTS.to_owned(),
             CAP_LSP_NAVIGATION.to_owned(),

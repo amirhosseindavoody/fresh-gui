@@ -17,6 +17,7 @@ use super::paths::{daemon_uses_unix_paths, workspace_root_for_daemon};
 
 #[derive(Debug, Clone)]
 pub enum AdeCmd {
+    Project(Message),
     OpenPty {
         cols: u16,
         rows: u16,
@@ -259,6 +260,7 @@ pub struct AttachedWorkspace {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum AdeEvent {
+    Project(Message),
     Connecting,
     // Boxed: every PTY chunk crosses this channel as an `AdeEvent`, so the
     // rare connect/switch payloads should not set the size of each one.
@@ -1061,6 +1063,13 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd, evt_tx: &async_channel::
         AdeCmd::Flush(ack) => {
             let _ = ack.send(());
         }
+        AdeCmd::Project(message) => {
+            if client.supports_capability(fresh_gui_protocol::CAP_PROJECT_SEARCH) {
+                client.send(message).await?;
+            } else {
+                let _ = evt_tx.send(AdeEvent::Error { code: "capability_unavailable".into(), message: "This daemon does not support project search; upgrade the daemon".into() }).await;
+            }
+        }
         AdeCmd::Search(message) => {
             if client.supports_capability(fresh_gui_protocol::CAP_EDITOR_SEARCH) {
                 client.send(message).await?;
@@ -1466,6 +1475,7 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             text,
             defaults,
         }),
+        message @ (Message::ProjectSearchFile { .. } | Message::ProjectSearchDone { .. } | Message::ProjectReplaceResult { .. }) => Some(AdeEvent::Project(message)),
         Message::BufferSearchResult { request_id, matches, error, capped } => Some(AdeEvent::SearchResult { request_id, matches, error, capped }),
         Message::ConfigUpdated { shortkeys, ui } => Some(AdeEvent::ConfigUpdated { shortkeys, ui }),
         Message::BufferSaved {

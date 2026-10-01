@@ -41,6 +41,15 @@ Manual GUI and Windows-to-Linux SSH testing for search has not been performed he
 
 Fresh's TUI request handlers and PositionHistory are tied to its local editor buffers and windows. The GUI therefore uses a native Command picker and a portable, bounded byte-location history while reusing the existing request/cancellation bridge. A selected opaque URI travels through `EditorOpenLocation`; Fresh decodes the URI on the daemon, the existing editor path enforces path authorization and buffer ownership, and the reply supplies the absolute byte offset. Large destinations use paged opens and bounded Fresh reads. History is per client window and workspace, retains view identities across pane changes, and reopens closed named files through the same editor path. It is not persisted across client restarts.
 
+## Project search and replace
+
+**Search in Workspace** runs on the daemon over the explicit active workspace root. It does not use the last-selected terminal's directory. The daemon's Fresh-compatible search helper supplies the same literal, whole-word, regex, and replacement expansion behavior as in-buffer search. The adapter uses the `ignore` crate already used by Fresh to honor hidden files and `.gitignore`, `.ignore`, global excludes, and parent ignore rules by default; **Include ignored** opts into those paths. Include globs further restrict paths. Results stream by file group and can be cancelled. The native result panel previews each match, opens its exact UTF-8 byte range, and supports selecting a whole file or individual matches for replacement.
+
+Open buffers, including dirty and recoverable drafts, are authoritative over disk and are replaced through revision-checked Fresh edits, so a stale preview cannot overwrite newer draft text. Unopened files are edited on the daemon only after disk-generation conflict checks. The scan is bounded to 2 MiB per file and 2,000 matches; replacement review snapshots are capped at 32 MiB, with a 1 MiB result payload per file. Files larger than 2 MiB, including paged buffers, are skipped with a warning. Files containing NUL bytes or invalid UTF-8 are skipped; project search is text-only. Older daemons without `project.search.v1` show an explicit unsupported-daemon message. Search criteria and result selections are transient.
+
+Fresh’s pinned `live_grep.ts` and `git_grep.ts` expose grep through the plugin/TUI runtime, without a Rust project replacement service for ADE. The adapter therefore owns daemon enumeration and review snapshots, reusing #148’s unchanged Fresh regex/replacement module and #141/#142/#143’s transactions, recovery and save guards. Replacements are one undo group per open file; a multi-file batch reports failures per file and is not atomic across files.
+
+Manual GUI and Windows-to-Linux SSH validation for project search has not been performed here.
 
 ## Settings and keybindings
 
