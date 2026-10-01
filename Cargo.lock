@@ -2483,6 +2483,7 @@ dependencies = [
  "ignore",
  "jsonc-parser",
  "libc",
+ "lsp-types",
  "notify 7.0.0",
  "portable-pty",
  "regex",

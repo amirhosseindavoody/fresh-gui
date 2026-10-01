@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+lsp-types = "0.97"
 axum = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }

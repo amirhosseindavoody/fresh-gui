@@ -17,6 +17,11 @@ pub(crate) fn method(feature: LspRequestFeature) -> &'static str {
         LspRequestFeature::References => "textDocument/references",
         LspRequestFeature::DocumentSymbols => "textDocument/documentSymbol",
         LspRequestFeature::WorkspaceSymbols => "workspace/symbol",
+        LspRequestFeature::PrepareRename => "textDocument/prepareRename",
+        LspRequestFeature::Rename => "textDocument/rename",
+        LspRequestFeature::CodeActions => "textDocument/codeAction",
+        LspRequestFeature::CodeActionResolve => "codeAction/resolve",
+        LspRequestFeature::ExecuteCommand => "workspace/executeCommand",
     }
 }
 

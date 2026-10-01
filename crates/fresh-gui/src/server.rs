@@ -15,7 +15,7 @@ use axum::routing::get;
 use base64::Engine;
 use fresh_gui_protocol::{
     ByteSelection, CAP_EDITOR, CAP_EDITOR_DRAFT_RECOVERY, CAP_EDITOR_EXTERNAL_CHANGES,
-    CAP_EDITOR_PAGED_READS, CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_SEARCH, CAP_PROJECT_SEARCH, CAP_LSP, CAP_LSP_NAVIGATION, CAP_LSP_REQUESTS,
+    CAP_EDITOR_PAGED_READS, CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_SEARCH, CAP_PROJECT_SEARCH, CAP_LSP, CAP_LSP_NAVIGATION, CAP_LSP_REQUESTS, CAP_LSP_WORKSPACE_EDITS,
     CAP_SCENE, CAP_SETTINGS_EDITOR, EditorDraftInfo, ExternalResolution, Hello, HelloUi,
     MAX_PAGE_BYTES, Message, PROTOCOL_VERSION,
 };
@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
-use crate::editor_worker::EditorHandle;
+use crate::editor_worker::{EditorHandle, WorkspaceNotice};
 use crate::fs::FsRoot;
 use crate::fs_watch::FsWatchStore;
 use crate::memory_monitor::MemoryMonitor;
@@ -141,6 +141,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 && c != CAP_LSP
                 && c != CAP_LSP_REQUESTS
                 && c != CAP_LSP_NAVIGATION
+                && c != CAP_LSP_WORKSPACE_EDITS
                 && c != CAP_SCENE
         });
     }
@@ -178,12 +179,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut client_project_search = false;
     let project = crate::project_session::ProjectSession::default();
     let (project_tx, mut project_rx) = mpsc::channel::<crate::project_session::SearchOutput>(8);
+    let mut client_workspace_edits = false;
     let mut session_id: Option<String> = None;
     let socket_id = uuid::Uuid::new_v4().to_string();
     let mut lsp_request_map: HashMap<u64, (u64, String, String)> = HashMap::new();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
     let mut external_rx = state.editor.as_ref().map(EditorHandle::subscribe_external);
     let mut lsp_rx = state.editor.as_ref().map(EditorHandle::subscribe_lsp);
+    let mut workspace_rx = state.editor.as_ref().map(EditorHandle::subscribe_workspace_edits);
 
     loop {
         tokio::select! {
@@ -194,6 +197,26 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     let id = match &message { Message::ProjectSearchFile { request_id, .. } | Message::ProjectSearchDone { request_id, .. } => request_id, _ => continue };
                     if !project.is_current(id) { continue; }
                     if send_msg(&mut sink, &message).await.is_err() { break; }
+                }
+            }
+            notice = async { match workspace_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } }, if authed && client_workspace_edits => {
+                match notice {
+                    Ok(notice) => {
+                        let workspace = match &notice {
+                            WorkspaceNotice::Preview { workspace_id, .. } | WorkspaceNotice::Applied { workspace_id, .. } | WorkspaceNotice::Rejected { workspace_id, .. } => workspace_id,
+                        };
+                        if current_workspace_id(&state, &session_id).await.as_ref().ok() != Some(workspace) { continue; }
+                        let message = match notice {
+                            WorkspaceNotice::Preview { preview, .. } => Message::WorkspaceEditPreview { request_id: String::new(), preview },
+                            WorkspaceNotice::Applied { updates, .. } => Message::WorkspaceEditApplied { request_id: String::new(), updates },
+                            WorkspaceNotice::Rejected { message, .. } => Message::Error { code: "workspace_edit_failed".into(), message },
+                        };
+                        if send_msg(&mut sink, &message).await.is_err() { break; }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let _ = send_msg(&mut sink, &Message::Error { code: "workspace_edit_failed".into(), message: "Workspace edit notifications were lost; refresh buffers before applying further edits".into() }).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => workspace_rx = None,
                 }
             }
             lsp = async { match lsp_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } }, if authed && client_lsp_requests => {
@@ -283,6 +306,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     &mut client_settings_editor,
                     &mut client_lsp_requests,
                     &mut client_lsp_navigation,
+                    &mut client_workspace_edits,
                     &mut lsp_request_map,
                     &socket_id,
                     &mut client_editor_search,
@@ -299,12 +323,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 }
                 if previous_session != session_id {
                     project.clear();
+                    if let Some(editor) = state.editor.as_ref() { editor.cancel_workspace_owner(&socket_id); }
                     cancel_socket_lsp(state.editor.as_ref(), &socket_id, &mut lsp_request_map);
                 }
             }
         }
     }
 
+    if let Some(editor) = state.editor.as_ref() { editor.cancel_workspace_owner(&socket_id); }
     if let Some(sid) = session_id {
         state.sessions.detach_subscriber(&sid).await;
     }
@@ -325,6 +351,7 @@ async fn handle_client_msg(
     client_settings_editor: &mut bool,
     client_lsp_requests: &mut bool,
     client_lsp_navigation: &mut bool,
+    client_workspace_edits: &mut bool,
     lsp_request_map: &mut HashMap<u64, (u64, String, String)>,
     socket_id: &str,
     client_editor_search: &mut bool,
@@ -358,6 +385,7 @@ async fn handle_client_msg(
                 .iter()
                 .any(|cap| cap == CAP_SETTINGS_EDITOR);
             *client_lsp_requests = client_hello.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS);
+            *client_workspace_edits = client_hello.capabilities.iter().any(|cap| cap == CAP_LSP_WORKSPACE_EDITS);
             *client_editor_search = client_hello
                 .capabilities
                 .iter()
@@ -1941,6 +1969,37 @@ async fn handle_client_msg(
             })?;
             Ok(())
         }
+        Message::WorkspaceEditPrepare { request_id, buffer_id, base_rev, edit } => {
+            require_auth(*authed)?;
+            require_workspace_edit_capability(*client_workspace_edits)?;
+            let editor = state.editor.as_ref().ok_or_else(|| Message::Error { code: "editor_unavailable".into(), message: "editor unavailable".into() })?;
+            ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
+            let preview = editor.prepare_workspace_edit(buffer_id, base_rev, socket_id.to_owned(), edit).await.map_err(|error| Message::Error {
+                code: "workspace_edit_failed".into(), message: format!("{request_id}: {error:#}"),
+            })?;
+            send_msg(sink, &Message::WorkspaceEditPreview { request_id, preview }).await.map_err(|_| Message::Error { code: "send_failed".into(), message: "failed to send workspace edit preview".into() })?;
+            Ok(())
+        }
+        Message::WorkspaceEditApply { request_id, buffer_id, token } => {
+            require_auth(*authed)?;
+            require_workspace_edit_capability(*client_workspace_edits)?;
+            let editor = state.editor.as_ref().ok_or_else(|| Message::Error { code: "editor_unavailable".into(), message: "editor unavailable".into() })?;
+            ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
+            let updates = editor.apply_workspace_edit(buffer_id, socket_id.to_owned(), token).await.map_err(|error| Message::Error {
+                code: "workspace_edit_failed".into(), message: format!("{request_id}: {error:#}"),
+            })?;
+            send_msg(sink, &Message::WorkspaceEditApplied { request_id, updates }).await.map_err(|_| Message::Error { code: "send_failed".into(), message: "failed to send workspace edit result".into() })?;
+            Ok(())
+        }
+        Message::WorkspaceEditCancel { buffer_id, token } => {
+            require_auth(*authed)?;
+            require_workspace_edit_capability(*client_workspace_edits)?;
+            if let Some(editor) = state.editor.as_ref() {
+                ensure_editor_workspace(editor, state, session_id, &buffer_id, "workspace edit cancel").await?;
+                let _ = editor.cancel_workspace_edit(buffer_id, socket_id.to_owned(), token);
+            }
+            Ok(())
+        }
         Message::BufferLspRequest { mut request } => {
             require_auth(*authed)?;
             if !*client_lsp_requests {
@@ -1964,6 +2023,9 @@ async fn handle_client_msg(
                     code: "capability_unavailable".into(),
                     message: format!("LSP navigation requires {CAP_LSP_NAVIGATION} capability"),
                 });
+            }
+            if matches!(request.feature, fresh_gui_protocol::LspRequestFeature::PrepareRename | fresh_gui_protocol::LspRequestFeature::Rename | fresh_gui_protocol::LspRequestFeature::CodeActions | fresh_gui_protocol::LspRequestFeature::CodeActionResolve | fresh_gui_protocol::LspRequestFeature::ExecuteCommand) {
+                require_workspace_edit_capability(*client_workspace_edits)?;
             }
             if lsp_request_map.len() >= 64 {
                 return Err(Message::Error {
@@ -2725,6 +2787,10 @@ async fn resolve_editor_open(
     }
 
     crate::path_open::resolve_path_open(&state.fs_root, path, cwd, line, column).await
+}
+
+fn require_workspace_edit_capability(supported: bool) -> Result<(), Message> {
+    if supported { Ok(()) } else { Err(Message::Error { code: "capability_unavailable".into(), message: format!("Refactoring requires {CAP_LSP_WORKSPACE_EDITS}; upgrade and restart the daemon") }) }
 }
 
 fn lsp_file_uri_to_path(uri: &str) -> anyhow::Result<PathBuf> {
