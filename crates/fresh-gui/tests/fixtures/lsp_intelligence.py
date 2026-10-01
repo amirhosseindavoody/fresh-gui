@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Small stdio LSP used by the ADE request bridge integration test."""
 import json
+from pathlib import Path
 import sys
 import time
 
 name = sys.argv[1]
 log_path = sys.argv[2]
 delay = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
+target_uri = Path(sys.argv[4]).as_uri() if len(sys.argv) > 4 else "file:///tmp/target.py"
+paged_uri = Path(sys.argv[5]).as_uri() if len(sys.argv) > 5 else target_uri
 
 
 def write_log(value):
@@ -46,11 +49,19 @@ while True:
                 "completionProvider": {"triggerCharacters": [".", ":"]},
                 "hoverProvider": True,
                 "signatureHelpProvider": {"triggerCharacters": ["(", ","]},
+                "definitionProvider": True,
+                "implementationProvider": True,
+                "referencesProvider": True,
+                "documentSymbolProvider": True,
+                "workspaceSymbolProvider": True,
             }
         }})
     elif method == "initialized" or method and method.startswith("textDocument/did"):
         pass
-    elif method in ("textDocument/completion", "textDocument/hover", "textDocument/signatureHelp"):
+    elif method in ("textDocument/completion", "textDocument/hover", "textDocument/signatureHelp",
+                    "textDocument/definition", "textDocument/declaration", "textDocument/typeDefinition",
+                    "textDocument/implementation", "textDocument/references", "textDocument/documentSymbol",
+                    "workspace/symbol"):
         if delay:
             time.sleep(delay)
         if method == "textDocument/completion":
@@ -70,8 +81,25 @@ while True:
             }]}
         elif method == "textDocument/hover":
             result = {"contents": {"kind": "markdown", "value": "hover from " + name}}
-        else:
+        elif method == "textDocument/signatureHelp":
             result = {"signatures": [{"label": name + "(value)"}], "activeSignature": 0}
+        elif method == "textDocument/definition":
+            result = [{"uri": target_uri, "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 8}}}]
+        elif method == "textDocument/declaration":
+            result = [{"targetUri": target_uri, "targetRange": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 8}}, "targetSelectionRange": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 8}}}]
+        elif method == "textDocument/typeDefinition":
+            result = {"uri": target_uri, "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 8}}}
+        elif method == "textDocument/implementation":
+            result = [{"uri": target_uri, "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 8}}}]
+        elif method == "textDocument/references":
+            result = [
+                {"uri": target_uri, "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 8}}},
+                {"uri": paged_uri, "range": {"start": {"line": 350000, "character": 3}, "end": {"line": 350000, "character": 4}}},
+            ]
+        elif method == "textDocument/documentSymbol":
+            result = [{"name": "symbol-from-" + name, "kind": 12, "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 5}}, "selectionRange": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 5}}}]
+        else:
+            result = [{"name": "workspace-" + name, "kind": 12, "location": {"uri": target_uri, "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 8}}}}]
         send({"jsonrpc": "2.0", "id": message["id"], "result": result})
     elif method == "shutdown":
         send({"jsonrpc": "2.0", "id": message["id"], "result": None})

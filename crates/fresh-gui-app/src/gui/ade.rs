@@ -42,6 +42,7 @@ pub enum AdeCmd {
         request_id: String,
         path: String,
     },
+    OpenLocation { request_id: String, uri: String, line: u32, character: u32 },
     OpenEditor {
         request_id: String,
         path: String,
@@ -325,6 +326,7 @@ pub enum AdeEvent {
         buffer_id: String,
         message: String,
     },
+    LocationOpened { request_id: String, buffer_id: String, path: String, offset: usize },
     EditorOpened {
         request_id: String,
         buffer_id: String,
@@ -607,6 +609,7 @@ async fn ade_loop(
                                     offset: request.offset,
                                     feature: request.feature,
                                     responses: Vec::new(),
+                                    navigation_targets: Vec::new(),
                                     completion_triggers: Vec::new(),
                                     signature_triggers: Vec::new(),
                                     status: Some(format!("LSP request failed: {err:#}")),
@@ -713,6 +716,10 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd, evt_tx: &async_channel::
             client
                 .send(Message::FsAuthorize { request_id, path })
                 .await?;
+        }
+        AdeCmd::OpenLocation { request_id, uri, line, character } => {
+            anyhow::ensure!(client.supports_capability(fresh_gui_protocol::CAP_LSP_NAVIGATION), "Daemon does not support lsp.navigation");
+            client.send(Message::EditorOpenLocation { request_id, uri, line, character }).await?;
         }
         AdeCmd::OpenEditor {
             request_id,
@@ -1337,7 +1344,8 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
         Message::EditorDraftWarning { buffer_id, message } => {
             Some(AdeEvent::DraftWarning { buffer_id, message })
         }
-        Message::EditorOpened {
+        Message::EditorLocationOpened { request_id, buffer_id, path, offset } => Some(AdeEvent::LocationOpened { request_id, buffer_id, path, offset }),
+                Message::EditorOpened {
             request_id,
             buffer_id,
             draft_id,

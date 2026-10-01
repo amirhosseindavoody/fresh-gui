@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::Router;
 use axum::extract::ws::{Message as WsMessage, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
@@ -14,13 +14,14 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use base64::Engine;
 use fresh_gui_protocol::{
-    CAP_EDITOR, CAP_EDITOR_DRAFT_RECOVERY, CAP_EDITOR_EXTERNAL_CHANGES, CAP_EDITOR_PAGED_READS,
-    CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_SEARCH, CAP_LSP, CAP_LSP_REQUESTS, CAP_SCENE, CAP_SETTINGS_EDITOR, ByteSelection,
-    EditorDraftInfo, ExternalResolution, Hello, HelloUi, Message, MAX_PAGE_BYTES, PROTOCOL_VERSION,
+    ByteSelection, CAP_EDITOR, CAP_EDITOR_DRAFT_RECOVERY, CAP_EDITOR_EXTERNAL_CHANGES,
+    CAP_EDITOR_PAGED_READS, CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_SEARCH, CAP_LSP, CAP_LSP_NAVIGATION, CAP_LSP_REQUESTS,
+    CAP_SCENE, CAP_SETTINGS_EDITOR, EditorDraftInfo, ExternalResolution, Hello, HelloUi,
+    MAX_PAGE_BYTES, Message, PROTOCOL_VERSION,
 };
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
@@ -138,6 +139,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 && c != CAP_EDITOR_SEARCH
                 && c != CAP_LSP
                 && c != CAP_LSP_REQUESTS
+                && c != CAP_LSP_NAVIGATION
                 && c != CAP_SCENE
         });
     }
@@ -171,6 +173,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut client_settings_editor = false;
     let mut client_lsp_requests = false;
     let mut client_editor_search = false;
+    let mut client_lsp_navigation = false;
     let mut session_id: Option<String> = None;
     let socket_id = uuid::Uuid::new_v4().to_string();
     let mut lsp_request_map: HashMap<u64, (u64, String, String)> = HashMap::new();
@@ -266,6 +269,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     &mut client_external_changes,
                     &mut client_settings_editor,
                     &mut client_lsp_requests,
+                    &mut client_lsp_navigation,
                     &mut lsp_request_map,
                     &socket_id,
                     &mut client_editor_search,
@@ -303,6 +307,7 @@ async fn handle_client_msg(
     client_external_changes: &mut bool,
     client_settings_editor: &mut bool,
     client_lsp_requests: &mut bool,
+    client_lsp_navigation: &mut bool,
     lsp_request_map: &mut HashMap<u64, (u64, String, String)>,
     socket_id: &str,
     client_editor_search: &mut bool,
@@ -337,6 +342,10 @@ async fn handle_client_msg(
                 .capabilities
                 .iter()
                 .any(|cap| cap == CAP_EDITOR_SEARCH);
+            *client_lsp_navigation = client_hello
+                .capabilities
+                .iter()
+                .any(|cap| cap == CAP_LSP_NAVIGATION);
             if client_hello.protocol_version != PROTOCOL_VERSION {
                 return Err(Message::Error {
                     code: "protocol_mismatch".into(),
@@ -971,6 +980,67 @@ async fn handle_client_msg(
             )
             .await
         }
+        Message::EditorOpenLocation {
+            request_id,
+            uri,
+            line,
+            character,
+        } => {
+            require_auth(*authed)?;
+            if !*client_lsp_navigation {
+                return Err(Message::Error {
+                    code: "capability_unavailable".into(),
+                    message: format!("{request_id}: client did not negotiate {CAP_LSP_NAVIGATION}"),
+                });
+            }
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: format!("{request_id}: editor capability not available"),
+                });
+            };
+            let target_path = lsp_file_uri_to_path(&uri).map_err(|error| Message::Error {
+                code: "editor_open_failed".into(),
+                message: format!("{request_id}: {error}"),
+            })?;
+            let path = crate::path_open::resolve_exact_file(&state.fs_root, &target_path)
+            .await
+            .map_err(|error| Message::Error {
+                code: "editor_open_failed".into(),
+                message: format!("{request_id}: {error:#}"),
+            })?;
+            if !*client_paged_reads && is_large_file(&path) {
+                return Err(paged_reads_unavailable(&request_id));
+            }
+            let workspace_id = current_workspace_id(state, session_id).await?;
+            let (opened, offset) = editor
+                .open_location_in_workspace(path, workspace_id, line, character)
+                .await
+                .map_err(|error| Message::Error {
+                    code: "editor_open_failed".into(),
+                    message: format!("{request_id}: {error:#}"),
+                })?;
+            if opened.total_bytes.is_some() && !*client_paged_reads {
+                return Err(paged_reads_unavailable(&request_id));
+            }
+            let buffer_id = opened.buffer_id.clone();
+            let path = opened.path.clone();
+            send_editor_opened_snapshot(sink, request_id.clone(), opened, None, None).await?;
+            send_msg(
+                sink,
+                &Message::EditorLocationOpened {
+                    request_id,
+                    buffer_id,
+                    path,
+                    offset,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send EditorLocationOpened".into(),
+            })
+        }
         Message::EditorOpenLink {
             request_id,
             line_text,
@@ -1049,11 +1119,11 @@ async fn handle_client_msg(
                 message: "failed to send EditorOpened".into(),
             })?;
             send_msg(sink, &opened_content_message(opened))
-            .await
-            .map_err(|_| Message::Error {
-                code: "send_failed".into(),
-                message: "failed to send BufferSnapshot".into(),
-            })?;
+                .await
+                .map_err(|_| Message::Error {
+                    code: "send_failed".into(),
+                    message: "failed to send BufferSnapshot".into(),
+                })?;
             Ok(())
         }
         Message::EditorDraftList { request_id } => {
@@ -1120,10 +1190,17 @@ async fn handle_client_msg(
             };
             let workspace_id = current_workspace_id(state, session_id).await?;
             if !*client_paged_reads {
-                let drafts = editor.draft_list(workspace_id.clone()).await.map_err(|err| Message::Error {
-                    code: "draft_restore_failed".into(), message: format!("{request_id}: {err:#}"),
-                })?;
-                if drafts.iter().any(|draft| draft.draft_id == draft_id && draft.paged.is_some()) {
+                let drafts = editor
+                    .draft_list(workspace_id.clone())
+                    .await
+                    .map_err(|err| Message::Error {
+                        code: "draft_restore_failed".into(),
+                        message: format!("{request_id}: {err:#}"),
+                    })?;
+                if drafts
+                    .iter()
+                    .any(|draft| draft.draft_id == draft_id && draft.paged.is_some())
+                {
                     return Err(paged_reads_unavailable(&request_id));
                 }
             }
@@ -1353,11 +1430,11 @@ async fn handle_client_msg(
                 }
             };
             send_msg(sink, &response)
-            .await
-            .map_err(|_| Message::Error {
-                code: "send_failed".into(),
-                message: "failed to send BufferEditResult".into(),
-            })?;
+                .await
+                .map_err(|_| Message::Error {
+                    code: "send_failed".into(),
+                    message: "failed to send BufferEditResult".into(),
+                })?;
             Ok(())
         }
         Message::BufferRead {
@@ -1397,18 +1474,21 @@ async fn handle_client_msg(
                     code: "buffer_read_failed".into(),
                     message: format!("{request_id}: {err:#}"),
                 })?;
-            send_msg(sink, &Message::BufferPage {
-                request_id,
-                buffer_id,
-                view_id,
-                rev: page.rev,
-                start: page.start,
-                total_bytes: page.total_bytes,
-                text: page.text,
-                selection: ByteSelection { anchor: 0, head: 0 },
-                accepted: true,
-                dirty: page.dirty,
-            })
+            send_msg(
+                sink,
+                &Message::BufferPage {
+                    request_id,
+                    buffer_id,
+                    view_id,
+                    rev: page.rev,
+                    start: page.start,
+                    total_bytes: page.total_bytes,
+                    text: page.text,
+                    selection: ByteSelection { anchor: 0, head: 0 },
+                    accepted: true,
+                    dirty: page.dirty,
+                },
+            )
             .await
             .map_err(|_| Message::Error {
                 code: "send_failed".into(),
@@ -1767,29 +1847,91 @@ async fn handle_client_msg(
         }
         Message::BufferLspRequest { mut request } => {
             require_auth(*authed)?;
-            if !*client_lsp_requests { return Err(Message::Error { code: "capability_unavailable".into(), message: "LSP requests require lsp.requests capability".into() }); }
-            if lsp_request_map.len() >= 64 { return Err(Message::Error { code: "too_many_lsp_requests".into(), message: "connection already has 64 outstanding LSP requests".into() }); }
-            let Some(editor) = state.editor.as_ref() else { return Err(Message::Error { code: "editor_unavailable".into(), message: "editor capability not available".into() }); };
-            ensure_editor_workspace(editor, state, session_id, &request.buffer_id, &request.request_id.to_string()).await?;
+            if !*client_lsp_requests {
+                return Err(Message::Error {
+                    code: "capability_unavailable".into(),
+                    message: "LSP requests require lsp.requests capability".into(),
+                });
+            }
+            if matches!(
+                request.feature,
+                fresh_gui_protocol::LspRequestFeature::Definition
+                    | fresh_gui_protocol::LspRequestFeature::Declaration
+                    | fresh_gui_protocol::LspRequestFeature::TypeDefinition
+                    | fresh_gui_protocol::LspRequestFeature::Implementation
+                    | fresh_gui_protocol::LspRequestFeature::References
+                    | fresh_gui_protocol::LspRequestFeature::DocumentSymbols
+                    | fresh_gui_protocol::LspRequestFeature::WorkspaceSymbols
+            ) && !*client_lsp_navigation
+            {
+                return Err(Message::Error {
+                    code: "capability_unavailable".into(),
+                    message: format!("LSP navigation requires {CAP_LSP_NAVIGATION} capability"),
+                });
+            }
+            if lsp_request_map.len() >= 64 {
+                return Err(Message::Error {
+                    code: "too_many_lsp_requests".into(),
+                    message: "connection already has 64 outstanding LSP requests".into(),
+                });
+            }
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: "editor capability not available".into(),
+                });
+            };
+            ensure_editor_workspace(
+                editor,
+                state,
+                session_id,
+                &request.buffer_id,
+                &request.request_id.to_string(),
+            )
+            .await?;
             let client_id = request.request_id;
             let internal_id = NEXT_LSP_WIRE_ID.fetch_add(1, Ordering::Relaxed).max(1);
             let client_view_id = request.view_id.clone();
             request.request_id = internal_id;
             request.view_id = format!("{socket_id}:{client_view_id}");
             // The socket's receiver was subscribed before this request is queued.
-            lsp_request_map.insert(internal_id, (client_id, request.buffer_id.clone(), client_view_id));
+            lsp_request_map.insert(
+                internal_id,
+                (client_id, request.buffer_id.clone(), client_view_id),
+            );
             if let Err(error) = editor.request_lsp(request) {
                 lsp_request_map.remove(&internal_id);
-                return Err(Message::Error { code: "lsp_failed".into(), message: error.to_string() });
+                return Err(Message::Error {
+                    code: "lsp_failed".into(),
+                    message: error.to_string(),
+                });
             }
             Ok(())
         }
-        Message::BufferLspCancel { request_id, buffer_id, view_id } => {
+        Message::BufferLspCancel {
+            request_id,
+            buffer_id,
+            view_id,
+        } => {
             require_auth(*authed)?;
-            if !*client_lsp_requests { return Err(Message::Error { code: "capability_unavailable".into(), message: "LSP requests require lsp.requests capability".into() }); }
-            if let Some((internal_id, _)) = lsp_request_map.iter().find(|(_, (client_id, buffer, view))| *client_id == request_id && *buffer == buffer_id && *view == view_id).map(|(id, value)| (*id, value.clone())) {
+            if !*client_lsp_requests {
+                return Err(Message::Error {
+                    code: "capability_unavailable".into(),
+                    message: "LSP requests require lsp.requests capability".into(),
+                });
+            }
+            if let Some((internal_id, _)) = lsp_request_map
+                .iter()
+                .find(|(_, (client_id, buffer, view))| {
+                    *client_id == request_id && *buffer == buffer_id && *view == view_id
+                })
+                .map(|(id, value)| (*id, value.clone()))
+            {
                 lsp_request_map.remove(&internal_id);
-                if let Some(editor) = state.editor.as_ref() { let _ = editor.cancel_lsp(internal_id, buffer_id, format!("{socket_id}:{view_id}")); }
+                if let Some(editor) = state.editor.as_ref() {
+                    let _ =
+                        editor.cancel_lsp(internal_id, buffer_id, format!("{socket_id}:{view_id}"));
+                }
             }
             Ok(())
         }
@@ -2479,6 +2621,18 @@ async fn resolve_editor_open(
     crate::path_open::resolve_path_open(&state.fs_root, path, cwd, line, column).await
 }
 
+fn lsp_file_uri_to_path(uri: &str) -> anyhow::Result<PathBuf> {
+    let wire = fresh::app::types::LspUri::from_wire(
+        serde_json::from_value(serde_json::Value::String(uri.to_owned()))
+            .context("invalid LSP URI")?,
+    );
+    // Fresh's LspManager runs under the daemon's local Authority. SSH transport
+    // translates the connection, while file URIs already name daemon paths.
+    let path = wire.to_host_path(None).context("LSP target is not a file URI")?;
+    anyhow::ensure!(path.is_absolute(), "LSP file URI path is not absolute");
+    Ok(path)
+}
+
 async fn reply_editor_opened(
     sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
     editor: &EditorHandle,
@@ -2497,10 +2651,19 @@ async fn reply_editor_opened(
         });
     }
     let prior_buffers = if !paged_reads {
-        Some(editor.scene().await.map_err(|err| Message::Error {
-            code: "editor_open_failed".into(), message: format!("{request_id}: {err:#}"),
-        })?.buffers)
-    } else { None };
+        Some(
+            editor
+                .scene()
+                .await
+                .map_err(|err| Message::Error {
+                    code: "editor_open_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?
+                .buffers,
+        )
+    } else {
+        None
+    };
     let opened = editor
         .open_in_workspace(path, preview, workspace_id.clone())
         .await
@@ -2520,11 +2683,20 @@ async fn reply_editor_opened(
     if opened.total_bytes.is_some() && !paged_reads {
         // A stat/open race can cross the threshold. Remove only a new clean
         // open; an existing dirty buffer belongs to other connected views.
-        if !opened.dirty && prior_buffers.as_ref().is_some_and(|buffers|
-            !buffers.iter().any(|buffer| buffer.buffer_id == opened.buffer_id)) {
-            editor.close_in_workspace(opened.buffer_id.clone(), workspace_id).await
-                .map_err(|err| Message::Error { code: "editor_close_failed".into(),
-                    message: format!("{request_id}: {err:#}") })?;
+        if !opened.dirty
+            && prior_buffers.as_ref().is_some_and(|buffers| {
+                !buffers
+                    .iter()
+                    .any(|buffer| buffer.buffer_id == opened.buffer_id)
+            })
+        {
+            editor
+                .close_in_workspace(opened.buffer_id.clone(), workspace_id)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "editor_close_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
         }
         return Err(paged_reads_unavailable(&request_id));
     }
@@ -2557,11 +2729,11 @@ async fn send_editor_opened_snapshot(
         message: "failed to send EditorOpened".into(),
     })?;
     send_msg(sink, &opened_content_message(opened))
-    .await
-    .map_err(|_| Message::Error {
-        code: "send_failed".into(),
-        message: "failed to send BufferSnapshot".into(),
-    })?;
+        .await
+        .map_err(|_| Message::Error {
+            code: "send_failed".into(),
+            message: "failed to send BufferSnapshot".into(),
+        })?;
     Ok(())
 }
 

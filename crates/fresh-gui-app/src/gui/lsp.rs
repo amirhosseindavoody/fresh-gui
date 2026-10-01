@@ -611,6 +611,7 @@ mod tests {
             rev: 3,
             offset,
             feature,
+            navigation_targets: Vec::new(),
             responses: vec![LspServerResponse {
                 server: "rust-analyzer".into(),
                 result: value,

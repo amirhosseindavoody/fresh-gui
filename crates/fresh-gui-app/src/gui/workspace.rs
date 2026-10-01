@@ -8,6 +8,10 @@
 //! switching swaps this dock for that workspace's session without closing
 //! its PTYs.
 
+#[path = "navigation.rs"]
+mod navigation;
+pub(super) use navigation::navigation_feature;
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -42,6 +46,8 @@ use super::actions::{FindInBuffer, ReplaceInBuffer, QueryReplace, ClearSearchHig
 use super::actions::{
     ClearExplorerInput, CloseAllEditors, CloseAllOtherTabs, CloseAllOtherTerminals,
     CloseAllTerminals, CloseTab, CloseWorkspace, CopyExplorer, DeleteExplorer, Disconnect, FilterExplorer,
+    GoToDefinition, GoToDeclaration, GoToTypeDefinition, GoToImplementation, FindReferences,
+    DocumentSymbols, WorkspaceSymbols, NavigateBack, NavigateForward,
     AskCopilot, Complete, ShowHover, SignatureHelp, FormatDocument, GoToFile, NewFile, NewTerminal, NewWorkspace, NextTab, OpenDefaultSettings, OpenSettings, PasteExplorer,
     PrevTab, QuitClient, Reconnect, RenameWorkspace, ResetContentZoom, ResetUiZoom, SaveBuffer,
     SplitTerminal, StopServer, RestartServer, ReloadConfig, TerminalCopyOrInterrupt, TogglePinTab, ToggleCommandPalette, ToggleSidebar, ToggleWordWrap, ZoomInContent, ZoomInUi, ZoomOutContent,
@@ -965,6 +971,8 @@ pub struct Workspace {
     copilot_open: bool,
     copilot_busy: bool,
     copilot_result: Option<String>,
+    navigation: navigation::Navigation,
+    navigation_state: Entity<CommandState>,
     palette_open: bool,
     goto_open: bool,
     goto_input: Entity<InputState>,
@@ -1213,6 +1221,7 @@ impl Workspace {
         let (dock, _) = install_workspace_dock(window, cx);
         let explorer = cx.new(|cx| TreeState::new(cx));
         let command_state = cx.new(|cx| CommandState::new(window, cx));
+        let navigation_state = cx.new(|cx| CommandState::new(window, cx));
         let copilot_input = cx.new(|cx| InputState::new(window, cx).placeholder("Ask Copilot about this project…"));
         let goto_input = cx.new(|cx| InputState::new(window, cx).placeholder("path[:line[:col]]"));
         let create_name = cx.new(|cx| InputState::new(window, cx).placeholder("Folder name"));
@@ -1521,6 +1530,8 @@ impl Workspace {
             copilot_open: false,
             copilot_busy: false,
             copilot_result: None,
+            navigation: navigation::Navigation::default(),
+            navigation_state,
             palette_open: false,
             goto_open: false,
             goto_input,
@@ -1656,6 +1667,7 @@ impl Workspace {
                 self.upsert_workspace(workspace);
             }
             AdeEvent::WorkspaceClosed { id, focused_id } => {
+                self.forget_navigation_workspace(&id);
                 let was_active = self.active_workspace_id.as_deref() == Some(id.as_str());
                 self.terminal_mru.remove(&id);
                 self.terminal_cwds.remove(&id);
@@ -1679,6 +1691,7 @@ impl Workspace {
                 self.restore_workspace(*attached, window, cx);
             }
             AdeEvent::Disconnected { reason } => {
+                self.clear_navigation_pending(cx);
                 self.close_settings(cx);
                 for panel in self.editors.values() {
                     panel.update(cx, |panel, _| panel.detach_transport());
@@ -1827,10 +1840,14 @@ impl Workspace {
                 }
                 if let Some(activate) = self.pending_editors.remove(&request_id) {
                     self.begin_editor_tab(
-                        buffer_id, draft_id, path, language, line, column, activate, window, cx,
+                        buffer_id, draft_id, path.clone(), language, line, column, activate, window, cx,
                     );
+                    self.history_editor_opened(&request_id, &path, window, cx);
                     self.finish_restore_if_idle(window, cx);
                 }
+            }
+            AdeEvent::LocationOpened { request_id, buffer_id, path, offset } => {
+                self.location_opened(&request_id, &buffer_id, &path, offset, window, cx);
             }
             AdeEvent::ExternalChanged { buffer_id, path, rev, generation, text, disk_text, dirty } => {
                 if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
@@ -1939,6 +1956,7 @@ impl Workspace {
                 }
             }
             AdeEvent::Error { code, message } => {
+                self.navigation_open_error(&message);
                 if code.starts_with("settings_") {
                     if let Some((request_id, detail)) = split_request_message(&message) {
                         self.settings
@@ -2957,6 +2975,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
 
     fn switch_to_ready(&mut self, id: String, cx: &mut Context<Self>) {
         self.close_settings(cx);
+        self.clear_navigation_pending(cx);
         self.pending_save_close = None;
         let from = if self.restoring {
             None
@@ -2997,6 +3016,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         cx: &mut Context<Self>,
     ) {
         self.close_settings(cx);
+        self.clear_navigation_pending(cx);
         let AttachedWorkspace {
             info,
             tabs,
@@ -4820,6 +4840,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     ) {
         self.palette_open = !self.palette_open;
         if self.palette_open {
+            self.dismiss_navigation(cx);
             self.goto_open = false;
             self.rename_pty = None;
             self.command_state.update(cx, |state, cx| {
@@ -4832,6 +4853,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
     fn on_goto_file(&mut self, _: &GoToFile, window: &mut Window, cx: &mut Context<Self>) {
         self.goto_open = !self.goto_open;
         if self.goto_open {
+            self.dismiss_navigation(cx);
             self.palette_open = false;
             self.rename_pty = None;
             let query = self.workspace_root().map(|root| goto_initial_query(&display_path(&root))).unwrap_or_default();
@@ -6681,6 +6703,15 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             ("Complete", Box::new(Complete)),
             ("Show Hover", Box::new(ShowHover)),
             ("Signature Help", Box::new(SignatureHelp)),
+            ("Go to Definition", Box::new(GoToDefinition)),
+            ("Go to Declaration", Box::new(GoToDeclaration)),
+            ("Go to Type Definition", Box::new(GoToTypeDefinition)),
+            ("Go to Implementation", Box::new(GoToImplementation)),
+            ("Find References", Box::new(FindReferences)),
+            ("Document Symbols", Box::new(DocumentSymbols)),
+            ("Workspace Symbols", Box::new(WorkspaceSymbols)),
+            ("Navigate Back", Box::new(NavigateBack)),
+            ("Navigate Forward", Box::new(NavigateForward)),
             ("Format Document", Box::new(FormatDocument)),
             ("Find in Buffer", Box::new(FindInBuffer)),
             ("Replace in Buffer", Box::new(ReplaceInBuffer)),
@@ -7209,6 +7240,15 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_clear_explorer_input))
             .on_action(cx.listener(Self::on_new_file))
             .on_action(cx.listener(Self::on_split_terminal))
+            .on_action(cx.listener(Self::on_definition))
+            .on_action(cx.listener(Self::on_declaration))
+            .on_action(cx.listener(Self::on_type_definition))
+            .on_action(cx.listener(Self::on_implementation))
+            .on_action(cx.listener(Self::on_references))
+            .on_action(cx.listener(Self::on_document_symbols))
+            .on_action(cx.listener(Self::on_workspace_symbols))
+            .on_action(cx.listener(Self::on_navigate_back))
+            .on_action(cx.listener(Self::on_navigate_forward))
             .on_action(cx.listener(Self::on_complete))
             .on_action(cx.listener(Self::on_show_hover))
             .on_action(cx.listener(Self::on_signature_help))
@@ -7343,6 +7383,7 @@ impl Render for Workspace {
             })
             .when(self.settings_open, |view| view.child(self.settings.clone()))
             .when(self.goto_open, |this| this.child(self.render_goto(window, cx)))
+            .when(self.navigation.is_open(), |this| this.child(self.render_navigation(cx)))
             .when(self.copilot_open, |this| this.child(self.render_copilot(cx)))
             .when(self.create_open, |this| {
                 this.child(self.render_create_workspace(cx))

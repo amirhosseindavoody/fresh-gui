@@ -48,6 +48,15 @@ actions!(
         Complete,
         ShowHover,
         SignatureHelp,
+        GoToDefinition,
+        GoToDeclaration,
+        GoToTypeDefinition,
+        GoToImplementation,
+        FindReferences,
+        DocumentSymbols,
+        WorkspaceSymbols,
+        NavigateBack,
+        NavigateForward,
         ToggleWordWrap,
         FindInBuffer,
         ReplaceInBuffer,
@@ -133,6 +142,15 @@ pub fn apply_shortkeys(cx: &mut App, shortkeys: &[Shortkey]) {
             "Complete" => KeyBinding::new(key, Complete, when),
             "ShowHover" => KeyBinding::new(key, ShowHover, when),
             "SignatureHelp" => KeyBinding::new(key, SignatureHelp, when),
+            "GoToDefinition" => KeyBinding::new(key, GoToDefinition, when),
+            "GoToDeclaration" => KeyBinding::new(key, GoToDeclaration, when),
+            "GoToTypeDefinition" => KeyBinding::new(key, GoToTypeDefinition, when),
+            "GoToImplementation" => KeyBinding::new(key, GoToImplementation, when),
+            "FindReferences" => KeyBinding::new(key, FindReferences, when),
+            "DocumentSymbols" => KeyBinding::new(key, DocumentSymbols, when),
+            "WorkspaceSymbols" => KeyBinding::new(key, WorkspaceSymbols, when),
+            "NavigateBack" => KeyBinding::new(key, NavigateBack, when),
+            "NavigateForward" => KeyBinding::new(key, NavigateForward, when),
             "FormatDocument" => KeyBinding::new(key, FormatDocument, when),
             "FindInBuffer" => KeyBinding::new(key, FindInBuffer, when),
             "ReplaceInBuffer" => KeyBinding::new(key, ReplaceInBuffer, when),
@@ -213,6 +231,15 @@ pub fn known_action(action: &str) -> bool {
             | "ClearSearchHighlights"
             | "NextSearchMatch"
             | "PreviousSearchMatch"
+            | "GoToDefinition"
+            | "GoToDeclaration"
+            | "GoToTypeDefinition"
+            | "GoToImplementation"
+            | "FindReferences"
+            | "DocumentSymbols"
+            | "WorkspaceSymbols"
+            | "NavigateBack"
+            | "NavigateForward"
             | "ToggleWordWrap"
             | "CloseTab"
             | "CloseAllEditors"

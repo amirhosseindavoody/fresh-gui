@@ -24,6 +24,8 @@ Right-click a workspace in the rail to rename it or choose **Change location…*
 
 ## Scope
 
+Definition and symbol jumps maintain a bounded, in-memory back/forward history per workspace in each client window. Switching workspaces cancels pending pickers and file reveals; it retains each workspace's history for later use in that window. History does not change the last-selected terminal directory that drives Explorer and Source Control. It is not part of persisted daemon layout state.
+
 Workspace roots are authorized alongside the daemon root for file operations; they are not separate OS-level sandboxes. Editor buffers are managed by the daemon process. Dock split geometry is persisted with the layout. Fresh currently deduplicates named files across its editor instance, so opening the same file in another workspace is explicitly rejected while the first workspace still holds its buffer; recovery copies remain isolated.
 
 See the [README](../README.md) for normal use and [Architecture](./DESIGN.md) for the client/daemon split.
