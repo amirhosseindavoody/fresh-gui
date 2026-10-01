@@ -110,8 +110,12 @@ impl Workspace {
             timer.await;
             let request = this.update(cx, |this, cx| {
                 if !this.navigation.open || this.navigation.generation != generation
-                    || this.workspace_id_or_empty() != workspace
-                    || this.current_location(cx).is_none_or(|location| location.view_id != panel.read(cx).navigation_location(cx).view_id) { return None; }
+                    || this.workspace_id_or_empty() != workspace { return None; }
+                if this.current_location(cx).is_none_or(|location| location.view_id != panel.read(cx).navigation_location(cx).view_id) {
+                    this.navigation.status = "Navigation cancelled because the active editor changed".into();
+                    cx.notify();
+                    return None;
+                }
                 this.navigation.origin = Some(panel.read(cx).navigation_location(cx));
                 let (text, offset) = panel.read(cx).navigation_snapshot(cx);
                 let receiver = panel.update(cx, |panel, cx| panel.queue_lsp_payload(
