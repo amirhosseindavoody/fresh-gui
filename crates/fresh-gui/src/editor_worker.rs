@@ -746,7 +746,7 @@ fn run_loop(
         loop {
             let cmd = tokio::select! {
                 _ = ticks.tick() => {
-                    poll_lsp_bridge(&mut editor, &tracked, &mut lsp_bridge);
+                    poll_lsp_bridge(&mut editor, &mut tracked, &mut lsp_bridge);
                     cancel_stale_lsp_requests(&mut editor, &tracked, &mut lsp_bridge);
                     if let Err(err) = fresh::app::editor_tick(&mut editor, || Ok(())) {
                         warn!(%err, "Fresh editor tick failed");
@@ -897,7 +897,10 @@ fn run_loop(
                     let _ = reply.send(result);
                 }
                 Cmd::LspRequest { request } => {
-                    begin_lsp_request(&mut editor, &tracked, request, &mut lsp_bridge);
+                    match sync_fresh_text(&editor, &mut tracked, &request.buffer_id) {
+                        Ok(_) => begin_lsp_request(&mut editor, &tracked, request, &mut lsp_bridge),
+                        Err(error) => send_lsp_status(&lsp_bridge.results, &request, &error.to_string(), true),
+                    }
                 }
                 Cmd::LspCancel { request_id, buffer_id, view_id } => {
                     cancel_lsp_request(&mut editor, request_id, &buffer_id, &view_id, &mut lsp_bridge);
@@ -1407,7 +1410,7 @@ fn cancel_lsp_request(
 
 fn poll_lsp_bridge(
     editor: &mut Editor,
-    tracked: &HashMap<String, TrackedBuffer>,
+    tracked: &mut HashMap<String, TrackedBuffer>,
     bridge_state: &mut LspBridgeState,
 ) {
     let LspBridgeState { pending, request_ids, aggregates, results, .. } = bridge_state;
@@ -1423,6 +1426,9 @@ fn poll_lsp_bridge(
                     }
                     continue;
                 };
+                // Fresh can also mutate the document asynchronously. Refresh
+                // the authoritative revision before deciding to present a reply.
+                let _ = sync_fresh_text(editor, tracked, &entry.request.buffer_id);
                 let response = result.map(|value| {
                     if entry.request.feature == LspRequestFeature::Completion
                         || entry.request.feature == LspRequestFeature::CompletionResolve

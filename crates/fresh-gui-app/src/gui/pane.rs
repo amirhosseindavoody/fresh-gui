@@ -2044,6 +2044,9 @@ impl EditorPanel {
 
     fn cancel_lsp_requests(&mut self) {
         self.lsp_request_tracker.clear();
+        self.signature_help = None;
+        self.signature_active = false;
+        self.signature_snapshot = None;
         for pending in self.pending_lsp.drain(..) {
             if pending.sent {
                 self.ade.send(AdeCmd::LspCancel { request_id: pending.request.request_id,
@@ -3640,6 +3643,8 @@ impl Render for EditorPanel {
                             .on_click(move |_, _, cx| {
                                 panel.update(cx, |this, cx| {
                                     this.markdown_preview = true;
+                                    this.cancel_lsp_requests();
+                                    this.editor.update(cx, |editor, cx| editor.dismiss_lsp_overlays(cx));
                                     cx.notify();
                                 });
                             }),

@@ -499,13 +499,13 @@ async fn rust_analyzer_local_symbol_completion_hover_and_signature_smoke() {
         "[package]\nname = \"lsp_smoke\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
     )
     .unwrap();
-    let source = "fn glimmer_signal(value: u32) -> u32 { value }\nfn caller() { glimmer_signal( }\n";
+    let source = "fn glimmer_signal(value: u32) -> u32 { value }\nfn caller() { glimmer_signal(0); }\n";
     fs::write(root.join("src/lib.rs"), source).unwrap();
     let config_path = root.join("config.json");
     fs::write(
         &config_path,
         serde_json::to_vec(&serde_json::json!({
-            "lsp": {"rust": {"name":"rust-analyzer","command":rust_analyzer.to_string_lossy().to_string(),"args":["--stdio"]}}
+            "lsp": {"rust": {"name":"rust-analyzer","command":rust_analyzer.to_string_lossy().to_string(),"args":[]}}
         }))
         .unwrap(),
     )
@@ -538,13 +538,24 @@ async fn rust_analyzer_local_symbol_completion_hover_and_signature_smoke() {
     assert!(ready, "rust-analyzer capabilities did not become ready");
 
     let completion_offset = source.rfind("glim").unwrap() + "glim".len();
-    client
-        .send(request(201, &buffer_id, rev, completion_offset, LspRequestFeature::Completion))
-        .await
-        .unwrap();
-    let completion = wait_lsp(&mut client, 201).await;
-    assert!(!completion.stale);
-    assert!(completion.responses.iter().any(|response| !response.result.is_null()));
+    // initialize advertises capabilities before Cargo project indexing finishes.
+    let mut completion_ready = false;
+    let mut last_completion = None;
+    for attempt in 0..60_u64 {
+        let id = 30_000 + attempt;
+        client.send(request(id, &buffer_id, rev, completion_offset, LspRequestFeature::Completion)).await.unwrap();
+        let completion = wait_lsp(&mut client, id).await;
+        assert!(!completion.stale);
+        completion_ready = completion.responses.iter().any(|response| {
+            let items = response.result.as_array().or_else(|| response.result["items"].as_array());
+            items.is_some_and(|items| items.iter().any(|item|
+                item["label"].as_str().is_some_and(|label| label.starts_with("glimmer_signal"))))
+        });
+        last_completion = Some(completion);
+        if completion_ready { break; }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(completion_ready, "rust-analyzer did not index local symbol: {last_completion:?}");
 
     let hover_offset = source.rfind("glimmer_signal").unwrap() + 5;
     client
