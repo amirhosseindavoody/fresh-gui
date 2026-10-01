@@ -226,7 +226,8 @@ fn commit_inner(
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    return Err(error).with_context(|| format!("inspect {}", change.path.display()));
+                    return Err(error)
+                        .with_context(|| format!("inspect {}", change.path.display()));
                 }
             }
             let actual = disk_generation(&change.path)?;
@@ -380,8 +381,8 @@ fn commit_inner(
                 ));
             }
         }
-        if let Some(backup) = entries[i].backup.as_ref() {
-            if let Err(error) = fs::hard_link(&changes[i].path, backup) {
+        if let Some(backup) = entries[i].backup.clone() {
+            if let Err(error) = fs::hard_link(&changes[i].path, &backup) {
                 cleanup_stages(&stages);
                 let mut txn = FileTransaction {
                     entries,
@@ -395,6 +396,24 @@ fn commit_inner(
                 ));
             }
             entries[i].backed_up = true;
+            let verify = (|| -> Result<()> {
+                anyhow::ensure!(
+                    disk_generation(&backup)? == changes[i].expected
+                        && disk_generation(&changes[i].path)? == changes[i].expected,
+                    "workspace edit target changed while preserving original: {}",
+                    changes[i].path.display()
+                );
+                Ok(())
+            })();
+            if let Err(error) = verify {
+                cleanup_stages(&stages);
+                let mut txn = FileTransaction {
+                    entries,
+                    finished: false,
+                };
+                let rollback = txn.rollback();
+                return Err(append_rollback_error(error, rollback));
+            }
             if let Err(error) = fs::remove_file(&changes[i].path) {
                 cleanup_stages(&stages);
                 let mut txn = FileTransaction {

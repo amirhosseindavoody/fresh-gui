@@ -362,6 +362,7 @@ pub struct WorkspaceEditPreview {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceEditFile {
     pub path: String,
+    pub operation: String,
     pub before: String,
     pub after: String,
     pub buffer_id: Option<String>,
@@ -2225,5 +2226,33 @@ mod tests {
         let old = Hello::client("old", Vec::new());
         assert!(!old.capabilities.contains(&CAP_EDITOR_SEARCH.to_owned()));
         assert!(Hello::default_client_caps().contains(&CAP_EDITOR_SEARCH.to_owned()));
+    }
+}
+
+#[cfg(test)]
+mod workspace_edit_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn workspace_edit_capability_and_preview_tokens_roundtrip() {
+        assert!(Hello::client("test", Hello::default_client_caps()).capabilities.iter().any(|cap| cap == CAP_LSP_WORKSPACE_EDITS));
+        let preview = WorkspaceEditPreview {
+            token: "opaque-token".into(), buffer_id: "7".into(),
+            files: vec![WorkspaceEditFile { path: "/project/new.rs".into(), operation: "create".into(),
+                before: String::new(), after: String::new(), buffer_id: None, base_rev: None }],
+        };
+        let messages = [
+            Message::WorkspaceEditPreview { request_id: "preview-1".into(), preview },
+            Message::WorkspaceEditApply { request_id: "apply-1".into(), buffer_id: "7".into(), token: "opaque-token".into() },
+            Message::WorkspaceEditCancel { buffer_id: "7".into(), token: "opaque-token".into() },
+            Message::WorkspaceEditApplied { request_id: "apply-1".into(), updates: vec![WorkspaceBufferUpdate { buffer_id: "7".into(), rev: 9, text: "new".into() }] },
+        ];
+        for message in messages {
+            assert_eq!(Message::from_json(&message.to_json().unwrap()).unwrap(), message);
+        }
+        for feature in [LspRequestFeature::PrepareRename, LspRequestFeature::Rename, LspRequestFeature::CodeActions, LspRequestFeature::CodeActionResolve, LspRequestFeature::ExecuteCommand] {
+            let encoded = serde_json::to_string(&feature).unwrap();
+            assert_eq!(serde_json::from_str::<LspRequestFeature>(&encoded).unwrap(), feature);
+        }
     }
 }
