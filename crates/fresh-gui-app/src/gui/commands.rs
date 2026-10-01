@@ -402,6 +402,12 @@ pub fn builtin_commands() -> Vec<CommandDescriptor> {
             Some(CommandContext::Editor),
             None
         ),
+        command!("SaveAs", "Save As…", SaveAs, Some(CommandContext::Editor), None),
+        command!("SaveAll", "Save All", SaveAll),
+        command!("InspectFileFormat", "File Encoding and Line Endings", InspectFileFormat, Some(CommandContext::Editor), Some(fresh_gui_protocol::CAP_EDITOR_FILE_CONTROLS)),
+        command!("ReopenWithEncoding", "Reopen with Encoding…", ReopenWithEncoding, Some(CommandContext::Editor), Some(fresh_gui_protocol::CAP_EDITOR_FILE_CONTROLS)),
+        command!("SaveWithEncoding", "Save with Encoding…", SaveWithEncoding, Some(CommandContext::Editor), Some(fresh_gui_protocol::CAP_EDITOR_FILE_CONTROLS)),
+        command!("ChangeLineEndings", "Change Line Endings…", ChangeLineEndings, Some(CommandContext::Editor), Some(fresh_gui_protocol::CAP_EDITOR_FILE_CONTROLS)),
         command!("ToggleSidebar", "Toggle Sidebar", ToggleSidebar),
         command!(
             "ToggleCommandPalette",
@@ -643,6 +649,19 @@ mod tests {
                     .any(|command| command.id == id)
             );
         }
+    }
+
+    #[test]
+    fn file_controls_require_daemon_support_and_share_command_lookup() {
+        let registry = CommandRegistry::with_builtins();
+        for id in ["InspectFileFormat", "ReopenWithEncoding", "SaveWithEncoding", "ChangeLineEndings"] {
+            assert!(command_descriptor(id).is_some());
+            assert!(!registry.available(Some(CommandContext::Editor), &[]).iter().any(|c| c.id == id));
+            assert!(registry.available(Some(CommandContext::Editor), &[fresh_gui_protocol::CAP_EDITOR_FILE_CONTROLS.into()]).iter().any(|c| c.id == id));
+            assert!(!registry.available(Some(CommandContext::Terminal), &[fresh_gui_protocol::CAP_EDITOR_FILE_CONTROLS.into()]).iter().any(|c| c.id == id));
+        }
+        assert!(registry.available(None, &[]).iter().any(|c| c.id == "SaveAll"));
+        assert!(registry.available(Some(CommandContext::Editor), &[]).iter().any(|c| c.id == "SaveAs"));
     }
 
     #[test]

@@ -177,6 +177,24 @@ pub fn catalog() -> Vec<SettingDefinition> {
         fresh(&["editor", "use_tabs"], Boolean),
         bounded(fresh(&["editor", "tab_size"], Integer), 1, 32),
         fresh(&["editor", "auto_indent"], Boolean),
+        // These values are read by Fresh's authoritative editor config. Keep
+        // their defaults there rather than duplicating them in this catalog.
+        fresh(&["editor", "auto_save_enabled"], Boolean),
+        bounded(
+            fresh(&["editor", "auto_save_interval_secs"], Integer),
+            1,
+            u32::MAX as u64,
+        ),
+        fresh(&["editor", "trim_trailing_whitespace_on_save"], Boolean),
+        fresh(&["editor", "ensure_final_newline_on_save"], Boolean),
+        SettingDefinition {
+            effect: SettingEffect::BackendOnly,
+            ..fresh(&["editor", "hot_exit"], Boolean)
+        },
+        SettingDefinition {
+            effect: SettingEffect::BackendOnly,
+            ..fresh(&["editor", "confirm_quit"], Boolean)
+        },
         SettingDefinition {
             scope: SettingScope::Global,
             effect: SettingEffect::Restart,
@@ -486,6 +504,49 @@ mod tests {
                 .value_type,
             SettingValueType::Object
         );
+    }
+
+    #[test]
+    fn catalog_exposes_fresh_save_policy_with_fresh_owned_defaults() {
+        let entries = catalog();
+        for path in [
+            ["editor", "auto_save_enabled"],
+            ["editor", "auto_save_interval_secs"],
+            ["editor", "trim_trailing_whitespace_on_save"],
+            ["editor", "ensure_final_newline_on_save"],
+            ["editor", "hot_exit"],
+            ["editor", "confirm_quit"],
+        ] {
+            let setting = entries.iter().find(|entry| entry.path == path).unwrap();
+            assert_eq!(setting.owner, SettingOwner::Daemon);
+            assert_eq!(setting.default, None);
+        }
+
+        let interval = entries
+            .iter()
+            .find(|entry| entry.path == ["editor", "auto_save_interval_secs"])
+            .unwrap();
+        assert_eq!(interval.value_type, SettingValueType::Integer);
+        assert_eq!(interval.minimum, Some(1));
+        assert_eq!(interval.maximum, Some(u32::MAX as u64));
+        assert!(validate_value(interval, &Value::from(30)).is_ok());
+        assert!(validate_value(interval, &Value::from(0)).is_err());
+        assert!(validate_value(interval, &Value::from(u64::from(u32::MAX) + 1)).is_err());
+        assert_eq!(interval.effect, SettingEffect::Restart);
+        for path in [
+            ["editor", "trim_trailing_whitespace_on_save"],
+            ["editor", "ensure_final_newline_on_save"],
+        ] {
+            let setting = entries.iter().find(|entry| entry.path == path).unwrap();
+            assert_eq!(setting.value_type, SettingValueType::Boolean);
+            assert_eq!(setting.default, None);
+            assert_eq!(setting.effect, SettingEffect::Restart);
+            assert!(validate_value(setting, &Value::Bool(true)).is_ok());
+        }
+        for path in [["editor", "hot_exit"], ["editor", "confirm_quit"]] {
+            let setting = entries.iter().find(|entry| entry.path == path).unwrap();
+            assert_eq!(setting.effect, SettingEffect::BackendOnly);
+        }
     }
 
     #[test]

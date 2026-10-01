@@ -34,6 +34,8 @@ pub const MAX_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 pub const CAP_EDITOR_DRAFT_RECOVERY: &str = "editor.draft-recovery";
 /// Revisioned external file change checks and resolution.
 pub const CAP_EDITOR_EXTERNAL_CHANGES: &str = "editor.external-changes";
+/// Inspect or change encoding and line-ending state for open buffers.
+pub const CAP_EDITOR_FILE_CONTROLS: &str = "editor.file-controls";
 /// Fresh-compatible in-buffer find and replacement preview.
 pub const CAP_EDITOR_SEARCH: &str = "editor.search";
 /// Daemon workspace search and reviewed replacement.
@@ -1145,6 +1147,24 @@ pub enum Message {
         #[serde(flatten)]
         outcome: SaveOutcome,
     },
+    /// Client → backend: inspect or change a buffer's on-disk text format.
+    /// Requires `editor.file-controls`.
+    BufferFileControl {
+        request_id: String,
+        buffer_id: String,
+        base_rev: u64,
+        operation: FileControlOperation,
+    },
+    /// Backend → client: current format metadata after inspection/change/reopen.
+    BufferFileState {
+        request_id: String,
+        buffer_id: String,
+        rev: u64,
+        metadata: BufferFileMetadata,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        dirty: bool,
+    },
     /// Client → backend: inspect current disk state for an open buffer.
     /// Requires `editor.external-changes`; used after reconnect and explorer refresh.
     BufferExternalCheck {
@@ -1410,6 +1430,44 @@ pub enum Message {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileControlOperation {
+    Inspect,
+    SetEncoding { encoding: String },
+    SetLineEnding { line_ending: String },
+    Reopen { encoding: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BufferFileControl {
+    pub request_id: String,
+    pub buffer_id: String,
+    pub base_rev: u64,
+    pub operation: FileControlOperation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BufferFileMetadata {
+    pub encoding: String,
+    pub bom: bool,
+    pub line_ending: String,
+    pub read_only: bool,
+    pub paged: bool,
+    pub auto_save_interval_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BufferFileState {
+    pub request_id: String,
+    pub buffer_id: String,
+    pub rev: u64,
+    pub metadata: BufferFileMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    pub dirty: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EditorDraftInfo {
     pub draft_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1468,6 +1526,7 @@ impl Hello {
             CAP_EDITOR_PAGED_READS.to_owned(),
             CAP_EDITOR_DRAFT_RECOVERY.to_owned(),
             CAP_EDITOR_EXTERNAL_CHANGES.to_owned(),
+            CAP_EDITOR_FILE_CONTROLS.to_owned(),
             CAP_EDITOR_SEARCH.to_owned(),
             CAP_PROJECT_SEARCH.to_owned(),
             CAP_FILE_FINDER.to_owned(),
@@ -1495,6 +1554,7 @@ impl Hello {
             CAP_EDITOR_PAGED_READS.to_owned(),
             CAP_EDITOR_DRAFT_RECOVERY.to_owned(),
             CAP_EDITOR_EXTERNAL_CHANGES.to_owned(),
+            CAP_EDITOR_FILE_CONTROLS.to_owned(),
             CAP_EDITOR_SEARCH.to_owned(),
             CAP_PROJECT_SEARCH.to_owned(),
             CAP_FILE_FINDER.to_owned(),
@@ -1523,6 +1583,51 @@ impl Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_control_messages_roundtrip_and_capability_is_advertised() {
+        let request = Message::BufferFileControl {
+            request_id: "format-1".into(),
+            buffer_id: "8".into(),
+            base_rev: 12,
+            operation: FileControlOperation::SetEncoding {
+                encoding: "UTF-16 LE".into(),
+            },
+        };
+        assert_eq!(
+            Message::from_json(&request.to_json().unwrap()).unwrap(),
+            request
+        );
+        let response = Message::BufferFileState {
+            request_id: "format-1".into(),
+            buffer_id: "8".into(),
+            rev: 13,
+            metadata: BufferFileMetadata {
+                encoding: "UTF-16 LE".into(),
+                bom: true,
+                line_ending: "CRLF".into(),
+                read_only: false,
+                paged: false,
+                auto_save_interval_secs: Some(30),
+            },
+            text: Some("hello\n".into()),
+            dirty: true,
+        };
+        assert_eq!(
+            Message::from_json(&response.to_json().unwrap()).unwrap(),
+            response
+        );
+        assert!(
+            Hello::default_backend_caps()
+                .iter()
+                .any(|cap| cap == CAP_EDITOR_FILE_CONTROLS)
+        );
+        assert!(
+            Hello::default_client_caps()
+                .iter()
+                .any(|cap| cap == CAP_EDITOR_FILE_CONTROLS)
+        );
+    }
 
     #[test]
     fn config_reload_and_legacy_config_updated_roundtrip() {
@@ -2364,7 +2469,13 @@ mod workspace_edit_protocol_tests {
         for message in messages {
             assert_eq!(Message::from_json(&message.to_json().unwrap()).unwrap(), message);
         }
-        for feature in [LspRequestFeature::PrepareRename, LspRequestFeature::Rename, LspRequestFeature::CodeActions, LspRequestFeature::CodeActionResolve, LspRequestFeature::ExecuteCommand] {
+        for feature in [
+            LspRequestFeature::PrepareRename,
+            LspRequestFeature::Rename,
+            LspRequestFeature::CodeActions,
+            LspRequestFeature::CodeActionResolve,
+            LspRequestFeature::ExecuteCommand,
+        ] {
             let encoded = serde_json::to_string(&feature).unwrap();
             assert_eq!(serde_json::from_str::<LspRequestFeature>(&encoded).unwrap(), feature);
         }

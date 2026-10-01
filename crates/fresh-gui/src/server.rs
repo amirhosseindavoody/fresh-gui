@@ -15,9 +15,11 @@ use axum::routing::get;
 use base64::Engine;
 use fresh_gui_protocol::{
     ByteSelection, CAP_EDITOR, CAP_EDITOR_DRAFT_RECOVERY, CAP_EDITOR_EXTERNAL_CHANGES,
-    CAP_EDITOR_PAGED_READS, CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_SMART_EDITING, CAP_EDITOR_SEARCH, CAP_PROJECT_SEARCH, CAP_FILE_FINDER, CAP_LSP_CONTROLS, CAP_LSP, CAP_LSP_NAVIGATION, CAP_LSP_REQUESTS, CAP_LSP_WORKSPACE_EDITS,
-    CAP_SCENE, CAP_SETTINGS_EDITOR, EditorDraftInfo, ExternalResolution, Hello, HelloUi,
-    MAX_PAGE_BYTES, Message, PROTOCOL_VERSION,
+    CAP_EDITOR_FILE_CONTROLS, CAP_EDITOR_PAGED_READS, CAP_EDITOR_RANGE_EDITS,
+    CAP_EDITOR_SEARCH, CAP_EDITOR_SMART_EDITING, CAP_FILE_FINDER, CAP_LSP, CAP_LSP_CONTROLS,
+    CAP_LSP_NAVIGATION, CAP_LSP_REQUESTS, CAP_LSP_WORKSPACE_EDITS, CAP_PROJECT_SEARCH, CAP_SCENE,
+    CAP_SETTINGS_EDITOR, EditorDraftInfo, ExternalResolution, Hello, HelloUi, MAX_PAGE_BYTES,
+    Message, PROTOCOL_VERSION,
 };
 use futures_util::{SinkExt, StreamExt};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -137,6 +139,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 && c != CAP_EDITOR_PAGED_READS
                 && c != CAP_EDITOR_DRAFT_RECOVERY
                 && c != CAP_EDITOR_EXTERNAL_CHANGES
+                && c != CAP_EDITOR_FILE_CONTROLS
                 && c != CAP_EDITOR_SEARCH
                 && c != CAP_PROJECT_SEARCH
                 && c != CAP_FILE_FINDER
@@ -176,6 +179,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut client_paged_reads = false;
     let mut client_draft_recovery = false;
     let mut client_external_changes = false;
+    let mut client_file_controls = false;
     let mut client_settings_editor = false;
     let mut client_lsp_requests = false;
     let mut client_editor_search = false;
@@ -319,6 +323,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     &mut client_paged_reads,
                     &mut client_draft_recovery,
                     &mut client_external_changes,
+                    &mut client_file_controls,
                     &mut client_settings_editor,
                     &mut client_lsp_requests,
                     &mut client_lsp_navigation,
@@ -371,6 +376,7 @@ async fn handle_client_msg(
     client_paged_reads: &mut bool,
     client_draft_recovery: &mut bool,
     client_external_changes: &mut bool,
+    client_file_controls: &mut bool,
     client_settings_editor: &mut bool,
     client_lsp_requests: &mut bool,
     client_lsp_navigation: &mut bool,
@@ -411,6 +417,10 @@ async fn handle_client_msg(
                 .capabilities
                 .iter()
                 .any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES);
+            *client_file_controls = client_hello
+                .capabilities
+                .iter()
+                .any(|cap| cap == CAP_EDITOR_FILE_CONTROLS);
             *client_settings_editor = client_hello
                 .capabilities
                 .iter()
@@ -1986,6 +1996,58 @@ async fn handle_client_msg(
             })?;
             Ok(())
         }
+        Message::BufferFileControl {
+            request_id,
+            buffer_id,
+            base_rev,
+            operation,
+        } => {
+            require_auth(*authed)?;
+            if !*client_file_controls {
+                return Err(Message::Error {
+                    code: "capability_unavailable".into(),
+                    message: format!(
+                        "{request_id}: client did not negotiate {CAP_EDITOR_FILE_CONTROLS}"
+                    ),
+                });
+            }
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: format!("{request_id}: editor capability not available"),
+                });
+            };
+            ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
+            let state = editor
+                .file_control(fresh_gui_protocol::BufferFileControl {
+                    request_id: request_id.clone(),
+                    buffer_id: buffer_id.clone(),
+                    base_rev,
+                    operation,
+                })
+                .await
+                .map_err(|err| Message::Error {
+                    code: "buffer_file_control_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
+            send_msg(
+                sink,
+                &Message::BufferFileState {
+                    request_id: state.request_id,
+                    buffer_id: state.buffer_id,
+                    rev: state.rev,
+                    metadata: state.metadata,
+                    text: state.text,
+                    dirty: state.dirty,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send BufferFileState".into(),
+            })?;
+            Ok(())
+        }
         Message::BufferLspGet {
             buffer_id,
             known_rev,
@@ -2027,10 +2089,25 @@ async fn handle_client_msg(
             require_workspace_edit_capability(*client_workspace_edits)?;
             let editor = state.editor.as_ref().ok_or_else(|| Message::Error { code: "editor_unavailable".into(), message: "editor unavailable".into() })?;
             ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
-            let preview = editor.prepare_workspace_edit(buffer_id, base_rev, socket_id.to_owned(), edit).await.map_err(|error| Message::Error {
-                code: "workspace_edit_failed".into(), message: format!("{request_id}: {error:#}"),
+            let preview = editor
+                .prepare_workspace_edit(buffer_id, base_rev, socket_id.to_owned(), edit)
+                .await
+                .map_err(|error| Message::Error {
+                    code: "workspace_edit_failed".into(),
+                    message: format!("{request_id}: {error:#}"),
+                })?;
+            send_msg(
+                sink,
+                &Message::WorkspaceEditPreview {
+                    request_id,
+                    preview,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send workspace edit preview".into(),
             })?;
-            send_msg(sink, &Message::WorkspaceEditPreview { request_id, preview }).await.map_err(|_| Message::Error { code: "send_failed".into(), message: "failed to send workspace edit preview".into() })?;
             Ok(())
         }
         Message::WorkspaceEditApply { request_id, buffer_id, token } => {
@@ -2038,10 +2115,25 @@ async fn handle_client_msg(
             require_workspace_edit_capability(*client_workspace_edits)?;
             let editor = state.editor.as_ref().ok_or_else(|| Message::Error { code: "editor_unavailable".into(), message: "editor unavailable".into() })?;
             ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
-            let updates = editor.apply_workspace_edit(buffer_id, socket_id.to_owned(), token).await.map_err(|error| Message::Error {
-                code: "workspace_edit_failed".into(), message: format!("{request_id}: {error:#}"),
+            let updates = editor
+                .apply_workspace_edit(buffer_id, socket_id.to_owned(), token)
+                .await
+                .map_err(|error| Message::Error {
+                    code: "workspace_edit_failed".into(),
+                    message: format!("{request_id}: {error:#}"),
+                })?;
+            send_msg(
+                sink,
+                &Message::WorkspaceEditApplied {
+                    request_id,
+                    updates,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send workspace edit result".into(),
             })?;
-            send_msg(sink, &Message::WorkspaceEditApplied { request_id, updates }).await.map_err(|_| Message::Error { code: "send_failed".into(), message: "failed to send workspace edit result".into() })?;
             Ok(())
         }
         Message::WorkspaceEditCancel { buffer_id, token } => {

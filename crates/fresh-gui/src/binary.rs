@@ -29,9 +29,18 @@ impl std::error::Error for BinaryFile {}
 
 /// True when `sample` should not be decoded as editor text.
 ///
-/// NUL (UTF-16, executables, images) is enough. A run of other C0 controls
-/// is too, so a file of NULs that were stripped still counts.
+/// Fresh recognizes UTF-16 before control-byte sniffing, since its text
+/// contains NUL bytes on disk. Decoded text still rejects binary controls.
 pub fn looks_binary(sample: &[u8]) -> bool {
+    use fresh::model::buffer::Encoding;
+    let (encoding, binary) = fresh::model::encoding::detect_encoding_or_binary(sample, true);
+    if !binary && matches!(encoding, Encoding::Utf16Le | Encoding::Utf16Be) {
+        return has_binary_controls(&fresh::model::encoding::convert_to_utf8(sample, encoding));
+    }
+    has_binary_controls(sample)
+}
+
+fn has_binary_controls(sample: &[u8]) -> bool {
     if sample.is_empty() {
         return false;
     }
@@ -71,9 +80,15 @@ mod tests {
     }
 
     #[test]
+    fn fresh_utf16_text_is_not_mistaken_for_binary() {
+        assert!(!looks_binary(&[0xff, 0xfe, 0x41, 0x00]));
+        assert!(!looks_binary(&[0xfe, 0xff, 0x00, 0x41]));
+    }
+
+    #[test]
     fn nul_and_control_runs_are_binary() {
         assert!(looks_binary(b"MZ\x00\x01"));
-        assert!(looks_binary(&[0xff, 0xfe, 0x41, 0x00]));
+        assert!(looks_binary(&[0xff, 0xfe, 0x00, 0x00]));
         let mut noisy = vec![0x01u8; 40];
         noisy.extend(std::iter::repeat_n(b'a', 40));
         assert!(looks_binary(&noisy));
