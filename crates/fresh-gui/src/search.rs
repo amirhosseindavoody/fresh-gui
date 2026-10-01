@@ -13,27 +13,37 @@ mod fresh_regex_replace {
         haystack: &str,
         template: &str,
         limit: usize,
-    ) -> Vec<ReplaceMatch> {
+    ) -> Result<Vec<ReplaceMatch>, String> {
         let escaped = interpret_escapes(template);
         let normalized = normalize_replacement(&escaped);
-        regex
-            .captures_iter(haystack.as_bytes())
-            .filter(|captures| {
+        let references = normalized.bytes().filter(|byte| *byte == b'$').count();
+        let mut output_bytes = 0usize;
+        let mut result = Vec::new();
+        for captures in regex.captures_iter(haystack.as_bytes()).filter(|captures| {
                 let matched = captures.get(0).expect("capture set has whole match");
                 haystack.is_char_boundary(matched.start()) && haystack.is_char_boundary(matched.end())
-            })
-            .take(limit)
-            .map(|captures| {
-                let matched = captures.get(0).expect("capture set has whole match");
-                let mut expanded = Vec::new();
-                captures.expand(normalized.as_bytes(), &mut expanded);
-                ReplaceMatch {
-                    offset: matched.start(),
-                    len: matched.len(),
-                    replacement: String::from_utf8_lossy(&expanded).into_owned(),
-                }
-            })
-            .collect()
+            }).take(limit)
+        {
+            let matched = captures.get(0).expect("capture set has whole match");
+            // Bound expansion before allocating it. Each `$` could expand to
+            // any capture up to the whole match length, so this is conservative.
+            let upper_bound = references
+                .checked_mul(matched.len())
+                .and_then(|extra| normalized.len().checked_add(extra))
+                .ok_or_else(|| "replacement preview exceeds the 8 MiB output limit".to_owned())?;
+            if upper_bound > MAX_SEARCH_DRAFT_BYTES.saturating_sub(output_bytes) {
+                return Err("replacement preview exceeds the 8 MiB output limit".into());
+            }
+            let mut expanded = Vec::new();
+            captures.expand(normalized.as_bytes(), &mut expanded);
+            output_bytes += upper_bound;
+            result.push(ReplaceMatch {
+                offset: matched.start(),
+                len: matched.len(),
+                replacement: String::from_utf8_lossy(&expanded).into_owned(),
+            });
+        }
+        Ok(result)
     }
 }
 
@@ -91,7 +101,7 @@ pub fn preview(
             haystack,
             replacement,
             limit,
-        ) {
+        )? {
             matches.push(SearchMatch {
                 start: base + matched.offset,
                 end: base + matched.offset + matched.len,
@@ -99,7 +109,12 @@ pub fn preview(
             });
         }
     } else {
+        let mut output_bytes = 0usize;
         for matched in find.find_iter(haystack).take(limit) {
+            if replacement.len() > MAX_SEARCH_DRAFT_BYTES.saturating_sub(output_bytes) {
+                return Err("replacement preview exceeds the 8 MiB output limit".into());
+            }
+            output_bytes += replacement.len();
             matches.push(SearchMatch {
                 start: base + matched.start(),
                 end: base + matched.end(),
@@ -217,6 +232,14 @@ mod tests {
     }
 
     #[test]
+    fn expanded_replacement_output_has_a_separate_memory_budget() {
+        let text = "x".repeat(10_000);
+        let replacement = format!("{}$1", "z".repeat(1024));
+        let error = preview(&text, "(x)", &replacement, &opts(true), None).unwrap_err();
+        assert!(error.contains("8 MiB output limit"));
+    }
+
+    #[test]
     fn reviewed_search_is_one_fresh_undo_group_and_rejects_stale_revision() {
         let (root, editor) = test_editor("review");
         let path = root.join("review.txt");
@@ -308,6 +331,8 @@ mod tests {
         let marker = 2 * 1024 * 1024 + 100;
         let mut contents = vec![b'a'; 3 * 1024 * 1024];
         contents[marker..marker + b"target".len()].copy_from_slice(b"target");
+        let mut expected_contents = contents.clone();
+        expected_contents.splice(marker..marker + b"target".len(), b"replacement".iter().copied());
         std::fs::write(&path, contents).unwrap();
         runtime().block_on(async {
             let opened = editor.open(path, false).await.unwrap();
@@ -350,7 +375,7 @@ mod tests {
             assert!(applied.accepted);
             assert!(applied.page.as_ref().unwrap().text.contains("replacement"));
 
-            let undone = editor
+            let undo = editor
                 .action(
                     opened.buffer_id.clone(),
                     "paged-search-test".into(),
@@ -358,11 +383,18 @@ mod tests {
                     EditorAction::Undo,
                     applied.selection,
                 )
+                .await;
+            assert!(undo.is_err(), "paged undo is not implemented by Fresh's ADE path");
+            let unchanged = editor.read_page(opened.buffer_id.clone(), page.start, 128).await.unwrap();
+            assert_eq!(unchanged.text, edited_page);
+
+            // Saving proves the replacement touched only its global byte range;
+            // the entire 3 MiB source must otherwise remain byte-for-byte intact.
+            editor
+                .save(opened.buffer_id, applied.rev, None)
                 .await
                 .unwrap();
-            assert!(undone.accepted);
-            let restored = editor.read_page(opened.buffer_id, page.start, page.text.len()).await.unwrap();
-            assert_eq!(restored.text, page.text);
+            assert_eq!(std::fs::read(&path).unwrap(), expected_contents);
         });
         drop(editor);
         let _ = std::fs::remove_dir_all(root);
