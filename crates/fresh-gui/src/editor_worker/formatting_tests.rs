@@ -365,3 +365,31 @@ fn timed_out_formatting_cannot_overwrite_a_newer_revision() {
     drop(editor);
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn service_reload_preserves_project_disabled_servers() {
+    use fresh_gui_protocol::LanguageServerAction;
+    let root = test_root("reload-disabled-server");
+    std::fs::create_dir_all(root.join(".fresh")).unwrap();
+    std::fs::write(
+        root.join(".fresh/config.json"),
+        r#"{"lsp":{"rust":{"name":"Fixture","enabled":false}}}"#,
+    ).unwrap();
+    let config = crate::config::Config::parse(
+        r#"{"lsp":{"rust":{"name":"Fixture","command":"fresh-gui-test-disabled-server"}}}"#,
+    ).unwrap();
+    let path = root.join("test.rs");
+    std::fs::write(&path, "fn main() {}\n").unwrap();
+    let editor = EditorHandle::spawn(root.clone(), config.clone()).unwrap();
+    runtime().block_on(async {
+        let opened = editor.open(path, false).await.unwrap();
+        let states = editor.language_servers(opened.buffer_id.clone(), LanguageServerAction::Status).await.unwrap();
+        assert_eq!(states[0].status, "disabled");
+        editor.reconfigure(config).await.unwrap();
+        let states = editor.language_servers(opened.buffer_id.clone(), LanguageServerAction::Status).await.unwrap();
+        assert_eq!(states[0].status, "disabled", "daemon reload must retain the project disable");
+        editor.close(opened.buffer_id).await.unwrap();
+    });
+    drop(editor);
+    let _ = std::fs::remove_dir_all(root);
+}

@@ -1245,17 +1245,27 @@ fn run_loop(
                     let _ = reply.send(result);
                 }
                 Cmd::Reconfigure { config, reply } => {
-                    editor.active_window_mut().lsp.shutdown_all();
-                    let languages: Vec<_> = editor.config().lsp.keys().cloned().collect();
-                    for language in languages {
-                        editor.set_lsp_config(language, Vec::new());
-                    }
                     let mut fresh_config = editor.config().clone();
                     fresh_config.lsp = config.lsp.clone();
                     fresh_config.lsp_enabled = !fresh_config.lsp.is_empty();
                     // Editor preferences are applied at construction; existing buffers
                     // retain their settings until server restart.
                     config.apply_fresh_services(&mut fresh_config);
+                    // Reload the startup-directory service layers too: a user
+                    // config reload must not re-enable a project-disabled server.
+                    // Keep unrelated editor preferences on their existing values.
+                    let mut layered = fresh_config.clone();
+                    if let Err(error) = config.apply_fresh_project(&mut layered, editor.working_dir()) {
+                        let _ = reply.send(Err(error));
+                        continue;
+                    }
+                    fresh_config.lsp = layered.lsp;
+                    fresh_config.lsp_enabled = layered.lsp_enabled;
+                    editor.active_window_mut().lsp.shutdown_all();
+                    let languages: Vec<_> = editor.config().lsp.keys().cloned().collect();
+                    for language in languages {
+                        editor.set_lsp_config(language, Vec::new());
+                    }
                     editor.set_config(fresh_config);
                     let lsp_enabled = editor.config().lsp_enabled;
                     editor
