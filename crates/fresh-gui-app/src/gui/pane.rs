@@ -3663,6 +3663,9 @@ impl EditorPanel {
 
 impl EventEmitter<PanelEvent> for EditorPanel {}
 
+#[cfg(test)]
+mod editing_tests;
+
 impl Focusable for EditorPanel {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.editor.read(cx).focus_handle(cx)
