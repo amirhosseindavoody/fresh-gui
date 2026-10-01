@@ -22,6 +22,7 @@ fresh = { path = "../../vendor/fresh/crates/fresh-editor", package = "fresh-edit
 fresh-gui-protocol = { workspace = true }
 futures-util = { workspace = true }
 notify = { workspace = true }
+regex = "1"
 portable-pty = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
