@@ -87,7 +87,7 @@ impl SettingsEditor {
             language: cx.new(|cx| {
                 InputState::new(window, cx).placeholder("Language id (optional, e.g. rust)")
             }),
-            action: cx.new(|cx| InputState::new(window, cx).placeholder("Action name")),
+            action: cx.new(|cx| InputState::new(window, cx).placeholder("Action name (e.g. GoToFile)")),
             context: cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("Context: Editor, Terminal, Explorer; empty = global")
@@ -281,7 +281,8 @@ impl SettingsEditor {
                 let action = self.action.read(cx).value().to_string();
                 anyhow::ensure!(
                     super::actions::known_action(&action),
-                    "Unknown native action; see JSON for Fresh actions"
+                    "Unknown native action; available native actions: {}",
+                    super::actions::command_ids().into_iter().map(|(id, _)| id).collect::<Vec<_>>().join(", ")
                 );
                 let context = self.context.read(cx).value().to_string();
                 anyhow::ensure!(

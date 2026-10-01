@@ -5,6 +5,7 @@
 //! `fresh-gui-client` and paints a Zed/VS Code-like shell.
 
 mod actions;
+mod commands;
 mod ade;
 mod assets;
 mod chrome;
