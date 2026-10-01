@@ -1083,7 +1083,10 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd, evt_tx: &async_channel::
             let _ = ack.send(());
         }
         AdeCmd::Project(message) => {
-            if client.supports_capability(fresh_gui_protocol::CAP_PROJECT_SEARCH) {
+            let capability = if matches!(message, Message::FileFinder { .. } | Message::FileFinderCancel { .. }) {
+                fresh_gui_protocol::CAP_FILE_FINDER
+            } else { fresh_gui_protocol::CAP_PROJECT_SEARCH };
+            if client.supports_capability(capability) {
                 client.send(message).await?;
             } else {
                 let _ = evt_tx.send(AdeEvent::Error { code: "capability_unavailable".into(), message: "This daemon does not support project search; upgrade the daemon".into() }).await;
@@ -1494,7 +1497,7 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             text,
             defaults,
         }),
-        message @ (Message::ProjectSearchFile { .. } | Message::ProjectSearchDone { .. } | Message::ProjectReplaceResult { .. }) => Some(AdeEvent::Project(message)),
+        message @ (Message::FileFinderResults { .. } | Message::ProjectSearchFile { .. } | Message::ProjectSearchDone { .. } | Message::ProjectReplaceResult { .. }) => Some(AdeEvent::Project(message)),
         Message::BufferSearchResult { request_id, matches, error, capped } => Some(AdeEvent::SearchResult { request_id, matches, error, capped }),
         Message::ConfigUpdated { shortkeys, ui } => Some(AdeEvent::ConfigUpdated { shortkeys, ui }),
         Message::BufferSaved {

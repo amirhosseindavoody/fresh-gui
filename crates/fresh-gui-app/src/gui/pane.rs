@@ -2272,6 +2272,25 @@ impl EditorPanel {
         (self.current_text(cx), self.byte_selection(cx).head)
     }
 
+    pub(crate) fn restore_preview_position(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let text = self.current_text(cx);
+        if offset <= text.len() && text.is_char_boundary(offset) {
+            self.editor.update(cx, |state, cx| state.set_selected_range(offset..offset, cx));
+        }
+    }
+
+    /// Preview only a fully loaded buffer; paged global line numbers require
+    /// daemon indexing. This moves the cursor without stealing finder focus.
+    pub(crate) fn preview_line(&mut self, query: &str, cx: &mut Context<Self>) -> Option<String> {
+        if self.page.is_some() { return None; }
+        let text = self.current_text(cx);
+        let offset = fresh_gui_client::finder::line_position(&text, query)?;
+        self.editor.update(cx, |state, cx| state.set_selected_range(offset..offset, cx));
+        let start = text[..offset].rfind('\n').map_or(0, |pos| pos + 1);
+        let end = text[offset..].find('\n').map_or(text.len(), |pos| offset + pos);
+        Some(text[start..end].chars().take(200).collect())
+    }
+
     pub(crate) fn cancel_navigation(&mut self) {
         let mut retained = Vec::new();
         for pending in self.pending_lsp.drain(..) {

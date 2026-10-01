@@ -929,3 +929,10 @@ mod tests {
         assert_eq!(opts.token.as_deref(), Some("secret"));
     }
 }
+
+pub mod finder;
+
+// Pure, self-contained source reuse keeps ranking identical to the pinned
+// daemon Fresh matcher without linking the terminal editor into the client.
+#[path = "../../../vendor/fresh/crates/fresh-editor/src/input/fuzzy/mod.rs"]
+pub mod fuzzy;
