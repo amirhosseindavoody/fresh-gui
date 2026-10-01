@@ -62,7 +62,11 @@ while True:
                     "start": message["params"]["position"],
                     "end": message["params"]["position"],
                 }, "newText": "call($1)\n$0"},
-                "additionalTextEdits": [],
+                "additionalTextEdits": [{"range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 0},
+                }, "newText": "import package_name\n"}],
+                "data": {"completionToken": name},
             }]}
         elif method == "textDocument/hover":
             result = {"contents": {"kind": "markdown", "value": "hover from " + name}}

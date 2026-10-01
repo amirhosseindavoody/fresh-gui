@@ -76,10 +76,7 @@ async fn wait_lsp(client: &mut Client, request_id: u64) -> fresh_gui_protocol::L
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match client.recv().await.expect("receive LSP response") {
-                Message::BufferLspResult { result }
-                    if result.request_id == request_id
-                        && (!result.responses.is_empty() || result.status.is_some() || result.stale) =>
-                {
+                Message::BufferLspResult { result } if result.request_id == request_id => {
                     return result;
                 }
                 Message::PtyData { .. }
@@ -130,11 +127,22 @@ fn request(
     offset: usize,
     feature: LspRequestFeature,
 ) -> Message {
+    request_for_view(request_id, buffer_id, "lsp-test-view", rev, offset, feature)
+}
+
+fn request_for_view(
+    request_id: u64,
+    buffer_id: &str,
+    view_id: &str,
+    rev: u64,
+    offset: usize,
+    feature: LspRequestFeature,
+) -> Message {
     Message::BufferLspRequest {
         request: LspRequest {
             request_id,
             buffer_id: buffer_id.into(),
-            view_id: "lsp-test-view".into(),
+            view_id: view_id.into(),
             base_rev: rev,
             offset,
             feature,
@@ -163,7 +171,7 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
             {"name":"Alpha","command":"python3","args":[fixture.display().to_string(),"Alpha",alpha_log.display().to_string(), "0"],"only_features":["completion"]},
             {"name":"Beta","command":"python3","args":[fixture.display().to_string(),"Beta",beta_log.display().to_string(), "0"],"except_features":["completion"]},
             {"name":"Slow","command":"python3","args":[fixture.display().to_string(),"Slow",slow_log.display().to_string(), "0.6"],"only_features":["hover"]}
-        ]}
+        ], "rust": [{"name":"MissingBinary","command":"fresh-gui-missing-language-server-145","only_features":["completion"]}]}
     });
     fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
     fs::write(root.join("sample.py"), "a😀b\ncallme\n").unwrap();
@@ -184,6 +192,25 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
         .expect("open python buffer");
     assert_eq!(text, "a😀b\ncallme\n");
 
+    // Wait until Fresh has initialized the servers and published their routed
+    // trigger metadata before asserting which server handles each feature.
+    let mut ready = false;
+    for attempt in 0..80_u64 {
+        client
+            .send(request(10_000 + attempt, &buffer_id, rev, 0, LspRequestFeature::Capabilities))
+            .await
+            .unwrap();
+        let capabilities = wait_lsp(&mut client, 10_000 + attempt).await;
+        if capabilities.completion_triggers.contains(&".".into())
+            && capabilities.signature_triggers.contains(&"(".into())
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ready, "Fresh LSP server capabilities did not become ready");
+
     // Byte offset 5 is after a (1 byte) and 😀 (4 bytes), but its LSP column is 3 UTF-16 units.
     client
         .send(request(101, &buffer_id, rev, 5, LspRequestFeature::Completion))
@@ -198,8 +225,10 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
     assert_eq!(completion.responses[0].server, "Alpha");
     let completion_item = &completion.responses[0].result["items"][0];
     assert_eq!(completion_item["insertText"], "call()\n");
-    assert_eq!(completion_item["_fresh_cursor_offset"], 7);
-    assert_eq!(completion_item["textEdit"]["newText"], "call($1)\n$0");
+    assert_eq!(completion_item["data"]["_fresh_cursor_offset"], 7);
+    assert_eq!(completion_item["textEdit"]["newText"], "call()\n");
+    assert_eq!(completion_item["additionalTextEdits"][0]["newText"], "import package_name\n");
+    assert_eq!(completion_item["data"]["_fresh_original_data"]["completionToken"], "Alpha");
 
     let alpha_request = fs::read_to_string(&alpha_log)
         .unwrap()
@@ -214,6 +243,15 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .all(|message| message["method"] != "textDocument/completion"));
+
+    // UTF-8 byte offsets must land on scalar boundaries; a byte inside the
+    // non-BMP character is rejected rather than rounded to an LSP position.
+    client
+        .send(request(108, &buffer_id, rev, 2, LspRequestFeature::Hover))
+        .await
+        .unwrap();
+    let invalid = wait_lsp(&mut client, 108).await;
+    assert!(invalid.status.as_deref().is_some_and(|status| status.contains("splits a UTF-8")));
 
     // Beta's except_features admits hover while Alpha is completion-only.
     client
@@ -364,5 +402,100 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
     let unavailable = wait_lsp(&mut client, 107).await;
     assert!(unavailable.status.as_deref().is_some_and(|status| status.contains("paged")));
 
+    // Wire ids are scoped to their websocket. Reusing request id 101 from a
+    // second connection must not deliver its result to the first client.
+    let mut second = Client::connect(ConnectOptions::new(format!("ws://{addr}/ws")))
+        .await
+        .expect("connect second client");
+    second
+        .send(request_for_view(101, &buffer_id, "second-view", rev, 5, LspRequestFeature::Completion))
+        .await
+        .unwrap();
+    let second_result = wait_lsp(&mut second, 101).await;
+    assert_eq!(second_result.view_id, "second-view");
+    assert_eq!(second_result.responses[0].server, "Alpha");
+    let leaked = tokio::time::timeout(Duration::from_millis(250), client.recv()).await;
+    assert!(leaked.is_err(), "another connection's request leaked to this websocket");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+#[ignore = "optional smoke test; set FRESH_GUI_SMOKE_RA to an installed rust-analyzer binary"]
+async fn rust_analyzer_local_symbol_completion_hover_and_signature_smoke() {
+    let Some(rust_analyzer) = std::env::var_os("FRESH_GUI_SMOKE_RA") else {
+        panic!("set FRESH_GUI_SMOKE_RA to the rust-analyzer binary");
+    };
+    let root = temp_root();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"lsp_smoke\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let source = "fn glimmer_signal(value: u32) -> u32 { value }\nfn caller() { glimmer_signal( }\n";
+    fs::write(root.join("src/lib.rs"), source).unwrap();
+    let config_path = root.join("config.json");
+    fs::write(
+        &config_path,
+        serde_json::to_vec(&serde_json::json!({
+            "lsp": {"rust": {"name":"rust-analyzer","command":rust_analyzer.to_string_lossy().to_string(),"args":["--stdio"]}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let addr = free_loopback();
+    let _backend = spawn_backend(addr, &root, &config_path);
+    wait_health(addr);
+    let mut client = Client::connect(ConnectOptions::new(format!("ws://{addr}/ws")))
+        .await
+        .expect("connect daemon");
+    let (buffer_id, _, _, rev, _) = client
+        .open_editor("src/lib.rs", false)
+        .await
+        .expect("open rust source");
+    let mut ready = false;
+    for attempt in 0..100_u64 {
+        client
+            .send(request(20_000 + attempt, &buffer_id, rev, 0, LspRequestFeature::Capabilities))
+            .await
+            .unwrap();
+        let capabilities = wait_lsp(&mut client, 20_000 + attempt).await;
+        if capabilities.completion_triggers.iter().any(|trigger| trigger == ".")
+            && !capabilities.signature_triggers.is_empty()
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    assert!(ready, "rust-analyzer capabilities did not become ready");
+
+    let completion_offset = source.rfind("glim").unwrap() + "glim".len();
+    client
+        .send(request(201, &buffer_id, rev, completion_offset, LspRequestFeature::Completion))
+        .await
+        .unwrap();
+    let completion = wait_lsp(&mut client, 201).await;
+    assert!(!completion.stale);
+    assert!(completion.responses.iter().any(|response| !response.result.is_null()));
+
+    let hover_offset = source.rfind("glimmer_signal").unwrap() + 5;
+    client
+        .send(request(202, &buffer_id, rev, hover_offset, LspRequestFeature::Hover))
+        .await
+        .unwrap();
+    let hover = wait_lsp(&mut client, 202).await;
+    assert!(!hover.stale);
+    assert!(hover.responses.iter().any(|response| !response.result.is_null()));
+
+    let signature_offset = source.rfind("glimmer_signal(").unwrap() + "glimmer_signal(".len();
+    client
+        .send(request(203, &buffer_id, rev, signature_offset, LspRequestFeature::SignatureHelp))
+        .await
+        .unwrap();
+    let signature = wait_lsp(&mut client, 203).await;
+    assert!(!signature.stale);
+    assert!(signature.responses.iter().any(|response| !response.result.is_null()));
     let _ = fs::remove_dir_all(root);
 }
