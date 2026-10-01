@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use fresh_gui_client::{Client, ConnectOptions};
 use fresh_gui_protocol::{
-    ByteSelection, CAP_LSP_REQUESTS, LspRequest, LspRequestFeature, Message, RangeEdit,
+    ByteSelection, CAP_LSP_REQUESTS, EditorAction, LspRequest, LspRequestFeature, Message,
+    RangeEdit,
 };
 
 fn free_loopback() -> SocketAddr {
@@ -120,6 +121,32 @@ async fn await_range(client: &mut Client, request_id: &str) -> u64 {
     .expect("edit response timed out")
 }
 
+async fn await_edit_result(
+    client: &mut Client,
+    request_id: &str,
+) -> (u64, String, ByteSelection, bool) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match client.recv().await.expect("receive edit result") {
+                Message::BufferEditResult { request_id: id, rev, text, selection, accepted, .. }
+                    if id == request_id => return (rev, text, selection, accepted),
+                Message::PtyData { .. }
+                | Message::FsChanged { .. }
+                | Message::Pong { .. }
+                | Message::Ping { .. }
+                | Message::BufferLspState { .. }
+                | Message::BufferLspResult { .. }
+                | Message::BufferChanged { .. }
+                | Message::BufferPaged { .. }
+                | Message::BufferEditResult { .. } => {}
+                other => panic!("unexpected message while waiting for edit result: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("edit result timed out")
+}
+
 fn request(
     request_id: u64,
     buffer_id: &str,
@@ -186,7 +213,7 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
         .expect("connect daemon");
     assert!(client.supports_capability(CAP_LSP_REQUESTS));
 
-    let (buffer_id, _, _, rev, text) = client
+    let (buffer_id, _, _, mut rev, text) = client
         .open_editor("sample.py", false)
         .await
         .expect("open python buffer");
@@ -228,7 +255,7 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
     assert_eq!(completion_item["data"]["_fresh_cursor_offset"], 7);
     assert_eq!(completion_item["textEdit"]["newText"], "call()\n");
     assert_eq!(completion_item["additionalTextEdits"][0]["newText"], "import package_name\n");
-    assert_eq!(completion_item["data"]["_fresh_original_data"]["completionToken"], "Alpha");
+    assert_eq!(completion_item["data"]["_fresh_original"]["data"]["completionToken"], "Alpha");
 
     let alpha_request = fs::read_to_string(&alpha_log)
         .unwrap()
@@ -243,6 +270,45 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .all(|message| message["method"] != "textDocument/completion"));
+
+    // Model accepting this item through #141 as one atomic edit containing
+    // both its primary textEdit and import additionalTextEdit. One Fresh Undo
+    // must restore the exact pre-completion buffer.
+    client
+        .send(Message::BufferRangeEdit {
+            request_id: "completion-transaction".into(),
+            buffer_id: buffer_id.clone(),
+            view_id: "lsp-test-view".into(),
+            base_rev: rev,
+            edits: vec![
+                RangeEdit { start: 0, end: 0, text: "import package_name\n".into() },
+                RangeEdit { start: 5, end: 5, text: "call()\n".into() },
+            ],
+            viewport: None,
+            selection: ByteSelection { anchor: 32, head: 32 },
+        })
+        .await
+        .unwrap();
+    let (completion_rev, completed_text, _, accepted) =
+        await_edit_result(&mut client, "completion-transaction").await;
+    assert!(accepted);
+    assert_eq!(completed_text, "import package_name\na😀call()\nb\ncallme\n");
+    client
+        .send(Message::BufferAction {
+            request_id: "undo-completion-transaction".into(),
+            buffer_id: buffer_id.clone(),
+            view_id: "lsp-test-view".into(),
+            base_rev: completion_rev,
+            action: EditorAction::Undo,
+            selection: ByteSelection { anchor: 32, head: 32 },
+        })
+        .await
+        .unwrap();
+    let (undo_rev, undone_text, _, accepted) =
+        await_edit_result(&mut client, "undo-completion-transaction").await;
+    assert!(accepted);
+    assert_eq!(undone_text, text);
+    rev = undo_rev;
 
     // UTF-8 byte offsets must land on scalar boundaries; a byte inside the
     // non-BMP character is rejected rather than rounded to an LSP position.
@@ -408,7 +474,7 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
         .await
         .expect("connect second client");
     second
-        .send(request_for_view(101, &buffer_id, "second-view", rev, 5, LspRequestFeature::Completion))
+        .send(request_for_view(101, &buffer_id, "second-view", next_rev + 1, 5, LspRequestFeature::Completion))
         .await
         .unwrap();
     let second_result = wait_lsp(&mut second, 101).await;
