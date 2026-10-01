@@ -2870,6 +2870,7 @@ impl EditorPanel {
             return;
         }
         self.auto_save_paused = false;
+        self.lsp_status = None;
         self.file_control_mode = Some(mode);
         if mode == FileControlMode::Inspect || self.file_metadata.is_none() {
             self.request_file_control(FileControlOperation::Inspect, cx);
@@ -2934,7 +2935,11 @@ impl EditorPanel {
             }
             self.dirty = dirty || local_dirty;
         }
-        if !preserve_local_state { self.lsp_status = None; }
+        // Background metadata polling must retain save failures and warnings.
+        // Explicitly opening the controls clears status in show_file_controls.
+        if !preserve_local_state && operation != Some(FileControlOperation::Inspect) {
+            self.lsp_status = None;
+        }
         if self.save_after_file_control {
             self.save_after_file_control = false;
             self.request_save(String::new(), window, cx);
@@ -4458,6 +4463,42 @@ mod project_update_tests {
             }, Some("stale inspection text".into()), false, window, cx);
             assert_eq!(panel.current_text(cx), "new local edits");
             assert!(panel.dirty, "metadata inspection must not clear a newer local draft");
+        });
+    }
+
+    #[gpui::test]
+    fn autosave_failure_survives_background_metadata_refresh(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (workspace, test_cx) = cx.add_window_view(test_workspace);
+        let (ade, _) = AdeHandle::test_channel();
+        let panel = test_cx.update(|window, cx| cx.new(|cx| EditorPanel::new(
+            "buffer".into(), "test.txt".into(), None, None, None, false, None, ade,
+            workspace.downgrade(), TabStripMetrics::default(), window, cx,
+        )));
+        panel.update_in(test_cx, |panel, window, cx| {
+            panel.set_file_controls_supported(true, window, cx);
+            panel.rev = 4;
+            panel.dirty = true;
+            panel.save_request_id = Some("autosave-1".into());
+            assert!(panel.handle_request_error("autosave-1", "disk full", cx));
+            assert!(panel.auto_save_paused);
+            let warning = panel.lsp_status.clone();
+            assert!(warning.as_deref().unwrap().contains("disk full"));
+
+            panel.file_control_request = Some("inspect-2".into());
+            panel.file_control_operation = Some(FileControlOperation::Inspect);
+            panel.apply_file_state("inspect-2", 4, BufferFileMetadata {
+                encoding: "UTF-8".into(), bom: false, line_ending: "LF".into(), read_only: false,
+                paged: false, auto_save_interval_secs: Some(5),
+            }, None, true, window, cx);
+            assert_eq!(panel.lsp_status, warning);
+            assert!(panel.auto_save_paused);
+            assert!(!panel.auto_save_is_safe());
+            assert!(panel.dirty);
+
+            panel.show_file_controls(FileControlMode::Inspect, window, cx);
+            assert!(!panel.auto_save_paused);
+            assert!(panel.lsp_status.is_none());
         });
     }
 
