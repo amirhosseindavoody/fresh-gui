@@ -13,6 +13,7 @@ mod editor_worker;
 mod fs;
 mod fs_watch;
 mod git;
+mod lsp_bridge;
 mod memory_monitor;
 mod open_external;
 mod path_open;

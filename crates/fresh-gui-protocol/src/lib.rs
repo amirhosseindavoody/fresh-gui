@@ -31,6 +31,8 @@ pub const CAP_EDITOR_DRAFT_RECOVERY: &str = "editor.draft-recovery";
 /// Revisioned external file change checks and resolution.
 pub const CAP_EDITOR_EXTERNAL_CHANGES: &str = "editor.external-changes";
 pub const CAP_LSP: &str = "lsp";
+/// Revision-aware completion, hover and signature-help requests.
+pub const CAP_LSP_REQUESTS: &str = "lsp.requests";
 pub const CAP_SCENE: &str = "scene";
 /// Workspace git status, diff, and stage/commit/pull/push. Absent on older daemons.
 pub const CAP_GIT: &str = "git";
@@ -262,6 +264,62 @@ pub struct BufferDiagnostic {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+}
+
+/// An LSP request made against a revisioned editor buffer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LspRequest {
+    pub request_id: u64,
+    pub buffer_id: String,
+    pub view_id: String,
+    pub base_rev: u64,
+    /// Byte offset in the full buffer, not a UTF-16 LSP character.
+    pub offset: usize,
+    pub feature: LspRequestFeature,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_character: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum LspRequestFeature {
+    Capabilities,
+    Completion,
+    Hover,
+    SignatureHelp,
+    CompletionResolve,
+}
+
+/// Short name used by the native editor client.
+pub type LspFeature = LspRequestFeature;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LspServerResponse {
+    pub server: String,
+    pub result: JsonValue,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LspResult {
+    pub request_id: u64,
+    pub buffer_id: String,
+    pub view_id: String,
+    pub rev: u64,
+    pub offset: usize,
+    pub feature: LspRequestFeature,
+    pub responses: Vec<LspServerResponse>,
+    #[serde(default)]
+    pub completion_triggers: Vec<String>,
+    #[serde(default)]
+    pub signature_triggers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub stale: bool,
 }
 
 /// Buffer selection positions and range edit offsets are UTF-8 byte offsets
@@ -883,6 +941,16 @@ pub enum Message {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
     },
+    /// Client → backend: issue a revision-checked LSP request.
+    BufferLspRequest { request: LspRequest },
+    /// Backend → client: asynchronous responses from eligible language servers.
+    BufferLspResult { result: LspResult },
+    /// Client → backend: cancel one outstanding LSP request.
+    BufferLspCancel {
+        request_id: u64,
+        buffer_id: String,
+        view_id: String,
+    },
     /// Client → backend: format the buffer with Fresh's formatter.
     BufferFormat {
         request_id: String,
@@ -1099,6 +1167,7 @@ impl Hello {
             CAP_EDITOR_DRAFT_RECOVERY.to_owned(),
             CAP_EDITOR_EXTERNAL_CHANGES.to_owned(),
             CAP_LSP.to_owned(),
+            CAP_LSP_REQUESTS.to_owned(),
             CAP_SCENE.to_owned(),
             CAP_GIT.to_owned(),
             CAP_SETTINGS_EDITOR.to_owned(),
@@ -1118,6 +1187,7 @@ impl Hello {
             CAP_EDITOR_DRAFT_RECOVERY.to_owned(),
             CAP_EDITOR_EXTERNAL_CHANGES.to_owned(),
             CAP_LSP.to_owned(),
+            CAP_LSP_REQUESTS.to_owned(),
             CAP_SCENE.to_owned(),
             CAP_GIT.to_owned(),
             CAP_SETTINGS_EDITOR.to_owned(),
@@ -1697,6 +1767,53 @@ mod tests {
             Message::from_json(&formatted.to_json().unwrap()).unwrap(),
             formatted
         );
+    }
+
+    #[test]
+    fn revision_aware_lsp_requests_results_and_capabilities_roundtrip() {
+        let request = Message::BufferLspRequest { request: LspRequest {
+            request_id: 19,
+            buffer_id: "42".into(),
+            view_id: "view-a".into(),
+            base_rev: 7,
+            offset: 12,
+            feature: LspRequestFeature::Capabilities,
+            trigger_character: None,
+            item: None,
+            server: None,
+        }};
+        assert_eq!(Message::from_json(&request.to_json().unwrap()).unwrap(), request);
+
+        let result = Message::BufferLspResult { result: LspResult {
+            request_id: 19,
+            buffer_id: "42".into(),
+            view_id: "view-a".into(),
+            rev: 7,
+            offset: 12,
+            feature: LspRequestFeature::Capabilities,
+            responses: Vec::new(),
+            completion_triggers: vec![".".into()],
+            signature_triggers: vec!["(".into()],
+            status: None,
+            stale: false,
+        }};
+        assert_eq!(Message::from_json(&result.to_json().unwrap()).unwrap(), result);
+
+        let cancel = Message::BufferLspCancel { request_id: 19, buffer_id: "42".into(), view_id: "view-a".into() };
+        assert_eq!(Message::from_json(&cancel.to_json().unwrap()).unwrap(), cancel);
+        assert!(Hello::default_client_caps().iter().any(|cap| cap == CAP_LSP_REQUESTS));
+
+        let legacy = r#"{"type":"buffer_lsp_request","request":{"request_id":1,"buffer_id":"b","view_id":"v","base_rev":1,"offset":0,"feature":"hover","future_field":true}}"#;
+        assert_eq!(Message::from_json(legacy).unwrap(), Message::BufferLspRequest { request: LspRequest {
+            request_id: 1, buffer_id: "b".into(), view_id: "v".into(), base_rev: 1, offset: 0,
+            feature: LspRequestFeature::Hover, trigger_character: None, item: None, server: None,
+        }});
+        let legacy_result = r#"{"type":"buffer_lsp_result","result":{"request_id":1,"buffer_id":"b","view_id":"v","rev":1,"offset":0,"feature":"capabilities","responses":[]}}"#;
+        assert_eq!(Message::from_json(legacy_result).unwrap(), Message::BufferLspResult { result: LspResult {
+            request_id: 1, buffer_id: "b".into(), view_id: "v".into(), rev: 1, offset: 0,
+            feature: LspRequestFeature::Capabilities, responses: Vec::new(), completion_triggers: Vec::new(),
+            signature_triggers: Vec::new(), status: None, stale: false,
+        }});
     }
 
     #[test]
