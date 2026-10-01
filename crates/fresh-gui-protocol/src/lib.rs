@@ -43,6 +43,8 @@ pub const CAP_LSP: &str = "lsp";
 pub const CAP_LSP_REQUESTS: &str = "lsp.requests";
 /// Definition, references, implementation, and symbol navigation requests.
 pub const CAP_LSP_NAVIGATION: &str = "lsp.navigation";
+/// Rename, code actions and previewed atomic workspace edits.
+pub const CAP_LSP_WORKSPACE_EDITS: &str = "lsp.workspace-edits";
 pub const CAP_SCENE: &str = "scene";
 /// Workspace git status, diff, and stage/commit/pull/push. Absent on older daemons.
 pub const CAP_GIT: &str = "git";
@@ -312,6 +314,11 @@ pub enum LspRequestFeature {
     References,
     DocumentSymbols,
     WorkspaceSymbols,
+    PrepareRename,
+    Rename,
+    CodeActions,
+    CodeActionResolve,
+    ExecuteCommand,
 }
 
 /// Short name used by the native editor client.
@@ -342,6 +349,30 @@ pub struct LspResult {
     pub status: Option<String>,
     #[serde(default)]
     pub stale: bool,
+}
+
+/// A daemon-owned, expiring workspace edit proposal. Applying requires its token.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceEditPreview {
+    pub token: String,
+    pub buffer_id: String,
+    pub files: Vec<WorkspaceEditFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceEditFile {
+    pub path: String,
+    pub before: String,
+    pub after: String,
+    pub buffer_id: Option<String>,
+    pub base_rev: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceBufferUpdate {
+    pub buffer_id: String,
+    pub rev: u64,
+    pub text: String,
 }
 
 /// Location returned by a navigation request. `uri` remains opaque to the
@@ -1109,6 +1140,29 @@ pub enum Message {
         text: Option<String>,
     },
     /// Client → backend: issue a revision-checked LSP request.
+    WorkspaceEditPrepare {
+        request_id: String,
+        buffer_id: String,
+        base_rev: u64,
+        edit: JsonValue,
+    },
+    WorkspaceEditPreview {
+        request_id: String,
+        preview: WorkspaceEditPreview,
+    },
+    WorkspaceEditApply {
+        request_id: String,
+        buffer_id: String,
+        token: String,
+    },
+    WorkspaceEditCancel {
+        buffer_id: String,
+        token: String,
+    },
+    WorkspaceEditApplied {
+        request_id: String,
+        updates: Vec<WorkspaceBufferUpdate>,
+    },
     BufferLspRequest {
         request: LspRequest,
     },
@@ -1342,6 +1396,7 @@ impl Hello {
             CAP_LSP.to_owned(),
             CAP_LSP_REQUESTS.to_owned(),
             CAP_LSP_NAVIGATION.to_owned(),
+            CAP_LSP_WORKSPACE_EDITS.to_owned(),
             CAP_SCENE.to_owned(),
             CAP_GIT.to_owned(),
             CAP_SETTINGS_EDITOR.to_owned(),
@@ -1365,6 +1420,7 @@ impl Hello {
             CAP_LSP.to_owned(),
             CAP_LSP_REQUESTS.to_owned(),
             CAP_LSP_NAVIGATION.to_owned(),
+            CAP_LSP_WORKSPACE_EDITS.to_owned(),
             CAP_SCENE.to_owned(),
             CAP_GIT.to_owned(),
             CAP_SETTINGS_EDITOR.to_owned(),
