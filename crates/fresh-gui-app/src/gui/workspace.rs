@@ -1683,6 +1683,7 @@ impl Workspace {
                 self.upsert_workspace(workspace);
             }
             AdeEvent::WorkspaceRootSet { workspace } => {
+                self.cancel_finder(window, cx);
                 self.project_search = None;
                 self.project_send_task = None;
                 let active = self.active_workspace_id.as_deref() == Some(workspace.id.as_str());
