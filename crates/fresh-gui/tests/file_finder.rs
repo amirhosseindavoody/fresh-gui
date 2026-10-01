@@ -86,9 +86,11 @@ async fn await_results(client: &mut Client, request_id: &str) -> (Vec<String>, b
                     truncated,
                     cancelled,
                     error,
-                } if id == request_id => {
-                    assert!(error.is_none(), "file finder failed: {error:?}");
-                    return (paths, truncated, cancelled);
+                } => {
+                    if id == request_id {
+                        assert!(error.is_none(), "file finder failed: {error:?}");
+                        return (paths, truncated, cancelled);
+                    }
                 }
                 Message::Error { code, message } if message.starts_with(request_id) => {
                     panic!("finder error {code}: {message}")
@@ -165,6 +167,24 @@ async fn finder_cancel_acknowledges_cancelled_request() {
     let _backend = spawn_backend(address, &root);
     wait_health(address);
     let mut client = connect(address).await;
+    client
+        .send(Message::FileFinder {
+            request_id: "finder-superseded".into(),
+            query: String::new(),
+        })
+        .await
+        .unwrap();
+    client
+        .send(Message::FileFinder {
+            request_id: "finder-latest".into(),
+            query: "dir-00 f000".into(),
+        })
+        .await
+        .unwrap();
+    let (latest_paths, _, latest_cancelled) = await_results(&mut client, "finder-latest").await;
+    assert!(!latest_cancelled);
+    assert_eq!(latest_paths, vec!["dir-00/file-000.rs"]);
+
     client
         .send(Message::FileFinder {
             request_id: "finder-cancel".into(),
