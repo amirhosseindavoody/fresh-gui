@@ -345,9 +345,10 @@ impl EditorPanel {
         if !self.search_can_replace(cx) {
             return;
         }
-        self.search.review = Some(SearchReview::new(
+        self.search.review = Some(SearchReview::new_at(
             self.search.result_text.clone(),
             self.search.matches.clone(),
+            self.search.current.unwrap_or(0),
         ));
         self.reveal_search_match(window, cx);
         self.editor.update(cx, |state, cx| state.focus(window, cx));
@@ -475,15 +476,15 @@ impl EditorPanel {
                 match key {
                     "y" => Some('y'),
                     "n" => Some('n'),
-                    "!" => Some('!'),
-                    "q" | "escape" => Some('q'),
+                    "!" | "a" => Some('!'),
+                    "q" | "c" | "escape" => Some('q'),
                     _ => None,
                 }
             };
             if let Some(decision) = decision {
                 self.review_decision(decision, window, cx);
-                cx.stop_propagation();
             }
+            cx.stop_propagation();
         } else if self.search.open
             && (key == "escape" || key == "enter")
             && (self

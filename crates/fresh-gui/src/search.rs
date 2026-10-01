@@ -443,7 +443,7 @@ mod tests {
                 "paged undo is not implemented by Fresh's ADE path"
             );
             let unchanged = editor
-                .read_page(opened.buffer_id.clone(), page.start, 128)
+                .read_page(opened.buffer_id.clone(), page.start, edited_page.len())
                 .await
                 .unwrap();
             assert_eq!(unchanged.text, edited_page);
