@@ -1393,12 +1393,9 @@ impl Workspace {
             if !this.goto_open {
                 return;
             }
-            match ev {
-                InputEvent::Change => {
-                    this.finder_changed(window, cx);
-                    cx.notify();
-                }
-                _ => {}
+            if matches!(ev, InputEvent::Change) {
+                this.finder_changed(window, cx);
+                cx.notify();
             }
         });
         let commit_sub = cx.subscribe(&commit_input, |this, _, ev: &InputEvent, cx| {

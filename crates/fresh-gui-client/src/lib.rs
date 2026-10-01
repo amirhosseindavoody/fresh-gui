@@ -938,5 +938,6 @@ pub mod finder;
 // Fresh; this source's unit tests and our ranked-label tests still run here.
 #[cfg(not(doctest))]
 #[doc(hidden)]
+#[allow(clippy::collapsible_if)] // Preserve the pinned upstream source style.
 #[path = "../../../vendor/fresh/crates/fresh-editor/src/input/fuzzy/mod.rs"]
 pub mod fuzzy;

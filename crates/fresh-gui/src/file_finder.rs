@@ -90,24 +90,27 @@ pub struct FinderOutput {
     pub generation: Arc<AtomicBool>,
     pub message: Message,
 }
+struct ScanGeneration {
+    id: String,
+    cancel: Arc<AtomicBool>,
+}
+
 #[derive(Default)]
 pub struct FileFinderSession {
-    current: Arc<Mutex<Option<(String, Arc<AtomicBool>)>>>,
+    current: Arc<Mutex<Option<ScanGeneration>>>,
 }
 impl FileFinderSession {
     pub fn clear(&self) {
-        if let Some((_, cancel)) = self.current.lock().expect("file finder session").take() {
-            cancel.store(true, Ordering::Relaxed);
+        if let Some(scan) = self.current.lock().expect("file finder session").take() {
+            scan.cancel.store(true, Ordering::Relaxed);
         }
     }
     pub fn cancel(&self, id: &str) {
         let mut current = self.current.lock().expect("file finder session");
-        if current
-            .as_ref()
-            .is_some_and(|(current_id, _)| current_id == id)
-            && let Some((_, cancel)) = current.take()
+        if current.as_ref().is_some_and(|scan| scan.id == id)
+            && let Some(scan) = current.take()
         {
-            cancel.store(true, Ordering::Relaxed);
+            scan.cancel.store(true, Ordering::Relaxed);
         }
     }
     pub fn is_current(&self, id: &str) -> bool {
@@ -115,12 +118,15 @@ impl FileFinderSession {
             .lock()
             .expect("file finder session")
             .as_ref()
-            .is_some_and(|(current_id, _)| current_id == id)
+            .is_some_and(|scan| scan.id == id)
     }
     pub fn start(&self, id: String, root: PathBuf, query: String, tx: mpsc::Sender<FinderOutput>) {
         self.clear();
         let cancel = Arc::new(AtomicBool::new(false));
-        *self.current.lock().expect("file finder session") = Some((id.clone(), cancel.clone()));
+        *self.current.lock().expect("file finder session") = Some(ScanGeneration {
+            id: id.clone(),
+            cancel: cancel.clone(),
+        });
         let generation = cancel.clone();
         tokio::spawn(async move {
             let worker_cancel = cancel.clone();
@@ -226,12 +232,26 @@ mod tests {
             "old".into(),
             tx.clone(),
         );
-        let old_cancel = session.current.lock().unwrap().as_ref().unwrap().1.clone();
+        let old_cancel = session
+            .current
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .cancel
+            .clone();
         session.start("new".into(), PathBuf::from("/missing"), "new".into(), tx);
         assert!(old_cancel.load(Ordering::Relaxed));
         assert!(!session.is_current("old"));
         assert!(session.is_current("new"));
-        let new_cancel = session.current.lock().unwrap().as_ref().unwrap().1.clone();
+        let new_cancel = session
+            .current
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .cancel
+            .clone();
         session.clear();
         assert!(new_cancel.load(Ordering::Relaxed));
         assert!(!session.is_current("new"));
