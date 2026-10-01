@@ -248,7 +248,7 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
     assert_eq!(completion.view_id, "lsp-test-view");
     assert_eq!(completion.rev, rev);
     assert_eq!(completion.offset, 5);
-    assert_eq!(completion.responses.len(), 1);
+    assert_eq!(completion.responses.len(), 1, "{completion:?}");
     assert_eq!(completion.responses[0].server, "Alpha");
     let completion_item = &completion.responses[0].result["items"][0];
     assert_eq!(completion_item["insertText"], "call()\n");
@@ -280,10 +280,10 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
             buffer_id: buffer_id.clone(),
             view_id: "lsp-test-view".into(),
             base_rev: rev,
-            edits: vec![
-                RangeEdit { start: 0, end: 0, text: "import package_name\n".into() },
-                RangeEdit { start: 5, end: 5, text: "call()\n".into() },
-            ],
+            // The native adapter composes both LSP edits into one spanning
+            // replacement; #141 offsets refer to the evolving transaction.
+            edits: vec![RangeEdit { start: 0, end: 5,
+                text: "import package_name\na😀call()\n".into() }],
             viewport: None,
             selection: ByteSelection { anchor: 32, head: 32 },
         })

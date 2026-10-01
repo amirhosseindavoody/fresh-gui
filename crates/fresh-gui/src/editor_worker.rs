@@ -720,8 +720,16 @@ fn run_loop(
         }
     };
 
+    // Give LspManager a daemon-owned inbox. Fresh drains its own editor/window
+    // queues during editor_tick, so sharing one would lose ADE replies between
+    // our drain and Fresh's drain. Its public runtime setter preserves the
+    // existing Authority while routing all server messages through this inbox.
+    let rt = fresh::services::runtime::LiveRuntime::new(rt);
+    let lsp_inbox = fresh::services::async_bridge::AsyncBridge::new();
+    editor.active_window_mut().lsp.set_runtime(rt.clone(), lsp_inbox.clone());
     let mut tracked: HashMap<String, TrackedBuffer> = HashMap::new();
     let mut lsp_bridge = LspBridgeState {
+        inbox: lsp_inbox,
         pending: HashMap::new(),
         request_ids: HashMap::new(),
         aggregates: HashMap::new(),
@@ -912,7 +920,7 @@ fn run_loop(
                     reply,
                 } => {
                     cancel_all_lsp_requests(&mut editor, &mut lsp_bridge);
-                    let result = format_buffer(&mut editor, &mut tracked, &buffer_id, base_rev)
+                    let result = format_buffer(&mut editor, &mut tracked, &buffer_id, base_rev, &mut lsp_bridge)
                         .await
                         .and_then(|result| {
                             if result.text.is_some() {
@@ -1077,6 +1085,7 @@ struct LspAggregate {
 }
 
 struct LspBridgeState {
+    inbox: fresh::services::async_bridge::AsyncBridge,
     pending: HashMap<u64, PendingLspRequest>,
     request_ids: HashMap<u64, Vec<u64>>,
     aggregates: HashMap<u64, LspAggregate>,
@@ -1405,7 +1414,7 @@ fn poll_lsp_bridge(
     use fresh::services::async_bridge::AsyncMessage;
     let Some(bridge) = editor.async_bridge() else { return };
     let sender = bridge.sender();
-    for message in bridge.try_recv_all() {
+    for message in bridge_state.inbox.try_recv_all() {
         match message {
             AsyncMessage::PluginLspResponse { request_id, result, language } => {
                 let Some(entry) = pending.remove(&request_id) else {
@@ -2748,6 +2757,7 @@ async fn format_buffer(
     tracked: &mut HashMap<String, TrackedBuffer>,
     buffer_id: &str,
     base_rev: u64,
+    bridge: &mut LspBridgeState,
 ) -> Result<FormatState> {
     if tracked
         .get(buffer_id)
@@ -2797,6 +2807,7 @@ async fn format_buffer(
     }
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
+        poll_lsp_bridge(editor, tracked, bridge);
         fresh::app::editor_tick(editor, || Ok(()))?;
         let after = editor
             .active_state()

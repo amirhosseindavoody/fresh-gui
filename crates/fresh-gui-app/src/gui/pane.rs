@@ -2026,7 +2026,7 @@ impl EditorPanel {
     }
 
     pub(crate) fn lsp_snapshot_matches(&self, text: &str, offset: Option<usize>, cx: &App) -> bool {
-        self.lsp_requests && self.transport_connected && !self.closed && self.page.is_none()
+        self.lsp_requests && self.transport_connected && !self.closed && self.page.is_none() && !self.markdown_preview
             && !self.conflict && !self.sync_paused && self.current_text(cx) == text
             && offset.is_none_or(|offset| self.byte_selection(cx).head == offset)
     }
