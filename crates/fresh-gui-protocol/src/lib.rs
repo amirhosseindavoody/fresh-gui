@@ -34,6 +34,8 @@ pub const MAX_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 pub const CAP_EDITOR_DRAFT_RECOVERY: &str = "editor.draft-recovery";
 /// Revisioned external file change checks and resolution.
 pub const CAP_EDITOR_EXTERNAL_CHANGES: &str = "editor.external-changes";
+/// Inspect or change encoding and line-ending state for open buffers.
+pub const CAP_EDITOR_FILE_CONTROLS: &str = "editor.file-controls";
 /// Fresh-compatible in-buffer find and replacement preview.
 pub const CAP_EDITOR_SEARCH: &str = "editor.search";
 /// Daemon workspace search and reviewed replacement.
@@ -299,7 +301,12 @@ pub struct DiagnosticRelatedInformation {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum LanguageServerAction { Status, Start, Stop, Restart }
+pub enum LanguageServerAction {
+    Status,
+    Start,
+    Stop,
+    Restart,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LanguageServerState {
@@ -1023,9 +1030,20 @@ pub enum Message {
         request_id: String,
         search: ProjectSearchRequest,
     },
-    FileFinder { request_id: String, query: String },
-    FileFinderCancel { request_id: String },
-    FileFinderResults { request_id: String, paths: Vec<String>, truncated: bool, cancelled: bool, error: Option<String> },
+    FileFinder {
+        request_id: String,
+        query: String,
+    },
+    FileFinderCancel {
+        request_id: String,
+    },
+    FileFinderResults {
+        request_id: String,
+        paths: Vec<String>,
+        truncated: bool,
+        cancelled: bool,
+        error: Option<String>,
+    },
     ProjectSearchCancel {
         request_id: String,
     },
@@ -1145,6 +1163,24 @@ pub enum Message {
         #[serde(flatten)]
         outcome: SaveOutcome,
     },
+    /// Client → backend: inspect or change a buffer's on-disk text format.
+    /// Requires `editor.file-controls`.
+    BufferFileControl {
+        request_id: String,
+        buffer_id: String,
+        base_rev: u64,
+        operation: FileControlOperation,
+    },
+    /// Backend → client: current format metadata after inspection/change/reopen.
+    BufferFileState {
+        request_id: String,
+        buffer_id: String,
+        rev: u64,
+        metadata: BufferFileMetadata,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        dirty: bool,
+    },
     /// Client → backend: inspect current disk state for an open buffer.
     /// Requires `editor.external-changes`; used after reconnect and explorer refresh.
     BufferExternalCheck {
@@ -1249,8 +1285,16 @@ pub enum Message {
         view_id: String,
     },
     /// Client → backend: format the buffer with Fresh's formatter.
-    LanguageServers { request_id: String, buffer_id: String, action: LanguageServerAction },
-    LanguageServersState { request_id: String, buffer_id: String, servers: Vec<LanguageServerState> },
+    LanguageServers {
+        request_id: String,
+        buffer_id: String,
+        action: LanguageServerAction,
+    },
+    LanguageServersState {
+        request_id: String,
+        buffer_id: String,
+        servers: Vec<LanguageServerState>,
+    },
     BufferFormat {
         request_id: String,
         buffer_id: String,
@@ -1410,6 +1454,44 @@ pub enum Message {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileControlOperation {
+    Inspect,
+    SetEncoding { encoding: String },
+    SetLineEnding { line_ending: String },
+    Reopen { encoding: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BufferFileControl {
+    pub request_id: String,
+    pub buffer_id: String,
+    pub base_rev: u64,
+    pub operation: FileControlOperation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BufferFileMetadata {
+    pub encoding: String,
+    pub bom: bool,
+    pub line_ending: String,
+    pub read_only: bool,
+    pub paged: bool,
+    pub auto_save_interval_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BufferFileState {
+    pub request_id: String,
+    pub buffer_id: String,
+    pub rev: u64,
+    pub metadata: BufferFileMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    pub dirty: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EditorDraftInfo {
     pub draft_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1468,6 +1550,7 @@ impl Hello {
             CAP_EDITOR_PAGED_READS.to_owned(),
             CAP_EDITOR_DRAFT_RECOVERY.to_owned(),
             CAP_EDITOR_EXTERNAL_CHANGES.to_owned(),
+            CAP_EDITOR_FILE_CONTROLS.to_owned(),
             CAP_EDITOR_SEARCH.to_owned(),
             CAP_PROJECT_SEARCH.to_owned(),
             CAP_FILE_FINDER.to_owned(),
@@ -1495,6 +1578,7 @@ impl Hello {
             CAP_EDITOR_PAGED_READS.to_owned(),
             CAP_EDITOR_DRAFT_RECOVERY.to_owned(),
             CAP_EDITOR_EXTERNAL_CHANGES.to_owned(),
+            CAP_EDITOR_FILE_CONTROLS.to_owned(),
             CAP_EDITOR_SEARCH.to_owned(),
             CAP_PROJECT_SEARCH.to_owned(),
             CAP_FILE_FINDER.to_owned(),
@@ -1523,6 +1607,51 @@ impl Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_control_messages_roundtrip_and_capability_is_advertised() {
+        let request = Message::BufferFileControl {
+            request_id: "format-1".into(),
+            buffer_id: "8".into(),
+            base_rev: 12,
+            operation: FileControlOperation::SetEncoding {
+                encoding: "UTF-16 LE".into(),
+            },
+        };
+        assert_eq!(
+            Message::from_json(&request.to_json().unwrap()).unwrap(),
+            request
+        );
+        let response = Message::BufferFileState {
+            request_id: "format-1".into(),
+            buffer_id: "8".into(),
+            rev: 13,
+            metadata: BufferFileMetadata {
+                encoding: "UTF-16 LE".into(),
+                bom: true,
+                line_ending: "CRLF".into(),
+                read_only: false,
+                paged: false,
+                auto_save_interval_secs: Some(30),
+            },
+            text: Some("hello\n".into()),
+            dirty: true,
+        };
+        assert_eq!(
+            Message::from_json(&response.to_json().unwrap()).unwrap(),
+            response
+        );
+        assert!(
+            Hello::default_backend_caps()
+                .iter()
+                .any(|cap| cap == CAP_EDITOR_FILE_CONTROLS)
+        );
+        assert!(
+            Hello::default_client_caps()
+                .iter()
+                .any(|cap| cap == CAP_EDITOR_FILE_CONTROLS)
+        );
+    }
 
     #[test]
     fn config_reload_and_legacy_config_updated_roundtrip() {
@@ -2104,17 +2233,50 @@ mod tests {
 
     #[test]
     fn diagnostics_controls_are_additive_and_roundtrip() {
-        let legacy = r#"{"type":"buffer_format","request_id":"format","buffer_id":"1","base_rev":2}"#;
-        assert!(matches!(Message::from_json(legacy).unwrap(), Message::BufferFormat { range: None, .. }));
-        let selection = Message::BufferFormat { request_id: "range".into(), buffer_id: "1".into(), base_rev: 2, range: Some(ByteRange { start: 3, len: 4 }) };
-        assert_eq!(Message::from_json(&selection.to_json().unwrap()).unwrap(), selection);
-        let status = Message::LanguageServersState { request_id: "servers".into(), buffer_id: "1".into(), servers: vec![LanguageServerState { name: "Ruff".into(), language: "python".into(), status: "running".into(), command: "ruff".into(), logs: vec!["ready".into()] }] };
-        assert_eq!(Message::from_json(&status.to_json().unwrap()).unwrap(), status);
+        let legacy =
+            r#"{"type":"buffer_format","request_id":"format","buffer_id":"1","base_rev":2}"#;
+        assert!(matches!(
+            Message::from_json(legacy).unwrap(),
+            Message::BufferFormat { range: None, .. }
+        ));
+        let selection = Message::BufferFormat {
+            request_id: "range".into(),
+            buffer_id: "1".into(),
+            base_rev: 2,
+            range: Some(ByteRange { start: 3, len: 4 }),
+        };
+        assert_eq!(
+            Message::from_json(&selection.to_json().unwrap()).unwrap(),
+            selection
+        );
+        let status = Message::LanguageServersState {
+            request_id: "servers".into(),
+            buffer_id: "1".into(),
+            servers: vec![LanguageServerState {
+                name: "Ruff".into(),
+                language: "python".into(),
+                status: "running".into(),
+                command: "ruff".into(),
+                logs: vec!["ready".into()],
+            }],
+        };
+        assert_eq!(
+            Message::from_json(&status.to_json().unwrap()).unwrap(),
+            status
+        );
         let old_diagnostic = serde_json::json!({"start_line":0,"start_character":0,"end_line":0,"end_character":1,"severity":"error","message":"bad"});
         let d: BufferDiagnostic = serde_json::from_value(old_diagnostic).unwrap();
         assert!(d.related_information.is_empty());
-        assert!(Hello::default_backend_caps().iter().any(|cap| cap == CAP_LSP_CONTROLS));
-        assert!(Hello::default_client_caps().iter().any(|cap| cap == CAP_LSP_CONTROLS));
+        assert!(
+            Hello::default_backend_caps()
+                .iter()
+                .any(|cap| cap == CAP_LSP_CONTROLS)
+        );
+        assert!(
+            Hello::default_client_caps()
+                .iter()
+                .any(|cap| cap == CAP_LSP_CONTROLS)
+        );
     }
 
     #[test]
@@ -2296,19 +2458,30 @@ mod tests {
         ));
     }
 
-
     #[test]
     fn search_workspace_overrides_are_optional_and_retain_explicit_false() {
         let old: WorkspaceLayoutExtra = serde_json::from_str("{}").unwrap();
         assert_eq!(old.search_options, None);
         let configured = WorkspaceLayoutExtra {
-            search_options: Some(SearchOptions { case_sensitive: false, whole_word: true, use_regex: false }),
+            search_options: Some(SearchOptions {
+                case_sensitive: false,
+                whole_word: true,
+                use_regex: false,
+            }),
             ..Default::default()
         };
         let saved = serde_json::to_value(&configured).unwrap();
         assert_eq!(saved["search_options"]["case_sensitive"], false);
-        assert_eq!(serde_json::from_value::<WorkspaceLayoutExtra>(saved).unwrap(), configured);
-        assert!(serde_json::to_value(&old).unwrap().get("search_options").is_none());
+        assert_eq!(
+            serde_json::from_value::<WorkspaceLayoutExtra>(saved).unwrap(),
+            configured
+        );
+        assert!(
+            serde_json::to_value(&old)
+                .unwrap()
+                .get("search_options")
+                .is_none()
+        );
     }
     #[test]
     fn buffer_search_roundtrips_and_search_cap_is_additive() {
@@ -2324,7 +2497,10 @@ mod tests {
             },
             scope: Some(ByteRange { start: 3, len: 3 }),
         };
-        assert_eq!(Message::from_json(&request.to_json().unwrap()).unwrap(), request);
+        assert_eq!(
+            Message::from_json(&request.to_json().unwrap()).unwrap(),
+            request
+        );
         let response = Message::BufferSearchResult {
             request_id: "search-1".into(),
             matches: vec![SearchMatch {
@@ -2335,7 +2511,10 @@ mod tests {
             error: None,
             capped: false,
         };
-        assert_eq!(Message::from_json(&response.to_json().unwrap()).unwrap(), response);
+        assert_eq!(
+            Message::from_json(&response.to_json().unwrap()).unwrap(),
+            response
+        );
 
         let old = Hello::client("old", Vec::new());
         assert!(!old.capabilities.contains(&CAP_EDITOR_SEARCH.to_owned()));
@@ -2349,24 +2528,65 @@ mod workspace_edit_protocol_tests {
 
     #[test]
     fn workspace_edit_capability_and_preview_tokens_roundtrip() {
-        assert!(Hello::client("test", Hello::default_client_caps()).capabilities.iter().any(|cap| cap == CAP_LSP_WORKSPACE_EDITS));
+        assert!(
+            Hello::client("test", Hello::default_client_caps())
+                .capabilities
+                .iter()
+                .any(|cap| cap == CAP_LSP_WORKSPACE_EDITS)
+        );
         let preview = WorkspaceEditPreview {
-            token: "opaque-token".into(), buffer_id: "7".into(),
-            files: vec![WorkspaceEditFile { path: "/project/new.rs".into(), operation: "create".into(),
-                before: String::new(), after: String::new(), buffer_id: None, base_rev: None }],
+            token: "opaque-token".into(),
+            buffer_id: "7".into(),
+            files: vec![WorkspaceEditFile {
+                path: "/project/new.rs".into(),
+                operation: "create".into(),
+                before: String::new(),
+                after: String::new(),
+                buffer_id: None,
+                base_rev: None,
+            }],
         };
         let messages = [
-            Message::WorkspaceEditPreview { request_id: "preview-1".into(), preview },
-            Message::WorkspaceEditApply { request_id: "apply-1".into(), buffer_id: "7".into(), token: "opaque-token".into() },
-            Message::WorkspaceEditCancel { buffer_id: "7".into(), token: "opaque-token".into() },
-            Message::WorkspaceEditApplied { request_id: "apply-1".into(), updates: vec![WorkspaceBufferUpdate { buffer_id: "7".into(), rev: 9, text: "new".into() }] },
+            Message::WorkspaceEditPreview {
+                request_id: "preview-1".into(),
+                preview,
+            },
+            Message::WorkspaceEditApply {
+                request_id: "apply-1".into(),
+                buffer_id: "7".into(),
+                token: "opaque-token".into(),
+            },
+            Message::WorkspaceEditCancel {
+                buffer_id: "7".into(),
+                token: "opaque-token".into(),
+            },
+            Message::WorkspaceEditApplied {
+                request_id: "apply-1".into(),
+                updates: vec![WorkspaceBufferUpdate {
+                    buffer_id: "7".into(),
+                    rev: 9,
+                    text: "new".into(),
+                }],
+            },
         ];
         for message in messages {
-            assert_eq!(Message::from_json(&message.to_json().unwrap()).unwrap(), message);
+            assert_eq!(
+                Message::from_json(&message.to_json().unwrap()).unwrap(),
+                message
+            );
         }
-        for feature in [LspRequestFeature::PrepareRename, LspRequestFeature::Rename, LspRequestFeature::CodeActions, LspRequestFeature::CodeActionResolve, LspRequestFeature::ExecuteCommand] {
+        for feature in [
+            LspRequestFeature::PrepareRename,
+            LspRequestFeature::Rename,
+            LspRequestFeature::CodeActions,
+            LspRequestFeature::CodeActionResolve,
+            LspRequestFeature::ExecuteCommand,
+        ] {
             let encoded = serde_json::to_string(&feature).unwrap();
-            assert_eq!(serde_json::from_str::<LspRequestFeature>(&encoded).unwrap(), feature);
+            assert_eq!(
+                serde_json::from_str::<LspRequestFeature>(&encoded).unwrap(),
+                feature
+            );
         }
     }
 }

@@ -14,6 +14,12 @@ pub struct Draft {
     pub text: String,
     /// Original bytes as text when opened; used to flag changes at restore.
     pub base_text: Option<String>,
+    /// Encoding selected when this dirty draft was checkpointed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    /// Line ending selected when this dirty draft was checkpointed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_ending: Option<String>,
     /// Ordered revisioned edits for a lazily loaded source. The source is
     /// identified by a content generation and replayed only when it matches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -220,18 +226,32 @@ impl DraftStore {
         let entries = match std::fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error).context("inspect recovery records before workspace edit"),
+            Err(error) => {
+                return Err(error).context("inspect recovery records before workspace edit");
+            }
         };
         let mut paths = Vec::new();
         for entry in entries {
             let path = entry?.path();
-            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
             if name.ends_with(".json.bak") {
-                if path.with_extension("").exists() { continue; }
-            } else if !name.ends_with(".json") { continue; }
+                if path.with_extension("").exists() {
+                    continue;
+                }
+            } else if !name.ends_with(".json") {
+                continue;
+            }
             let state: DraftFile = serde_json::from_slice(&std::fs::read(&path)?)
                 .with_context(|| format!("inspect recovery record {}", path.display()))?;
-            paths.extend(state.drafts.into_iter().filter_map(|draft| draft.path.map(PathBuf::from)));
+            paths.extend(
+                state
+                    .drafts
+                    .into_iter()
+                    .filter_map(|draft| draft.path.map(PathBuf::from)),
+            );
         }
         Ok(paths)
     }
@@ -258,9 +278,19 @@ impl DraftStore {
                 .is_none_or(|current| current.signature != paged.generation);
         }
         match (&draft.path, &draft.base_text) {
-            (Some(path), Some(base)) => std::fs::read_to_string(Path::new(path))
-                .map(|current| current != *base)
-                .unwrap_or(true),
+            (Some(path), Some(base)) => {
+                let Some(current) = crate::editor_worker::disk_generation(Path::new(path))
+                    .ok()
+                    .and_then(|generation| generation.text)
+                else {
+                    return true;
+                };
+                let normalized_base =
+                    fresh::model::buffer::format::normalize_line_endings(base.as_bytes().to_vec());
+                String::from_utf8(normalized_base)
+                    .map(|base| current != base)
+                    .unwrap_or(true)
+            }
             _ => false,
         }
     }
@@ -275,13 +305,29 @@ mod tests {
         let root = std::env::temp_dir().join(format!("draft-protection-{}", uuid::Uuid::new_v4()));
         let store = DraftStore::new(root.clone());
         let path = root.join("source.txt");
-        store.checkpoint("detached", Draft { draft_id: "dirty".into(), path: Some(path.display().to_string()), text: "draft".into(), base_text: Some("base".into()), paged: None }).unwrap();
+        store
+            .checkpoint(
+                "detached",
+                Draft {
+                    draft_id: "dirty".into(),
+                    path: Some(path.display().to_string()),
+                    text: "draft".into(),
+                    base_text: Some("base".into()),
+                    encoding: None,
+                    line_ending: None,
+                    paged: None,
+                },
+            )
+            .unwrap();
         assert_eq!(store.protected_paths().unwrap(), vec![path.clone()]);
         let record = store.path("detached");
         std::fs::rename(&record, record.with_extension("json.bak")).unwrap();
         assert_eq!(store.protected_paths().unwrap(), vec![path]);
         std::fs::write(&record, b"broken").unwrap();
-        assert!(store.protected_paths().is_err(), "unreadable recovery records block destructive workspace edits");
+        assert!(
+            store.protected_paths().is_err(),
+            "unreadable recovery records block destructive workspace edits"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -294,6 +340,8 @@ mod tests {
             path: None,
             text: "draft".into(),
             base_text: None,
+            encoding: None,
+            line_ending: None,
             paged: None,
         };
         store.checkpoint("workspace-a", draft.clone()).unwrap();
@@ -317,6 +365,8 @@ mod tests {
             path: Some(source.display().to_string()),
             text: "draft".into(),
             base_text: Some("original".into()),
+            encoding: None,
+            line_ending: None,
             paged: None,
         };
         assert!(DraftStore::source_changed(&draft));
@@ -334,6 +384,8 @@ mod tests {
             path: None,
             text: "durable old copy".into(),
             base_text: None,
+            encoding: None,
+            line_ending: None,
             paged: None,
         };
         store.checkpoint("workspace", draft.clone()).unwrap();
@@ -353,6 +405,8 @@ mod tests {
             path: None,
             text: "ordinary recovery".into(),
             base_text: None,
+            encoding: None,
+            line_ending: None,
             paged: None,
         };
         let paged = Draft {
@@ -360,6 +414,8 @@ mod tests {
             path: Some("/tmp/large.txt".into()),
             text: String::new(),
             base_text: None,
+            encoding: None,
+            line_ending: None,
             paged: Some(PagedDraft {
                 generation: "source-generation".into(),
                 edits: vec![PagedEditTransaction {
@@ -405,6 +461,8 @@ mod tests {
             path: Some("/tmp/large.txt".into()),
             text: String::new(),
             base_text: None,
+            encoding: None,
+            line_ending: None,
             paged: Some(PagedDraft {
                 generation: "g".into(),
                 edits: vec![],
@@ -416,6 +474,8 @@ mod tests {
             path: None,
             text: "ordinary".into(),
             base_text: None,
+            encoding: None,
+            line_ending: None,
             paged: None,
         };
         store.checkpoint("workspace", ordinary.clone()).unwrap();

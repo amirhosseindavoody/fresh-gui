@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use fresh::app::Editor;
 use fresh::config::Config;
 use fresh::config_io::DirectoryContext;
+use fresh::model::buffer::{Encoding, LineEnding};
 use fresh::model::event::{BufferId, Event};
 use fresh::model::filesystem::{FileSystem, StdFileSystem};
 use fresh::input::keybindings::Action as FreshAction;
@@ -24,15 +25,15 @@ use fresh_gui_protocol::{
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
-mod workspace_edits;
-mod language_servers;
-#[cfg(test)]
-mod workspace_edit_tests;
 #[cfg(test)]
 #[path = "editor_worker/formatting_tests.rs"]
 mod formatting_tests;
-pub(crate) use workspace_edits::WorkspaceNotice;
+mod language_servers;
+#[cfg(test)]
+mod workspace_edit_tests;
+mod workspace_edits;
 use workspace_edits::WorkspaceEdits;
+pub(crate) use workspace_edits::WorkspaceNotice;
 
 const MAX_PAGE_BYTES: usize = 64 * 1024;
 const MAX_PAGED_RECOVERY_BYTES: usize = 4 * 1024 * 1024;
@@ -103,6 +104,8 @@ struct TrackedBuffer {
     overwrite_generation: Option<String>,
     paged_generation: Option<String>,
     paged_journal: Vec<crate::drafts::PagedEditTransaction>,
+    encoding: String,
+    line_ending: String,
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +161,13 @@ pub(crate) struct DiskGeneration {
 }
 
 pub(crate) fn disk_generation(path: &Path) -> Result<DiskGeneration> {
+    disk_generation_with_encoding(path, None)
+}
+
+fn disk_generation_with_encoding(
+    path: &Path,
+    override_encoding: Option<Encoding>,
+) -> Result<DiskGeneration> {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -183,10 +193,18 @@ pub(crate) fn disk_generation(path: &Path) -> Result<DiskGeneration> {
         if bytes.len() > MAX_SNAPSHOT_BYTES {
             bail!("external file exceeds snapshot limit: {}", path.display());
         }
-        let text = String::from_utf8(bytes.clone())
-            .with_context(|| format!("external file is not UTF-8 text: {}", path.display()))?;
+        let (encoding, binary) = override_encoding
+            .map(|encoding| (encoding, false))
+            .unwrap_or_else(|| fresh::model::encoding::detect_encoding_or_binary(&bytes, false));
+        let text = if binary {
+            None
+        } else {
+            let decoded = fresh::model::encoding::convert_to_utf8(&bytes, encoding);
+            let normalized = fresh::model::buffer::format::normalize_line_endings(decoded);
+            String::from_utf8(normalized).ok()
+        };
         Some(bytes).hash(&mut hasher);
-        Some(text)
+        text
     } else {
         None
     };
@@ -208,6 +226,13 @@ pub(crate) fn disk_generation(path: &Path) -> Result<DiskGeneration> {
         signature: format!("{len}:{modified}:{identity}:{:016x}", hasher.finish()),
         text,
     })
+}
+
+fn normalize_text_line_endings(text: &str) -> String {
+    String::from_utf8(fresh::model::buffer::format::normalize_line_endings(
+        text.as_bytes().to_vec(),
+    ))
+    .expect("normalizing UTF-8 preserves UTF-8")
 }
 
 enum Cmd {
@@ -285,6 +310,10 @@ enum Cmd {
         on_save_actions: bool,
         reply: oneshot::Sender<Result<SavedBuffer>>,
     },
+    FileControl {
+        request: fresh_gui_protocol::BufferFileControl,
+        reply: oneshot::Sender<Result<fresh_gui_protocol::BufferFileState>>,
+    },
     Close {
         buffer_id: String,
         workspace_id: String,
@@ -345,14 +374,23 @@ enum Cmd {
     WorkspaceAuthority(crate::fs::FsRoot),
     WorkspaceCancelOwner(String),
     WorkspacePrepare {
-        buffer_id: String, base_rev: u64, owner: String, edit: serde_json::Value,
+        buffer_id: String,
+        base_rev: u64,
+        owner: String,
+        edit: serde_json::Value,
         reply: oneshot::Sender<Result<fresh_gui_protocol::WorkspaceEditPreview>>,
     },
     WorkspaceApply {
-        buffer_id: String, owner: String, token: String,
+        buffer_id: String,
+        owner: String,
+        token: String,
         reply: oneshot::Sender<Result<Vec<fresh_gui_protocol::WorkspaceBufferUpdate>>>,
     },
-    WorkspaceCancel { buffer_id: String, owner: String, token: String },
+    WorkspaceCancel {
+        buffer_id: String,
+        owner: String,
+        token: String,
+    },
     LspRequest {
         request: LspRequest,
     },
@@ -390,20 +428,61 @@ impl EditorHandle {
         let _ = self.tx.send(Cmd::WorkspaceCancelOwner(owner.to_owned()));
     }
 
-    pub(crate) fn subscribe_workspace_edits(&self) -> tokio::sync::broadcast::Receiver<WorkspaceNotice> { self.workspace_tx.subscribe() }
+    pub(crate) fn subscribe_workspace_edits(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<WorkspaceNotice> {
+        self.workspace_tx.subscribe()
+    }
 
-    pub(crate) async fn prepare_workspace_edit(&self, buffer_id: String, base_rev: u64, owner: String, edit: serde_json::Value) -> Result<fresh_gui_protocol::WorkspaceEditPreview> {
+    pub(crate) async fn prepare_workspace_edit(
+        &self,
+        buffer_id: String,
+        base_rev: u64,
+        owner: String,
+        edit: serde_json::Value,
+    ) -> Result<fresh_gui_protocol::WorkspaceEditPreview> {
         let (reply, receive) = oneshot::channel();
-        self.tx.send(Cmd::WorkspacePrepare { buffer_id, base_rev, owner, edit, reply }).map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        self.tx
+            .send(Cmd::WorkspacePrepare {
+                buffer_id,
+                base_rev,
+                owner,
+                edit,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
         receive.await.context("editor worker stopped")?
     }
-    pub(crate) async fn apply_workspace_edit(&self, buffer_id: String, owner: String, token: String) -> Result<Vec<fresh_gui_protocol::WorkspaceBufferUpdate>> {
+    pub(crate) async fn apply_workspace_edit(
+        &self,
+        buffer_id: String,
+        owner: String,
+        token: String,
+    ) -> Result<Vec<fresh_gui_protocol::WorkspaceBufferUpdate>> {
         let (reply, receive) = oneshot::channel();
-        self.tx.send(Cmd::WorkspaceApply { buffer_id, owner, token, reply }).map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        self.tx
+            .send(Cmd::WorkspaceApply {
+                buffer_id,
+                owner,
+                token,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
         receive.await.context("editor worker stopped")?
     }
-    pub(crate) fn cancel_workspace_edit(&self, buffer_id: String, owner: String, token: String) -> Result<()> {
-        self.tx.send(Cmd::WorkspaceCancel { buffer_id, owner, token }).map_err(|_| anyhow::anyhow!("editor worker stopped"))
+    pub(crate) fn cancel_workspace_edit(
+        &self,
+        buffer_id: String,
+        owner: String,
+        token: String,
+    ) -> Result<()> {
+        self.tx
+            .send(Cmd::WorkspaceCancel {
+                buffer_id,
+                owner,
+                token,
+            })
+            .map_err(|_| anyhow::anyhow!("editor worker stopped"))
     }
 
     pub fn subscribe_lsp(&self) -> tokio::sync::broadcast::Receiver<LspResult> {
@@ -785,12 +864,18 @@ impl EditorHandle {
         base_rev: u64,
         path: Option<PathBuf>,
     ) -> Result<(String, u64)> {
-        let saved = self.save_with_actions(buffer_id, base_rev, path, true).await?;
+        let saved = self
+            .save_with_actions(buffer_id, base_rev, path, true)
+            .await?;
         Ok((saved.path, saved.rev))
     }
 
     pub async fn save_with_actions(
-        &self, buffer_id: String, base_rev: u64, path: Option<PathBuf>, on_save_actions: bool,
+        &self,
+        buffer_id: String,
+        base_rev: u64,
+        path: Option<PathBuf>,
+        on_save_actions: bool,
     ) -> Result<SavedBuffer> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -799,6 +884,22 @@ impl EditorHandle {
                 base_rev,
                 path,
                 on_save_actions,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+    }
+
+    pub async fn file_control(
+        &self,
+        request: fresh_gui_protocol::BufferFileControl,
+    ) -> Result<fresh_gui_protocol::BufferFileState> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::FileControl {
+                request,
                 reply: reply_tx,
             })
             .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
@@ -856,9 +957,14 @@ impl EditorHandle {
     ) -> Result<Vec<fresh_gui_protocol::LanguageServerState>> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Cmd::LanguageServers { buffer_id, action, reply })
+            .send(Cmd::LanguageServers {
+                buffer_id,
+                action,
+                reply,
+            })
             .map_err(|_| anyhow::anyhow!("editor worker stopped"))?;
-        rx.await.map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("editor worker dropped reply"))?
     }
 
     pub async fn format(&self, buffer_id: String, base_rev: u64) -> Result<FormatState> {
@@ -961,7 +1067,9 @@ fn run_loop(
         request_ids: HashMap::new(),
         aggregates: HashMap::new(),
         results: lsp_tx,
-        edits: WorkspaceEdits::with_authority(crate::fs::FsRoot::new(editor.working_dir().to_path_buf()).ok()),
+        edits: WorkspaceEdits::with_authority(
+            crate::fs::FsRoot::new(editor.working_dir().to_path_buf()).ok(),
+        ),
         drafts: drafts.clone(),
         workspace_tx,
         language_logs: HashMap::new(),
@@ -980,7 +1088,19 @@ fn run_loop(
                 _ = ticks.tick() => {
                     poll_lsp_bridge(&mut editor, &mut tracked, &mut lsp_bridge);
                     cancel_stale_lsp_requests(&mut editor, &tracked, &mut lsp_bridge);
-                    if let Err(err) = fresh::app::editor_tick(&mut editor, || Ok(())) {
+                    // Fresh's regular GUI/TUI tick performs disk auto-save
+                    // internally. ADE routes auto-save through its serialized,
+                    // revision-checked save command so drafts and on-save actions
+                    // share the same authoritative pipeline.
+                    let auto_save_enabled = editor.config().editor.auto_save_enabled;
+                    if auto_save_enabled {
+                        editor.config_mut().editor.auto_save_enabled = false;
+                    }
+                    let tick_result = fresh::app::editor_tick(&mut editor, || Ok(()));
+                    if auto_save_enabled {
+                        editor.config_mut().editor.auto_save_enabled = true;
+                    }
+                    if let Err(err) = tick_result {
                         warn!(%err, "Fresh editor tick failed");
                     }
                     continue;
@@ -1167,6 +1287,19 @@ fn run_loop(
                         let entry = tracked.get(&buffer_id).expect("saved buffer");
                         if entry.dirty { checkpoint(&drafts, &tracked, &buffer_id)?; } else { drafts.discard(&entry.workspace_id, &entry.draft_id)?; }
                         Ok(saved)
+                    });
+                    let _ = reply.send(result);
+                }
+                Cmd::FileControl { request, reply } => {
+                    let buffer_id = request.buffer_id.clone();
+                    let result = file_control(&mut editor, &mut tracked, request).and_then(|state| {
+                        let entry = tracked.get(&buffer_id).context("controlled buffer disappeared")?;
+                        if entry.dirty {
+                            checkpoint(&drafts, &tracked, &buffer_id)?;
+                        } else {
+                            drafts.discard(&entry.workspace_id, &entry.draft_id)?;
+                        }
+                        Ok(state)
                     });
                     let _ = reply.send(result);
                 }
@@ -1578,9 +1711,18 @@ fn begin_lsp_request(
     bridge: &mut LspBridgeState,
 ) {
     let mut request = request;
-    if let Some(item) = request.item.as_mut().and_then(serde_json::Value::as_object_mut) {
-        if request.server.is_none() { request.server = item.remove("_fresh_gui_server").and_then(|v| v.as_str().map(str::to_owned)); }
-        else { item.remove("_fresh_gui_server"); }
+    if let Some(item) = request
+        .item
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        if request.server.is_none() {
+            request.server = item
+                .remove("_fresh_gui_server")
+                .and_then(|v| v.as_str().map(str::to_owned));
+        } else {
+            item.remove("_fresh_gui_server");
+        }
     }
     if request.view_id.is_empty() {
         send_lsp_status(&bridge.results, &request, "view_id cannot be empty", false);
@@ -1614,8 +1756,13 @@ fn begin_lsp_request(
             bridge,
         );
     }
-    if matches!(request.feature, LspRequestFeature::Rename | LspRequestFeature::CodeActions | LspRequestFeature::CodeActionResolve)
-        && let Some((owner, _)) = request.view_id.split_once(':') {
+    if matches!(
+        request.feature,
+        LspRequestFeature::Rename
+            | LspRequestFeature::CodeActions
+            | LspRequestFeature::CodeActionResolve
+    ) && let Some((owner, _)) = request.view_id.split_once(':')
+    {
         bridge.edits.cancel_source_owner(&request.buffer_id, owner);
     }
     let LspBridgeState {
@@ -1711,10 +1858,16 @@ fn begin_lsp_request(
         .into_iter()
         .filter(|server| {
             (uri.is_some() || request.feature == LspRequestFeature::WorkspaceSymbols)
-                && (!matches!(request.feature, LspRequestFeature::Rename | LspRequestFeature::CodeActionResolve | LspRequestFeature::ExecuteCommand)
-                    || request.server.as_deref() == Some(server.name.as_str()))
-                && (request.feature != LspRequestFeature::CodeActionResolve || server.capabilities.code_action_resolve)
-                && (request.feature != LspRequestFeature::PrepareRename || server.capabilities.rename)
+                && (!matches!(
+                    request.feature,
+                    LspRequestFeature::Rename
+                        | LspRequestFeature::CodeActionResolve
+                        | LspRequestFeature::ExecuteCommand
+                ) || request.server.as_deref() == Some(server.name.as_str()))
+                && (request.feature != LspRequestFeature::CodeActionResolve
+                    || server.capabilities.code_action_resolve)
+                && (request.feature != LspRequestFeature::PrepareRename
+                    || server.capabilities.rename)
                 && (request.feature != LspRequestFeature::CompletionResolve
                     || (server.name == request.server.as_deref().unwrap_or("")
                         && server.capabilities.completion_resolve))
@@ -1726,7 +1879,14 @@ fn begin_lsp_request(
             (server.name.clone(), triggers)
         })
         .collect::<Vec<_>>();
-    if matches!(request.feature, LspRequestFeature::SignatureHelp | LspRequestFeature::PrepareRename | LspRequestFeature::Rename) { eligible.truncate(1); }
+    if matches!(
+        request.feature,
+        LspRequestFeature::SignatureHelp
+            | LspRequestFeature::PrepareRename
+            | LspRequestFeature::Rename
+    ) {
+        eligible.truncate(1);
+    }
     if eligible.is_empty() {
         let response = if request.feature == LspRequestFeature::Completion {
             buffer_word_completions(&entry.text, request.offset)
@@ -1770,7 +1930,11 @@ fn begin_lsp_request(
         .map(|_| editor.active_window_mut().alloc_lsp_request_id())
         .collect::<Vec<_>>();
     let mut sent = Vec::new();
-    let diagnostics = uri.as_ref().and_then(|uri| editor.get_stored_diagnostics().get(uri)).cloned().unwrap_or_default();
+    let diagnostics = uri
+        .as_ref()
+        .and_then(|uri| editor.get_stored_diagnostics().get(uri))
+        .cloned()
+        .unwrap_or_default();
     let manager = &mut editor.active_window_mut().lsp;
     for ((server_name, _), lsp_id) in eligible.into_iter().zip(request_ids_to_send) {
         let Some(server) = manager
@@ -1781,10 +1945,27 @@ fn begin_lsp_request(
             continue;
         };
         let method = crate::lsp_bridge::method(request.feature).to_owned();
-        let params = if matches!(request.feature, LspRequestFeature::PrepareRename | LspRequestFeature::Rename | LspRequestFeature::CodeActions | LspRequestFeature::CodeActionResolve | LspRequestFeature::ExecuteCommand) {
-            match refactoring_params(&entry.text, uri.as_deref().unwrap_or(""), line, character, &request, &diagnostics) {
+        let params = if matches!(
+            request.feature,
+            LspRequestFeature::PrepareRename
+                | LspRequestFeature::Rename
+                | LspRequestFeature::CodeActions
+                | LspRequestFeature::CodeActionResolve
+                | LspRequestFeature::ExecuteCommand
+        ) {
+            match refactoring_params(
+                &entry.text,
+                uri.as_deref().unwrap_or(""),
+                line,
+                character,
+                &request,
+                &diagnostics,
+            ) {
                 Ok(params) => Some(params),
-                Err(error) => { send_lsp_status(results, &request, &error.to_string(), false); continue; }
+                Err(error) => {
+                    send_lsp_status(results, &request, &error.to_string(), false);
+                    continue;
+                }
             }
         } else if request.feature == LspRequestFeature::CompletionResolve {
             request
@@ -1856,27 +2037,62 @@ fn begin_lsp_request(
                 signature_triggers,
                 deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(5),
                 status: None,
-                revisions: tracked.iter().map(|(id, entry)| (id.clone(), entry.rev)).collect(),
+                revisions: tracked
+                    .iter()
+                    .map(|(id, entry)| (id.clone(), entry.rev))
+                    .collect(),
             },
         );
     }
 }
 
-fn refactoring_params(text: &str, uri: &str, line: u32, character: u32, request: &LspRequest, diagnostics: &[lsp_types::Diagnostic]) -> Result<serde_json::Value> {
+fn refactoring_params(
+    text: &str,
+    uri: &str,
+    line: u32,
+    character: u32,
+    request: &LspRequest,
+    diagnostics: &[lsp_types::Diagnostic],
+) -> Result<serde_json::Value> {
     use serde_json::json;
-    let mut params = json!({"textDocument":{"uri":uri},"position":{"line":line,"character":character}});
+    let mut params =
+        json!({"textDocument":{"uri":uri},"position":{"line":line,"character":character}});
     match request.feature {
-        LspRequestFeature::PrepareRename => {},
+        LspRequestFeature::PrepareRename => {}
         LspRequestFeature::Rename => {
-            let name = request.item.as_ref().and_then(|v| v.get("newName")).and_then(serde_json::Value::as_str).context("rename requires newName")?;
-            anyhow::ensure!(!name.is_empty() && name.len() <= 1024 && !name.contains(['\n', '\r']), "invalid rename name");
+            let name = request
+                .item
+                .as_ref()
+                .and_then(|v| v.get("newName"))
+                .and_then(serde_json::Value::as_str)
+                .context("rename requires newName")?;
+            anyhow::ensure!(
+                !name.is_empty() && name.len() <= 1024 && !name.contains(['\n', '\r']),
+                "invalid rename name"
+            );
             params["newName"] = json!(name);
         }
         LspRequestFeature::CodeActions => {
-            let start = request.item.as_ref().and_then(|v| v.get("startOffset")).and_then(serde_json::Value::as_u64).unwrap_or(request.offset as u64);
-            let end = request.item.as_ref().and_then(|v| v.get("endOffset")).and_then(serde_json::Value::as_u64).unwrap_or(request.offset as u64);
+            let start = request
+                .item
+                .as_ref()
+                .and_then(|v| v.get("startOffset"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(request.offset as u64);
+            let end = request
+                .item
+                .as_ref()
+                .and_then(|v| v.get("endOffset"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(request.offset as u64);
             let (start, end) = (usize::try_from(start)?, usize::try_from(end)?);
-            anyhow::ensure!(start <= end && end <= text.len() && text.is_char_boundary(start) && text.is_char_boundary(end), "code action range is invalid");
+            anyhow::ensure!(
+                start <= end
+                    && end <= text.len()
+                    && text.is_char_boundary(start)
+                    && text.is_char_boundary(end),
+                "code action range is invalid"
+            );
             let at = |offset| {
                 let prefix = &text[..offset];
                 json!({"line":prefix.bytes().filter(|b| *b == b'\n').count() as u32,
@@ -1885,12 +2101,22 @@ fn refactoring_params(text: &str, uri: &str, line: u32, character: u32, request:
             params = json!({"textDocument":{"uri":uri},"range":{"start":at(start),"end":at(end)},"context":{"diagnostics":diagnostics}});
         }
         LspRequestFeature::CodeActionResolve => {
-            params = request.item.clone().context("code action resolve requires an action")?;
-            let _: lsp_types::CodeAction = serde_json::from_value(params.clone()).context("invalid code action")?;
+            params = request
+                .item
+                .clone()
+                .context("code action resolve requires an action")?;
+            let _: lsp_types::CodeAction =
+                serde_json::from_value(params.clone()).context("invalid code action")?;
         }
         LspRequestFeature::ExecuteCommand => {
-            let item = request.item.as_ref().context("executeCommand requires a command")?;
-            let command = item.get("command").and_then(serde_json::Value::as_str).context("invalid command identifier")?;
+            let item = request
+                .item
+                .as_ref()
+                .context("executeCommand requires a command")?;
+            let command = item
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .context("invalid command identifier")?;
             let arguments = item.get("arguments").cloned().unwrap_or_else(|| json!([]));
             anyhow::ensure!(arguments.is_array(), "command arguments must be an array");
             params = json!({"command":command,"arguments":arguments});
@@ -1928,7 +2154,9 @@ fn lsp_route_feature(feature: LspRequestFeature) -> LspFeature {
         LspRequestFeature::DocumentSymbols => LspFeature::DocumentSymbols,
         LspRequestFeature::WorkspaceSymbols => LspFeature::WorkspaceSymbols,
         LspRequestFeature::PrepareRename | LspRequestFeature::Rename => LspFeature::Rename,
-        LspRequestFeature::CodeActions | LspRequestFeature::CodeActionResolve | LspRequestFeature::ExecuteCommand => LspFeature::CodeAction,
+        LspRequestFeature::CodeActions
+        | LspRequestFeature::CodeActionResolve
+        | LspRequestFeature::ExecuteCommand => LspFeature::CodeAction,
     }
 }
 
@@ -2079,34 +2307,66 @@ fn poll_lsp_bridge(
         match message {
             message @ AsyncMessage::LspFormatting { .. } => {
                 let (request_id, uri) = match &message {
-                    AsyncMessage::LspFormatting { request_id, uri, .. } => (*request_id, uri),
+                    AsyncMessage::LspFormatting {
+                        request_id, uri, ..
+                    } => (*request_id, uri),
                     _ => unreachable!(),
                 };
                 // Fresh's dispatcher applies formatting without a revision guard.
                 // Only the currently awaited ADE request can mutate the buffer;
                 // timed-out or superseded responses must never reach it.
                 let valid = bridge_state.formatting.as_ref().is_some_and(|request| {
-                    request.request_id == request_id && request.uri == *uri
-                        && tracked.get(&request.buffer_id).is_some_and(|buffer| buffer.rev == request.rev)
-                        && request.buffer_id.parse::<usize>().ok().and_then(|id| editor.active_window().buffers.get(&BufferId(id))).and_then(|state| state.buffer.to_string()).as_deref() == Some(request.text.as_str())
+                    request.request_id == request_id
+                        && request.uri == *uri
+                        && tracked
+                            .get(&request.buffer_id)
+                            .is_some_and(|buffer| buffer.rev == request.rev)
+                        && request
+                            .buffer_id
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|id| editor.active_window().buffers.get(&BufferId(id)))
+                            .and_then(|state| state.buffer.to_string())
+                            .as_deref()
+                            == Some(request.text.as_str())
                 });
                 if valid {
                     bridge_state.formatting = None;
                     let _ = sender.send(message);
                 }
             }
-            message @ (AsyncMessage::LspLogMessage { .. } | AsyncMessage::LspWindowMessage { .. }) => {
+            message @ (AsyncMessage::LspLogMessage { .. }
+            | AsyncMessage::LspWindowMessage { .. }) => {
                 let (language, message_type, body) = match &message {
-                    AsyncMessage::LspLogMessage { language, message_type, message } | AsyncMessage::LspWindowMessage { language, message_type, message } => (language, message_type, message),
+                    AsyncMessage::LspLogMessage {
+                        language,
+                        message_type,
+                        message,
+                    }
+                    | AsyncMessage::LspWindowMessage {
+                        language,
+                        message_type,
+                        message,
+                    } => (language, message_type, message),
                     _ => unreachable!(),
                 };
-                let workspaces = tracked.values().map(|entry| &entry.workspace_id).collect::<std::collections::HashSet<_>>();
+                let workspaces = tracked
+                    .values()
+                    .map(|entry| &entry.workspace_id)
+                    .collect::<std::collections::HashSet<_>>();
                 if workspaces.len() == 1 {
                     let workspace = (*workspaces.iter().next().expect("one workspace")).clone();
-                    let ring = bridge_state.language_logs.entry((workspace, language.clone())).or_default();
+                    let ring = bridge_state
+                        .language_logs
+                        .entry((workspace, language.clone()))
+                        .or_default();
                     let body = body.chars().take(2048).collect::<String>();
-                    ring.push_back(format!("Language log (server identity unavailable) {message_type:?}: {body}"));
-                    while ring.len() > 100 { ring.pop_front(); }
+                    ring.push_back(format!(
+                        "Language log (server identity unavailable) {message_type:?}: {body}"
+                    ));
+                    while ring.len() > 100 {
+                        ring.pop_front();
+                    }
                 }
                 let _ = sender.send(message);
             }
@@ -2153,30 +2413,78 @@ fn poll_lsp_bridge(
                             Ok(mut value) => {
                                 if entry.request.feature == LspRequestFeature::CodeActions {
                                     for action in value.as_array_mut().into_iter().flatten() {
-                                        if action.get("disabled").is_some() { continue; }
-                                        let Some(edit) = action.get("edit").filter(|edit| edit.is_object()).cloned() else { continue; };
-                                        if let Err(error) = bridge_state.edits.offer(editor, tracked, &bridge_state.drafts,
-                                            &entry.request.buffer_id, entry.request.base_rev,
-                                            entry.request.view_id.split_once(':').map(|(owner, _)| owner.to_owned()), edit,
-                                            Some(&entry.server), &aggregate.revisions) {
+                                        if action.get("disabled").is_some() {
+                                            continue;
+                                        }
+                                        let Some(edit) = action
+                                            .get("edit")
+                                            .filter(|edit| edit.is_object())
+                                            .cloned()
+                                        else {
+                                            continue;
+                                        };
+                                        if let Err(error) = bridge_state.edits.offer(
+                                            editor,
+                                            tracked,
+                                            &bridge_state.drafts,
+                                            &entry.request.buffer_id,
+                                            entry.request.base_rev,
+                                            entry
+                                                .request
+                                                .view_id
+                                                .split_once(':')
+                                                .map(|(owner, _)| owner.to_owned()),
+                                            edit,
+                                            Some(&entry.server),
+                                            &aggregate.revisions,
+                                        ) {
                                             action["disabled"] = serde_json::json!({"reason":format!("Workspace edit rejected: {error:#}")});
                                         }
                                     }
                                 }
-                                for edit in workspace_edits::response_edits(entry.request.feature, &value).into_iter().filter(|_| entry.request.feature != LspRequestFeature::CodeActions) {
-                                    if let Err(error) = bridge_state.edits.offer(editor, tracked, &bridge_state.drafts,
-                                        &entry.request.buffer_id, entry.request.base_rev,
-                                        entry.request.view_id.split_once(':').map(|(owner, _)| owner.to_owned()), edit,
-                                        Some(&entry.server), &aggregate.revisions) {
-                                        aggregate.status.get_or_insert(format!("workspace edit rejected: {error:#}"));
+                                for edit in
+                                    workspace_edits::response_edits(entry.request.feature, &value)
+                                        .into_iter()
+                                        .filter(|_| {
+                                            entry.request.feature != LspRequestFeature::CodeActions
+                                        })
+                                {
+                                    if let Err(error) = bridge_state.edits.offer(
+                                        editor,
+                                        tracked,
+                                        &bridge_state.drafts,
+                                        &entry.request.buffer_id,
+                                        entry.request.base_rev,
+                                        entry
+                                            .request
+                                            .view_id
+                                            .split_once(':')
+                                            .map(|(owner, _)| owner.to_owned()),
+                                        edit,
+                                        Some(&entry.server),
+                                        &aggregate.revisions,
+                                    ) {
+                                        aggregate.status.get_or_insert(format!(
+                                            "workspace edit rejected: {error:#}"
+                                        ));
                                     }
                                 }
-                                aggregate.responses.push(crate::lsp_bridge::one_response(entry.server, value));
-                            },
-                            Err(error) if entry.request.feature == LspRequestFeature::PrepareRename &&
-                                (error.to_ascii_lowercase().contains("method not found") || error.contains("-32601")) => {
+                                aggregate
+                                    .responses
+                                    .push(crate::lsp_bridge::one_response(entry.server, value));
+                            }
+                            Err(error)
+                                if entry.request.feature == LspRequestFeature::PrepareRename
+                                    && (error
+                                        .to_ascii_lowercase()
+                                        .contains("method not found")
+                                        || error.contains("-32601")) =>
+                            {
                                 // prepareRename is optional even when renameProvider is true.
-                                aggregate.responses.push(crate::lsp_bridge::one_response(entry.server, serde_json::json!({"defaultBehavior":true})));
+                                aggregate.responses.push(crate::lsp_bridge::one_response(
+                                    entry.server,
+                                    serde_json::json!({"defaultBehavior":true}),
+                                ));
                             }
                             Err(error) => {
                                 aggregate.status.get_or_insert(error);
@@ -2200,11 +2508,25 @@ fn poll_lsp_bridge(
                 );
             }
             AsyncMessage::LspApplyEdit { edit, label: _ } => {
-                let commands = pending.values().filter(|p| p.request.feature == LspRequestFeature::ExecuteCommand).cloned().collect::<Vec<_>>();
+                let commands = pending
+                    .values()
+                    .filter(|p| p.request.feature == LspRequestFeature::ExecuteCommand)
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let command = (commands.len() == 1).then(|| &commands[0]);
                 let touched = workspace_edits::touched_open_buffers(&edit, tracked);
-                let touched_workspaces = touched.as_ref().ok().into_iter().flatten().filter_map(|id| tracked.get(id)).map(|e| &e.workspace_id).collect::<std::collections::HashSet<_>>();
-                let all_workspaces = tracked.values().map(|e| &e.workspace_id).collect::<std::collections::HashSet<_>>();
+                let touched_workspaces = touched
+                    .as_ref()
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|id| tracked.get(id))
+                    .map(|e| &e.workspace_id)
+                    .collect::<std::collections::HashSet<_>>();
+                let all_workspaces = tracked
+                    .values()
+                    .map(|e| &e.workspace_id)
+                    .collect::<std::collections::HashSet<_>>();
                 let source = if touched.is_err() || touched_workspaces.len() > 1 {
                     None
                 } else if let Some(command) = command {
@@ -2213,19 +2535,46 @@ fn poll_lsp_bridge(
                     tracked.get(id).map(|entry| (id.clone(), entry.rev))
                 } else if all_workspaces.len() == 1 {
                     let active = editor.active_buffer().0.to_string();
-                    tracked.get_key_value(&active).or_else(|| tracked.iter().min_by_key(|(id, _)| *id)).map(|(id, e)| (id.clone(), e.rev))
-                } else { None };
+                    tracked
+                        .get_key_value(&active)
+                        .or_else(|| tracked.iter().min_by_key(|(id, _)| *id))
+                        .map(|(id, e)| (id.clone(), e.rev))
+                } else {
+                    None
+                };
                 if let Some((source, rev)) = source {
                     if let Some(entry) = tracked.get(&source) {
                         let workspace_id = entry.workspace_id.clone();
-                        let revisions = command.and_then(|c| aggregates.get(&c.request.request_id)).map(|a| a.revisions.clone())
-                            .unwrap_or_else(|| tracked.iter().map(|(id, e)| (id.clone(), e.rev)).collect());
-                        let result = serde_json::to_value(edit).context("encode server workspace edit").and_then(|edit|
-                            bridge_state.edits.offer(editor, tracked, &bridge_state.drafts, &source, rev, None, edit,
-                                command.map(|c| c.server.as_str()), &revisions));
+                        let revisions = command
+                            .and_then(|c| aggregates.get(&c.request.request_id))
+                            .map(|a| a.revisions.clone())
+                            .unwrap_or_else(|| {
+                                tracked.iter().map(|(id, e)| (id.clone(), e.rev)).collect()
+                            });
+                        let result = serde_json::to_value(edit)
+                            .context("encode server workspace edit")
+                            .and_then(|edit| {
+                                bridge_state.edits.offer(
+                                    editor,
+                                    tracked,
+                                    &bridge_state.drafts,
+                                    &source,
+                                    rev,
+                                    None,
+                                    edit,
+                                    command.map(|c| c.server.as_str()),
+                                    &revisions,
+                                )
+                            });
                         let notice = match result {
-                            Ok(preview) => WorkspaceNotice::Preview { workspace_id, preview },
-                            Err(error) => WorkspaceNotice::Rejected { workspace_id, message: format!("Server workspace edit rejected: {error:#}") },
+                            Ok(preview) => WorkspaceNotice::Preview {
+                                workspace_id,
+                                preview,
+                            },
+                            Err(error) => WorkspaceNotice::Rejected {
+                                workspace_id,
+                                message: format!("Server workspace edit rejected: {error:#}"),
+                            },
                         };
                         let _ = bridge_state.workspace_tx.send(notice);
                     }
@@ -2557,6 +2906,18 @@ fn open_buffer(
             external,
             overwrite_generation,
             paged_generation,
+            encoding: editor
+                .active_state()
+                .buffer
+                .encoding()
+                .display_name()
+                .to_owned(),
+            line_ending: editor
+                .active_state()
+                .buffer
+                .line_ending()
+                .display_name()
+                .to_owned(),
             paged_journal: previous
                 .map(|entry| entry.paged_journal)
                 .unwrap_or_default(),
@@ -2596,6 +2957,8 @@ fn checkpoint(
                 .map(|path| path.display().to_string()),
             text: entry.text.clone(),
             base_text: entry.base_text.clone(),
+            encoding: Some(entry.encoding.clone()),
+            line_ending: Some(entry.line_ending.clone()),
             paged: entry
                 .paged_generation
                 .clone()
@@ -2658,6 +3021,23 @@ fn restore_draft(
         } else {
             create_untitled(editor, tracked, workspace_id)?
         };
+    activate_tracked(editor, tracked, &opened.buffer_id)?;
+    if let Some(encoding) = draft.encoding.as_deref() {
+        let encoding = parse_encoding(encoding)?;
+        let current = editor.active_state().buffer.encoding();
+        if current != encoding {
+            editor.active_state_mut().buffer.set_encoding(encoding);
+        }
+    }
+    if let Some(line_ending) = draft.line_ending.as_deref() {
+        let line_ending = parse_line_ending(line_ending)?;
+        if editor.active_state().buffer.line_ending() != line_ending {
+            editor
+                .active_state_mut()
+                .buffer
+                .set_line_ending(line_ending);
+        }
+    }
     if let Some(paged) = draft.paged.as_ref() {
         let source = draft
             .path
@@ -2731,6 +3111,12 @@ fn restore_draft(
     entry.recovery_path = recovery_path.clone();
     entry.dirty = true;
     entry.text = draft.text.clone();
+    if let Some(encoding) = draft.encoding.as_deref() {
+        entry.encoding = parse_encoding(encoding)?.display_name().to_owned();
+    }
+    if let Some(line_ending) = draft.line_ending.as_deref() {
+        entry.line_ending = parse_line_ending(line_ending)?.display_name().to_owned();
+    }
     if source_changed {
         if let Some(path) = recovery_path.as_deref() {
             let disk = disk_generation(path)?;
@@ -4035,12 +4421,21 @@ fn lsp_state(
                 Some(lsp_types::DiagnosticSeverity::WARNING) => "warning",
                 Some(lsp_types::DiagnosticSeverity::HINT) => "hint",
                 _ => "info",
-            }.into(),
+            }
+            .into(),
             message: d.message,
             source: d.source,
-            related_information: d.related_information.unwrap_or_default().into_iter().map(|info| fresh_gui_protocol::DiagnosticRelatedInformation {
-                uri: info.location.uri.to_string(), line: info.location.range.start.line, character: info.location.range.start.character, message: info.message,
-            }).collect(),
+            related_information: d
+                .related_information
+                .unwrap_or_default()
+                .into_iter()
+                .map(|info| fresh_gui_protocol::DiagnosticRelatedInformation {
+                    uri: info.location.uri.to_string(),
+                    line: info.location.range.start.line,
+                    character: info.location.range.start.character,
+                    message: info.message,
+                })
+                .collect(),
         })
         .collect();
     let rev = tracked[buffer_id].rev;
@@ -4093,12 +4488,32 @@ async fn format_buffer(
     }
     activate_tracked(editor, tracked, buffer_id)?;
     let language = tracked[buffer_id].language.as_deref().unwrap_or("");
-    let has_external = editor.config().languages.get(language).is_some_and(|language| language.formatter.is_some());
+    let has_external = editor
+        .config()
+        .languages
+        .get(language)
+        .is_some_and(|language| language.formatter.is_some());
     if !has_external {
-        let formatter = editor.config().lsp.get(language).and_then(|servers| servers.as_slice().iter().find(|server| server.enabled && server.feature_filter().allows(LspFeature::Format)))
+        let formatter = editor
+            .config()
+            .lsp
+            .get(language)
+            .and_then(|servers| {
+                servers.as_slice().iter().find(|server| {
+                    server.enabled && server.feature_filter().allows(LspFeature::Format)
+                })
+            })
             .context("no formatting server or external formatter configured for this file")?;
-        if !editor.config().lsp_enabled { bail!("Language servers are disabled in settings"); }
-        if !fresh::services::lsp::command_exists(&formatter.command) { bail!("LSP {}: command '{}' not found on daemon host; install it or change lsp settings", formatter.display_name(), formatter.command); }
+        if !editor.config().lsp_enabled {
+            bail!("Language servers are disabled in settings");
+        }
+        if !fresh::services::lsp::command_exists(&formatter.command) {
+            bail!(
+                "LSP {}: command '{}' not found on daemon host; install it or change lsp settings",
+                formatter.display_name(),
+                formatter.command
+            );
+        }
     }
     let before = editor
         .active_state()
@@ -4108,16 +4523,33 @@ async fn format_buffer(
     let prior_status = editor.get_status_message().cloned();
     let prior_selection = current_selection(editor);
     if let Some(range) = range {
-        let end = range.start.checked_add(range.len).context("format range overflow")?;
+        let end = range
+            .start
+            .checked_add(range.len)
+            .context("format range overflow")?;
         if end > before.len()
             || !before.is_char_boundary(range.start)
             || !before.is_char_boundary(end)
         {
             bail!("format range is outside the buffer or not on UTF-8 boundaries");
         }
-        set_selection(editor, ByteSelection { anchor: range.start, head: end });
+        set_selection(
+            editor,
+            ByteSelection {
+                anchor: range.start,
+                head: end,
+            },
+        );
     }
-    if range.is_none() { set_selection(editor, ByteSelection { anchor: prior_selection.head, head: prior_selection.head }); }
+    if range.is_none() {
+        set_selection(
+            editor,
+            ByteSelection {
+                anchor: prior_selection.head,
+                head: prior_selection.head,
+            },
+        );
+    }
     let before_request = editor.active_window().next_lsp_request_id;
     let format_result = editor.format_buffer();
     set_selection(editor, prior_selection);
@@ -4126,8 +4558,17 @@ async fn format_buffer(
     if requested_lsp {
         bridge.formatting = Some(PendingFormatting {
             request_id: editor.active_window().next_lsp_request_id,
-            uri: fresh::services::lsp::manager::path_to_uri(tracked[buffer_id].path.as_deref().context("formatting needs a saved path")?).context("invalid formatting file URI")?.to_string(),
-            buffer_id: buffer_id.to_owned(), rev: current, text: before.clone(),
+            uri: fresh::services::lsp::manager::path_to_uri(
+                tracked[buffer_id]
+                    .path
+                    .as_deref()
+                    .context("formatting needs a saved path")?,
+            )
+            .context("invalid formatting file URI")?
+            .to_string(),
+            buffer_id: buffer_id.to_owned(),
+            rev: current,
+            text: before.clone(),
         });
     }
     if let Some(status) = editor.get_status_message()
@@ -4158,7 +4599,11 @@ async fn format_buffer(
             });
         }
         if !requested_lsp || bridge.formatting.is_none() {
-            return Ok(FormatState { rev: current, text: None, status: Some("No formatting changes".into()) });
+            return Ok(FormatState {
+                rev: current,
+                text: None,
+                status: Some("No formatting changes".into()),
+            });
         }
         if tokio::time::Instant::now() >= deadline {
             bridge.formatting = None;
@@ -4198,6 +4643,18 @@ fn create_untitled(
             external: None,
             overwrite_generation: None,
             paged_generation: None,
+            encoding: editor
+                .active_state()
+                .buffer
+                .encoding()
+                .display_name()
+                .to_owned(),
+            line_ending: editor
+                .active_state()
+                .buffer
+                .line_ending()
+                .display_name()
+                .to_owned(),
             paged_journal: Vec::new(),
         },
     );
@@ -4489,6 +4946,12 @@ fn save_buffer(
         bail!("revision conflict: base_rev={base_rev} current={current}");
     }
     activate_tracked(editor, tracked, buffer_id)?;
+    preflight_active_encoding(
+        editor,
+        tracked
+            .get(buffer_id)
+            .is_some_and(|entry| entry.total_bytes.is_some()),
+    )?;
     let explicit_destination = dest.is_some();
     let had_fresh_path = tracked
         .get(buffer_id)
@@ -4498,6 +4961,32 @@ fn save_buffer(
             .get(buffer_id)
             .and_then(|entry| entry.path.clone().or_else(|| entry.recovery_path.clone()))
     });
+    if let Some(target) = save_path.as_deref() {
+        if path_is_read_only(target) {
+            bail!("destination is read-only; choose a writable Save As path");
+        }
+        let buffer_key = BufferId(buffer_id.parse().context("invalid buffer_id")?);
+        let fresh_read_only = editor
+            .active_window()
+            .buffer_metadata
+            .get(&buffer_key)
+            .is_some_and(|metadata| metadata.read_only)
+            || editor.active_window().is_editing_disabled();
+        let same_source = tracked
+            .get(buffer_id)
+            .and_then(|entry| entry.path.as_deref())
+            .is_some_and(|source| {
+                source
+                    .canonicalize()
+                    .unwrap_or_else(|_| source.to_path_buf())
+                    == target
+                        .canonicalize()
+                        .unwrap_or_else(|_| target.to_path_buf())
+            });
+        if fresh_read_only && same_source {
+            bail!("buffer is read-only; choose a writable Save As path");
+        }
+    }
     if let Some(entry) = tracked
         .get(buffer_id)
         .filter(|entry| entry.total_bytes.is_some())
@@ -4586,12 +5075,60 @@ fn save_buffer(
     // Reuse Fresh's configured format-on-save and on-save actions after its
     // normal save has passed ADE's external-change checks. Fresh persists any
     // formatter output itself and refreshes its watched-file metadata.
-    let status = if on_save_actions && tracked.get(buffer_id).is_some_and(|entry| entry.total_bytes.is_none()) {
-        match editor.run_on_save_actions() {
-            Ok(_) => editor.get_status_message().filter(|message| message.starts_with("Formatter ")).cloned(),
-            Err(error) => Some(format!("File written, but Fresh on-save actions failed: {error}")),
+    let status = if on_save_actions
+        && tracked
+            .get(buffer_id)
+            .is_some_and(|entry| entry.total_bytes.is_none())
+    {
+        let encoding = editor.active_state().buffer.encoding();
+        let language = editor.active_buffer_mode().map(str::to_owned);
+        let skip_formatter = !encoding_supports_all_unicode(encoding)
+            && language
+                .as_ref()
+                .and_then(|language| editor.config().languages.get(language))
+                .is_some_and(|config| config.format_on_save);
+        if skip_formatter {
+            let language_name = language.as_deref().expect("formatter language exists");
+            editor
+                .config_mut()
+                .languages
+                .get_mut(language_name)
+                .expect("checked formatter config")
+                .format_on_save = false;
         }
-    } else { None };
+        let action_result = editor.run_on_save_actions();
+        if skip_formatter {
+            let language_name = language.as_deref().expect("formatter language exists");
+            editor
+                .config_mut()
+                .languages
+                .get_mut(language_name)
+                .expect("checked formatter config")
+                .format_on_save = true;
+            Some(match action_result {
+                Ok(_) => format!(
+                    "Fresh formatter was skipped to preserve lossless {} output; other on-save actions ran",
+                    encoding.display_name()
+                ),
+                Err(error) => format!(
+                    "Fresh formatter was skipped to preserve lossless {} output; other on-save actions failed: {error}",
+                    encoding.display_name()
+                ),
+            })
+        } else {
+            match action_result {
+                Ok(_) => editor
+                    .get_status_message()
+                    .filter(|message| message.starts_with("Formatter "))
+                    .cloned(),
+                Err(error) => Some(format!(
+                    "File written, but Fresh on-save actions failed: {error}"
+                )),
+            }
+        }
+    } else {
+        None
+    };
     let total_bytes = editor.active_state().buffer.total_bytes();
     let was_paged = tracked
         .get(buffer_id)
@@ -4605,8 +5142,9 @@ fn save_buffer(
     let entry = tracked.get_mut(buffer_id).expect("tracked");
     entry.text = text;
     entry.total_bytes = paged.then_some(total_bytes);
-    entry.disk = Some(disk_generation(
+    entry.disk = Some(disk_generation_with_encoding(
         entry.path.as_deref().context("saved buffer path")?,
+        Some(editor.active_state().buffer.encoding()),
     )?);
     entry.paged_generation = entry
         .total_bytes
@@ -4615,19 +5153,397 @@ fn save_buffer(
     entry.external = None;
     entry.overwrite_generation = None;
     entry.base_text = entry.disk.as_ref().and_then(|disk| disk.text.clone());
-    entry.dirty = !paged && entry.base_text.as_deref() != Some(entry.text.as_str());
+    entry.dirty = editor.active_state().buffer.is_modified()
+        || (!paged
+            && entry.base_text.as_deref().is_some_and(|base| {
+                normalize_text_line_endings(base) != normalize_text_line_endings(&entry.text)
+            }));
     // Acknowledge the actual generation even if a later on-save action failed.
     entry.rev += 1;
     Ok(SavedBuffer {
-        path: entry.path.as_ref().expect("saved buffer has a path").display().to_string(),
+        path: entry
+            .path
+            .as_ref()
+            .expect("saved buffer has a path")
+            .display()
+            .to_string(),
         rev: entry.rev,
-        outcome: fresh_gui_protocol::SaveOutcome { text: (!paged && on_save_actions).then(|| entry.text.clone()), status, dirty: entry.dirty },
+        outcome: fresh_gui_protocol::SaveOutcome {
+            text: (!paged && on_save_actions).then(|| entry.text.clone()),
+            status,
+            dirty: entry.dirty,
+        },
+    })
+}
+
+fn parse_encoding(value: &str) -> Result<Encoding> {
+    Encoding::all()
+        .iter()
+        .copied()
+        .find(|encoding| encoding.display_name().eq_ignore_ascii_case(value.trim()))
+        .ok_or_else(|| anyhow::anyhow!("unsupported encoding: {value}"))
+}
+
+fn parse_line_ending(value: &str) -> Result<LineEnding> {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "LF" => Ok(LineEnding::LF),
+        "CRLF" => Ok(LineEnding::CRLF),
+        "CR" => Ok(LineEnding::CR),
+        _ => bail!("unsupported line ending: {value}"),
+    }
+}
+
+fn path_is_read_only(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().readonly())
+}
+
+fn strict_encode_check(text: &str, encoding: Encoding) -> Result<()> {
+    if encoding == Encoding::Ascii && !text.is_ascii() {
+        bail!(
+            "text contains characters that cannot be represented as ASCII; choose UTF-8 or another encoding"
+        );
+    }
+    let encoded = fresh::model::encoding::convert_from_utf8(text.as_bytes(), encoding);
+    let decoded = fresh::model::encoding::convert_to_utf8(&encoded, encoding);
+    if decoded != text.as_bytes() {
+        bail!(
+            "text cannot be represented losslessly as {}; choose another encoding",
+            encoding.display_name()
+        );
+    }
+    Ok(())
+}
+
+fn encoding_supports_all_unicode(encoding: Encoding) -> bool {
+    matches!(
+        encoding,
+        Encoding::Utf8 | Encoding::Utf8Bom | Encoding::Utf16Le | Encoding::Utf16Be
+    )
+}
+
+fn preflight_active_encoding(editor: &Editor, paged: bool) -> Result<()> {
+    let buffer = &editor.active_state().buffer;
+    let encoding = buffer.encoding();
+    if paged {
+        if let Some(text) = buffer.to_string() {
+            return strict_encode_check(&text, encoding);
+        }
+        if matches!(encoding, Encoding::Utf8 | Encoding::Ascii) {
+            // Fresh's only genuinely lazy input encodings are UTF-8 and
+            // ASCII. Their unchanged backing pieces are copied verbatim, and
+            // those encodings do not replace Unicode on write.
+            return Ok(());
+        }
+        bail!(
+            "lossless encoding validation is unavailable for paged buffers; reopen as UTF-8 or save a copy"
+        );
+    }
+    let text = buffer
+        .to_string()
+        .context("buffer text unavailable for encoding validation")?;
+    strict_encode_check(&text, encoding)
+}
+
+fn file_control(
+    editor: &mut Editor,
+    tracked: &mut HashMap<String, TrackedBuffer>,
+    request: fresh_gui_protocol::BufferFileControl,
+) -> Result<fresh_gui_protocol::BufferFileState> {
+    use fresh_gui_protocol::{BufferFileMetadata, BufferFileState, FileControlOperation};
+    let buffer_id = request.buffer_id.as_str();
+    let _ = sync_fresh_text(editor, tracked, buffer_id)?;
+    let entry = tracked
+        .get(buffer_id)
+        .with_context(|| format!("unknown buffer_id {buffer_id}"))?;
+    if entry.rev != request.base_rev {
+        bail!(
+            "revision conflict: base_rev={} current={}",
+            request.base_rev,
+            entry.rev
+        );
+    }
+    activate_tracked(editor, tracked, buffer_id)?;
+    let buffer_key = BufferId(buffer_id.parse().context("invalid buffer_id")?);
+    let source_path = tracked
+        .get(buffer_id)
+        .and_then(|entry| entry.path.as_deref());
+    let metadata_read_only = editor
+        .active_window()
+        .buffer_metadata
+        .get(&buffer_key)
+        .is_some_and(|metadata| metadata.read_only)
+        || editor.active_window().is_editing_disabled()
+        || source_path.is_some_and(path_is_read_only);
+    let paged = tracked
+        .get(buffer_id)
+        .is_some_and(|entry| entry.total_bytes.is_some());
+    let mut text = None;
+    let is_inspect = matches!(&request.operation, FileControlOperation::Inspect);
+    let is_reopen = matches!(&request.operation, FileControlOperation::Reopen { .. });
+    match request.operation {
+        FileControlOperation::Inspect => {}
+        FileControlOperation::SetEncoding { encoding } => {
+            if paged {
+                bail!("encoding changes are unavailable for paged buffers");
+            }
+            if metadata_read_only {
+                bail!("buffer is read-only; encoding cannot be changed");
+            }
+            let encoding = parse_encoding(&encoding)?;
+            let current_text = editor
+                .active_state()
+                .buffer
+                .to_string()
+                .context("buffer text unavailable")?;
+            strict_encode_check(&current_text, encoding)?;
+            editor.active_state_mut().buffer.set_encoding(encoding);
+            tracked.get_mut(buffer_id).expect("tracked").encoding =
+                encoding.display_name().to_owned();
+        }
+        FileControlOperation::SetLineEnding { line_ending } => {
+            if paged {
+                bail!("line-ending changes are unavailable for paged buffers");
+            }
+            if metadata_read_only {
+                bail!("buffer is read-only; line endings cannot be changed");
+            }
+            let line_ending = parse_line_ending(&line_ending)?;
+            editor
+                .active_state_mut()
+                .buffer
+                .set_line_ending(line_ending);
+            tracked.get_mut(buffer_id).expect("tracked").line_ending =
+                line_ending.display_name().to_owned();
+            preflight_active_encoding(editor, false)?;
+        }
+        FileControlOperation::Reopen { encoding } => {
+            if paged {
+                bail!("reopen with encoding is unavailable for paged buffers");
+            }
+            if editor.active_state().buffer.is_modified()
+                || tracked.get(buffer_id).is_some_and(|entry| entry.dirty)
+            {
+                bail!("cannot reopen with encoding while the buffer has unsaved changes");
+            }
+            let path = tracked
+                .get(buffer_id)
+                .and_then(|entry| entry.path.clone())
+                .context("scratch buffers cannot be reopened with an encoding")?;
+            let known = tracked
+                .get(buffer_id)
+                .and_then(|entry| entry.disk.as_ref())
+                .map(|disk| disk.signature.clone());
+            let disk = disk_generation(&path)?;
+            if known.as_deref() != Some(disk.signature.as_str()) {
+                bail!("file changed on disk; resolve the external change before reopening");
+            }
+            let encoding = parse_encoding(&encoding)?;
+            editor.reload_with_encoding(encoding)?;
+            let current = editor
+                .active_state()
+                .buffer
+                .to_string()
+                .context("reopened buffer text unavailable")?;
+            let line_ending = editor
+                .active_state()
+                .buffer
+                .line_ending()
+                .display_name()
+                .to_owned();
+            let entry = tracked.get_mut(buffer_id).expect("validated tracked entry");
+            entry.text = current;
+            entry.base_text = Some(entry.text.clone());
+            entry.disk = Some(disk);
+            entry.dirty = false;
+            entry.encoding = encoding.display_name().to_owned();
+            entry.line_ending = line_ending;
+            entry.rev = entry.rev.wrapping_add(1);
+            text = Some(entry.text.clone());
+        }
+    }
+    let buffer = &editor.active_state().buffer;
+    let entry = tracked.get_mut(buffer_id).expect("tracked buffer");
+    entry.dirty = buffer.is_modified();
+    if !paged && text.is_none() {
+        entry.text = buffer.to_string().context("buffer text unavailable")?;
+        text = Some(entry.text.clone());
+    }
+    if !is_inspect && !is_reopen {
+        entry.rev = entry.rev.wrapping_add(1);
+    }
+    let encoding = buffer.encoding();
+    let line_ending = buffer.line_ending();
+    let autosave = editor
+        .config()
+        .editor
+        .auto_save_enabled
+        .then_some(editor.config().editor.auto_save_interval_secs as u64);
+    Ok(BufferFileState {
+        request_id: request.request_id,
+        buffer_id: buffer_id.to_owned(),
+        rev: entry.rev,
+        metadata: BufferFileMetadata {
+            encoding: encoding.display_name().to_owned(),
+            bom: encoding.has_bom(),
+            line_ending: line_ending.display_name().to_owned(),
+            read_only: metadata_read_only,
+            paged,
+            auto_save_interval_secs: autosave,
+        },
+        text,
+        dirty: entry.dirty,
     })
 }
 
 #[cfg(test)]
 mod external_generation_tests {
     use super::*;
+
+    #[test]
+    fn disk_generation_decodes_bom_encodings_and_normalizes_endings() {
+        let root =
+            std::env::temp_dir().join(format!("fresh-encoded-generation-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("utf16.txt");
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in "first\r\nsecond\r\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(&path, bytes).unwrap();
+        let generation = disk_generation(&path).unwrap();
+        assert_eq!(generation.text.as_deref(), Some("first\nsecond\n"));
+        let be = root.join("utf16be.txt");
+        let mut bytes = vec![0xFE, 0xFF];
+        for unit in "first\r\nsecond\r\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        std::fs::write(&be, bytes).unwrap();
+        assert_eq!(
+            disk_generation(&be).unwrap().text.as_deref(),
+            Some("first\nsecond\n")
+        );
+        let cp1251 = root.join("cp1251.txt");
+        let encoded = fresh::model::encoding::convert_from_utf8(
+            "Привет\r\n".as_bytes(),
+            Encoding::Windows1251,
+        );
+        std::fs::write(&cp1251, encoded).unwrap();
+        assert_eq!(
+            disk_generation(&cp1251).unwrap().text.as_deref(),
+            Some("Привет\n")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn encoding_preflight_rejects_lossy_and_ascii_saves() {
+        assert!(strict_encode_check("café", Encoding::Latin1).is_ok());
+        assert!(strict_encode_check("λ", Encoding::Latin1).is_err());
+        assert!(strict_encode_check("é", Encoding::Ascii).is_err());
+        assert!(encoding_supports_all_unicode(Encoding::Utf16Le));
+        assert!(!encoding_supports_all_unicode(Encoding::Windows1252));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_write_permission_bits_are_reported_read_only_even_for_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("fresh-readonly-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("locked.txt");
+        std::fs::write(&path, "locked").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(path_is_read_only(&path));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reopen_encoding_rejects_dirty_and_stale_sources() {
+        let root =
+            std::env::temp_dir().join(format!("fresh-reopen-encoding-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("source.txt");
+        std::fs::write(&path, "source").unwrap();
+        let editor = EditorHandle::spawn(root.clone(), crate::config::Config::default()).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let opened = editor.open(path.clone(), false).await.unwrap();
+            let changed = editor
+                .file_control(fresh_gui_protocol::BufferFileControl {
+                    request_id: "encoding-dirty".into(),
+                    buffer_id: opened.buffer_id.clone(),
+                    base_rev: opened.rev,
+                    operation: fresh_gui_protocol::FileControlOperation::SetEncoding {
+                        encoding: "Latin-1".into(),
+                    },
+                })
+                .await
+                .unwrap();
+            let dirty_reopen = editor
+                .file_control(fresh_gui_protocol::BufferFileControl {
+                    request_id: "dirty-reopen".into(),
+                    buffer_id: opened.buffer_id.clone(),
+                    base_rev: changed.rev,
+                    operation: fresh_gui_protocol::FileControlOperation::Reopen {
+                        encoding: "UTF-8".into(),
+                    },
+                })
+                .await
+                .unwrap_err();
+            assert!(dirty_reopen.to_string().contains("unsaved changes"));
+            let saved = editor
+                .save(opened.buffer_id.clone(), changed.rev, None)
+                .await
+                .unwrap();
+            std::fs::write(&path, "external").unwrap();
+            let stale_reopen = editor
+                .file_control(fresh_gui_protocol::BufferFileControl {
+                    request_id: "stale-reopen".into(),
+                    buffer_id: opened.buffer_id.clone(),
+                    base_rev: saved.1,
+                    operation: fresh_gui_protocol::FileControlOperation::Reopen {
+                        encoding: "UTF-8".into(),
+                    },
+                })
+                .await
+                .unwrap_err();
+            assert!(stale_reopen.to_string().contains("changed on disk"));
+        });
+        drop(editor);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn worker_ticks_do_not_bypass_revisioned_autosave() {
+        let root =
+            std::env::temp_dir().join(format!("fresh-autosave-policy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("source.txt");
+        std::fs::write(&path, "disk").unwrap();
+        let config = crate::config::Config::parse(
+            r#"{"editor":{"auto_save_enabled":true,"auto_save_interval_secs":1}}"#,
+        )
+        .unwrap();
+        let editor = EditorHandle::spawn(root.clone(), config).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let opened = editor.open(path.clone(), false).await.unwrap();
+            editor
+                .edit(opened.buffer_id, opened.rev, "draft".into())
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(1250)).await;
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "disk");
+        });
+        drop(editor);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn disk_generation_detects_atomic_replace_delete_and_recreate() {
@@ -4711,6 +5627,31 @@ mod paged_file_tests {
             let opened = editor.open(path.clone(), false).await.unwrap();
             assert!(opened.text.is_empty());
             assert_eq!(opened.total_bytes, Some(3 * 1024 * 1024));
+            let state = editor
+                .file_control(fresh_gui_protocol::BufferFileControl {
+                    request_id: "inspect-paged".into(),
+                    buffer_id: opened.buffer_id.clone(),
+                    base_rev: opened.rev,
+                    operation: fresh_gui_protocol::FileControlOperation::Inspect,
+                })
+                .await
+                .unwrap();
+            assert!(state.metadata.paged);
+            assert!(
+                editor
+                    .file_control(fresh_gui_protocol::BufferFileControl {
+                        request_id: "reject-paged-eol".into(),
+                        buffer_id: opened.buffer_id.clone(),
+                        base_rev: opened.rev,
+                        operation: fresh_gui_protocol::FileControlOperation::SetLineEnding {
+                            line_ending: "CRLF".into()
+                        },
+                    })
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unavailable for paged buffers")
+            );
             let page = editor
                 .read_page(opened.buffer_id.clone(), offset - 128, MAX_PAGE_BYTES)
                 .await
@@ -5340,6 +6281,8 @@ mod external_recovery_tests {
                         path: Some(path.display().to_string()),
                         text: "recovered draft".into(),
                         base_text: Some("original".into()),
+                        encoding: None,
+                        line_ending: None,
                         paged: None,
                     },
                 )
@@ -5839,9 +6782,35 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            let encoding = editor
+                .file_control(fresh_gui_protocol::BufferFileControl {
+                    request_id: "set-encoding".into(),
+                    buffer_id: opened.buffer_id.clone(),
+                    base_rev: 1,
+                    operation: fresh_gui_protocol::FileControlOperation::SetEncoding {
+                        encoding: "Latin-1".into(),
+                    },
+                })
+                .await
+                .unwrap();
+            let format = editor
+                .file_control(fresh_gui_protocol::BufferFileControl {
+                    request_id: "set-eol".into(),
+                    buffer_id: opened.buffer_id.clone(),
+                    base_rev: encoding.rev,
+                    operation: fresh_gui_protocol::FileControlOperation::SetLineEnding {
+                        line_ending: "CRLF".into(),
+                    },
+                })
+                .await
+                .unwrap();
+            let dirty_rev = editor
+                .edit(opened.buffer_id.clone(), format.rev, "unsaved λ".into())
+                .await
+                .unwrap();
             let drafts = editor.draft_list("workspace-one".into()).await.unwrap();
             assert_eq!(drafts.len(), 1);
-            assert_eq!(drafts[0].text, "unsaved scratch");
+            assert_eq!(drafts[0].text, "unsaved λ");
             assert!(
                 editor
                     .draft_list("workspace-two".into())
@@ -5850,12 +6819,11 @@ mod tests {
                     .is_empty()
             );
             let missing = root.join("missing").join("file.txt");
-            assert!(
-                editor
-                    .save(opened.buffer_id.clone(), 1, Some(missing))
-                    .await
-                    .is_err()
-            );
+            let save_error = editor
+                .save(opened.buffer_id.clone(), dirty_rev, Some(missing))
+                .await
+                .unwrap_err();
+            assert!(format!("{save_error:#}").contains("cannot be represented"));
             assert_eq!(
                 editor
                     .draft_list("workspace-one".into())
@@ -5880,7 +6848,18 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!changed);
-            assert_eq!(restored.text, "unsaved scratch");
+            assert_eq!(restored.text, "unsaved λ");
+            let file_state = restarted
+                .file_control(fresh_gui_protocol::BufferFileControl {
+                    request_id: "inspect-restored".into(),
+                    buffer_id: restored.buffer_id.clone(),
+                    base_rev: restored.rev,
+                    operation: fresh_gui_protocol::FileControlOperation::Inspect,
+                })
+                .await
+                .unwrap();
+            assert_eq!(file_state.metadata.encoding, "Latin-1");
+            assert_eq!(file_state.metadata.line_ending, "CRLF");
             assert!(
                 restarted.draft_list("workspace-one".into()).await.unwrap()[0].draft_id == draft_id
             );
@@ -5975,6 +6954,8 @@ mod tests {
                     path: Some(missing.display().to_string()),
                     text: "review this".into(),
                     base_text: Some("old source".into()),
+                    encoding: None,
+                    line_ending: None,
                     paged: None,
                 },
             )
@@ -6997,6 +7978,4 @@ while True:
         drop(editor);
         let _ = std::fs::remove_dir_all(root);
     }
-
-
 }

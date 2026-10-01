@@ -15,9 +15,11 @@ use axum::routing::get;
 use base64::Engine;
 use fresh_gui_protocol::{
     ByteSelection, CAP_EDITOR, CAP_EDITOR_DRAFT_RECOVERY, CAP_EDITOR_EXTERNAL_CHANGES,
-    CAP_EDITOR_PAGED_READS, CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_SMART_EDITING, CAP_EDITOR_SEARCH, CAP_PROJECT_SEARCH, CAP_FILE_FINDER, CAP_LSP_CONTROLS, CAP_LSP, CAP_LSP_NAVIGATION, CAP_LSP_REQUESTS, CAP_LSP_WORKSPACE_EDITS,
-    CAP_SCENE, CAP_SETTINGS_EDITOR, EditorDraftInfo, ExternalResolution, Hello, HelloUi,
-    MAX_PAGE_BYTES, Message, PROTOCOL_VERSION,
+    CAP_EDITOR_FILE_CONTROLS, CAP_EDITOR_PAGED_READS, CAP_EDITOR_RANGE_EDITS,
+    CAP_EDITOR_SEARCH, CAP_EDITOR_SMART_EDITING, CAP_FILE_FINDER, CAP_LSP, CAP_LSP_CONTROLS,
+    CAP_LSP_NAVIGATION, CAP_LSP_REQUESTS, CAP_LSP_WORKSPACE_EDITS, CAP_PROJECT_SEARCH, CAP_SCENE,
+    CAP_SETTINGS_EDITOR, EditorDraftInfo, ExternalResolution, Hello, HelloUi, MAX_PAGE_BYTES,
+    Message, PROTOCOL_VERSION,
 };
 use futures_util::{SinkExt, StreamExt};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -137,6 +139,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 && c != CAP_EDITOR_PAGED_READS
                 && c != CAP_EDITOR_DRAFT_RECOVERY
                 && c != CAP_EDITOR_EXTERNAL_CHANGES
+                && c != CAP_EDITOR_FILE_CONTROLS
                 && c != CAP_EDITOR_SEARCH
                 && c != CAP_PROJECT_SEARCH
                 && c != CAP_FILE_FINDER
@@ -176,6 +179,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut client_paged_reads = false;
     let mut client_draft_recovery = false;
     let mut client_external_changes = false;
+    let mut client_file_controls = false;
     let mut client_settings_editor = false;
     let mut client_lsp_requests = false;
     let mut client_editor_search = false;
@@ -194,7 +198,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
     let mut external_rx = state.editor.as_ref().map(EditorHandle::subscribe_external);
     let mut lsp_rx = state.editor.as_ref().map(EditorHandle::subscribe_lsp);
-    let mut workspace_rx = state.editor.as_ref().map(EditorHandle::subscribe_workspace_edits);
+    let mut workspace_rx = state
+        .editor
+        .as_ref()
+        .map(EditorHandle::subscribe_workspace_edits);
 
     loop {
         tokio::select! {
@@ -319,6 +326,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     &mut client_paged_reads,
                     &mut client_draft_recovery,
                     &mut client_external_changes,
+                    &mut client_file_controls,
                     &mut client_settings_editor,
                     &mut client_lsp_requests,
                     &mut client_lsp_navigation,
@@ -351,7 +359,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    if let Some(editor) = state.editor.as_ref() { editor.cancel_workspace_owner(&socket_id); }
+    if let Some(editor) = state.editor.as_ref() {
+        editor.cancel_workspace_owner(&socket_id);
+    }
     if let Some(sid) = session_id {
         state.sessions.detach_subscriber(&sid).await;
     }
@@ -371,6 +381,7 @@ async fn handle_client_msg(
     client_paged_reads: &mut bool,
     client_draft_recovery: &mut bool,
     client_external_changes: &mut bool,
+    client_file_controls: &mut bool,
     client_settings_editor: &mut bool,
     client_lsp_requests: &mut bool,
     client_lsp_navigation: &mut bool,
@@ -411,12 +422,22 @@ async fn handle_client_msg(
                 .capabilities
                 .iter()
                 .any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES);
+            *client_file_controls = client_hello
+                .capabilities
+                .iter()
+                .any(|cap| cap == CAP_EDITOR_FILE_CONTROLS);
             *client_settings_editor = client_hello
                 .capabilities
                 .iter()
                 .any(|cap| cap == CAP_SETTINGS_EDITOR);
-            *client_lsp_requests = client_hello.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS);
-            *client_workspace_edits = client_hello.capabilities.iter().any(|cap| cap == CAP_LSP_WORKSPACE_EDITS);
+            *client_lsp_requests = client_hello
+                .capabilities
+                .iter()
+                .any(|cap| cap == CAP_LSP_REQUESTS);
+            *client_workspace_edits = client_hello
+                .capabilities
+                .iter()
+                .any(|cap| cap == CAP_LSP_WORKSPACE_EDITS);
             *client_editor_search = client_hello
                 .capabilities
                 .iter()
@@ -425,9 +446,18 @@ async fn handle_client_msg(
                 .capabilities
                 .iter()
                 .any(|cap| cap == CAP_LSP_NAVIGATION);
-            *client_lsp_controls = client_hello.capabilities.iter().any(|cap| cap == CAP_LSP_CONTROLS);
-            *client_project_search = client_hello.capabilities.iter().any(|cap| cap == CAP_PROJECT_SEARCH);
-            *client_file_finder = client_hello.capabilities.iter().any(|cap| cap == CAP_FILE_FINDER);
+            *client_lsp_controls = client_hello
+                .capabilities
+                .iter()
+                .any(|cap| cap == CAP_LSP_CONTROLS);
+            *client_project_search = client_hello
+                .capabilities
+                .iter()
+                .any(|cap| cap == CAP_PROJECT_SEARCH);
+            *client_file_finder = client_hello
+                .capabilities
+                .iter()
+                .any(|cap| cap == CAP_FILE_FINDER);
             if client_hello.protocol_version != PROTOCOL_VERSION {
                 return Err(Message::Error {
                     code: "protocol_mismatch".into(),
@@ -1086,11 +1116,11 @@ async fn handle_client_msg(
                 message: format!("{request_id}: {error}"),
             })?;
             let path = crate::path_open::resolve_exact_file(&state.fs_root, &target_path)
-            .await
-            .map_err(|error| Message::Error {
-                code: "editor_open_failed".into(),
-                message: format!("{request_id}: {error:#}"),
-            })?;
+                .await
+                .map_err(|error| Message::Error {
+                    code: "editor_open_failed".into(),
+                    message: format!("{request_id}: {error:#}"),
+                })?;
             if !*client_paged_reads && is_large_file(&path) {
                 return Err(paged_reads_unavailable(&request_id));
             }
@@ -1389,14 +1419,36 @@ async fn handle_client_msg(
             require_auth(*authed)?;
             require_file_finder_cap(*client_file_finder, state.editor.is_some(), &request_id)?;
             finder.cancel(&request_id);
-            send_msg(sink, &Message::FileFinderResults { request_id, paths: Vec::new(), truncated: false, cancelled: true, error: None }).await.map_err(|_| settings_error("send_failed", "file finder", "socket closed"))?;
+            send_msg(
+                sink,
+                &Message::FileFinderResults {
+                    request_id,
+                    paths: Vec::new(),
+                    truncated: false,
+                    cancelled: true,
+                    error: None,
+                },
+            )
+            .await
+            .map_err(|_| settings_error("send_failed", "file finder", "socket closed"))?;
             Ok(())
         }
         Message::ProjectSearchCancel { request_id } => {
             require_auth(*authed)?;
             require_project_cap(*client_project_search, state.editor.is_some(), &request_id)?;
             project.cancel(&request_id);
-            send_msg(sink, &Message::ProjectSearchDone { request_id: request_id.clone(), truncated: false, cancelled: true, warnings: Vec::new(), error: None }).await.map_err(|_| settings_error("send_failed", &request_id, "socket closed"))?;
+            send_msg(
+                sink,
+                &Message::ProjectSearchDone {
+                    request_id: request_id.clone(),
+                    truncated: false,
+                    cancelled: true,
+                    warnings: Vec::new(),
+                    error: None,
+                },
+            )
+            .await
+            .map_err(|_| settings_error("send_failed", &request_id, "socket closed"))?;
             Ok(())
         }
         Message::ProjectReplace {
@@ -1480,7 +1532,11 @@ async fn handle_client_msg(
             let (matches, capped, error) = match preview {
                 Ok(Ok((matches, capped))) => (matches, capped, None),
                 Ok(Err(error)) => (Vec::new(), false, Some(error)),
-                Err(error) => (Vec::new(), false, Some(format!("search preview failed: {error}"))),
+                Err(error) => (
+                    Vec::new(),
+                    false,
+                    Some(format!("search preview failed: {error}")),
+                ),
             };
             send_msg(
                 sink,
@@ -1898,7 +1954,10 @@ async fn handle_client_msg(
                         }
                     })?)
                 };
-            let saved = match editor.save_with_actions(buffer_id.clone(), base_rev, dest, *client_lsp_controls).await {
+            let saved = match editor
+                .save_with_actions(buffer_id.clone(), base_rev, dest, *client_lsp_controls)
+                .await
+            {
                 Ok(saved) => saved,
                 Err(err) => {
                     // A disk-generation conflict is returned as a save error to
@@ -1986,6 +2045,58 @@ async fn handle_client_msg(
             })?;
             Ok(())
         }
+        Message::BufferFileControl {
+            request_id,
+            buffer_id,
+            base_rev,
+            operation,
+        } => {
+            require_auth(*authed)?;
+            if !*client_file_controls {
+                return Err(Message::Error {
+                    code: "capability_unavailable".into(),
+                    message: format!(
+                        "{request_id}: client did not negotiate {CAP_EDITOR_FILE_CONTROLS}"
+                    ),
+                });
+            }
+            let Some(editor) = state.editor.as_ref() else {
+                return Err(Message::Error {
+                    code: "editor_unavailable".into(),
+                    message: format!("{request_id}: editor capability not available"),
+                });
+            };
+            ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
+            let state = editor
+                .file_control(fresh_gui_protocol::BufferFileControl {
+                    request_id: request_id.clone(),
+                    buffer_id: buffer_id.clone(),
+                    base_rev,
+                    operation,
+                })
+                .await
+                .map_err(|err| Message::Error {
+                    code: "buffer_file_control_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
+            send_msg(
+                sink,
+                &Message::BufferFileState {
+                    request_id: state.request_id,
+                    buffer_id: state.buffer_id,
+                    rev: state.rev,
+                    metadata: state.metadata,
+                    text: state.text,
+                    dirty: state.dirty,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send BufferFileState".into(),
+            })?;
+            Ok(())
+        }
         Message::BufferLspGet {
             buffer_id,
             known_rev,
@@ -2022,33 +2133,85 @@ async fn handle_client_msg(
             })?;
             Ok(())
         }
-        Message::WorkspaceEditPrepare { request_id, buffer_id, base_rev, edit } => {
+        Message::WorkspaceEditPrepare {
+            request_id,
+            buffer_id,
+            base_rev,
+            edit,
+        } => {
             require_auth(*authed)?;
             require_workspace_edit_capability(*client_workspace_edits)?;
-            let editor = state.editor.as_ref().ok_or_else(|| Message::Error { code: "editor_unavailable".into(), message: "editor unavailable".into() })?;
-            ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
-            let preview = editor.prepare_workspace_edit(buffer_id, base_rev, socket_id.to_owned(), edit).await.map_err(|error| Message::Error {
-                code: "workspace_edit_failed".into(), message: format!("{request_id}: {error:#}"),
+            let editor = state.editor.as_ref().ok_or_else(|| Message::Error {
+                code: "editor_unavailable".into(),
+                message: "editor unavailable".into(),
             })?;
-            send_msg(sink, &Message::WorkspaceEditPreview { request_id, preview }).await.map_err(|_| Message::Error { code: "send_failed".into(), message: "failed to send workspace edit preview".into() })?;
+            ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
+            let preview = editor
+                .prepare_workspace_edit(buffer_id, base_rev, socket_id.to_owned(), edit)
+                .await
+                .map_err(|error| Message::Error {
+                    code: "workspace_edit_failed".into(),
+                    message: format!("{request_id}: {error:#}"),
+                })?;
+            send_msg(
+                sink,
+                &Message::WorkspaceEditPreview {
+                    request_id,
+                    preview,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send workspace edit preview".into(),
+            })?;
             Ok(())
         }
-        Message::WorkspaceEditApply { request_id, buffer_id, token } => {
+        Message::WorkspaceEditApply {
+            request_id,
+            buffer_id,
+            token,
+        } => {
             require_auth(*authed)?;
             require_workspace_edit_capability(*client_workspace_edits)?;
-            let editor = state.editor.as_ref().ok_or_else(|| Message::Error { code: "editor_unavailable".into(), message: "editor unavailable".into() })?;
-            ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
-            let updates = editor.apply_workspace_edit(buffer_id, socket_id.to_owned(), token).await.map_err(|error| Message::Error {
-                code: "workspace_edit_failed".into(), message: format!("{request_id}: {error:#}"),
+            let editor = state.editor.as_ref().ok_or_else(|| Message::Error {
+                code: "editor_unavailable".into(),
+                message: "editor unavailable".into(),
             })?;
-            send_msg(sink, &Message::WorkspaceEditApplied { request_id, updates }).await.map_err(|_| Message::Error { code: "send_failed".into(), message: "failed to send workspace edit result".into() })?;
+            ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
+            let updates = editor
+                .apply_workspace_edit(buffer_id, socket_id.to_owned(), token)
+                .await
+                .map_err(|error| Message::Error {
+                    code: "workspace_edit_failed".into(),
+                    message: format!("{request_id}: {error:#}"),
+                })?;
+            send_msg(
+                sink,
+                &Message::WorkspaceEditApplied {
+                    request_id,
+                    updates,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send workspace edit result".into(),
+            })?;
             Ok(())
         }
         Message::WorkspaceEditCancel { buffer_id, token } => {
             require_auth(*authed)?;
             require_workspace_edit_capability(*client_workspace_edits)?;
             if let Some(editor) = state.editor.as_ref() {
-                ensure_editor_workspace(editor, state, session_id, &buffer_id, "workspace edit cancel").await?;
+                ensure_editor_workspace(
+                    editor,
+                    state,
+                    session_id,
+                    &buffer_id,
+                    "workspace edit cancel",
+                )
+                .await?;
                 let _ = editor.cancel_workspace_edit(buffer_id, socket_id.to_owned(), token);
             }
             Ok(())
@@ -2077,7 +2240,14 @@ async fn handle_client_msg(
                     message: format!("LSP navigation requires {CAP_LSP_NAVIGATION} capability"),
                 });
             }
-            if matches!(request.feature, fresh_gui_protocol::LspRequestFeature::PrepareRename | fresh_gui_protocol::LspRequestFeature::Rename | fresh_gui_protocol::LspRequestFeature::CodeActions | fresh_gui_protocol::LspRequestFeature::CodeActionResolve | fresh_gui_protocol::LspRequestFeature::ExecuteCommand) {
+            if matches!(
+                request.feature,
+                fresh_gui_protocol::LspRequestFeature::PrepareRename
+                    | fresh_gui_protocol::LspRequestFeature::Rename
+                    | fresh_gui_protocol::LspRequestFeature::CodeActions
+                    | fresh_gui_protocol::LspRequestFeature::CodeActionResolve
+                    | fresh_gui_protocol::LspRequestFeature::ExecuteCommand
+            ) {
                 require_workspace_edit_capability(*client_workspace_edits)?;
             }
             if lsp_request_map.len() >= 64 {
@@ -2146,13 +2316,45 @@ async fn handle_client_msg(
             }
             Ok(())
         }
-        Message::LanguageServers { request_id, buffer_id, action } => {
+        Message::LanguageServers {
+            request_id,
+            buffer_id,
+            action,
+        } => {
             require_auth(*authed)?;
-            if !*client_lsp_controls { return Err(Message::Error { code: "capability_unavailable".into(), message: format!("{request_id}: language server controls require {CAP_LSP_CONTROLS}") }); }
-            let editor = state.editor.as_ref().ok_or_else(|| Message::Error { code: "editor_unavailable".into(), message: format!("{request_id}: editor unavailable") })?;
+            if !*client_lsp_controls {
+                return Err(Message::Error {
+                    code: "capability_unavailable".into(),
+                    message: format!(
+                        "{request_id}: language server controls require {CAP_LSP_CONTROLS}"
+                    ),
+                });
+            }
+            let editor = state.editor.as_ref().ok_or_else(|| Message::Error {
+                code: "editor_unavailable".into(),
+                message: format!("{request_id}: editor unavailable"),
+            })?;
             ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
-            let servers = editor.language_servers(buffer_id.clone(), action).await.map_err(|err| Message::Error { code: "language_servers_failed".into(), message: format!("{request_id}: {err:#}") })?;
-            send_msg(sink, &Message::LanguageServersState { request_id, buffer_id, servers }).await.map_err(|_| Message::Error { code: "send_failed".into(), message: "failed to send language server status".into() })?;
+            let servers = editor
+                .language_servers(buffer_id.clone(), action)
+                .await
+                .map_err(|err| Message::Error {
+                    code: "language_servers_failed".into(),
+                    message: format!("{request_id}: {err:#}"),
+                })?;
+            send_msg(
+                sink,
+                &Message::LanguageServersState {
+                    request_id,
+                    buffer_id,
+                    servers,
+                },
+            )
+            .await
+            .map_err(|_| Message::Error {
+                code: "send_failed".into(),
+                message: "failed to send language server status".into(),
+            })?;
             Ok(())
         }
         Message::BufferFormat {
@@ -2169,12 +2371,25 @@ async fn handle_client_msg(
                 });
             };
             ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
-            if range.is_some() && !*client_lsp_controls { return Err(Message::Error { code: "capability_unavailable".into(), message: format!("{request_id}: selection formatting requires {CAP_LSP_CONTROLS}") }); }
-            let formatted = if range.is_some() { editor.format_range(buffer_id.clone(), base_rev, range).await } else { editor.format(buffer_id.clone(), base_rev).await }
-                .map_err(|err| Message::Error {
-                    code: "buffer_format_failed".into(),
-                    message: format!("{request_id}: {err:#}"),
-                })?;
+            if range.is_some() && !*client_lsp_controls {
+                return Err(Message::Error {
+                    code: "capability_unavailable".into(),
+                    message: format!(
+                        "{request_id}: selection formatting requires {CAP_LSP_CONTROLS}"
+                    ),
+                });
+            }
+            let formatted = if range.is_some() {
+                editor
+                    .format_range(buffer_id.clone(), base_rev, range)
+                    .await
+            } else {
+                editor.format(buffer_id.clone(), base_rev).await
+            }
+            .map_err(|err| Message::Error {
+                code: "buffer_format_failed".into(),
+                message: format!("{request_id}: {err:#}"),
+            })?;
             send_msg(
                 sink,
                 &Message::BufferFormatted {
@@ -2611,11 +2826,27 @@ async fn handle_client_msg(
 }
 
 fn require_project_cap(client: bool, editor: bool, request_id: &str) -> Result<(), Message> {
-    if client && editor { Ok(()) } else { Err(settings_error("capability_unavailable", request_id, "project.search.v1 capability not negotiated")) }
+    if client && editor {
+        Ok(())
+    } else {
+        Err(settings_error(
+            "capability_unavailable",
+            request_id,
+            "project.search.v1 capability not negotiated",
+        ))
+    }
 }
 
 fn require_file_finder_cap(client: bool, editor: bool, request_id: &str) -> Result<(), Message> {
-    if client && editor { Ok(()) } else { Err(settings_error("capability_unavailable", request_id, "project.file-finder capability not negotiated")) }
+    if client && editor {
+        Ok(())
+    } else {
+        Err(settings_error(
+            "capability_unavailable",
+            request_id,
+            "project.file-finder capability not negotiated",
+        ))
+    }
 }
 
 fn require_smart_editing_negotiated(
@@ -2665,14 +2896,26 @@ mod file_finder_capability_tests {
     #[test]
     fn file_finder_requires_client_negotiation_and_editor_daemon() {
         assert!(require_file_finder_cap(true, true, "finder-1").is_ok());
-        assert!(matches!(require_file_finder_cap(false, true, "finder-1"), Err(Message::Error { code, .. }) if code == "capability_unavailable"));
-        assert!(matches!(require_file_finder_cap(true, false, "finder-1"), Err(Message::Error { code, .. }) if code == "capability_unavailable"));
+        assert!(
+            matches!(require_file_finder_cap(false, true, "finder-1"), Err(Message::Error { code, .. }) if code == "capability_unavailable")
+        );
+        assert!(
+            matches!(require_file_finder_cap(true, false, "finder-1"), Err(Message::Error { code, .. }) if code == "capability_unavailable")
+        );
     }
 }
 
 async fn project_root(state: &AppState, workspace: &str) -> Result<PathBuf, Message> {
-    let root = state.workspaces.root_of(workspace).await.unwrap_or_else(|| state.fs_root.root_display());
-    state.fs_root.resolve(&root).await.map_err(|e| settings_error("project_search_failed", workspace, e))
+    let root = state
+        .workspaces
+        .root_of(workspace)
+        .await
+        .unwrap_or_else(|| state.fs_root.root_display());
+    state
+        .fs_root
+        .resolve(&root)
+        .await
+        .map_err(|e| settings_error("project_search_failed", workspace, e))
 }
 
 fn require_settings_cap(enabled: bool, request_id: &str) -> Result<(), Message> {
@@ -2909,7 +3152,16 @@ async fn resolve_editor_open(
 }
 
 fn require_workspace_edit_capability(supported: bool) -> Result<(), Message> {
-    if supported { Ok(()) } else { Err(Message::Error { code: "capability_unavailable".into(), message: format!("Refactoring requires {CAP_LSP_WORKSPACE_EDITS}; upgrade and restart the daemon") }) }
+    if supported {
+        Ok(())
+    } else {
+        Err(Message::Error {
+            code: "capability_unavailable".into(),
+            message: format!(
+                "Refactoring requires {CAP_LSP_WORKSPACE_EDITS}; upgrade and restart the daemon"
+            ),
+        })
+    }
 }
 
 fn lsp_file_uri_to_path(uri: &str) -> anyhow::Result<PathBuf> {
@@ -2919,7 +3171,9 @@ fn lsp_file_uri_to_path(uri: &str) -> anyhow::Result<PathBuf> {
     );
     // Fresh's LspManager runs under the daemon's local Authority. SSH transport
     // translates the connection, while file URIs already name daemon paths.
-    let path = wire.to_host_path(None).context("LSP target is not a file URI")?;
+    let path = wire
+        .to_host_path(None)
+        .context("LSP target is not a file URI")?;
     anyhow::ensure!(path.is_absolute(), "LSP file URI path is not absolute");
     Ok(path)
 }
