@@ -2469,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "fresh-gui"
-version = "2026.1001.3"
+version = "2026.1001.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -2495,7 +2495,7 @@ dependencies = [
 
 [[package]]
 name = "fresh-gui-app"
-version = "2026.1001.3"
+version = "2026.1001.4"
 dependencies = [
  "alacritty_terminal 0.25.1",
  "anyhow",
@@ -2522,7 +2522,7 @@ dependencies = [
 
 [[package]]
 name = "fresh-gui-client"
-version = "2026.1001.3"
+version = "2026.1001.4"
 dependencies = [
  "anyhow",
  "base64",
@@ -2537,7 +2537,7 @@ dependencies = [
 
 [[package]]
 name = "fresh-gui-protocol"
-version = "2026.1001.3"
+version = "2026.1001.4"
 dependencies = [
  "jsonc-parser",
  "serde",
