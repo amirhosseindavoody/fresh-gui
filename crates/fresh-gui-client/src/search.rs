@@ -11,52 +11,76 @@ use fresh_gui_protocol::SearchMatch;
 pub struct SearchReview {
     text: String,
     matches: Vec<SearchMatch>,
-    current: usize,
+    visit_order: Vec<usize>,
+    visit_position: usize,
     accepted: Vec<bool>,
 }
 
 impl SearchReview {
     pub fn new(text: impl Into<String>, matches: Vec<SearchMatch>) -> Self {
+        Self::new_at(text, matches, 0)
+    }
+
+    /// Create a review that starts at a match index and wraps once through the
+    /// source-ordered result set. `start_index` is clamped to the result count.
+    pub fn new_at(
+        text: impl Into<String>,
+        matches: Vec<SearchMatch>,
+        start_index: usize,
+    ) -> Self {
+        let len = matches.len();
+        let start_index = start_index.min(len);
+        let visit_order = if len == 0 || start_index == len {
+            (0..len).collect()
+        } else {
+            (start_index..len).chain(0..start_index).collect()
+        };
         let accepted = vec![false; matches.len()];
         Self {
             text: text.into(),
             matches,
-            current: 0,
+            visit_order,
+            visit_position: 0,
             accepted,
         }
     }
 
     pub fn current(&self) -> Option<&SearchMatch> {
-        self.matches.get(self.current)
+        self.visit_order
+            .get(self.visit_position)
+            .and_then(|&index| self.matches.get(index))
     }
 
     pub fn current_index(&self) -> Option<usize> {
-        self.current().map(|_| self.current)
+        self.visit_order.get(self.visit_position).copied()
     }
 
     pub fn is_done(&self) -> bool {
-        self.current >= self.matches.len()
+        self.visit_position >= self.visit_order.len()
     }
 
     /// Accept the current match and advance to the next one.
     pub fn accept(&mut self) {
-        if let Some(accepted) = self.accepted.get_mut(self.current) {
+        if let Some(&index) = self.visit_order.get(self.visit_position) {
+            let accepted = &mut self.accepted[index];
             *accepted = true;
-            self.current += 1;
+            self.visit_position += 1;
         }
     }
 
     /// Leave the current match unchanged and advance to the next one.
     pub fn skip(&mut self) {
         if !self.is_done() {
-            self.current += 1;
+            self.visit_position += 1;
         }
     }
 
     /// Accept every match from the current position onward.
     pub fn accept_all(&mut self) {
-        self.accepted[self.current..].fill(true);
-        self.current = self.matches.len();
+        for &index in &self.visit_order[self.visit_position..] {
+            self.accepted[index] = true;
+        }
+        self.visit_position = self.visit_order.len();
     }
 
     /// Whether the match set still refers to this exact text snapshot.
@@ -181,5 +205,23 @@ mod tests {
             apply_matches("abcdef", &[matched(0, 4, "x"), matched(3, 5, "y")]),
             None
         );
+    }
+
+    #[test]
+    fn review_starts_at_match_then_wraps_once_in_source_order() {
+        let text = "abc";
+        let matches = vec![matched(0, 0, "X"), matched(1, 2, "B"), matched(2, 3, "C")];
+        let mut review = SearchReview::new_at(text, matches, 1);
+
+        assert_eq!(review.current_index(), Some(1));
+        review.accept();
+        assert_eq!(review.current_index(), Some(2));
+        review.skip();
+        assert_eq!(review.current_index(), Some(0));
+        review.accept();
+
+        assert!(review.is_done());
+        assert_eq!(review.current_index(), None);
+        assert_eq!(review.finish().as_deref(), Some("XaBc"));
     }
 }
