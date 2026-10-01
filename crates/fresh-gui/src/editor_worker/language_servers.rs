@@ -24,7 +24,7 @@ pub(super) fn language_servers(
         .active_window()
         .lsp
         .get_configs(language)
-        .map(<[_]>::to_vec)
+        .map(|configs| configs.to_vec())
         .unwrap_or_default();
     if configs.is_empty() {
         bail!("no language servers are configured for {language}");
