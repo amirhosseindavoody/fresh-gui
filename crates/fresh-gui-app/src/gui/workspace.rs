@@ -971,6 +971,7 @@ pub struct Workspace {
     navigation_state: Entity<CommandState>,
     workspace_edits: workspace_edits::WorkspaceEdits,
     palette_open: bool,
+    palette_context: Option<super::commands::CommandContext>,
     goto_open: bool,
     goto_input: Entity<InputState>,
     finder: finder::Finder,
@@ -1557,6 +1558,7 @@ impl Workspace {
             navigation_state,
             workspace_edits: workspace_edits::WorkspaceEdits::default(),
             palette_open: false,
+            palette_context: None,
             goto_open: false,
             goto_input,
             finder: finder::Finder::default(),
@@ -5037,14 +5039,28 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         cx.notify();
     }
 
+    fn command_context(&self, window: &Window) -> Option<super::commands::CommandContext> {
+        use super::commands::CommandContext;
+        if self.explorer_focus.is_focused(window) {
+            return Some(CommandContext::Explorer);
+        }
+        match &self.active {
+            Some(ActiveSurface::Editor(_)) | Some(ActiveSurface::Diff(_)) => Some(CommandContext::Editor),
+            Some(ActiveSurface::Terminal(_)) => Some(CommandContext::Terminal),
+            _ => None,
+        }
+    }
+
     fn on_toggle_palette(
         &mut self,
         _: &ToggleCommandPalette,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let context = self.command_context(window);
         self.palette_open = !self.palette_open;
         if self.palette_open {
+            self.palette_context = context;
             self.dismiss_navigation(cx);
             self.cancel_finder(window, cx);
             self.rename_pty = None;
@@ -6886,14 +6902,9 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         let confirm = cx.entity();
         let cancel = cx.entity();
         let query_view = cx.entity();
-        let context = match &self.active {
-            Some(ActiveSurface::Editor(_)) | Some(ActiveSurface::Diff(_)) => Some(super::commands::CommandContext::Editor),
-            Some(ActiveSurface::Terminal(_)) => Some(super::commands::CommandContext::Terminal),
-            _ => Some(super::commands::CommandContext::Explorer),
-        };
         let query = self.command_state.read(cx).query(cx);
         let items = fresh_gui_client::finder::ranked(&query,
-            super::commands::command_descriptors(context, &self.capabilities), |command| command.label.as_str());
+            super::commands::command_descriptors(self.palette_context, &self.capabilities), |command| command.label.as_str());
         Command::new(&self.command_state)
             .filterable(false)
             .on_query(move |_, _, cx| query_view.update(cx, |_, cx| cx.notify()))

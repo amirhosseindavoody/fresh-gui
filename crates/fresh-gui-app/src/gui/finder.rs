@@ -75,7 +75,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let context = self.command_context(window);
         self.cancel_finder(window, cx);
+        self.palette_context = context;
         self.dismiss_navigation(cx);
         self.palette_open = false;
         self.rename_pty = None;
