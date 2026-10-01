@@ -101,7 +101,11 @@ async fn await_range(client: &mut Client, request_id: &str) -> u64 {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match client.recv().await.expect("receive edit response") {
-                Message::BufferEditResult { request_id: id, rev, .. } if id == request_id => {
+                Message::BufferEditResult {
+                    request_id: id,
+                    rev,
+                    ..
+                } if id == request_id => {
                     return rev;
                 }
                 Message::PtyData { .. }
@@ -128,8 +132,14 @@ async fn await_edit_result(
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match client.recv().await.expect("receive edit result") {
-                Message::BufferEditResult { request_id: id, rev, text, selection, accepted, .. }
-                    if id == request_id => return (rev, text, selection, accepted),
+                Message::BufferEditResult {
+                    request_id: id,
+                    rev,
+                    text,
+                    selection,
+                    accepted,
+                    ..
+                } if id == request_id => return (rev, text, selection, accepted),
                 Message::PtyData { .. }
                 | Message::FsChanged { .. }
                 | Message::Pong { .. }
@@ -187,8 +197,8 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
         return;
     }
     let root = temp_root();
-    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/lsp_intelligence.py");
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lsp_intelligence.py");
     let alpha_log = root.join("alpha.log");
     let beta_log = root.join("beta.log");
     let slow_log = root.join("slow.log");
@@ -224,7 +234,13 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
     let mut ready = false;
     for attempt in 0..80_u64 {
         client
-            .send(request(10_000 + attempt, &buffer_id, rev, 0, LspRequestFeature::Capabilities))
+            .send(request(
+                10_000 + attempt,
+                &buffer_id,
+                rev,
+                0,
+                LspRequestFeature::Capabilities,
+            ))
             .await
             .unwrap();
         let capabilities = wait_lsp(&mut client, 10_000 + attempt).await;
@@ -240,7 +256,13 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
 
     // Byte offset 5 is after a (1 byte) and 😀 (4 bytes), but its LSP column is 3 UTF-16 units.
     client
-        .send(request(101, &buffer_id, rev, 5, LspRequestFeature::Completion))
+        .send(request(
+            101,
+            &buffer_id,
+            rev,
+            5,
+            LspRequestFeature::Completion,
+        ))
         .await
         .unwrap();
     let completion = wait_lsp(&mut client, 101).await;
@@ -254,8 +276,14 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
     assert_eq!(completion_item["insertText"], "call()\n");
     assert_eq!(completion_item["data"]["_fresh_cursor_offset"], 7);
     assert_eq!(completion_item["textEdit"]["newText"], "call()\n");
-    assert_eq!(completion_item["additionalTextEdits"][0]["newText"], "import package_name\n");
-    assert_eq!(completion_item["data"]["_fresh_original"]["data"]["completionToken"], "Alpha");
+    assert_eq!(
+        completion_item["additionalTextEdits"][0]["newText"],
+        "import package_name\n"
+    );
+    assert_eq!(
+        completion_item["data"]["_fresh_original"]["data"]["completionToken"],
+        "Alpha"
+    );
 
     let alpha_request = fs::read_to_string(&alpha_log)
         .unwrap()
@@ -265,11 +293,13 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
         .expect("completion request reached Alpha");
     assert_eq!(alpha_request["params"]["position"]["line"], 0);
     assert_eq!(alpha_request["params"]["position"]["character"], 3);
-    assert!(fs::read_to_string(&beta_log)
-        .unwrap()
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .all(|message| message["method"] != "textDocument/completion"));
+    assert!(
+        fs::read_to_string(&beta_log)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .all(|message| message["method"] != "textDocument/completion")
+    );
 
     // Model accepting this item through #141 as one atomic edit containing
     // both its primary textEdit and import additionalTextEdit. One Fresh Undo
@@ -282,17 +312,26 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
             base_rev: rev,
             // The native adapter composes both LSP edits into one spanning
             // replacement; #141 offsets refer to the evolving transaction.
-            edits: vec![RangeEdit { start: 0, end: 5,
-                text: "import package_name\na😀call()\n".into() }],
+            edits: vec![RangeEdit {
+                start: 0,
+                end: 5,
+                text: "import package_name\na😀call()\n".into(),
+            }],
             viewport: None,
-            selection: ByteSelection { anchor: 32, head: 32 },
+            selection: ByteSelection {
+                anchor: 32,
+                head: 32,
+            },
         })
         .await
         .unwrap();
     let (completion_rev, completed_text, _, accepted) =
         await_edit_result(&mut client, "completion-transaction").await;
     assert!(accepted);
-    assert_eq!(completed_text, "import package_name\na😀call()\nb\ncallme\n");
+    assert_eq!(
+        completed_text,
+        "import package_name\na😀call()\nb\ncallme\n"
+    );
     client
         .send(Message::BufferAction {
             request_id: "undo-completion-transaction".into(),
@@ -300,7 +339,10 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
             view_id: "lsp-test-view".into(),
             base_rev: completion_rev,
             action: EditorAction::Undo,
-            selection: ByteSelection { anchor: 32, head: 32 },
+            selection: ByteSelection {
+                anchor: 32,
+                head: 32,
+            },
         })
         .await
         .unwrap();
@@ -317,7 +359,12 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
         .await
         .unwrap();
     let invalid = wait_lsp(&mut client, 108).await;
-    assert!(invalid.status.as_deref().is_some_and(|status| status.contains("splits a UTF-8")));
+    assert!(
+        invalid
+            .status
+            .as_deref()
+            .is_some_and(|status| status.contains("splits a UTF-8"))
+    );
 
     // Beta's except_features admits hover while Alpha is completion-only.
     client
@@ -326,11 +373,27 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
         .unwrap();
     let hover = wait_lsp(&mut client, 102).await;
     assert_eq!(hover.responses.len(), 2);
-    assert!(hover.responses.iter().any(|response| response.server == "Beta"));
-    assert!(hover.responses.iter().any(|response| response.server == "Slow"));
+    assert!(
+        hover
+            .responses
+            .iter()
+            .any(|response| response.server == "Beta")
+    );
+    assert!(
+        hover
+            .responses
+            .iter()
+            .any(|response| response.server == "Slow")
+    );
 
     client
-        .send(request(106, &buffer_id, rev, 6, LspRequestFeature::SignatureHelp))
+        .send(request(
+            106,
+            &buffer_id,
+            rev,
+            6,
+            LspRequestFeature::SignatureHelp,
+        ))
         .await
         .unwrap();
     let signature = wait_lsp(&mut client, 106).await;
@@ -355,7 +418,11 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
             buffer_id: buffer_id.clone(),
             view_id: "lsp-test-view".into(),
             base_rev: rev,
-            edits: vec![RangeEdit { start: 5, end: 5, text: "x".into() }],
+            edits: vec![RangeEdit {
+                start: 5,
+                end: 5,
+                text: "x".into(),
+            }],
             viewport: None,
             selection: ByteSelection { anchor: 6, head: 6 },
         })
@@ -369,7 +436,13 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
 
     // Cancellation is keyed by request, buffer, and view and does not starve subsequent edits.
     client
-        .send(request(104, &buffer_id, next_rev, 6, LspRequestFeature::Hover))
+        .send(request(
+            104,
+            &buffer_id,
+            next_rev,
+            6,
+            LspRequestFeature::Hover,
+        ))
         .await
         .unwrap();
     client
@@ -386,13 +459,20 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
             buffer_id: buffer_id.clone(),
             view_id: "lsp-test-view".into(),
             base_rev: next_rev,
-            edits: vec![RangeEdit { start: 6, end: 6, text: "y".into() }],
+            edits: vec![RangeEdit {
+                start: 6,
+                end: 6,
+                text: "y".into(),
+            }],
             viewport: None,
             selection: ByteSelection { anchor: 7, head: 7 },
         })
         .await
         .unwrap();
-    assert_eq!(await_range(&mut client, "edit-after-cancel").await, next_rev + 1);
+    assert_eq!(
+        await_range(&mut client, "edit-after-cancel").await,
+        next_rev + 1
+    );
     let cancelled_response = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             match client.recv().await.expect("receive after cancellation") {
@@ -411,7 +491,10 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
         }
     })
     .await;
-    assert!(cancelled_response.is_err(), "cancelled request returned a result");
+    assert!(
+        cancelled_response.is_err(),
+        "cancelled request returned a result"
+    );
 
     // A language without an eligible server still offers local buffer words for completion.
     let (words_id, _, _, words_rev, _) = client
@@ -419,7 +502,13 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
         .await
         .expect("open serverless Rust buffer");
     client
-        .send(request(105, &words_id, words_rev, 4, LspRequestFeature::Completion))
+        .send(request(
+            105,
+            &words_id,
+            words_rev,
+            4,
+            LspRequestFeature::Completion,
+        ))
         .await
         .unwrap();
     let fallback = wait_lsp(&mut client, 105).await;
@@ -443,10 +532,16 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
         let mut opened = None;
         loop {
             match client.recv().await.expect("receive paged open") {
-                Message::EditorOpened { request_id, buffer_id, .. } if request_id == "open-paged-lsp" => {
+                Message::EditorOpened {
+                    request_id,
+                    buffer_id,
+                    ..
+                } if request_id == "open-paged-lsp" => {
                     opened = Some(buffer_id);
                 }
-                Message::BufferPaged { buffer_id, rev, .. } if opened.as_deref() == Some(&buffer_id) => {
+                Message::BufferPaged { buffer_id, rev, .. }
+                    if opened.as_deref() == Some(&buffer_id) =>
+                {
                     return (buffer_id, rev);
                 }
                 Message::PtyData { .. }
@@ -462,11 +557,22 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
     .await
     .expect("paged open timed out");
     client
-        .send(request(107, &paged_id.0, paged_id.1, 0, LspRequestFeature::Completion))
+        .send(request(
+            107,
+            &paged_id.0,
+            paged_id.1,
+            0,
+            LspRequestFeature::Completion,
+        ))
         .await
         .unwrap();
     let unavailable = wait_lsp(&mut client, 107).await;
-    assert!(unavailable.status.as_deref().is_some_and(|status| status.contains("paged")));
+    assert!(
+        unavailable
+            .status
+            .as_deref()
+            .is_some_and(|status| status.contains("paged"))
+    );
 
     // Wire ids are scoped to their websocket. Reusing request id 101 from a
     // second connection must not deliver its result to the first client.
@@ -474,14 +580,24 @@ async fn lsp_request_bridge_routes_tracks_revisions_and_handles_unavailable_buff
         .await
         .expect("connect second client");
     second
-        .send(request_for_view(101, &buffer_id, "second-view", next_rev + 1, 5, LspRequestFeature::Completion))
+        .send(request_for_view(
+            101,
+            &buffer_id,
+            "second-view",
+            next_rev + 1,
+            5,
+            LspRequestFeature::Completion,
+        ))
         .await
         .unwrap();
     let second_result = wait_lsp(&mut second, 101).await;
     assert_eq!(second_result.view_id, "second-view");
     assert_eq!(second_result.responses[0].server, "Alpha");
     let leaked = tokio::time::timeout(Duration::from_millis(250), client.recv()).await;
-    assert!(leaked.is_err(), "another connection's request leaked to this websocket");
+    assert!(
+        leaked.is_err(),
+        "another connection's request leaked to this websocket"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -499,7 +615,8 @@ async fn rust_analyzer_local_symbol_completion_hover_and_signature_smoke() {
         "[package]\nname = \"lsp_smoke\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
     )
     .unwrap();
-    let source = "fn glimmer_signal(value: u32) -> u32 { value }\nfn caller() { glimmer_signal(0); }\n";
+    let source =
+        "fn glimmer_signal(value: u32) -> u32 { value }\nfn caller() { glimmer_signal(0); }\n";
     fs::write(root.join("src/lib.rs"), source).unwrap();
     let config_path = root.join("config.json");
     fs::write(
@@ -523,11 +640,20 @@ async fn rust_analyzer_local_symbol_completion_hover_and_signature_smoke() {
     let mut ready = false;
     for attempt in 0..100_u64 {
         client
-            .send(request(20_000 + attempt, &buffer_id, rev, 0, LspRequestFeature::Capabilities))
+            .send(request(
+                20_000 + attempt,
+                &buffer_id,
+                rev,
+                0,
+                LspRequestFeature::Capabilities,
+            ))
             .await
             .unwrap();
         let capabilities = wait_lsp(&mut client, 20_000 + attempt).await;
-        if capabilities.completion_triggers.iter().any(|trigger| trigger == ".")
+        if capabilities
+            .completion_triggers
+            .iter()
+            .any(|trigger| trigger == ".")
             && !capabilities.signature_triggers.is_empty()
         {
             ready = true;
@@ -543,36 +669,80 @@ async fn rust_analyzer_local_symbol_completion_hover_and_signature_smoke() {
     let mut last_completion = None;
     for attempt in 0..60_u64 {
         let id = 30_000 + attempt;
-        client.send(request(id, &buffer_id, rev, completion_offset, LspRequestFeature::Completion)).await.unwrap();
+        client
+            .send(request(
+                id,
+                &buffer_id,
+                rev,
+                completion_offset,
+                LspRequestFeature::Completion,
+            ))
+            .await
+            .unwrap();
         let completion = wait_lsp(&mut client, id).await;
         assert!(!completion.stale);
         completion_ready = completion.responses.iter().any(|response| {
-            let items = response.result.as_array().or_else(|| response.result["items"].as_array());
-            items.is_some_and(|items| items.iter().any(|item|
-                item["label"].as_str().is_some_and(|label| label.starts_with("glimmer_signal"))))
+            let items = response
+                .result
+                .as_array()
+                .or_else(|| response.result["items"].as_array());
+            items.is_some_and(|items| {
+                items.iter().any(|item| {
+                    item["label"]
+                        .as_str()
+                        .is_some_and(|label| label.starts_with("glimmer_signal"))
+                })
+            })
         });
         last_completion = Some(completion);
-        if completion_ready { break; }
+        if completion_ready {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert!(completion_ready, "rust-analyzer did not index local symbol: {last_completion:?}");
+    assert!(
+        completion_ready,
+        "rust-analyzer did not index local symbol: {last_completion:?}"
+    );
 
     let hover_offset = source.rfind("glimmer_signal").unwrap() + 5;
     client
-        .send(request(202, &buffer_id, rev, hover_offset, LspRequestFeature::Hover))
+        .send(request(
+            202,
+            &buffer_id,
+            rev,
+            hover_offset,
+            LspRequestFeature::Hover,
+        ))
         .await
         .unwrap();
     let hover = wait_lsp(&mut client, 202).await;
     assert!(!hover.stale);
-    assert!(hover.responses.iter().any(|response| !response.result.is_null()));
+    assert!(
+        hover
+            .responses
+            .iter()
+            .any(|response| !response.result.is_null())
+    );
 
     let signature_offset = source.rfind("glimmer_signal(").unwrap() + "glimmer_signal(".len();
     client
-        .send(request(203, &buffer_id, rev, signature_offset, LspRequestFeature::SignatureHelp))
+        .send(request(
+            203,
+            &buffer_id,
+            rev,
+            signature_offset,
+            LspRequestFeature::SignatureHelp,
+        ))
         .await
         .unwrap();
     let signature = wait_lsp(&mut client, 203).await;
     assert!(!signature.stale);
-    assert!(signature.responses.iter().any(|response| !response.result.is_null()));
+    assert!(
+        signature
+            .responses
+            .iter()
+            .any(|response| !response.result.is_null())
+    );
     let _ = fs::remove_dir_all(root);
 }

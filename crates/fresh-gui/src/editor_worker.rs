@@ -269,8 +269,14 @@ enum Cmd {
         resolution: ExternalResolution,
         reply: oneshot::Sender<Result<BufferTransactionResult>>,
     },
-    LspRequest { request: LspRequest },
-    LspCancel { request_id: u64, buffer_id: String, view_id: String },
+    LspRequest {
+        request: LspRequest,
+    },
+    LspCancel {
+        request_id: u64,
+        buffer_id: String,
+        view_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -304,7 +310,11 @@ impl EditorHandle {
 
     pub fn cancel_lsp(&self, request_id: u64, buffer_id: String, view_id: String) -> Result<()> {
         self.tx
-            .send(Cmd::LspCancel { request_id, buffer_id, view_id })
+            .send(Cmd::LspCancel {
+                request_id,
+                buffer_id,
+                view_id,
+            })
             .map_err(|_| anyhow::anyhow!("editor worker stopped"))
     }
 
@@ -370,7 +380,13 @@ impl EditorHandle {
             .spawn(move || match build_editor(&working_dir, &gui_config) {
                 Ok(editor) => {
                     let _ = ready_tx.send(Ok(()));
-                    run_loop(editor, rx, DraftStore::new(recovery_dir), worker_external, worker_lsp);
+                    run_loop(
+                        editor,
+                        rx,
+                        DraftStore::new(recovery_dir),
+                        worker_external,
+                        worker_lsp,
+                    );
                 }
                 Err(err) => {
                     let _ = ready_tx.send(Err(err));
@@ -381,7 +397,11 @@ impl EditorHandle {
         match ready_rx.recv() {
             Ok(Ok(())) => {
                 info!(dir = %dir_for_log.display(), "Fresh editor worker ready");
-                Some(Self { tx, external_tx, lsp_tx })
+                Some(Self {
+                    tx,
+                    external_tx,
+                    lsp_tx,
+                })
             }
             Ok(Err(err)) => {
                 warn!(error = %err, "Fresh editor worker failed to start");
@@ -726,7 +746,10 @@ fn run_loop(
     // existing Authority while routing all server messages through this inbox.
     let rt = fresh::services::runtime::LiveRuntime::new(rt);
     let lsp_inbox = fresh::services::async_bridge::AsyncBridge::new();
-    editor.active_window_mut().lsp.set_runtime(rt.clone(), lsp_inbox.clone());
+    editor
+        .active_window_mut()
+        .lsp
+        .set_runtime(rt.clone(), lsp_inbox.clone());
     let mut tracked: HashMap<String, TrackedBuffer> = HashMap::new();
     let mut lsp_bridge = LspBridgeState {
         inbox: lsp_inbox,
@@ -1113,8 +1136,17 @@ fn begin_lsp_request(
                 && entry.request.feature == request.feature
         })
     }) {
-        if let Some(old) = bridge.aggregates.get(&superseded).map(|aggregate| aggregate.request.clone()) {
-            send_lsp_status(&bridge.results, &old, "request superseded by a newer request", true);
+        if let Some(old) = bridge
+            .aggregates
+            .get(&superseded)
+            .map(|aggregate| aggregate.request.clone())
+        {
+            send_lsp_status(
+                &bridge.results,
+                &old,
+                "request superseded by a newer request",
+                true,
+            );
         }
         cancel_lsp_request(
             editor,
@@ -1124,7 +1156,13 @@ fn begin_lsp_request(
             bridge,
         );
     }
-    let LspBridgeState { pending, request_ids, aggregates, results, .. } = bridge;
+    let LspBridgeState {
+        pending,
+        request_ids,
+        aggregates,
+        results,
+        ..
+    } = bridge;
     let Some(entry) = tracked.get(&request.buffer_id) else {
         send_lsp_status(results, &request, "buffer is closed", true);
         return;
@@ -1134,7 +1172,12 @@ fn begin_lsp_request(
         return;
     }
     if entry.total_bytes.is_some() {
-        send_lsp_status(results, &request, "LSP requests are unavailable for paged buffers", false);
+        send_lsp_status(
+            results,
+            &request,
+            "LSP requests are unavailable for paged buffers",
+            false,
+        );
         return;
     }
     let language = entry.language.as_deref().unwrap_or("");
@@ -1150,7 +1193,12 @@ fn begin_lsp_request(
     };
     let uri = metadata.file_uri().map(|uri| uri.as_uri().to_string());
     if request.offset > entry.text.len() || !entry.text.is_char_boundary(request.offset) {
-        send_lsp_status(results, &request, "offset is outside the buffer or splits a UTF-8 character", false);
+        send_lsp_status(
+            results,
+            &request,
+            "offset is outside the buffer or splits a UTF-8 character",
+            false,
+        );
         return;
     }
     let Some(buffer_state) = editor.active_window().buffers.get(&buffer_id) else {
@@ -1160,10 +1208,17 @@ fn begin_lsp_request(
     let (line, character) = buffer_state.buffer.position_to_lsp_position(request.offset);
     let (line, character) = (line as u32, character as u32);
     let manager = &editor.active_window().lsp;
-    let all_completion_triggers = manager.handles_for_feature(language, LspFeature::Completion)
-        .into_iter().flat_map(|server| server.capabilities.completion_trigger_characters.clone())
-        .collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>();
-    let all_signature_triggers = if manager.handles_for_feature(language, LspFeature::SignatureHelp).is_empty() {
+    let all_completion_triggers = manager
+        .handles_for_feature(language, LspFeature::Completion)
+        .into_iter()
+        .flat_map(|server| server.capabilities.completion_trigger_characters.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let all_signature_triggers = if manager
+        .handles_for_feature(language, LspFeature::SignatureHelp)
+        .is_empty()
+    {
         Vec::new()
     } else {
         vec!["(".into(), ",".into()]
@@ -1187,7 +1242,9 @@ fn begin_lsp_request(
     }
 
     let route_feature = match request.feature {
-        LspRequestFeature::Capabilities | LspRequestFeature::Completion | LspRequestFeature::CompletionResolve => LspFeature::Completion,
+        LspRequestFeature::Capabilities
+        | LspRequestFeature::Completion
+        | LspRequestFeature::CompletionResolve => LspFeature::Completion,
         LspRequestFeature::Hover => LspFeature::Hover,
         LspRequestFeature::SignatureHelp => LspFeature::SignatureHelp,
     };
@@ -1198,8 +1255,8 @@ fn begin_lsp_request(
         .filter(|server| {
             uri.is_some()
                 && (request.feature != LspRequestFeature::CompletionResolve
-                || (server.name == request.server.as_deref().unwrap_or("")
-                    && server.capabilities.completion_resolve))
+                    || (server.name == request.server.as_deref().unwrap_or("")
+                        && server.capabilities.completion_resolve))
         })
         .map(|server| {
             let mut triggers = server.capabilities.completion_trigger_characters.clone();
@@ -1227,7 +1284,13 @@ fn begin_lsp_request(
             responses: response,
             completion_triggers: all_completion_triggers,
             signature_triggers: all_signature_triggers,
-            status: if language.is_empty() { Some("buffer has no language mode; using buffer words".into()) } else if uri.is_none() { Some("buffer has no file URI; using buffer words".into()) } else { Some("no eligible language server".into()) },
+            status: if language.is_empty() {
+                Some("buffer has no language mode; using buffer words".into())
+            } else if uri.is_none() {
+                Some("buffer has no file URI; using buffer words".into())
+            } else {
+                Some("no eligible language server".into())
+            },
             stale: false,
         });
         return;
@@ -1261,7 +1324,10 @@ fn begin_lsp_request(
             } else {
                 server.capabilities.completion_trigger_characters.clone()
             };
-            let trigger = request.trigger_character.as_deref().filter(|trigger| allowed_triggers.iter().any(|allowed| allowed == *trigger));
+            let trigger = request
+                .trigger_character
+                .as_deref()
+                .filter(|trigger| allowed_triggers.iter().any(|allowed| allowed == *trigger));
             Some(crate::lsp_bridge::position_params(
                 uri,
                 line,
@@ -1288,18 +1354,26 @@ fn begin_lsp_request(
         }
     }
     if sent.is_empty() {
-        send_lsp_status(results, &request, "language server request could not be queued", false);
+        send_lsp_status(
+            results,
+            &request,
+            "language server request could not be queued",
+            false,
+        );
     } else {
         request_ids.insert(request.request_id, sent.clone());
-        aggregates.insert(request.request_id, LspAggregate {
-            request,
-            remaining: sent.len(),
-            responses: Vec::new(),
-            completion_triggers,
-            signature_triggers,
-            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(5),
-            status: None,
-        });
+        aggregates.insert(
+            request.request_id,
+            LspAggregate {
+                request,
+                remaining: sent.len(),
+                responses: Vec::new(),
+                completion_triggers,
+                signature_triggers,
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                status: None,
+            },
+        );
     }
 }
 
@@ -1318,8 +1392,12 @@ fn buffer_word_completions(text: &str, offset: usize) -> Vec<LspServerResponse> 
     // The GUI uses standard identifier boundaries. Fresh supplies smart-case
     // matching, frequency/proximity ranking, and a bounded scan window.
     let mut scan_range = CompletionContext::compute_scan_range(offset, text.len(), false);
-    while !text.is_char_boundary(scan_range.start) { scan_range.start += 1; }
-    while !text.is_char_boundary(scan_range.end) { scan_range.end -= 1; }
+    while !text.is_char_boundary(scan_range.start) {
+        scan_range.start += 1;
+    }
+    while !text.is_char_boundary(scan_range.end) {
+        scan_range.end -= 1;
+    }
     let context = CompletionContext {
         prefix: prefix.into(),
         cursor_byte: offset,
@@ -1335,19 +1413,32 @@ fn buffer_word_completions(text: &str, offset: usize) -> Vec<LspServerResponse> 
         other_buffers: Vec::new(),
     };
     let provider = BufferWordProvider::new();
-    if !provider.is_enabled(&context) { return Vec::new(); }
-    let ProviderResult::Ready(candidates) = provider.provide(&context, &text.as_bytes()[scan_range]) else {
+    if !provider.is_enabled(&context) {
+        return Vec::new();
+    }
+    let ProviderResult::Ready(candidates) =
+        provider.provide(&context, &text.as_bytes()[scan_range])
+    else {
         return Vec::new();
     };
-    let items = candidates.into_iter().enumerate().map(|(rank, candidate)| {
-        serde_json::json!({
-            "label": candidate.label,
-            "insertText": candidate.insert_text,
-            "sortText": format!("{rank:03}"),
+    let items = candidates
+        .into_iter()
+        .enumerate()
+        .map(|(rank, candidate)| {
+            serde_json::json!({
+                "label": candidate.label,
+                "insertText": candidate.insert_text,
+                "sortText": format!("{rank:03}"),
+            })
         })
-    }).collect::<Vec<_>>();
-    if items.is_empty() { Vec::new() } else {
-        vec![crate::lsp_bridge::one_response("buffer_words".into(), serde_json::json!(items))]
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        Vec::new()
+    } else {
+        vec![crate::lsp_bridge::one_response(
+            "buffer_words".into(),
+            serde_json::json!(items),
+        )]
     }
 }
 
@@ -1379,20 +1470,29 @@ fn cancel_lsp_request(
     view_id: &str,
     bridge: &mut LspBridgeState,
 ) {
-    if !bridge.aggregates.get(&request_id).is_some_and(|aggregate| aggregate.request.buffer_id == buffer_id && aggregate.request.view_id == view_id) {
+    if !bridge.aggregates.get(&request_id).is_some_and(|aggregate| {
+        aggregate.request.buffer_id == buffer_id && aggregate.request.view_id == view_id
+    }) {
         return;
     }
-    let Some(ids) = bridge.request_ids.remove(&request_id) else { bridge.aggregates.remove(&request_id); return };
+    let Some(ids) = bridge.request_ids.remove(&request_id) else {
+        bridge.aggregates.remove(&request_id);
+        return;
+    };
     bridge.aggregates.remove(&request_id);
     for id in ids {
-        let Some(entry) = bridge.pending.remove(&id) else { continue };
+        let Some(entry) = bridge.pending.remove(&id) else {
+            continue;
+        };
         if entry.request.buffer_id != buffer_id || entry.request.view_id != view_id {
             bridge.pending.insert(id, entry);
             bridge.request_ids.entry(request_id).or_default().push(id);
             continue;
         }
         let feature = match entry.request.feature {
-            LspRequestFeature::Capabilities | LspRequestFeature::Completion | LspRequestFeature::CompletionResolve => LspFeature::Completion,
+            LspRequestFeature::Capabilities
+            | LspRequestFeature::Completion
+            | LspRequestFeature::CompletionResolve => LspFeature::Completion,
             LspRequestFeature::Hover => LspFeature::Hover,
             LspRequestFeature::SignatureHelp => LspFeature::SignatureHelp,
         };
@@ -1413,15 +1513,34 @@ fn poll_lsp_bridge(
     tracked: &mut HashMap<String, TrackedBuffer>,
     bridge_state: &mut LspBridgeState,
 ) {
-    let LspBridgeState { pending, request_ids, aggregates, results, .. } = bridge_state;
+    let LspBridgeState {
+        pending,
+        request_ids,
+        aggregates,
+        results,
+        ..
+    } = bridge_state;
     use fresh::services::async_bridge::AsyncMessage;
-    let Some(bridge) = editor.async_bridge() else { return };
+    let Some(bridge) = editor.async_bridge() else {
+        return;
+    };
     let sender = bridge.sender();
     for message in bridge_state.inbox.try_recv_all() {
         match message {
-            AsyncMessage::PluginLspResponse { request_id, result, language } => {
+            AsyncMessage::PluginLspResponse {
+                request_id,
+                result,
+                language,
+            } => {
                 let Some(entry) = pending.remove(&request_id) else {
-                    if sender.send(AsyncMessage::PluginLspResponse { request_id, result, language }).is_err() {
+                    if sender
+                        .send(AsyncMessage::PluginLspResponse {
+                            request_id,
+                            result,
+                            language,
+                        })
+                        .is_err()
+                    {
                         warn!("failed to return unmatched Fresh LSP response to its dispatcher");
                     }
                     continue;
@@ -1442,13 +1561,18 @@ fn poll_lsp_bridge(
                 let stale = current != Some(entry.request.base_rev);
                 if let Some(aggregate) = aggregates.get_mut(&entry.request.request_id) {
                     if stale {
-                        aggregate.status = Some("buffer revision changed while request was pending".into());
+                        aggregate.status =
+                            Some("buffer revision changed while request was pending".into());
                         aggregate.responses.clear();
                         aggregate.remaining = 0;
                     } else {
                         match response {
-                            Ok(value) => aggregate.responses.push(crate::lsp_bridge::one_response(entry.server, value)),
-                            Err(error) => { aggregate.status.get_or_insert(error); }
+                            Ok(value) => aggregate
+                                .responses
+                                .push(crate::lsp_bridge::one_response(entry.server, value)),
+                            Err(error) => {
+                                aggregate.status.get_or_insert(error);
+                            }
                         };
                         aggregate.remaining = aggregate.remaining.saturating_sub(1);
                     }
@@ -1459,7 +1583,13 @@ fn poll_lsp_bridge(
                         request_ids.remove(&entry.request.request_id);
                     }
                 }
-                finish_lsp_aggregate(entry.request.request_id, tracked, aggregates, request_ids, results);
+                finish_lsp_aggregate(
+                    entry.request.request_id,
+                    tracked,
+                    aggregates,
+                    request_ids,
+                    results,
+                );
             }
             message => {
                 if sender.send(message).is_err() {
@@ -1478,10 +1608,19 @@ fn finish_lsp_aggregate(
     request_ids: &mut HashMap<u64, Vec<u64>>,
     results: &tokio::sync::broadcast::Sender<LspResult>,
 ) {
-    if !aggregates.get(&request_id).is_some_and(|aggregate| aggregate.remaining == 0) { return; }
-    let Some(aggregate) = aggregates.remove(&request_id) else { return };
+    if !aggregates
+        .get(&request_id)
+        .is_some_and(|aggregate| aggregate.remaining == 0)
+    {
+        return;
+    }
+    let Some(aggregate) = aggregates.remove(&request_id) else {
+        return;
+    };
     request_ids.remove(&request_id);
-    let current = tracked.get(&aggregate.request.buffer_id).map(|entry| entry.rev);
+    let current = tracked
+        .get(&aggregate.request.buffer_id)
+        .map(|entry| entry.rev);
     let stale = current != Some(aggregate.request.base_rev);
     let _ = results.send(LspResult {
         request_id: aggregate.request.request_id,
@@ -1490,10 +1629,18 @@ fn finish_lsp_aggregate(
         rev: current.unwrap_or(aggregate.request.base_rev),
         offset: aggregate.request.offset,
         feature: aggregate.request.feature,
-        responses: if stale { Vec::new() } else { aggregate.responses },
+        responses: if stale {
+            Vec::new()
+        } else {
+            aggregate.responses
+        },
         completion_triggers: aggregate.completion_triggers,
         signature_triggers: aggregate.signature_triggers,
-        status: if stale { Some("buffer revision changed while request was pending".into()) } else { aggregate.status },
+        status: if stale {
+            Some("buffer revision changed while request was pending".into())
+        } else {
+            aggregate.status
+        },
         stale,
     });
 }
@@ -1504,42 +1651,62 @@ fn expire_lsp_aggregates(
     bridge: &mut LspBridgeState,
 ) {
     let now = tokio::time::Instant::now();
-    let expired = bridge.aggregates.iter().filter_map(|(id, aggregate)| (aggregate.deadline <= now).then_some(*id)).collect::<Vec<_>>();
+    let expired = bridge
+        .aggregates
+        .iter()
+        .filter_map(|(id, aggregate)| (aggregate.deadline <= now).then_some(*id))
+        .collect::<Vec<_>>();
     for id in expired {
         if let Some(aggregate) = bridge.aggregates.get_mut(&id) {
             aggregate.remaining = 0;
-            aggregate.status.get_or_insert_with(|| "language server request timed out".into());
+            aggregate
+                .status
+                .get_or_insert_with(|| "language server request timed out".into());
         }
-        let request = bridge.aggregates.get(&id).map(|aggregate| aggregate.request.clone());
-        if let Some(request) = request {
-            if let Some(ids) = bridge.request_ids.remove(&id) {
-                for lsp_id in ids {
-                    if let Some(entry) = bridge.pending.remove(&lsp_id) {
-                        let route_feature = match entry.request.feature {
-                            LspRequestFeature::Capabilities | LspRequestFeature::Completion | LspRequestFeature::CompletionResolve => LspFeature::Completion,
-                            LspRequestFeature::Hover => LspFeature::Hover,
-                            LspRequestFeature::SignatureHelp => LspFeature::SignatureHelp,
-                        };
-                        if let Some(server) = editor.active_window_mut().lsp.handles_for_feature_mut(&entry.language, route_feature).into_iter().find(|server| server.name == entry.server) {
-                            let _ = server.handle.cancel_request(entry.lsp_request_id);
-                        }
+        if let Some(ids) = bridge.request_ids.remove(&id) {
+            for lsp_id in ids {
+                if let Some(entry) = bridge.pending.remove(&lsp_id) {
+                    let route_feature = match entry.request.feature {
+                        LspRequestFeature::Capabilities
+                        | LspRequestFeature::Completion
+                        | LspRequestFeature::CompletionResolve => LspFeature::Completion,
+                        LspRequestFeature::Hover => LspFeature::Hover,
+                        LspRequestFeature::SignatureHelp => LspFeature::SignatureHelp,
+                    };
+                    if let Some(server) = editor
+                        .active_window_mut()
+                        .lsp
+                        .handles_for_feature_mut(&entry.language, route_feature)
+                        .into_iter()
+                        .find(|server| server.name == entry.server)
+                    {
+                        let _ = server.handle.cancel_request(entry.lsp_request_id);
                     }
                 }
             }
-            let _ = request;
         }
-        finish_lsp_aggregate(id, tracked, &mut bridge.aggregates, &mut bridge.request_ids, &bridge.results);
+        finish_lsp_aggregate(
+            id,
+            tracked,
+            &mut bridge.aggregates,
+            &mut bridge.request_ids,
+            &bridge.results,
+        );
     }
 }
 
-fn cancel_buffer_lsp_requests(
-    editor: &mut Editor,
-    buffer_id: &str,
-    bridge: &mut LspBridgeState,
-) {
-    let ids = bridge.aggregates.iter().filter_map(|(id, aggregate)| (aggregate.request.buffer_id == buffer_id).then_some(*id)).collect::<Vec<_>>();
+fn cancel_buffer_lsp_requests(editor: &mut Editor, buffer_id: &str, bridge: &mut LspBridgeState) {
+    let ids = bridge
+        .aggregates
+        .iter()
+        .filter_map(|(id, aggregate)| (aggregate.request.buffer_id == buffer_id).then_some(*id))
+        .collect::<Vec<_>>();
     for id in ids {
-        if let Some(request) = bridge.aggregates.get(&id).map(|aggregate| aggregate.request.clone()) {
+        if let Some(request) = bridge
+            .aggregates
+            .get(&id)
+            .map(|aggregate| aggregate.request.clone())
+        {
             cancel_lsp_request(editor, id, &request.buffer_id, &request.view_id, bridge);
             let _ = bridge.results.send(LspResult {
                 request_id: request.request_id,
@@ -1558,15 +1725,27 @@ fn cancel_buffer_lsp_requests(
     }
 }
 
-fn cancel_all_lsp_requests(
-    editor: &mut Editor,
-    bridge: &mut LspBridgeState,
-) {
-    let requests = bridge.aggregates.values().map(|aggregate| aggregate.request.clone()).collect::<Vec<_>>();
+fn cancel_all_lsp_requests(editor: &mut Editor, bridge: &mut LspBridgeState) {
+    let requests = bridge
+        .aggregates
+        .values()
+        .map(|aggregate| aggregate.request.clone())
+        .collect::<Vec<_>>();
     for request in requests {
         let request_id = request.request_id;
-        cancel_lsp_request(editor, request_id, &request.buffer_id, &request.view_id, bridge);
-        send_lsp_status(&bridge.results, &request, "LSP request cancelled before formatting", false);
+        cancel_lsp_request(
+            editor,
+            request_id,
+            &request.buffer_id,
+            &request.view_id,
+            bridge,
+        );
+        send_lsp_status(
+            &bridge.results,
+            &request,
+            "LSP request cancelled before formatting",
+            false,
+        );
     }
 }
 
@@ -1575,14 +1754,28 @@ fn cancel_stale_lsp_requests(
     tracked: &HashMap<String, TrackedBuffer>,
     bridge: &mut LspBridgeState,
 ) {
-    let ids = bridge.aggregates.iter().filter_map(|(id, aggregate)| {
-        (tracked.get(&aggregate.request.buffer_id).map(|entry| entry.rev) != Some(aggregate.request.base_rev)).then_some(*id)
-    }).collect::<Vec<_>>();
+    let ids = bridge
+        .aggregates
+        .iter()
+        .filter_map(|(id, aggregate)| {
+            (tracked
+                .get(&aggregate.request.buffer_id)
+                .map(|entry| entry.rev)
+                != Some(aggregate.request.base_rev))
+            .then_some(*id)
+        })
+        .collect::<Vec<_>>();
     for id in ids {
-        let request = bridge.aggregates.get(&id).map(|aggregate| aggregate.request.clone());
+        let request = bridge
+            .aggregates
+            .get(&id)
+            .map(|aggregate| aggregate.request.clone());
         if let Some(request) = request {
             cancel_lsp_request(editor, id, &request.buffer_id, &request.view_id, bridge);
-            let current = tracked.get(&request.buffer_id).map(|entry| entry.rev).unwrap_or(request.base_rev);
+            let current = tracked
+                .get(&request.buffer_id)
+                .map(|entry| entry.rev)
+                .unwrap_or(request.base_rev);
             let _ = bridge.results.send(LspResult {
                 request_id: request.request_id,
                 buffer_id: request.buffer_id,

@@ -136,7 +136,9 @@ impl HoverProvider for RemoteLsp {
                 .map_err(|_| anyhow!("LSP hover request timed out"))?
                 .map_err(|_| anyhow!("LSP hover response channel closed"))?;
             let current = panel
-                .update(_cx, |panel, cx| panel.lsp_result_matches(&response, &text, None, cx))
+                .update(_cx, |panel, cx| {
+                    panel.lsp_result_matches(&response, &text, None, cx)
+                })
                 .unwrap_or(false);
             Ok(current.then(|| merge_hover(&response)).flatten())
         })

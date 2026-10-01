@@ -2020,7 +2020,7 @@ impl EditorPanel {
         self.lsp_provider = self.lsp_requests.then(|| provider.clone());
         self.editor.update(cx, |editor, cx| {
             editor.lsp_mut().completion_provider = self.lsp_requests.then(|| provider.clone() as Rc<dyn gpui_kit::component::input::CompletionProvider>);
-            editor.lsp_mut().hover_provider = self.lsp_requests.then(|| provider as Rc<dyn gpui_kit::component::input::HoverProvider>);
+            editor.lsp_mut().hover_provider = self.lsp_requests.then_some(provider as Rc<dyn gpui_kit::component::input::HoverProvider>);
             editor.refresh(cx);
         });
     }
