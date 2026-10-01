@@ -441,9 +441,13 @@ impl DiffPanel {
     }
     pub fn is_dirty(&self) -> bool { self.dirty }
     pub fn set_rev(&mut self, rev: u64) { self.rev = rev; }
-    pub fn mark_saved(&mut self, rev: u64, saved_text: Option<&str>, cx: &mut Context<Self>) {
+    pub fn mark_saved(&mut self, rev: u64, saved_text: Option<&str>, outcome: fresh_gui_protocol::SaveOutcome, window: &mut Window, cx: &mut Context<Self>) {
+        let draft = self.editor.read(cx).value().to_string();
+        if let Some(text) = outcome.text.as_ref() && saved_text == Some(draft.as_str()) {
+            self.editor.update(cx, |editor, cx| editor.set_value(text.clone(), window, cx));
+        }
         self.rev = rev;
-        self.dirty = saved_text.map_or(self.dirty, |saved| self.editor.read(cx).value().to_string() != saved);
+        self.dirty = outcome.dirty || outcome.text.as_deref().or(saved_text).map_or(self.dirty, |saved| self.editor.read(cx).value().as_ref() != saved);
         cx.notify();
     }
 

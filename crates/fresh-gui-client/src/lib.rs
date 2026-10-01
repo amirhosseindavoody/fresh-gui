@@ -730,6 +730,7 @@ impl Client {
                     buffer_id: bid,
                     path,
                     rev,
+                    ..
                 } if rid == request_id && bid == buffer_id => return Ok((path, rev)),
                 Message::Error { code, message } => {
                     bail!("buffer save failed: {code}: {message}")

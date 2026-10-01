@@ -119,10 +119,12 @@ pub enum AdeCmd {
         /// Empty saves the buffer's existing file.
         path: String,
     },
+    LanguageServers { request_id: String, buffer_id: String, action: fresh_gui_protocol::LanguageServerAction },
     FormatBuffer {
         request_id: String,
         buffer_id: String,
         base_rev: u64,
+        range: Option<ByteRange>,
     },
     /// Issue a revision-aware language server request for an editor buffer.
     LspRequest { request: LspRequest },
@@ -390,6 +392,7 @@ pub enum AdeEvent {
         buffer_id: String,
         path: String,
         rev: u64,
+        outcome: fresh_gui_protocol::SaveOutcome,
     },
     BufferLspState {
         buffer_id: String,
@@ -398,6 +401,7 @@ pub enum AdeEvent {
         diagnostics: Vec<BufferDiagnostic>,
         status: Option<String>,
     },
+    LanguageServersState { request_id: String, buffer_id: String, servers: Vec<fresh_gui_protocol::LanguageServerState> },
     LspResult { result: LspResult },
     WorkspaceEditPreview { request_id: String, preview: WorkspaceEditPreview },
     WorkspaceEditApplied { request_id: String, updates: Vec<WorkspaceBufferUpdate> },
@@ -903,16 +907,23 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd, evt_tx: &async_channel::
                 })
                 .await?;
         }
+        AdeCmd::LanguageServers { request_id, buffer_id, action } => {
+            anyhow::ensure!(client.supports_capability(fresh_gui_protocol::CAP_LSP_CONTROLS), "Upgrade and restart daemon for language-server controls (lsp.controls)");
+            client.send(Message::LanguageServers { request_id, buffer_id, action }).await?;
+        }
         AdeCmd::FormatBuffer {
             request_id,
             buffer_id,
             base_rev,
+            range,
         } => {
+            anyhow::ensure!(range.is_none() || client.supports_capability(fresh_gui_protocol::CAP_LSP_CONTROLS), "Upgrade and restart daemon for selection formatting (lsp.controls)");
             client
                 .send(Message::BufferFormat {
                     request_id,
                     buffer_id,
                     base_rev,
+                    range,
                 })
                 .await?;
         }
@@ -1505,11 +1516,13 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             buffer_id,
             path,
             rev,
+            outcome,
         } => Some(AdeEvent::BufferSaved {
             request_id,
             buffer_id,
             path,
             rev,
+            outcome,
         }),
         Message::BufferLspState {
             buffer_id,
@@ -1524,6 +1537,7 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             diagnostics,
             status,
         }),
+        Message::LanguageServersState { request_id, buffer_id, servers } => Some(AdeEvent::LanguageServersState { request_id, buffer_id, servers }),
         Message::BufferLspResult { result } => Some(AdeEvent::LspResult { result }),
         Message::WorkspaceEditPreview { request_id, preview } => Some(AdeEvent::WorkspaceEditPreview { request_id, preview }),
         Message::WorkspaceEditApplied { request_id, updates } => Some(AdeEvent::WorkspaceEditApplied { request_id, updates }),

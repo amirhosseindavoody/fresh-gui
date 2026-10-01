@@ -10,6 +10,8 @@
 
 #[path = "navigation.rs"]
 mod navigation;
+#[path = "diagnostics.rs"]
+mod diagnostics;
 #[path = "workspace_edits.rs"]
 mod workspace_edits;
 #[path = "finder.rs"]
@@ -52,6 +54,7 @@ use super::actions::{
     CloseAllTerminals, CloseTab, CloseWorkspace, CopyExplorer, DeleteExplorer, Disconnect, FilterExplorer,
     GoToDefinition, GoToDeclaration, GoToTypeDefinition, GoToImplementation, FindReferences, RenameSymbol, CodeActions,
     DocumentSymbols, WorkspaceSymbols, NavigateBack, NavigateForward,
+    FormatSelection, ShowProblems, NextError, PreviousError, ShowLanguageServers, StartLanguageServers, StopLanguageServers, RestartLanguageServers,
     AskCopilot, Complete, ShowHover, SignatureHelp, FormatDocument, GoToFile, GoToLine, SwitchBuffer, NewFile, NewTerminal, NewWorkspace, NextTab, OpenDefaultSettings, OpenSettings, PasteExplorer,
     PrevTab, QuitClient, Reconnect, RenameWorkspace, ResetContentZoom, ResetUiZoom, SaveBuffer,
     SplitTerminal, StopServer, RestartServer, ReloadConfig, TerminalCopyOrInterrupt, TogglePinTab, ToggleCommandPalette, ToggleSidebar, ToggleWordWrap, ZoomInContent, ZoomInUi, ZoomOutContent,
@@ -967,6 +970,7 @@ pub struct Workspace {
     copilot_open: bool,
     copilot_busy: bool,
     copilot_result: Option<String>,
+    diagnostics: diagnostics::Diagnostics,
     navigation: navigation::Navigation,
     navigation_state: Entity<CommandState>,
     workspace_edits: workspace_edits::WorkspaceEdits,
@@ -1551,6 +1555,7 @@ impl Workspace {
             copilot_open: false,
             copilot_busy: false,
             copilot_result: None,
+            diagnostics: diagnostics::Diagnostics::default(),
             navigation: navigation::Navigation::default(),
             navigation_state,
             workspace_edits: workspace_edits::WorkspaceEdits::default(),
@@ -1978,20 +1983,25 @@ impl Workspace {
                 buffer_id,
                 path,
                 rev,
+                outcome,
             } => {
                 if let Some(panel) = self.diffs.values().find(|panel| panel.read(cx).buffer_id() == Some(buffer_id.as_str())).cloned() {
                     let panel_id = PanelId::from(panel.entity_id());
                     let saved_text = if self.diff_save_snapshots.get(&buffer_id).is_some_and(|(_, _, sent_id)| sent_id == &request_id) {
                         self.diff_save_snapshots.remove(&buffer_id).map(|(_, text, _)| text)
                     } else { None };
-                    panel.update(cx, |panel, cx| panel.mark_saved(rev, saved_text.as_deref(), cx));
+                    let save_status = outcome.status.clone().unwrap_or_else(|| "Saved".into());
+                    panel.update(cx, |panel, cx| panel.mark_saved(rev, saved_text.as_deref(), outcome, window, cx));
                     if let Some(pending) = self.pending_save_close.as_mut() {
                         pending.waiting_for_diff_saves.remove(&panel_id);
                     }
-                    self.status = "Saved".into();
+                    self.status = save_status.into();
                     self.resume_pending_save_close(window, cx);
                     cx.notify();
-                } else { self.on_buffer_saved(&request_id, &buffer_id, path, rev, window, cx); }
+                } else { self.on_buffer_saved(&request_id, &buffer_id, (path, rev, outcome), window, cx); }
+            }
+            AdeEvent::LanguageServersState { request_id, buffer_id, servers } => {
+                self.receive_language_servers(request_id, buffer_id, servers, cx);
             }
             AdeEvent::LspResult { result } => {
                 if let Some(panel) = self.editor_by_buffer(&result.buffer_id, cx) {
@@ -2406,11 +2416,13 @@ impl Workspace {
         }
     }
 
-    fn on_buffer_saved(&mut self, request_id: &str, buffer_id: &str, path: String, rev: u64, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_buffer_saved(&mut self, request_id: &str, buffer_id: &str, saved: (String, u64, fresh_gui_protocol::SaveOutcome), window: &mut Window, cx: &mut Context<Self>) {
+        let (path, rev, outcome) = saved;
         let Some(panel) = self.editor_by_buffer(buffer_id, cx) else {
             return;
         };
-        let previous = panel.update(cx, |panel, cx| panel.finish_save(request_id, path.clone(), rev, cx));
+        let save_status = outcome.status.clone().unwrap_or_else(|| "Saved".into());
+        let previous = panel.update(cx, |panel, cx| panel.finish_save(request_id, path.clone(), rev, outcome, window, cx));
         if let Some(previous) = previous
             && let Some(entity) = self.editors.remove(&previous)
         {
@@ -2425,7 +2437,7 @@ impl Workspace {
                 self.anchor = Some(path.clone());
             }
         }
-        self.status = "Saved".into();
+        self.status = save_status.into();
         self.resume_pending_save_close(window, cx);
     }
 
@@ -2810,6 +2822,7 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
                 .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
         }
         self.terminals.clear();
+        self.diagnostics = diagnostics::Diagnostics::default();
         self.editors.clear();
         self.diffs.clear();
         self.binaries.clear();
@@ -7240,6 +7253,14 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_show_hover))
             .on_action(cx.listener(Self::on_signature_help))
             .on_action(cx.listener(Self::on_format_document))
+            .on_action(cx.listener(Self::on_format_selection))
+            .on_action(cx.listener(Self::on_show_problems))
+            .on_action(cx.listener(Self::on_next_error))
+            .on_action(cx.listener(Self::on_previous_error))
+            .on_action(cx.listener(Self::on_language_servers))
+            .on_action(cx.listener(Self::on_start_language_servers))
+            .on_action(cx.listener(Self::on_stop_language_servers))
+            .on_action(cx.listener(Self::on_restart_language_servers))
             .on_action(cx.listener(Self::on_search_project))
             .on_action(cx.listener(Self::on_rename_symbol))
             .on_action(cx.listener(Self::on_code_actions))
@@ -7334,6 +7355,8 @@ impl Render for Workspace {
                                 .when(self.panes_empty(), |this| this.child(self.render_empty(cx)))),
                     ),
             )
+            .when(self.diagnostics.open, |this| this.child(self.render_problems(cx)))
+            .when(self.diagnostics.servers_open, |this| this.child(self.render_language_servers(cx)))
             .child(
                 StatusBar::new()
                     .h(self.ui_px(STATUS_BAR_H))

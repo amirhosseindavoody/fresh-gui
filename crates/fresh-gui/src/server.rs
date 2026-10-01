@@ -15,7 +15,7 @@ use axum::routing::get;
 use base64::Engine;
 use fresh_gui_protocol::{
     ByteSelection, CAP_EDITOR, CAP_EDITOR_DRAFT_RECOVERY, CAP_EDITOR_EXTERNAL_CHANGES,
-    CAP_EDITOR_PAGED_READS, CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_SEARCH, CAP_PROJECT_SEARCH, CAP_FILE_FINDER, CAP_LSP, CAP_LSP_NAVIGATION, CAP_LSP_REQUESTS, CAP_LSP_WORKSPACE_EDITS,
+    CAP_EDITOR_PAGED_READS, CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_SEARCH, CAP_PROJECT_SEARCH, CAP_FILE_FINDER, CAP_LSP_CONTROLS, CAP_LSP, CAP_LSP_NAVIGATION, CAP_LSP_REQUESTS, CAP_LSP_WORKSPACE_EDITS,
     CAP_SCENE, CAP_SETTINGS_EDITOR, EditorDraftInfo, ExternalResolution, Hello, HelloUi,
     MAX_PAGE_BYTES, Message, PROTOCOL_VERSION,
 };
@@ -140,6 +140,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 && c != CAP_PROJECT_SEARCH
                 && c != CAP_FILE_FINDER
                 && c != CAP_LSP
+                && c != CAP_LSP_CONTROLS
                 && c != CAP_LSP_REQUESTS
                 && c != CAP_LSP_NAVIGATION
                 && c != CAP_LSP_WORKSPACE_EDITS
@@ -179,6 +180,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut client_lsp_navigation = false;
     let mut client_project_search = false;
     let mut client_file_finder = false;
+    let mut client_lsp_controls = false;
     let project = crate::project_session::ProjectSession::default();
     let (project_tx, mut project_rx) = mpsc::channel::<crate::project_session::SearchOutput>(8);
     let mut client_workspace_edits = false;
@@ -323,6 +325,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     &mut client_editor_search,
                     &mut client_project_search,
                     &mut client_file_finder,
+                    &mut client_lsp_controls,
                     &project,
                     project_tx.clone(),
                     &finder,
@@ -373,6 +376,7 @@ async fn handle_client_msg(
     client_editor_search: &mut bool,
     client_project_search: &mut bool,
     client_file_finder: &mut bool,
+    client_lsp_controls: &mut bool,
     project: &crate::project_session::ProjectSession,
     project_tx: mpsc::Sender<crate::project_session::SearchOutput>,
     finder: &crate::file_finder::FileFinderSession,
@@ -413,6 +417,7 @@ async fn handle_client_msg(
                 .capabilities
                 .iter()
                 .any(|cap| cap == CAP_LSP_NAVIGATION);
+            *client_lsp_controls = client_hello.capabilities.iter().any(|cap| cap == CAP_LSP_CONTROLS);
             *client_project_search = client_hello.capabilities.iter().any(|cap| cap == CAP_PROJECT_SEARCH);
             *client_file_finder = client_hello.capabilities.iter().any(|cap| cap == CAP_FILE_FINDER);
             if client_hello.protocol_version != PROTOCOL_VERSION {
@@ -1884,7 +1889,7 @@ async fn handle_client_msg(
                         }
                     })?)
                 };
-            let (path, rev) = match editor.save(buffer_id.clone(), base_rev, dest).await {
+            let saved = match editor.save_with_actions(buffer_id.clone(), base_rev, dest, *client_lsp_controls).await {
                 Ok(saved) => saved,
                 Err(err) => {
                     // A disk-generation conflict is returned as a save error to
@@ -1906,6 +1911,8 @@ async fn handle_client_msg(
                     });
                 }
             };
+            let path = saved.path;
+            let rev = saved.rev;
             if Config::path_matches(&state.config_path, &path) {
                 match Config::load_from_path(&state.config_path) {
                     Ok(cfg) => {
@@ -1960,6 +1967,7 @@ async fn handle_client_msg(
                     buffer_id,
                     path,
                     rev,
+                    outcome: saved.outcome,
                 },
             )
             .await
@@ -1980,6 +1988,7 @@ async fn handle_client_msg(
                     message: "editor capability not available".into(),
                 });
             };
+            ensure_editor_workspace(editor, state, session_id, &buffer_id, "lsp-get").await?;
             let lsp = editor
                 .lsp_get(buffer_id.clone(), known_rev)
                 .await
@@ -2128,10 +2137,20 @@ async fn handle_client_msg(
             }
             Ok(())
         }
+        Message::LanguageServers { request_id, buffer_id, action } => {
+            require_auth(*authed)?;
+            if !*client_lsp_controls { return Err(Message::Error { code: "capability_unavailable".into(), message: format!("{request_id}: language server controls require {CAP_LSP_CONTROLS}") }); }
+            let editor = state.editor.as_ref().ok_or_else(|| Message::Error { code: "editor_unavailable".into(), message: format!("{request_id}: editor unavailable") })?;
+            ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
+            let servers = editor.language_servers(buffer_id.clone(), action).await.map_err(|err| Message::Error { code: "language_servers_failed".into(), message: format!("{request_id}: {err:#}") })?;
+            send_msg(sink, &Message::LanguageServersState { request_id, buffer_id, servers }).await.map_err(|_| Message::Error { code: "send_failed".into(), message: "failed to send language server status".into() })?;
+            Ok(())
+        }
         Message::BufferFormat {
             request_id,
             buffer_id,
             base_rev,
+            range,
         } => {
             require_auth(*authed)?;
             let Some(editor) = state.editor.as_ref() else {
@@ -2141,9 +2160,8 @@ async fn handle_client_msg(
                 });
             };
             ensure_editor_workspace(editor, state, session_id, &buffer_id, &request_id).await?;
-            let formatted = editor
-                .format(buffer_id.clone(), base_rev)
-                .await
+            if range.is_some() && !*client_lsp_controls { return Err(Message::Error { code: "capability_unavailable".into(), message: format!("{request_id}: selection formatting requires {CAP_LSP_CONTROLS}") }); }
+            let formatted = if range.is_some() { editor.format_range(buffer_id.clone(), base_rev, range).await } else { editor.format(buffer_id.clone(), base_rev).await }
                 .map_err(|err| Message::Error {
                     code: "buffer_format_failed".into(),
                     message: format!("{request_id}: {err:#}"),

@@ -223,6 +223,9 @@ impl Config {
         overrides.editor = Some(self.editor.clone());
         overrides.languages = Some(self.languages.clone());
         overrides.lsp = Some(self.lsp.clone());
+        // An explicit global disable is meaningful even when the daemon has
+        // configured servers. Otherwise derive whether the daemon has any
+        // servers at all, preserving the default "off when unconfigured".
         overrides.lsp_enabled = self.fresh.lsp_enabled.or(Some(!self.lsp.is_empty()));
         // The value being mutated is the lower-precedence layer. Fresh's
         // Merge contract keeps values already present in `self`, so start
@@ -233,8 +236,11 @@ impl Config {
         // `fresh-gui` owns the daemon's LSP set. It intentionally replaces
         // Fresh's discovered servers rather than inheriting unrelated ones.
         partial.lsp = Some(self.lsp.clone());
-        partial.lsp_enabled = Some(!self.lsp.is_empty());
+        partial.lsp_enabled = self.fresh.lsp_enabled.or(Some(!self.lsp.is_empty()));
         *fresh_config = partial.resolve();
+        // resolve() merges Fresh's built-in servers. ADE only authorizes the
+        // explicitly configured daemon set, so replace it after resolution.
+        fresh_config.lsp = self.lsp.clone();
     }
 
     /// Reconfigure the already supported language/server services without
@@ -242,7 +248,12 @@ impl Config {
     pub fn apply_fresh_services(&self, config: &mut fresh::config::Config) {
         let mut services = self.clone();
         services.editor = Default::default();
+        // A service-only reload must still honor the user's global LSP kill
+        // switch; clearing all typed Fresh settings used to silently turn it
+        // back on whenever an LSP was configured.
+        let lsp_enabled = services.fresh.lsp_enabled;
         services.fresh = Default::default();
+        services.fresh.lsp_enabled = lsp_enabled;
         services.apply_fresh(config);
     }
 
@@ -268,8 +279,23 @@ impl Config {
         if let Some(project) = resolver.load_project_layer().map_err(anyhow::Error::new)? {
             higher.merge_from(&project);
         }
+        // Keep server commands and associations owned by the daemon. Project
+        // layers may only disable matching configured servers; they cannot
+        // add a server (which could spawn an unreviewed process) or replace a
+        // daemon command. Fresh's ordinary map merge would replace a whole
+        // language entry, so capture these booleans before merging the lower
+        // daemon config and apply them to the configured set afterward.
+        let workspace_lsp = higher.lsp.clone();
+        let daemon_lsp = fresh_config.lsp.clone();
         higher.merge_from(&PartialConfig::from(&*fresh_config));
-        *fresh_config = higher.resolve();
+        let mut resolved = higher.resolve();
+        resolved.lsp = apply_workspace_lsp_enablement(daemon_lsp, workspace_lsp.as_ref());
+        // An explicit daemon-level false is a global opt-out and has higher
+        // precedence than project/session settings.
+        if self.fresh.lsp_enabled == Some(false) {
+            resolved.lsp_enabled = false;
+        }
+        *fresh_config = resolved;
         Ok(())
     }
 
@@ -442,6 +468,53 @@ impl Config {
             _ => config_path.to_string_lossy() == candidate,
         }
     }
+}
+
+/// Apply only workspace enable/disable controls to the daemon-owned server
+/// set. The workspace may use a compact `{ "enabled": false }` entry, a
+/// server array, or identify servers by name/command. It cannot introduce a
+/// command or turn on a server disabled by the daemon.
+fn apply_workspace_lsp_enablement(
+    mut configured: std::collections::HashMap<String, fresh::types::LspLanguageConfig>,
+    workspace: Option<&std::collections::HashMap<String, fresh::types::LspLanguageConfig>>,
+) -> std::collections::HashMap<String, fresh::types::LspLanguageConfig> {
+    let Some(workspace) = workspace else {
+        return configured;
+    };
+
+    for (language, servers) in &mut configured {
+        let Some(controls) = workspace.get(language) else {
+            continue;
+        };
+        let controls = controls.as_slice();
+        let servers = servers.as_mut_slice();
+        let server_count = servers.len();
+        for (index, server) in servers.iter_mut().enumerate() {
+            let matching_control = controls
+                .iter()
+                .find(|control| {
+                    control.name.is_some() && control.name == server.name
+                        || !control.command.is_empty() && control.command == server.command
+                })
+                .or_else(|| {
+                    let positional = if controls.len() == server_count {
+                        controls.get(index)
+                    } else if controls.len() == 1 {
+                        controls.first()
+                    } else {
+                        None
+                    };
+                    positional.filter(|control| {
+                        control.name.is_none() && control.command.is_empty()
+                    })
+                });
+            if let Some(control) = matching_control {
+                server.enabled &= control.enabled;
+            }
+        }
+    }
+
+    configured
 }
 
 /// Unix: `$XDG_CONFIG_HOME/fresh-gui/config.json` or `~/.config/fresh-gui/config.json`.
@@ -921,6 +994,72 @@ mod tests {
         cfg.apply_fresh(&mut fresh);
         assert_eq!(fresh.theme.0, "noir");
         assert!(!fresh.editor.restore_previous_session);
+    }
+
+    #[test]
+    fn explicit_global_lsp_disable_survives_user_and_service_layers() {
+        let cfg = Config::parse(
+            r#"{"lsp_enabled":false,"lsp":{"rust":{"command":"rust-analyzer"}}}"#,
+        )
+        .unwrap();
+        let mut fresh = fresh::config::Config::default();
+        cfg.apply_fresh(&mut fresh);
+        assert!(!fresh.lsp_enabled);
+        cfg.apply_fresh_services(&mut fresh);
+        assert!(!fresh.lsp_enabled);
+    }
+
+    #[test]
+    fn workspace_can_disable_daemon_server_but_cannot_add_or_enable_servers() {
+        let root = tempfile_dir();
+        std::fs::create_dir_all(root.join(".fresh")).unwrap();
+        std::fs::write(
+            root.join(".fresh/config.json"),
+            r#"{"lsp":{"rust":{"enabled":false},"python":{"command":"python-lsp"}}}"#,
+        )
+        .unwrap();
+
+        let host = Config::parse(
+            r#"{"lsp":{"rust":{"command":"rust-analyzer"}},"lsp_enabled":true}"#,
+        )
+        .unwrap();
+        let mut fresh = fresh::config::Config::default();
+        host.apply_fresh(&mut fresh);
+        host.apply_fresh_project(&mut fresh, &root).unwrap();
+
+        let rust = fresh.lsp.get("rust").unwrap().as_slice();
+        assert_eq!(rust.len(), 1);
+        assert_eq!(rust[0].command, "rust-analyzer");
+        assert!(!rust[0].enabled);
+        assert!(!fresh.lsp.contains_key("python"));
+        assert!(fresh.lsp_enabled);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_language_formatter_and_format_on_save_override_daemon_layer() {
+        let root = tempfile_dir();
+        std::fs::create_dir_all(root.join(".fresh")).unwrap();
+        std::fs::write(
+            root.join(".fresh/config.json"),
+            r#"{"languages":{"rust":{"formatter":{"command":"rustfmt","args":["--edition","2024"]},"format_on_save":true}}}"#,
+        )
+        .unwrap();
+
+        let host = Config::parse(
+            r#"{"languages":{"rust":{"formatter":{"command":"oldfmt"},"format_on_save":false}}}"#,
+        )
+        .unwrap();
+        let mut fresh = fresh::config::Config::default();
+        host.apply_fresh(&mut fresh);
+        host.apply_fresh_project(&mut fresh, &root).unwrap();
+        let rust = fresh.languages.get("rust").unwrap();
+        assert_eq!(rust.formatter.as_ref().unwrap().command, "rustfmt");
+        assert_eq!(rust.formatter.as_ref().unwrap().args, ["--edition", "2024"]);
+        assert!(rust.format_on_save);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

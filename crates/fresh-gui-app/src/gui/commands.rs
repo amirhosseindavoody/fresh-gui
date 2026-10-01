@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use super::actions::*;
 use fresh_gui_protocol::{
-    CAP_EDITOR_SEARCH, CAP_LSP_NAVIGATION, CAP_LSP_REQUESTS, CAP_LSP_WORKSPACE_EDITS,
-    CAP_PROJECT_SEARCH,
+    CAP_EDITOR_SEARCH, CAP_LSP, CAP_LSP_CONTROLS, CAP_LSP_NAVIGATION, CAP_LSP_REQUESTS,
+    CAP_LSP_WORKSPACE_EDITS, CAP_PROJECT_SEARCH,
 };
 
 pub type ActionFactory = Arc<dyn Fn() -> Box<dyn Action> + Send + Sync>;
@@ -176,7 +176,57 @@ pub fn builtin_commands() -> Vec<CommandDescriptor> {
             "Format Document",
             FormatDocument,
             Some(CommandContext::Editor),
-            Some(CAP_LSP_REQUESTS)
+            Some(CAP_LSP)
+        ),
+        command!(
+            "FormatSelection",
+            "Format Selection",
+            FormatSelection,
+            Some(CommandContext::Editor),
+            Some(CAP_LSP_CONTROLS)
+        ),
+        command!(
+            "ShowProblems",
+            "Problems",
+            ShowProblems,
+            None,
+            Some(CAP_LSP)
+        ),
+        command!("NextError", "Next Error", NextError, None, Some(CAP_LSP)),
+        command!(
+            "PreviousError",
+            "Previous Error",
+            PreviousError,
+            None,
+            Some(CAP_LSP)
+        ),
+        command!(
+            "ShowLanguageServers",
+            "Language Servers",
+            ShowLanguageServers,
+            Some(CommandContext::Editor),
+            Some(CAP_LSP_CONTROLS)
+        ),
+        command!(
+            "StartLanguageServers",
+            "Start Language Servers",
+            StartLanguageServers,
+            Some(CommandContext::Editor),
+            Some(CAP_LSP_CONTROLS)
+        ),
+        command!(
+            "StopLanguageServers",
+            "Stop Language Servers",
+            StopLanguageServers,
+            Some(CommandContext::Editor),
+            Some(CAP_LSP_CONTROLS)
+        ),
+        command!(
+            "RestartLanguageServers",
+            "Restart Language Servers",
+            RestartLanguageServers,
+            Some(CommandContext::Editor),
+            Some(CAP_LSP_CONTROLS)
         ),
         command!(
             "RenameSymbol",
@@ -545,6 +595,52 @@ mod tests {
                 .any(|command| command.id == "GoToFile"),
             "exact path opening remains available on older daemons"
         );
+    }
+
+    #[test]
+    fn diagnostics_controls_share_palette_and_keybinding_registration() {
+        let registry = CommandRegistry::with_builtins();
+        for id in [
+            "ShowProblems",
+            "NextError",
+            "PreviousError",
+            "FormatDocument",
+        ] {
+            assert!(command_descriptor(id).is_some());
+            assert!(
+                registry
+                    .available(Some(CommandContext::Editor), &[CAP_LSP.into()])
+                    .iter()
+                    .any(|command| command.id == id)
+            );
+        }
+        for id in [
+            "FormatSelection",
+            "ShowLanguageServers",
+            "StartLanguageServers",
+            "StopLanguageServers",
+            "RestartLanguageServers",
+        ] {
+            assert!(command_descriptor(id).is_some());
+            assert!(
+                !registry
+                    .available(Some(CommandContext::Editor), &[CAP_LSP.into()])
+                    .iter()
+                    .any(|command| command.id == id)
+            );
+            assert!(
+                registry
+                    .available(Some(CommandContext::Editor), &[CAP_LSP_CONTROLS.into()])
+                    .iter()
+                    .any(|command| command.id == id)
+            );
+            assert!(
+                !registry
+                    .available(Some(CommandContext::Terminal), &[CAP_LSP_CONTROLS.into()])
+                    .iter()
+                    .any(|command| command.id == id)
+            );
+        }
     }
 
     #[test]

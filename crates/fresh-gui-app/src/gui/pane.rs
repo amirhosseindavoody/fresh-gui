@@ -1697,6 +1697,7 @@ pub struct EditorPanel {
     next_request: u64,
     pending_save: Option<String>,
     pending_format: bool,
+    pending_format_range: Option<fresh_gui_protocol::ByteRange>,
     format_inflight: bool,
     pending_actions: VecDeque<EditorAction>,
     action_inflight: bool,
@@ -1885,6 +1886,7 @@ impl EditorPanel {
             next_request: 1,
             pending_save: None,
             pending_format: false,
+            pending_format_range: None,
             format_inflight: false,
             pending_actions: VecDeque::new(),
             action_inflight: false,
@@ -2179,6 +2181,8 @@ impl EditorPanel {
 
     fn on_lsp_text_change(&mut self, cx: &mut Context<Self>) -> bool {
         let draft = self.current_text(cx);
+        self.diagnostics.clear();
+        self.editor.update(cx, |editor, cx| { if let Some(set) = editor.diagnostics_mut() { set.clear(); } cx.notify(); });
         // Invalidate callbacks that received their reply before this change.
         self.lsp_request_tracker.clear();
         for pending in &self.pending_lsp {
@@ -2735,6 +2739,7 @@ impl EditorPanel {
                 request_id,
                 buffer_id: self.buffer_id.clone(),
                 base_rev,
+                range: self.pending_format_range.take(),
             });
             self.format_inflight = true;
             self.lsp_status = Some("Formatting…".into());
@@ -3367,7 +3372,23 @@ impl EditorPanel {
                 });
             }
         }
-        self.diagnostics = diagnostics;
+        // Never paint offsets against a local draft newer than the daemon snapshot.
+        let draft = self.current_text(cx);
+        let current = self.edit_sync.as_ref().is_some_and(|sync| { let (text, acknowledged_rev) = sync.acknowledged(); acknowledged_rev == rev && text == draft });
+        self.diagnostics = if current && self.page.is_none() { diagnostics } else { Vec::new() };
+        let mut decorations = self.diagnostics.iter().map(|d| {
+            use gpui_kit::base::input::{Diagnostic, DiagnosticSeverity};
+            let start = Position::new(d.start_line, utf16_to_scalar_column(&draft, d.start_line, d.start_character));
+            let end = Position::new(d.end_line, utf16_to_scalar_column(&draft, d.end_line, d.end_character));
+            let severity = match d.severity.as_str() { "error" => DiagnosticSeverity::Error, "warning" => DiagnosticSeverity::Warning, "hint" => DiagnosticSeverity::Hint, _ => DiagnosticSeverity::Info };
+            Diagnostic::new(start..end, d.message.clone()).with_severity(severity).with_source(d.source.clone().unwrap_or_else(|| "LSP".into()))
+        }).collect::<Vec<_>>();
+        decorations.sort_by_key(|d| d.range.start);
+        self.editor.update(cx, |editor, cx| {
+            let text = editor.text().clone();
+            if let Some(set) = editor.diagnostics_mut() { set.reset(&text); set.extend(decorations); }
+            cx.notify();
+        });
         if self.lsp_requests && self.page.is_none() && self.edit_sync.is_some()
             && !self.pending_lsp.iter().any(|pending| pending.request.feature == LspRequestFeature::Capabilities) {
             let text = self.current_text(cx);
@@ -3536,9 +3557,29 @@ impl EditorPanel {
             cx.notify();
             return;
         }
+        self.pending_format_range = None;
         self.pending_format = true;
         self.flush_pending(cx);
         cx.notify();
+    }
+
+    pub(crate) fn request_format_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page.is_some() || self.conflict { self.lsp_status = Some("Selection formatting requires a synchronized full buffer".into()); cx.notify(); return; }
+        self.commit_markdown_inline_edit(window, cx);
+        let selection = self.byte_selection(cx);
+        if selection.anchor == selection.head { self.lsp_status = Some("Select text to format".into()); cx.notify(); return; }
+        self.pending_format_range = Some(fresh_gui_protocol::ByteRange { start: selection.anchor.min(selection.head), len: selection.anchor.abs_diff(selection.head) });
+        self.pending_format = true;
+        self.flush_pending(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn problems(&self) -> &[BufferDiagnostic] { &self.diagnostics }
+
+    pub(crate) fn reveal_problem(&mut self, line: u32, character: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.current_text(cx);
+        let col = utf16_to_scalar_column(&text, line, character);
+        self.editor.update(cx, |state, cx| { state.set_cursor_position(Position::new(line, col), window, cx); state.focus(window, cx); });
     }
 
     /// Returns the previous path when the saved path differs, so the workspace
@@ -3572,12 +3613,36 @@ impl EditorPanel {
         request_id: &str,
         path: String,
         rev: u64,
+        outcome: fresh_gui_protocol::SaveOutcome,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
         if self.save_request_id.as_deref() != Some(request_id) {
             return None;
         }
-        self.mark_saved(path, rev, cx)
+        if let Some(text) = outcome.text {
+            let draft = self.current_text(cx);
+            let sent = self.save_sent_text.as_deref();
+            if sent == Some(draft.as_str()) {
+                let selection = map_selection_through_edits(&draft, &text, self.byte_selection(cx));
+                self.set_editor_text_and_selection(&text, Some(selection), window, cx);
+                self.save_sent_text = Some(text);
+            } else if sent.is_some_and(|sent| sent != text) {
+                // Protect a draft typed while a formatter ran. The normal snapshot
+                // reconciliation records conflict rather than overwriting it.
+                let outcome = self.edit_sync.as_mut().map(|sync| sync.reconcile_snapshot(rev, text.clone(), &draft));
+                self.save_sent_text = Some(text);
+                if outcome == Some(SnapshotReconciliation::Conflict) {
+                    self.conflict = true;
+                    self.lsp_status = Some("Save formatting conflicted with newer edits; local draft kept".into());
+                }
+            }
+        }
+        let previous = self.mark_saved(path, rev, cx);
+        self.dirty |= outcome.dirty;
+        if let Some(status) = outcome.status { self.lsp_status = Some(status); }
+        cx.notify();
+        previous
     }
 
     fn label(&self) -> String {
@@ -4037,35 +4102,6 @@ impl Render for EditorPanel {
         .child(Button::new("conflict-use-server").ghost().xsmall().label("Use server text")
                         .on_click(move |_, window, cx| { let _ = panel.update(cx, |this, cx| this.resolve_use_server(window, cx)); }))
             );
-        }
-        if !self.diagnostics.is_empty() {
-            let mut problems = v_flex().id("editor-problems").w_full().h(px(112.))
-                .overflow_y_scroll().border_t_1().border_color(cx.theme().border);
-            for (index, diagnostic) in self.diagnostics.iter().enumerate() {
-                let row_panel = cx.entity();
-                let line = diagnostic.start_line;
-                let utf16_col = diagnostic.start_character;
-                let source = diagnostic.source.as_deref().unwrap_or("LSP");
-                let label = format!("{}:{} {}: {}", line + 1, utf16_col + 1,
-                    source, diagnostic.message.replace('\n', " "));
-                problems = problems.child(
-                    div().id(format!("problem-{index}")).px_2().py_1()
-                        .text_xs().text_color(if diagnostic.severity == "error" {
-                            cx.theme().danger
-                        } else { cx.theme().muted_foreground })
-                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                            row_panel.update(cx, |this, cx| {
-                                let source = this.current_text(cx);
-                                let col = utf16_to_scalar_column(&source, line, utf16_col);
-                                this.editor.update(cx, |state, cx| {
-                                    state.set_cursor_position(Position::new(line, col), window, cx);
-                                });
-                            });
-                        })
-                        .child(label),
-                );
-            }
-            root = root.child(problems);
         }
         root
     }
@@ -4929,3 +4965,7 @@ pub(crate) fn language_from_path(path: &str, reported: Option<&str>) -> Option<S
     };
     Some(name.into())
 }
+
+#[cfg(test)]
+#[path = "diagnostic_tests.rs"]
+mod diagnostic_tests;
