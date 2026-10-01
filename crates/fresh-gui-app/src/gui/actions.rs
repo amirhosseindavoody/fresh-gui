@@ -153,11 +153,13 @@ pub fn apply_shortkeys(cx: &mut App, shortkeys: &[Shortkey]) {
     // The window Root binds Tab to focus-next, which lands on the File menu.
     // A Terminal-context binding is more specific and wins while the shell is focused.
     cx.bind_keys([
-        KeyBinding::new("tab", TerminalInputTab, Some("Terminal")),
-        KeyBinding::new("shift-tab", TerminalInputBacktab, Some("Terminal")),
-        KeyBinding::new("f2", RenameSymbol, Some("Editor")),
-        KeyBinding::new("ctrl-.", CodeActions, Some("Editor")),
-    ]);
+        ("tab", "TerminalInputTab", "Terminal"),
+        ("shift-tab", "TerminalInputBacktab", "Terminal"),
+        ("f2", "RenameSymbol", "Editor"),
+        ("ctrl-.", "CodeActions", "Editor"),
+    ].into_iter().filter_map(|(key, id, context)| {
+        super::commands::command_descriptor(id).map(|command| command.key_binding(key, Some(context)))
+    }));
 }
 
 /// Native actions understood by the shortkeys adapter.

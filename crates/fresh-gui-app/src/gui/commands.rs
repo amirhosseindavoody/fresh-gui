@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use super::actions::*;
 use fresh_gui_protocol::{
-    CAP_EDITOR_SEARCH, CAP_FILE_FINDER, CAP_LSP_NAVIGATION, CAP_LSP_REQUESTS, CAP_PROJECT_SEARCH,
+    CAP_EDITOR_SEARCH, CAP_LSP_NAVIGATION, CAP_LSP_REQUESTS, CAP_LSP_WORKSPACE_EDITS,
+    CAP_PROJECT_SEARCH,
 };
 
 pub type ActionFactory = Arc<dyn Fn() -> Box<dyn Action> + Send + Sync>;
@@ -176,6 +177,20 @@ pub fn builtin_commands() -> Vec<CommandDescriptor> {
             FormatDocument,
             Some(CommandContext::Editor),
             Some(CAP_LSP_REQUESTS)
+        ),
+        command!(
+            "RenameSymbol",
+            "Rename Symbol",
+            RenameSymbol,
+            Some(CommandContext::Editor),
+            Some(CAP_LSP_WORKSPACE_EDITS)
+        ),
+        command!(
+            "CodeActions",
+            "Code Actions",
+            CodeActions,
+            Some(CommandContext::Editor),
+            Some(CAP_LSP_WORKSPACE_EDITS)
         ),
         command!(
             "Complete",
@@ -343,13 +358,7 @@ pub fn builtin_commands() -> Vec<CommandDescriptor> {
             "Toggle Command Palette",
             ToggleCommandPalette
         ),
-        command!(
-            "GoToFile",
-            "Go to File…",
-            GoToFile,
-            None,
-            Some(CAP_FILE_FINDER)
-        ),
+        command!("GoToFile", "Go to File…", GoToFile, None, None),
         command!("OpenSettings", "Open Settings", OpenSettings),
         command!(
             "OpenDefaultSettings",
@@ -509,12 +518,44 @@ mod tests {
     }
 
     #[test]
+    fn merged_workspace_edit_commands_share_discovery_and_shortkey_lookup() {
+        let registry = CommandRegistry::with_builtins();
+        for id in ["RenameSymbol", "CodeActions"] {
+            assert!(command_descriptor(id).is_some());
+            assert!(
+                !registry
+                    .available(Some(CommandContext::Editor), &[CAP_LSP_REQUESTS.into()])
+                    .iter()
+                    .any(|command| command.id == id)
+            );
+            assert!(
+                registry
+                    .available(
+                        Some(CommandContext::Editor),
+                        &[CAP_LSP_WORKSPACE_EDITS.into()]
+                    )
+                    .iter()
+                    .any(|command| command.id == id)
+            );
+        }
+        assert!(
+            registry
+                .available(None, &[])
+                .iter()
+                .any(|command| command.id == "GoToFile"),
+            "exact path opening remains available on older daemons"
+        );
+    }
+
+    #[test]
     fn defaults_include_shortkey_only_and_palette_commands() {
         let registry = CommandRegistry::with_builtins();
         for id in [
             "ToggleCommandPalette",
             "SwitchBuffer",
             "GoToLine",
+            "RenameSymbol",
+            "CodeActions",
             "QuitClient",
         ] {
             assert!(registry.get(id).is_some(), "missing {id}");
