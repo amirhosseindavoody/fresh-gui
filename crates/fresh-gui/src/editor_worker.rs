@@ -28,6 +28,9 @@ use tracing::{info, warn};
 #[cfg(test)]
 #[path = "editor_worker/formatting_tests.rs"]
 mod formatting_tests;
+#[cfg(test)]
+#[path = "editor_worker/file_format_tests.rs"]
+mod file_format_tests;
 mod language_servers;
 #[cfg(test)]
 mod workspace_edit_tests;
@@ -5225,10 +5228,7 @@ fn preflight_active_encoding(editor: &Editor, paged: bool) -> Result<()> {
     let buffer = &editor.active_state().buffer;
     let encoding = buffer.encoding();
     if paged {
-        if let Some(text) = buffer.to_string() {
-            return strict_encode_check(&text, encoding);
-        }
-        if matches!(encoding, Encoding::Utf8 | Encoding::Ascii) {
+        if encoding_supports_all_unicode(encoding) || encoding == Encoding::Ascii {
             // Fresh's only genuinely lazy input encodings are UTF-8 and
             // ASCII. Their unchanged backing pieces are copied verbatim, and
             // those encodings do not replace Unicode on write.
@@ -5308,13 +5308,13 @@ fn file_control(
                 bail!("buffer is read-only; line endings cannot be changed");
             }
             let line_ending = parse_line_ending(&line_ending)?;
+            preflight_active_encoding(editor, false)?;
             editor
                 .active_state_mut()
                 .buffer
                 .set_line_ending(line_ending);
             tracked.get_mut(buffer_id).expect("tracked").line_ending =
                 line_ending.display_name().to_owned();
-            preflight_active_encoding(editor, false)?;
         }
         FileControlOperation::Reopen { encoding } => {
             if paged {
