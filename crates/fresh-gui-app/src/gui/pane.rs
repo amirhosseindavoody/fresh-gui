@@ -2839,7 +2839,7 @@ impl EditorPanel {
                     this.request_save(String::new(), window, cx);
                 } else if this.auto_save_poll_elapsed >= 5 && this.file_control_request.is_none() && this.edit_request_id.is_none()
                     && this.sync_request_id.is_none()
-                    && this.edit_sync.as_ref().map_or(true, |sync| sync.acknowledged().0 == this.current_text(cx)) {
+                    && this.edit_sync.as_ref().is_none_or(|sync| sync.acknowledged().0 == this.current_text(cx)) {
                     this.auto_save_poll_elapsed = 0;
                     this.request_file_control(FileControlOperation::Inspect, cx);
                 }
@@ -2886,7 +2886,7 @@ impl EditorPanel {
         { return false; }
         let snapshot = self.current_text(cx);
         let synchronized = self.edit_request_id.is_none() && self.sync_request_id.is_none()
-            && self.edit_sync.as_ref().map_or(true, |sync| sync.acknowledged().0 == snapshot);
+            && self.edit_sync.as_ref().is_none_or(|sync| sync.acknowledged().0 == snapshot);
         if !synchronized {
             self.lsp_status = Some("Wait for pending edits to synchronize before changing file format".into());
             cx.notify();
@@ -2905,6 +2905,7 @@ impl EditorPanel {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_file_state(&mut self, request_id: &str, rev: u64, metadata: BufferFileMetadata,
         text: Option<String>, dirty: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.file_control_request.as_deref() != Some(request_id) { return; }

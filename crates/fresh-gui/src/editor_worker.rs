@@ -4809,7 +4809,9 @@ fn save_buffer(
     {
         let encoding = editor.active_state().buffer.encoding();
         let language = editor.active_state().language.clone();
-        let skip_formatter = !encoding_supports_all_unicode(encoding)
+        // Fresh writes ASCII buffers as UTF-8 bytes, so only legacy
+        // encoder-backed encodings can be silently replaced by formatter output.
+        let skip_formatter = !(encoding_supports_all_unicode(encoding) || encoding == Encoding::Ascii)
             && editor
                 .config()
                 .languages
