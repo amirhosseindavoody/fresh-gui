@@ -110,7 +110,9 @@ impl Workspace {
             timer.await;
             let request = this.update(cx, |this, cx| {
                 if !this.navigation.open || this.navigation.generation != generation
-                    || this.workspace_id_or_empty() != workspace { return None; }
+                    || this.workspace_id_or_empty() != workspace
+                    || this.current_location(cx).is_none_or(|location| location.view_id != panel.read(cx).navigation_location(cx).view_id) { return None; }
+                this.navigation.origin = Some(panel.read(cx).navigation_location(cx));
                 let (text, offset) = panel.read(cx).navigation_snapshot(cx);
                 let receiver = panel.update(cx, |panel, cx| panel.queue_lsp_payload(
                     feature, offset, None, text.clone(), Some(serde_json::json!({"query":query})), cx));
@@ -122,7 +124,8 @@ impl Workspace {
                 if !this.navigation.open || this.navigation.generation != generation
                     || this.workspace_id_or_empty() != workspace { return; }
                 match result {
-                    Ok(result) if panel.read(cx).lsp_result_matches(&result, &text, Some(offset), cx) => {
+                    Ok(result) if panel.read(cx).lsp_result_matches(&result, &text, Some(offset), cx)
+                        && this.current_location(cx).is_some_and(|location| location.view_id == panel.read(cx).navigation_location(cx).view_id) => {
                         this.navigation.accepted = Some((result.clone(), text.clone(), offset));
                         this.navigation.targets = result.navigation_targets;
                         this.navigation.status = result.status.unwrap_or_else(|| {
@@ -147,7 +150,8 @@ impl Workspace {
 
     fn open_navigation_target(&mut self, target: LspNavigationTarget, cx: &mut Context<Self>) {
         let current = self.navigation.source.as_ref().zip(self.navigation.accepted.as_ref())
-            .is_some_and(|(panel, (result, text, offset))| panel.read(cx).lsp_result_matches(result, text, Some(*offset), cx));
+            .is_some_and(|(panel, (result, text, offset))| panel.read(cx).lsp_result_matches(result, text, Some(*offset), cx)
+                && self.current_location(cx).is_some_and(|location| location.view_id == panel.read(cx).navigation_location(cx).view_id));
         if !current {
             self.navigation.targets.clear();
             self.navigation.status = "Navigation cancelled because the editor changed".into();
