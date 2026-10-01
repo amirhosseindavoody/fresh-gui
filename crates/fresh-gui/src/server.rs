@@ -196,10 +196,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         tokio::select! {
             finder_output = finder_rx.recv() => {
                 if let Some(output) = finder_output {
-                    if !output.generation.load(Ordering::Relaxed) {
-                        let id = match &output.message { Message::FileFinderResults { request_id, .. } => request_id, _ => continue };
-                        if finder.is_current(id) && send_msg(&mut sink, &output.message).await.is_err() { break; }
-                    }
+                    if output.generation.load(Ordering::Relaxed) { continue; }
+                    let id = match &output.message { Message::FileFinderResults { request_id, .. } => request_id, _ => continue };
+                    if finder.is_current(id) && send_msg(&mut sink, &output.message).await.is_err() { break; }
                 }
             }
             project_message = project_rx.recv() => {
