@@ -39,7 +39,12 @@ fn encoded_crlf_fixtures_round_trip_edits_save_as_and_eol_conversion() {
     let root =
         std::env::temp_dir().join(format!("fresh-format-roundtrip-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
-    let editor = EditorHandle::spawn(root.clone(), crate::config::Config::default()).unwrap();
+    let editor = EditorHandle::spawn_with_recovery_dir(
+        root.clone(),
+        crate::config::Config::default(),
+        root.join("recovery"),
+    )
+    .unwrap();
     runtime().block_on(async {
         for (index, encoding) in [
             Encoding::Utf8,
@@ -53,8 +58,13 @@ fn encoded_crlf_fixtures_round_trip_edits_save_as_and_eol_conversion() {
         {
             let path = root.join(format!("fixture-{index}.txt"));
             std::fs::write(&path, encoded("Привет\r\nмир\r\n", encoding)).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            }
             let opened = editor.open(path.clone(), false).await.unwrap();
-            assert_eq!(opened.text, "Привет\nмир\n");
+            assert_eq!(normalize_text_line_endings(&opened.text), "Привет\nмир\n");
             let state = control(
                 &editor,
                 &opened.buffer_id,
@@ -62,6 +72,7 @@ fn encoded_crlf_fixtures_round_trip_edits_save_as_and_eol_conversion() {
                 FileControlOperation::Inspect,
             )
             .await;
+            assert!(state.text.is_none(), "inspection only sends metadata");
             assert_eq!(state.metadata.encoding, encoding.display_name());
             assert_eq!(state.metadata.bom, encoding.has_bom());
             assert_eq!(state.metadata.line_ending, "CRLF");
@@ -69,7 +80,7 @@ fn encoded_crlf_fixtures_round_trip_edits_save_as_and_eol_conversion() {
                 .edit(
                     opened.buffer_id.clone(),
                     state.rev,
-                    "Привет\nизменение\n".into(),
+                    "Привет\r\nизменение\r\n".into(),
                 )
                 .await
                 .unwrap();
@@ -86,6 +97,14 @@ fn encoded_crlf_fixtures_round_trip_edits_save_as_and_eol_conversion() {
                 std::fs::read(&path).unwrap(),
                 encoded("Привет\r\nизменение\r\n", encoding)
             );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o640
+                );
+            }
             let state = control(
                 &editor,
                 &opened.buffer_id,
@@ -125,7 +144,12 @@ fn read_only_save_retains_draft_and_save_as_preserves_source() {
     let path = root.join("source.txt");
     std::fs::write(&path, "source\n").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
-    let editor = EditorHandle::spawn(root.clone(), crate::config::Config::default()).unwrap();
+    let editor = EditorHandle::spawn_with_recovery_dir(
+        root.clone(),
+        crate::config::Config::default(),
+        root.join("recovery"),
+    )
+    .unwrap();
     runtime().block_on(async {
         let opened = editor.open(path.clone(), false).await.unwrap();
         let state = control(
@@ -182,14 +206,15 @@ fn save_cleanup_precedes_formatter_and_legacy_formatter_is_explicitly_skipped() 
     let formatter = root.join("formatter.py");
     std::fs::write(
         &formatter,
-        "import sys\nsys.stdout.write(sys.stdin.read().replace('bad\\n', 'good\\n'))\n",
+        "import sys\nfrom pathlib import Path\nwith Path(__file__).with_suffix('.calls').open('a') as calls: calls.write('call\\n')\nsys.stdout.write(sys.stdin.read().replace('bad\\n', 'good\\n'))\n",
     )
     .unwrap();
     let config = crate::config::Config::parse(&serde_json::json!({
         "editor": {"trim_trailing_whitespace_on_save": true, "ensure_final_newline_on_save": true},
         "languages": {"python": {"formatter": {"command": "python3", "args": [formatter.display().to_string()], "stdin": true}, "format_on_save": true}}
     }).to_string()).unwrap();
-    let editor = EditorHandle::spawn(root.clone(), config).unwrap();
+    let editor =
+        EditorHandle::spawn_with_recovery_dir(root.clone(), config, root.join("recovery")).unwrap();
     runtime().block_on(async {
         for (index, encoding, expected) in [
             (0, Encoding::Utf8Bom, "good\n"),
@@ -216,6 +241,10 @@ fn save_cleanup_precedes_formatter_and_legacy_formatter_is_explicitly_skipped() 
                 .await
                 .unwrap();
             assert_eq!(saved.outcome.text.as_deref(), Some(expected));
+            assert_eq!(
+                std::fs::read_to_string(formatter.with_extension("calls")).unwrap(),
+                "call\n"
+            );
             assert_eq!(std::fs::read(path).unwrap(), encoded(expected, encoding));
             if encoding == Encoding::Windows1251 {
                 assert!(
@@ -227,6 +256,51 @@ fn save_cleanup_precedes_formatter_and_legacy_formatter_is_explicitly_skipped() 
                 );
             }
         }
+    });
+    drop(editor);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn lossy_save_keeps_original_bytes_and_recoverable_draft() {
+    let root = std::env::temp_dir().join(format!("fresh-lossy-save-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("source.txt");
+    let original = encoded("Привет\n", Encoding::Windows1251);
+    std::fs::write(&path, &original).unwrap();
+    let editor = EditorHandle::spawn_with_recovery_dir(
+        root.clone(),
+        crate::config::Config::default(),
+        root.join("recovery"),
+    )
+    .unwrap();
+    runtime().block_on(async {
+        let opened = editor.open(path.clone(), false).await.unwrap();
+        let rev = editor
+            .edit(opened.buffer_id.clone(), opened.rev, "λ\n".into())
+            .await
+            .unwrap();
+        let error = editor
+            .save(opened.buffer_id.clone(), rev, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("losslessly"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let drafts = editor.draft_list("default".into()).await.unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].text, "λ\n");
+        let state = control(
+            &editor,
+            &opened.buffer_id,
+            rev,
+            FileControlOperation::Inspect,
+        )
+        .await;
+        assert!(state.dirty);
+        assert_eq!(
+            state.metadata.encoding,
+            Encoding::Windows1251.display_name()
+        );
     });
     drop(editor);
     let _ = std::fs::remove_dir_all(root);

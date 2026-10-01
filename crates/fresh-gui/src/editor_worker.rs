@@ -4911,7 +4911,19 @@ fn save_buffer(
                 .save_to_file(dest)
                 .with_context(|| format!("save to {}", dest.display()))?;
         } else {
-            editor.save().context("Editor::save")?;
+            // Editor::save also runs actions inside its private finalizer.
+            // Defer them to ADE's explicit, capability-gated pass below so
+            // they run once and legacy encoding output can be protected.
+            let config = editor.config().clone();
+            editor.config_mut().editor.trim_trailing_whitespace_on_save = false;
+            editor.config_mut().editor.ensure_final_newline_on_save = false;
+            for language in editor.config_mut().languages.values_mut() {
+                language.format_on_save = false;
+                language.on_save.clear();
+            }
+            let result = editor.save();
+            *editor.config_mut() = config;
+            result.context("Editor::save")?;
         }
         let language = editor.active_buffer_mode().map(|mode| mode.to_owned());
         let entry = tracked.get_mut(buffer_id).expect("tracked");
@@ -4932,14 +4944,15 @@ fn save_buffer(
             .is_some_and(|entry| entry.total_bytes.is_none())
     {
         let encoding = editor.active_state().buffer.encoding();
-        let language = editor.active_buffer_mode().map(str::to_owned);
+        let language = editor.active_state().language.clone();
         let skip_formatter = !encoding_supports_all_unicode(encoding)
-            && language
-                .as_ref()
-                .and_then(|language| editor.config().languages.get(language))
+            && editor
+                .config()
+                .languages
+                .get(&language)
                 .is_some_and(|config| config.format_on_save);
         if skip_formatter {
-            let language_name = language.as_deref().expect("formatter language exists");
+            let language_name = language.as_str();
             editor
                 .config_mut()
                 .languages
@@ -4949,7 +4962,7 @@ fn save_buffer(
         }
         let action_result = editor.run_on_save_actions();
         if skip_formatter {
-            let language_name = language.as_deref().expect("formatter language exists");
+            let language_name = language.as_str();
             editor
                 .config_mut()
                 .languages
@@ -5207,7 +5220,7 @@ fn file_control(
     let buffer = &editor.active_state().buffer;
     let entry = tracked.get_mut(buffer_id).expect("tracked buffer");
     entry.dirty = buffer.is_modified();
-    if !paged && text.is_none() {
+    if !paged && !is_inspect && text.is_none() {
         entry.text = buffer.to_string().context("buffer text unavailable")?;
         text = Some(entry.text.clone());
     }
