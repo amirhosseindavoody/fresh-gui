@@ -529,8 +529,8 @@ impl Workspace {
                                     "{} — {}:{}:{}",
                                     target.name.as_deref().unwrap_or("Location"),
                                     target.uri,
-                                    target.line + 1,
-                                    target.character + 1
+                                    target.line.saturating_add(1),
+                                    target.character.saturating_add(1)
                                 ))
                             }))
                             .on_query(move |query, _, cx| {
