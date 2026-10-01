@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fresh_gui_protocol::{
-    CAP_GIT, CAP_EDITOR_PAGED_READS, CAP_EDITOR_EXTERNAL_CHANGES, CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_DRAFT_RECOVERY, CAP_WORKSPACE, CAP_WORKSPACE_SET_ROOT, FsEntry, FsKind, GitFile, Hello, PtyInfo,
+    CAP_LSP_REQUESTS, LspRequestFeature, CAP_GIT, CAP_EDITOR_PAGED_READS, CAP_EDITOR_EXTERNAL_CHANGES, CAP_EDITOR_RANGE_EDITS, CAP_EDITOR_DRAFT_RECOVERY, CAP_WORKSPACE, CAP_WORKSPACE_SET_ROOT, FsEntry, FsKind, GitFile, Hello, PtyInfo,
     LayoutNode, WorkspaceInfo, WorkspaceLayoutExtra, WorkspaceTab, WorkspaceTabKind,
 };
 use gpui_kit::base::Placement;
@@ -41,7 +41,7 @@ use gpui_kit::*;
 use super::actions::{
     ClearExplorerInput, CloseAllEditors, CloseAllOtherTabs, CloseAllOtherTerminals,
     CloseAllTerminals, CloseTab, CloseWorkspace, CopyExplorer, DeleteExplorer, Disconnect, FilterExplorer,
-    AskCopilot, FormatDocument, GoToFile, NewFile, NewTerminal, NewWorkspace, NextTab, OpenDefaultSettings, OpenSettings, PasteExplorer,
+    AskCopilot, Complete, ShowHover, SignatureHelp, FormatDocument, GoToFile, NewFile, NewTerminal, NewWorkspace, NextTab, OpenDefaultSettings, OpenSettings, PasteExplorer,
     PrevTab, QuitClient, Reconnect, RenameWorkspace, ResetContentZoom, ResetUiZoom, SaveBuffer,
     SplitTerminal, StopServer, RestartServer, ReloadConfig, TerminalCopyOrInterrupt, TogglePinTab, ToggleCommandPalette, ToggleSidebar, ToggleWordWrap, ZoomInContent, ZoomInUi, ZoomOutContent,
     ZoomOutUi,
@@ -1905,6 +1905,11 @@ impl Workspace {
                     cx.notify();
                 } else { self.on_buffer_saved(&request_id, &buffer_id, path, rev, window, cx); }
             }
+            AdeEvent::LspResult { result } => {
+                if let Some(panel) = self.editor_by_buffer(&result.buffer_id, cx) {
+                    panel.update(cx, |panel, cx| panel.apply_lsp_result(result, cx));
+                }
+            }
             AdeEvent::BufferLspState { buffer_id, rev, text, diagnostics, status } => {
                 if let Some(panel) = self.editor_by_buffer(&buffer_id, cx) {
                     panel.update(cx, |panel, cx| {
@@ -2062,6 +2067,7 @@ impl Workspace {
         for panel in self.editors.values() {
             panel.update(cx, |panel, cx| {
                 panel.configure_range_edits(range_edits, cx);
+                panel.configure_lsp_requests(self.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS), cx);
                 panel.configure_draft_recovery(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
                 panel.configure_external_changes(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES));
             });
@@ -2206,10 +2212,12 @@ impl Workspace {
         let lookup_key = if path.is_empty() { untitled_editor_key(draft_id.as_deref().unwrap_or(&buffer_id)) } else { path.clone() };
         if let Some(panel) = self.editors.get(&lookup_key).cloned() {
             panel.update(cx, |panel, cx| {
+                panel.configure_lsp_requests(self.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS), cx);
                 panel.configure_draft_recovery(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
                 panel.configure_external_changes(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES));
                 panel.note_reopen(buffer_id, line, column, cx);
                 panel.reconnect(self.ade.clone(), self.capabilities.iter().any(|cap| cap == CAP_EDITOR_RANGE_EDITS), self.capabilities.iter().any(|cap| cap == CAP_EDITOR_PAGED_READS), cx);
+                panel.configure_lsp_requests(self.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS), cx);
             });
             if activate {
                 self.select_entity(&panel, window, cx);
@@ -2243,7 +2251,8 @@ impl Workspace {
         });
         panel.update(cx, |panel, cx| {
             panel.configure_range_edits(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_RANGE_EDITS), cx);
-            panel.configure_draft_recovery(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
+            panel.configure_lsp_requests(self.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS), cx);
+                panel.configure_draft_recovery(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
                 panel.configure_external_changes(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES));
             panel.set_word_wrap(self.editor_line_wrap, window, cx);
         });
@@ -5229,6 +5238,23 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
         self.split_terminal_vertical(cx);
     }
 
+    fn language_help(&mut self, feature: LspRequestFeature, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ActiveSurface::Editor(path)) = &self.active else { return; };
+        if let Some(panel) = self.editors.get(path).cloned() {
+            panel.update(cx, |panel, cx| panel.request_language_help(feature, window, cx));
+        }
+    }
+
+    fn on_complete(&mut self, _: &Complete, window: &mut Window, cx: &mut Context<Self>) {
+        self.language_help(LspRequestFeature::Completion, window, cx);
+    }
+    fn on_show_hover(&mut self, _: &ShowHover, window: &mut Window, cx: &mut Context<Self>) {
+        self.language_help(LspRequestFeature::Hover, window, cx);
+    }
+    fn on_signature_help(&mut self, _: &SignatureHelp, window: &mut Window, cx: &mut Context<Self>) {
+        self.language_help(LspRequestFeature::SignatureHelp, window, cx);
+    }
+
     fn on_format_document(&mut self, _: &FormatDocument, window: &mut Window, cx: &mut Context<Self>) {
         self.format_active(window, cx);
     }
@@ -6632,6 +6658,9 @@ pub(crate) fn new_terminal(&mut self, cx: &App) {
             ("New Terminal", Box::new(NewTerminal) as Box<dyn Action>),
             ("New File", Box::new(NewFile)),
             ("Split Terminal Vertically", Box::new(SplitTerminal)),
+            ("Complete", Box::new(Complete)),
+            ("Show Hover", Box::new(ShowHover)),
+            ("Signature Help", Box::new(SignatureHelp)),
             ("Format Document", Box::new(FormatDocument)),
             ("Toggle Word Wrap", Box::new(ToggleWordWrap)),
             ("New Workspace", Box::new(NewWorkspace)),
@@ -7154,6 +7183,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_clear_explorer_input))
             .on_action(cx.listener(Self::on_new_file))
             .on_action(cx.listener(Self::on_split_terminal))
+            .on_action(cx.listener(Self::on_complete))
+            .on_action(cx.listener(Self::on_show_hover))
+            .on_action(cx.listener(Self::on_signature_help))
             .on_action(cx.listener(Self::on_format_document))
             .on_action(cx.listener(Self::on_toggle_word_wrap))
             .on_action(cx.listener(Self::on_new_workspace))

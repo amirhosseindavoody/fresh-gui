@@ -1,6 +1,7 @@
 //! Host-side WebSocket client for the fresh-gui ADE protocol.
 
 pub mod edit_sync;
+pub mod lsp_sync;
 
 use std::time::Duration;
 

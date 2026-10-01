@@ -45,6 +45,9 @@ actions!(
         NewFile,
         SplitTerminal,
         FormatDocument,
+        Complete,
+        ShowHover,
+        SignatureHelp,
         ToggleWordWrap,
         TerminalInputTab,
         TerminalInputBacktab,
@@ -121,6 +124,9 @@ pub fn apply_shortkeys(cx: &mut App, shortkeys: &[Shortkey]) {
             "NewTerminal" => KeyBinding::new(key, NewTerminal, when),
             "NewFile" => KeyBinding::new(key, NewFile, when),
             "SplitTerminal" => KeyBinding::new(key, SplitTerminal, when),
+            "Complete" => KeyBinding::new(key, Complete, when),
+            "ShowHover" => KeyBinding::new(key, ShowHover, when),
+            "SignatureHelp" => KeyBinding::new(key, SignatureHelp, when),
             "FormatDocument" => KeyBinding::new(key, FormatDocument, when),
             "ToggleWordWrap" => KeyBinding::new(key, ToggleWordWrap, when),
             "CloseTab" => KeyBinding::new(key, CloseTab, when),
@@ -186,6 +192,9 @@ pub fn known_action(action: &str) -> bool {
             | "NewFile"
             | "SplitTerminal"
             | "FormatDocument"
+            | "Complete"
+            | "ShowHover"
+            | "SignatureHelp"
             | "ToggleWordWrap"
             | "CloseTab"
             | "CloseAllEditors"

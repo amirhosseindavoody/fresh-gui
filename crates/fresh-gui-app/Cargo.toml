@@ -51,6 +51,7 @@ tracing-subscriber = { workspace = true }
 alacritty_terminal = "0.25.1"
 # Same major as gpui-pre's image, so the X11 icon type is one crate.
 image = { version = "0.25", default-features = false, features = ["png"] }
+lsp-types = "0.97"
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

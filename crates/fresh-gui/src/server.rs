@@ -2,6 +2,7 @@
 
 #![allow(clippy::result_large_err)] // ADE `Message` is the shared error envelope.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,11 +15,12 @@ use axum::routing::get;
 use base64::Engine;
 use fresh_gui_protocol::{
     CAP_EDITOR, CAP_EDITOR_DRAFT_RECOVERY, CAP_EDITOR_EXTERNAL_CHANGES, CAP_EDITOR_PAGED_READS,
-    CAP_EDITOR_RANGE_EDITS, CAP_LSP, CAP_SCENE, CAP_SETTINGS_EDITOR, ByteSelection,
+    CAP_EDITOR_RANGE_EDITS, CAP_LSP, CAP_LSP_REQUESTS, CAP_SCENE, CAP_SETTINGS_EDITOR, ByteSelection,
     EditorDraftInfo, ExternalResolution, Hello, HelloUi, Message, MAX_PAGE_BYTES, PROTOCOL_VERSION,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
@@ -30,6 +32,7 @@ use crate::session::SessionStore;
 use crate::workspace::WorkspaceStore;
 
 const MAX_SNAPSHOT_BYTES: u64 = 2 * 1024 * 1024;
+static NEXT_LSP_WIRE_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct AppState {
     pub token: Option<String>,
@@ -133,6 +136,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 && c != CAP_EDITOR_DRAFT_RECOVERY
                 && c != CAP_EDITOR_EXTERNAL_CHANGES
                 && c != CAP_LSP
+                && c != CAP_LSP_REQUESTS
                 && c != CAP_SCENE
         });
     }
@@ -164,12 +168,39 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut client_draft_recovery = false;
     let mut client_external_changes = false;
     let mut client_settings_editor = false;
+    let mut client_lsp_requests = false;
     let mut session_id: Option<String> = None;
+    let socket_id = uuid::Uuid::new_v4().to_string();
+    let mut lsp_request_map: HashMap<u64, (u64, String, String)> = HashMap::new();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
     let mut external_rx = state.editor.as_ref().map(EditorHandle::subscribe_external);
+    let mut lsp_rx = state.editor.as_ref().map(EditorHandle::subscribe_lsp);
 
     loop {
         tokio::select! {
+            lsp = async { match lsp_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } }, if authed && client_lsp_requests => {
+                match lsp {
+                    Ok(result) => if let Some((client_id, buffer_id, view_id)) = lsp_request_map.remove(&result.request_id) {
+                        let mut result = result;
+                        let owned = if let Some(editor) = state.editor.as_ref() {
+                            ensure_editor_workspace(editor, &state, &session_id, &buffer_id, &client_id.to_string()).await.is_ok()
+                        } else { false };
+                        if !owned {
+                            if let Some(editor) = state.editor.as_ref() { let _ = editor.cancel_lsp(result.request_id, buffer_id, format!("{socket_id}:{view_id}")); }
+                            continue;
+                        }
+                        result.request_id = client_id;
+                        result.buffer_id = buffer_id;
+                        result.view_id = view_id;
+                        if send_msg(&mut sink, &Message::BufferLspResult { result }).await.is_err() { break; }
+                    },
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        cancel_socket_lsp(state.editor.as_ref(), &socket_id, &mut lsp_request_map);
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => lsp_rx = None,
+                }
+            }
             external = async {
                 match external_rx.as_mut() {
                     Some(rx) => rx.recv().await,
@@ -221,6 +252,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     }
                 };
 
+                let previous_session = session_id.clone();
                 if let Err(resp) = handle_client_msg(
                     msg,
                     &state,
@@ -231,6 +263,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     &mut client_draft_recovery,
                     &mut client_external_changes,
                     &mut client_settings_editor,
+                    &mut client_lsp_requests,
+                    &mut lsp_request_map,
+                    &socket_id,
                     &mut session_id,
                     out_tx.clone(),
                     &mut sink,
@@ -239,6 +274,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 {
                     let _ = send_msg(&mut sink, &resp).await;
                 }
+                if previous_session != session_id {
+                    cancel_socket_lsp(state.editor.as_ref(), &socket_id, &mut lsp_request_map);
+                }
             }
         }
     }
@@ -246,6 +284,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     if let Some(sid) = session_id {
         state.sessions.detach_subscriber(&sid).await;
     }
+    cancel_socket_lsp(state.editor.as_ref(), &socket_id, &mut lsp_request_map);
     let _ = std::fs::remove_file(&defaults_path);
     info!("websocket client disconnected");
 }
@@ -260,6 +299,9 @@ async fn handle_client_msg(
     client_draft_recovery: &mut bool,
     client_external_changes: &mut bool,
     client_settings_editor: &mut bool,
+    client_lsp_requests: &mut bool,
+    lsp_request_map: &mut HashMap<u64, (u64, String, String)>,
+    socket_id: &str,
     session_id: &mut Option<String>,
     out_tx: mpsc::UnboundedSender<Message>,
     sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
@@ -286,6 +328,7 @@ async fn handle_client_msg(
                 .capabilities
                 .iter()
                 .any(|cap| cap == CAP_SETTINGS_EDITOR);
+            *client_lsp_requests = client_hello.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS);
             if client_hello.protocol_version != PROTOCOL_VERSION {
                 return Err(Message::Error {
                     code: "protocol_mismatch".into(),
@@ -1668,6 +1711,34 @@ async fn handle_client_msg(
             })?;
             Ok(())
         }
+        Message::BufferLspRequest { mut request } => {
+            require_auth(*authed)?;
+            if !*client_lsp_requests { return Err(Message::Error { code: "capability_unavailable".into(), message: "LSP requests require lsp.requests capability".into() }); }
+            if lsp_request_map.len() >= 64 { return Err(Message::Error { code: "too_many_lsp_requests".into(), message: "connection already has 64 outstanding LSP requests".into() }); }
+            let Some(editor) = state.editor.as_ref() else { return Err(Message::Error { code: "editor_unavailable".into(), message: "editor capability not available".into() }); };
+            ensure_editor_workspace(editor, state, session_id, &request.buffer_id, &request.request_id.to_string()).await?;
+            let client_id = request.request_id;
+            let internal_id = NEXT_LSP_WIRE_ID.fetch_add(1, Ordering::Relaxed).max(1);
+            let client_view_id = request.view_id.clone();
+            request.request_id = internal_id;
+            request.view_id = format!("{socket_id}:{client_view_id}");
+            // The socket's receiver was subscribed before this request is queued.
+            lsp_request_map.insert(internal_id, (client_id, request.buffer_id.clone(), client_view_id));
+            if let Err(error) = editor.request_lsp(request) {
+                lsp_request_map.remove(&internal_id);
+                return Err(Message::Error { code: "lsp_failed".into(), message: error.to_string() });
+            }
+            Ok(())
+        }
+        Message::BufferLspCancel { request_id, buffer_id, view_id } => {
+            require_auth(*authed)?;
+            if !*client_lsp_requests { return Err(Message::Error { code: "capability_unavailable".into(), message: "LSP requests require lsp.requests capability".into() }); }
+            if let Some((internal_id, _)) = lsp_request_map.iter().find(|(_, (client_id, buffer, view))| *client_id == request_id && *buffer == buffer_id && *view == view_id).map(|(id, value)| (*id, value.clone())) {
+                lsp_request_map.remove(&internal_id);
+                if let Some(editor) = state.editor.as_ref() { let _ = editor.cancel_lsp(internal_id, buffer_id, format!("{socket_id}:{view_id}")); }
+            }
+            Ok(())
+        }
         Message::BufferFormat {
             request_id,
             buffer_id,
@@ -2162,6 +2233,20 @@ mod settings_capability_tests {
             settings_error("settings_patch_failed", "settings-1", "stale config"),
             Message::Error { code, message } if code == "settings_patch_failed" && message.starts_with("settings-1:")
         ));
+    }
+}
+
+fn cancel_socket_lsp(
+    editor: Option<&EditorHandle>,
+    socket_id: &str,
+    requests: &mut HashMap<u64, (u64, String, String)>,
+) {
+    if let Some(editor) = editor {
+        for (internal_id, (_, buffer_id, view_id)) in requests.drain() {
+            let _ = editor.cancel_lsp(internal_id, buffer_id, format!("{socket_id}:{view_id}"));
+        }
+    } else {
+        requests.clear();
     }
 }
 

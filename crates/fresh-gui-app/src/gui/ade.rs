@@ -8,7 +8,8 @@ use fresh_gui_client::{Client, ConnectOptions};
 use fresh_gui_protocol::{
     BufferDiagnostic, ByteRange, ByteSelection, CAP_EDITOR_PAGED_READS, CAP_EDITOR_EXTERNAL_CHANGES, CAP_EDITOR_RANGE_EDITS, CAP_LSP,
     CAP_WORKSPACE, EditorAction, EditorDraftInfo, ExternalResolution, FsEntry, GitFile, Hello,
-    Message, PtyInfo, RangeEdit, WorkspaceInfo, WorkspaceTab,
+    LspRequest, LspResult, Message, PtyInfo, RangeEdit, WorkspaceInfo, WorkspaceTab,
+    CAP_LSP_REQUESTS,
 };
 
 use super::connect::ConnectTarget;
@@ -120,6 +121,10 @@ pub enum AdeCmd {
         buffer_id: String,
         base_rev: u64,
     },
+    /// Issue a revision-aware language server request for an editor buffer.
+    LspRequest { request: LspRequest },
+    /// Cancel an outstanding language server request.
+    LspCancel { request_id: u64, buffer_id: String, view_id: String },
     /// Client-local acknowledgement of an installed/reconciled poll snapshot.
     AcknowledgeBufferState {
         buffer_id: String,
@@ -383,6 +388,7 @@ pub enum AdeEvent {
         diagnostics: Vec<BufferDiagnostic>,
         status: Option<String>,
     },
+    LspResult { result: LspResult },
     BufferFormatted {
         request_id: String,
         buffer_id: String,
@@ -577,11 +583,33 @@ async fn ade_loop(
                         if let AdeCmd::CloseEditor { buffer_id } = &cmd {
                             open_buffers.remove(buffer_id);
                         }
+                        let lsp_request = match &cmd {
+                            AdeCmd::LspRequest { request } => Some(request.clone()),
+                            _ => None,
+                        };
                         if let Err(err) = dispatch_cmd(&mut client, cmd).await {
-                            let _ = evt_tx.send(AdeEvent::Error {
-                                code: "ade".into(),
-                                message: format!("{err:#}"),
-                            }).await;
+                            if let Some(request) = lsp_request {
+                                // Complete the waiting provider even when an older daemon or a
+                                // transport failure prevents the request from being sent.
+                                let _ = evt_tx.send(AdeEvent::LspResult { result: LspResult {
+                                    request_id: request.request_id,
+                                    buffer_id: request.buffer_id,
+                                    view_id: request.view_id,
+                                    rev: request.base_rev,
+                                    offset: request.offset,
+                                    feature: request.feature,
+                                    responses: Vec::new(),
+                                    completion_triggers: Vec::new(),
+                                    signature_triggers: Vec::new(),
+                                    status: Some(format!("LSP request failed: {err:#}")),
+                                    stale: false,
+                                }}).await;
+                            } else {
+                                let _ = evt_tx.send(AdeEvent::Error {
+                                    code: "ade".into(),
+                                    message: format!("{err:#}"),
+                                }).await;
+                            }
                         }
                     }
                 }
@@ -864,6 +892,18 @@ async fn dispatch_cmd(client: &mut Client, cmd: AdeCmd) -> anyhow::Result<()> {
                     base_rev,
                 })
                 .await?;
+        }
+        AdeCmd::LspRequest { request } => {
+            anyhow::ensure!(
+                client.supports_capability(CAP_LSP_REQUESTS),
+                "daemon does not support LSP completion, hover, or signature requests"
+            );
+            client.send(Message::BufferLspRequest { request }).await?;
+        }
+        AdeCmd::LspCancel { request_id, buffer_id, view_id } => {
+            if client.supports_capability(CAP_LSP_REQUESTS) {
+                client.send(Message::BufferLspCancel { request_id, buffer_id, view_id }).await?;
+            }
         }
         AdeCmd::AcknowledgeBufferState { .. } => {}
         AdeCmd::CloseEditor { buffer_id } => {
@@ -1428,6 +1468,7 @@ fn event_from_message(msg: Message) -> Option<AdeEvent> {
             diagnostics,
             status,
         }),
+        Message::BufferLspResult { result } => Some(AdeEvent::LspResult { result }),
         Message::BufferFormatted {
             request_id,
             buffer_id,
