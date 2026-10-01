@@ -254,10 +254,15 @@ impl Workspace {
                 return;
             }
         }
-        // Path-shaped input is resolved by Fresh immediately, even while the
-        // recursive scan is pending. Bare names select ranked results.
-        let explicit =
-            goto_is_absolute(&file) || file.starts_with(['.', '~']) || file.contains(['/', '\\']);
+        if chosen.is_none() && self.goto_path_is_dir(&file) {
+            self.complete_goto_path(file, window, cx);
+            return;
+        }
+        // Exact path-shaped input opens immediately while enumeration is pending.
+        // Once relative fuzzy results exist, Enter accepts the highlighted match.
+        let explicit = goto_is_absolute(&file)
+            || file.starts_with(['.', '~'])
+            || (self.finder.paths.is_empty() && file.contains(['/', '\\']));
         let target = chosen.unwrap_or_else(|| {
             if explicit {
                 file.clone()

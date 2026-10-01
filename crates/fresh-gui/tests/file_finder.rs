@@ -183,7 +183,17 @@ async fn finder_cancel_acknowledges_cancelled_request() {
         .unwrap();
     let (latest_paths, _, latest_cancelled) = await_results(&mut client, "finder-latest").await;
     assert!(!latest_cancelled);
-    assert_eq!(latest_paths, vec!["dir-00/file-000.rs"]);
+    // Multi-term fuzzy matching ranks the exact directory first; it can also
+    // find the directory term's zeroes in the filename of other paths.
+    assert_eq!(
+        latest_paths.first().map(String::as_str),
+        Some("dir-00/file-000.rs")
+    );
+    assert!(
+        latest_paths
+            .iter()
+            .all(|path| path.ends_with("/file-000.rs"))
+    );
 
     client
         .send(Message::FileFinder {
