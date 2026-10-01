@@ -2063,6 +2063,9 @@ impl Workspace {
                     self.diff_save_snapshots.clear();
                     for panel in self.editors.values() {
                         panel.update(cx, |panel, cx| {
+                            if code.starts_with("buffer_file_control") {
+                                panel.handle_file_control_error(request_id, detail, cx);
+                            }
                             panel.handle_request_error(request_id, detail, cx);
                         });
                     }
@@ -2186,8 +2189,8 @@ impl Workspace {
         for panel in self.editors.values() {
             panel.update(cx, |panel, cx| {
                 panel.configure_range_edits(range_edits, cx);
-                panel.set_file_controls_supported(self.capabilities.iter().any(|cap| cap == fresh_gui_protocol::CAP_EDITOR_FILE_CONTROLS));
-            panel.configure_lsp_requests(self.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS), cx);
+                panel.set_file_controls_supported(self.capabilities.iter().any(|cap| cap == fresh_gui_protocol::CAP_EDITOR_FILE_CONTROLS), window, cx);
+                panel.configure_lsp_requests(self.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS), cx);
                 panel.configure_search(self.search_options.clone(), cx);
                 panel.configure_draft_recovery(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
                 panel.configure_external_changes(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES));
@@ -2333,14 +2336,13 @@ impl Workspace {
         let lookup_key = if path.is_empty() { untitled_editor_key(draft_id.as_deref().unwrap_or(&buffer_id)) } else { path.clone() };
         if let Some(panel) = self.editors.get(&lookup_key).cloned() {
             panel.update(cx, |panel, cx| {
-                panel.set_file_controls_supported(self.capabilities.iter().any(|cap| cap == fresh_gui_protocol::CAP_EDITOR_FILE_CONTROLS));
-            panel.configure_lsp_requests(self.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS), cx);
+                panel.configure_lsp_requests(self.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS), cx);
                 panel.configure_draft_recovery(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
                 panel.configure_external_changes(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES));
                 panel.note_reopen(buffer_id, line, column, cx);
                 panel.reconnect(self.ade.clone(), self.capabilities.iter().any(|cap| cap == CAP_EDITOR_RANGE_EDITS), self.capabilities.iter().any(|cap| cap == CAP_EDITOR_PAGED_READS), cx);
-                panel.set_file_controls_supported(self.capabilities.iter().any(|cap| cap == fresh_gui_protocol::CAP_EDITOR_FILE_CONTROLS));
-            panel.configure_lsp_requests(self.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS), cx);
+                panel.set_file_controls_supported(self.capabilities.iter().any(|cap| cap == fresh_gui_protocol::CAP_EDITOR_FILE_CONTROLS), window, cx);
+                panel.configure_lsp_requests(self.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS), cx);
             });
             if activate {
                 self.select_entity(&panel, window, cx);
@@ -2375,8 +2377,8 @@ impl Workspace {
         panel.update(cx, |panel, cx| {
             panel.configure_search(self.search_options.clone(), cx);
             panel.configure_range_edits(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_RANGE_EDITS), cx);
-            panel.set_file_controls_supported(self.capabilities.iter().any(|cap| cap == fresh_gui_protocol::CAP_EDITOR_FILE_CONTROLS));
-            panel.configure_lsp_requests(self.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS), cx);
+            panel.set_file_controls_supported(self.capabilities.iter().any(|cap| cap == fresh_gui_protocol::CAP_EDITOR_FILE_CONTROLS), window, cx);
+                panel.configure_lsp_requests(self.capabilities.iter().any(|cap| cap == CAP_LSP_REQUESTS), cx);
                 panel.configure_draft_recovery(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_DRAFT_RECOVERY));
                 panel.configure_external_changes(self.capabilities.iter().any(|cap| cap == CAP_EDITOR_EXTERNAL_CHANGES));
             panel.set_word_wrap(self.editor_line_wrap, window, cx);
