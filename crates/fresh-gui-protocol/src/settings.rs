@@ -185,8 +185,14 @@ pub fn catalog() -> Vec<SettingDefinition> {
             1,
             u32::MAX as u64,
         ),
-        fresh(&["editor", "hot_exit"], Boolean),
-        fresh(&["editor", "confirm_quit"], Boolean),
+        SettingDefinition {
+            effect: SettingEffect::BackendOnly,
+            ..fresh(&["editor", "hot_exit"], Boolean)
+        },
+        SettingDefinition {
+            effect: SettingEffect::BackendOnly,
+            ..fresh(&["editor", "confirm_quit"], Boolean)
+        },
         SettingDefinition {
             scope: SettingScope::Global,
             effect: SettingEffect::Restart,
@@ -522,6 +528,11 @@ mod tests {
         assert!(validate_value(interval, &Value::from(30)).is_ok());
         assert!(validate_value(interval, &Value::from(0)).is_err());
         assert!(validate_value(interval, &Value::from(u64::from(u32::MAX) + 1)).is_err());
+        assert_eq!(interval.effect, SettingEffect::Restart);
+        for path in [["editor", "hot_exit"], ["editor", "confirm_quit"]] {
+            let setting = entries.iter().find(|entry| entry.path == path).unwrap();
+            assert_eq!(setting.effect, SettingEffect::BackendOnly);
+        }
     }
 
     #[test]

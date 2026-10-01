@@ -2,6 +2,14 @@
 
 The daemon embeds Fresh's editor library for buffer open, edit, and save. The GPUI client does not link Fresh; it exchanges editor snapshots, bounded pages, and edits with the daemon over ADE.
 
+## Encoding, line endings, and save behavior
+
+Encoding detection, BOM handling, line-ending detection, and serialization use Fresh's daemon-side buffer and save path, so local and SSH sessions apply the same byte conversion. The editor status controls expose the detected encoding/BOM and line-ending style; Save As, Save All, reopen with an encoding, save with an encoding, and line-ending conversion use the shared command registry and authoritative save results. Encoding changes that cannot round-trip the current text without loss are rejected; there is no forced lossy-save option. Reopen with another encoding is available only for a clean buffer.
+
+Paged buffers retain Fresh's detected encoding, BOM, and line-ending defaults when saved. Their controls are inspection-only: changing encoding or line endings requires materializing/reopening the file as a normal buffer and is rejected while it remains paged. Paged saves preserve the original byte representation and cannot use conversion controls.
+
+Persistent auto-save is configured with Fresh's `editor.auto_save_enabled` and `editor.auto_save_interval_secs` settings. The interval is taken from the effective Fresh config at daemon editor startup. The GUI timer saves open, dirty, named editor buffers through the same revisioned save pipeline as manual Save, so format-on-save and Fresh on-save actions still run. It skips untitled buffers, closed recoverable drafts, and Source Control views, and pauses while disconnected or after a save error. Fresh's `hot_exit` and `confirm_quit` settings do not bypass ADE's mandatory dirty-buffer Save / Discard / Cancel guards or daemon draft recovery. Auto-save does not protect edits that have not yet reached the daemon.
+
 ## Build setup
 
 Fresh is a pinned git submodule in `vendor/fresh`. Initialize it when cloning:
